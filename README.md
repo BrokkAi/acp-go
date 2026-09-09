@@ -32,9 +32,6 @@ Generic `Call` and `Notify` permit extensions. ACP v2 is not supported.
 
 Run `go test -race ./...` and `go vet ./...`. No agent credentials are needed.
 
-Apache-2.0. Originally developed in BrokkAi/release-bot; license terms are
-retained in LICENSE. Tagged Go modules are the distribution format.
-
 ## Process runner
 
 `github.com/BrokkAi/acp-go/runner` adds a process lifecycle, confined client file
@@ -44,3 +41,15 @@ receipt parsing and workflow policy. Set `Config.AutoApprove` explicitly to allo
 permission requests for unattended operation. It defaults to false. This is not
 an OS sandbox: agents and terminal commands inherit the caller's permissions.
 `SetupError` distinguishes failures before a prompt from failures during work.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and our
+[Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately using
+[SECURITY.md](SECURITY.md).
+
+## License
+
+Licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for project
+attribution and [licenses/README.md](licenses/README.md) for dependency terms,
+third-party notices, and the license review process.

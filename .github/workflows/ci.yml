@@ -14,5 +14,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - name: Check dependency licenses and notices
+        run: python3 scripts/licenses.py
       - run: go test -race ./...
       - run: go vet ./...
+      - run: python3 -m unittest discover -s scripts -p '*_test.py'
