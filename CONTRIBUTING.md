@@ -33,6 +33,23 @@ documentation changes need a diff and link review. Tests should use temporary
 repositories and simulated agents, without publishing releases or requiring
 live credentials.
 
+## Schema generation
+
+The `schema` package is generated from the pinned ACP JSON Schema release
+(`schema/schema.json`, `schema/meta.json`, `schema/VERSION`) and must stay in
+sync with it. To track a new schema release:
+
+```sh
+go run ./cmd/acpgen -update <version>   # e.g. 1.21.0; downloads and pins
+go run ./cmd/acpgen                     # regenerates schema/*_gen*.go
+go test -race ./schema/
+```
+
+Commit the regenerated files together with the updated pin, and review the
+diff like any API change. Regeneration is deterministic; a clean tree after
+`go run ./cmd/acpgen` proves the checked-in files match the pin. The generator
+fails loudly on schema constructs it cannot model rather than guessing.
+
 ## Licensing and dependencies
 
 This project uses [Apache-2.0](LICENSE). By intentionally submitting a

@@ -6,3 +6,9 @@ See LICENSE for the full terms. Third-party terms and attribution are
 provided in licenses/THIRD_PARTY_NOTICES.txt.
 
 Originally developed as part of BrokkAi/release-bot.
+
+The pinned Agent Client Protocol JSON Schema artifacts in schema/
+(schema.json, meta.json, VERSION) are distributed by the ACP project
+(https://github.com/agentclientprotocol/agent-client-protocol) under the
+Apache License 2.0. The generated code in schema/*_gen.go derives from
+those artifacts.
