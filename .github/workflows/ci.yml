@@ -55,11 +55,11 @@ jobs:
       matrix:
         include:
           - agent: claude-agent
-            command: '["npx","-y","@agentclientprotocol/claude-agent-acp"]'
+            command: '["npx","-y","@agentclientprotocol/claude-agent-acp@0.76.0"]'
             auth-method: ""
             required-env: ANTHROPIC_API_KEY
           - agent: codex
-            command: '["npx","-y","@agentclientprotocol/codex-acp"]'
+            command: '["npx","-y","@agentclientprotocol/codex-acp@1.11.0"]'
             auth-method: api-key
             required-env: OPENAI_API_KEY
     env:
