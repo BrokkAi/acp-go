@@ -9,7 +9,8 @@
 //
 // The schema releases live at
 // https://github.com/agentclientprotocol/agent-client-protocol/releases,
-// tagged schema-v<version>, with schema.json and meta.json attached.
+// tagged schema-v<version>, with schema.json and meta.json attached. Both the
+// stable v1 and draft-v2 releases can be generated as separate packages.
 package main
 
 import (
@@ -28,6 +29,7 @@ func main() {
 	schemaPath := flag.String("schema", "schema/schema.json", "path to the pinned schema.json")
 	metaPath := flag.String("meta", "schema/meta.json", "path to the pinned meta.json")
 	outDir := flag.String("out", "schema", "directory receiving generated files")
+	packageName := flag.String("package", "schema", "Go package name for generated files")
 	flag.Parse()
 
 	if *update != "" {
@@ -60,7 +62,7 @@ func main() {
 	if err != nil {
 		fatal(fmt.Errorf("build IR: %w", err))
 	}
-	for _, f := range emit(ir, pin) {
+	for _, f := range emit(ir, pin, *packageName) {
 		path := filepath.Join(*outDir, f.name)
 		if err := os.WriteFile(path, f.source, 0o644); err != nil {
 			fatal(err)

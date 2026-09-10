@@ -140,6 +140,9 @@ func synthValue(r *ir, f field, full bool, depth map[string]int) (string, error)
 	_ = optional
 
 	switch {
+	case strings.HasPrefix(typ, "*"):
+		f.GoType = typ[1:]
+		return synthValue(r, f, full, depth)
 	case typ == "string":
 		return `""`, nil
 	case typ == "int64" || typ == "uint64":

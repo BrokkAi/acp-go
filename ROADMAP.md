@@ -23,7 +23,7 @@ diff instead of a rewrite.
 | 1 | Complete v1 client surface | Done |
 | 2 | Agent-side runtime | Done |
 | 3 | Trust and ecosystem | Done |
-| 4 | v2 draft | Planned |
+| 4 | v2 draft | In progress (`schema-v2.0.0-alpha.3`) |
 
 ## Phase 1 — complete the v1 client
 
@@ -84,10 +84,22 @@ want editor integration for free.
 
 ## Phase 4 — v2 draft
 
-Generate a separate v2 package from the `schema/v2` artifacts when that
-spec stabilizes. No cross-version conversion: per the schema team's
-guidance, SDKs expose explicit versioned implementations. The codegen
-built in Phase 0 makes this mostly free.
+Generate and expose a separate v2 package from the published `schema/v2`
+artifacts. The reference Rust SDK already ships an explicit opt-in v2 module,
+so waiting for a final 2.0 tag would leave Go consumers behind adapters that
+can negotiate the draft. No cross-version conversion: per the schema team's
+guidance, SDKs expose explicit versioned implementations. The codegen built in
+Phase 0 makes tracking alpha releases a reviewed regeneration.
+
+Current scope:
+
+- Generated `schema/v2` bindings pinned to `schema-v2.0.0-alpha.3`.
+- A separate `/v2` client package for initialization, authentication, session
+  lifecycle, prompt submission, cancellation, and typed update dispatch.
+- V2 prompt semantics: `session/prompt` returns after acceptance; completion is
+  reported by `state_update` notifications.
+- Track alpha releases as they ship, then add the v2 agent runtime once the
+  request surface is sufficiently settled for a stable Go interface.
 
 ## Guardrails
 
@@ -98,7 +110,7 @@ built in Phase 0 makes this mostly free.
 - No silent fallbacks: selections are acknowledged, capabilities gate
   optional methods, and the generator fails loudly on constructs it cannot
   model.
-- Generated files always match the pinned release; regeneration is
-  deterministic, so a clean tree after `go run ./cmd/acpgen` proves it.
+- Generated files always match each pinned release; regeneration is
+  deterministic, so a clean tree after regenerating both v1 and v2 proves it.
 - Artifact (module) versions are independent of the negotiated
   `protocolVersion`; wire compatibility comes from initialization.

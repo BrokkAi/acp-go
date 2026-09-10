@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Added
+
+- Generated draft-v2 schema bindings pinned to the official
+  `schema-v2.0.0-alpha.3` release.
+- A separate v2 client package for v2 initialization, authentication, session
+  lifecycle, prompt acceptance, cancellation, capability checks, and typed
+  session updates.
+- Generated open unions now retain the unknown discriminator in `Kind` as well
+  as the raw payload in `Other`.
+- Generated v2 patch fields use `Nullable[T]` to distinguish omitted values,
+  explicit JSON null values, and concrete payloads.
+
 ## 0.2.1 - 2026-09-10
 
 ### Fixed

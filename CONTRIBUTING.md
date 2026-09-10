@@ -70,13 +70,19 @@ sync with it. To track a new schema release:
 ```sh
 go run ./cmd/acpgen -update <version>   # e.g. 1.21.0; downloads and pins
 go run ./cmd/acpgen                     # regenerates schema/*_gen*.go
+go run ./cmd/acpgen -update <version> \
+  -schema schema/v2/schema.json -meta schema/v2/meta.json \
+  -out schema/v2 -package v2           # e.g. 2.0.0-alpha.3
+go run ./cmd/acpgen -schema schema/v2/schema.json \
+  -meta schema/v2/meta.json -out schema/v2 -package v2
 go test -race ./schema/
 ```
 
-Commit the regenerated files together with the updated pin, and review the
-diff like any API change. Regeneration is deterministic; a clean tree after
-`go run ./cmd/acpgen` proves the checked-in files match the pin. The generator
-fails loudly on schema constructs it cannot model rather than guessing.
+Commit each version's regenerated files together with its updated pin, and
+review the diff like any API change. Regeneration is deterministic; clean
+output after regenerating both pins proves the checked-in files match them.
+The generator fails loudly on schema constructs it cannot model rather than
+guessing.
 
 ## Licensing and dependencies
 

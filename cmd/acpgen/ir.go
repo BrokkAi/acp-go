@@ -27,6 +27,7 @@ type field struct {
 	GoName   string // Go field name
 	GoType   string // rendered type expression
 	Required bool
+	Nullable bool // JSON null is distinct from an omitted optional field
 	Doc      string
 }
 
@@ -63,10 +64,11 @@ type methodDesc struct {
 }
 
 type ir struct {
-	Pin     string
-	Defs    []*typeDef
-	ByName  map[string]*typeDef
-	Methods []methodDesc
+	Pin          string
+	PreserveNull bool
+	Defs         []*typeDef
+	ByName       map[string]*typeDef
+	Methods      []methodDesc
 }
 
 // skippedDefs are JSON-RPC routing envelopes. The acp runtime dispatches by
@@ -80,7 +82,11 @@ var skippedDefs = map[string]bool{
 }
 
 func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
-	r := &ir{Pin: pin, ByName: map[string]*typeDef{}}
+	// v2 introduced patch objects whose omitted and null fields can have
+	// different meanings. Preserve that distinction in Go. v1 treats the two
+	// states as equivalent, so its established API remains unchanged.
+	preserveNull := meta.ProtocolVersion >= 2
+	r := &ir{Pin: pin, PreserveNull: preserveNull, ByName: map[string]*typeDef{}}
 	// Sort def names for deterministic output independent of JSON map order.
 	names := make([]string, 0, len(root.Defs))
 	for name := range root.Defs {
@@ -92,7 +98,7 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 		if skippedDefs[name] {
 			continue
 		}
-		td, err := classify(name, def, root)
+		td, err := classify(name, def, root, preserveNull)
 		if err != nil {
 			return nil, err
 		}
@@ -112,7 +118,7 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 	return r, nil
 }
 
-func classify(name string, def *rawSchema, root *rootSchema) (*typeDef, error) {
+func classify(name string, def *rawSchema, root *rootSchema, preserveNull bool) (*typeDef, error) {
 	td := &typeDef{Name: name, Doc: def.Description}
 	switch {
 	case def.Ref != "":
@@ -123,7 +129,7 @@ func classify(name string, def *rawSchema, root *rootSchema) (*typeDef, error) {
 		if len(variants) == 0 {
 			variants = def.AnyOf
 		}
-		return classifyUnion(name, def, variants, root)
+		return classifyUnion(name, def, variants, root, preserveNull)
 
 	case def.Properties == nil && def.Type == nil && def.soleType() == "" &&
 		len(def.OneOf) == 0 && len(def.AnyOf) == 0 && len(def.AllOf) == 0:
@@ -139,7 +145,7 @@ func classify(name string, def *rawSchema, root *rootSchema) (*typeDef, error) {
 			required[k] = true
 		}
 		for _, p := range sortedProps(def.Properties) {
-			f, err := fieldFrom(p.key, p.value, root)
+			f, err := fieldFrom(p.key, p.value, root, preserveNull)
 			if err != nil {
 				return nil, fmt.Errorf("%s.%s: %w", name, p.key, err)
 			}
@@ -168,7 +174,7 @@ func classify(name string, def *rawSchema, root *rootSchema) (*typeDef, error) {
 	}
 }
 
-func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *rootSchema) (*typeDef, error) {
+func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *rootSchema, preserveNull bool) (*typeDef, error) {
 	td := &typeDef{Name: name, Doc: def.Description}
 
 	// Enum: every variant is a bare string or integer; known members carry
@@ -209,7 +215,7 @@ func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *roo
 		}
 	}
 
-	tagged, err := taggedVariants(name, variants, root)
+	tagged, err := taggedVariants(name, variants, root, preserveNull)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +233,7 @@ func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *roo
 				if p.key == tagged.tag {
 					continue
 				}
-				f, err := fieldFrom(p.key, p.value, root)
+				f, err := fieldFrom(p.key, p.value, root, preserveNull)
 				if err != nil {
 					return nil, fmt.Errorf("%s.%s: %w", name, p.key, err)
 				}
@@ -319,7 +325,7 @@ type taggedResult struct {
 // a const discriminator property. Variants without the tag property are the
 // wire default (absent tag); a tag property without a const marks the open
 // catch-all for unknown tag values.
-func taggedVariants(name string, variants []*rawSchema, root *rootSchema) (*taggedResult, error) {
+func taggedVariants(name string, variants []*rawSchema, root *rootSchema, preserveNull bool) (*taggedResult, error) {
 	tag := ""
 	for _, v := range variants {
 		if t, ok := unionTagProp(v); ok {
@@ -360,7 +366,7 @@ func taggedVariants(name string, variants []*rawSchema, root *rootSchema) (*tagg
 				required[k] = true
 			}
 			for _, p := range sortedProps(props) {
-				f, err := fieldFrom(p.key, p.value, root)
+				f, err := fieldFrom(p.key, p.value, root, preserveNull)
 				if err != nil {
 					return nil, fmt.Errorf("%s default variant: %w", name, err)
 				}
@@ -413,7 +419,7 @@ func taggedVariants(name string, variants []*rawSchema, root *rootSchema) (*tagg
 				if p.key == tag {
 					continue
 				}
-				f, err := fieldFrom(p.key, p.value, root)
+				f, err := fieldFrom(p.key, p.value, root, preserveNull)
 				if err != nil {
 					return nil, fmt.Errorf("%s inline variant: %w", name, err)
 				}
@@ -437,9 +443,10 @@ func unionTagProp(v *rawSchema) (string, bool) {
 }
 
 // fieldFrom maps one object property to a Go field.
-func fieldFrom(prop string, ps *rawSchema, root *rootSchema) (field, error) {
+func fieldFrom(prop string, ps *rawSchema, root *rootSchema, preserveNull bool) (field, error) {
 	f := field{JSONName: prop, GoName: goNameOf(prop), Doc: ps.Description}
 	inner := ps.unwrap()
+	f.Nullable = preserveNull && ps.isNull()
 
 	if target, ok := nullableRef(inner); ok {
 		f.GoType = target

@@ -12,11 +12,11 @@ type genFile struct {
 	source []byte
 }
 
-func emit(r *ir, pin string) []genFile {
+func emit(r *ir, pin, packageName string) []genFile {
 	return []genFile{
-		{"types_gen.go", emitTypes(r, pin)},
-		{"methods_gen.go", emitMethods(r, pin)},
-		{"parity_gen_test.go", emitParity(r, pin)},
+		{"types_gen.go", emitTypes(r, pin, packageName)},
+		{"methods_gen.go", emitMethods(r, pin, packageName)},
+		{"parity_gen_test.go", emitParity(r, pin, packageName)},
 	}
 }
 
@@ -87,26 +87,68 @@ func (f field) isContainer() bool {
 }
 
 func (f field) pointer() bool {
-	return !f.Required && !f.isContainer()
+	return !f.Nullable && !f.Required && !f.isContainer()
 }
 
 func (f field) goDecl() string {
 	typ := f.GoType
-	if f.pointer() {
+	if f.Nullable {
+		typ = "Nullable[" + typ + "]"
+	} else if f.pointer() {
 		typ = "*" + typ
 	}
 	omit := ""
 	if !f.Required {
-		omit = ",omitempty"
+		if f.Nullable {
+			omit = ",omitzero"
+		} else {
+			omit = ",omitempty"
+		}
 	}
 	return fmt.Sprintf("%s %s `json:\"%s%s\"`", f.GoName, typ, f.JSONName, omit)
 }
 
-func emitTypes(r *ir, pin string) []byte {
+func emitNullable(b *strings.Builder) {
+	b.WriteString(`// Nullable preserves the difference between an omitted field, an explicit
+// JSON null, and a concrete value. Set controls wire presence; Null requests
+// an explicit null; Value carries the concrete payload when Null is false.
+type Nullable[T any] struct {
+	Set   bool
+	Null  bool
+	Value T
+}
+
+func (v Nullable[T]) MarshalJSON() ([]byte, error) {
+	if !v.Set || v.Null {
+		return []byte("null"), nil
+	}
+	return json.Marshal(v.Value)
+}
+
+func (v *Nullable[T]) UnmarshalJSON(data []byte) error {
+	v.Set = true
+	if string(data) == "null" {
+		v.Null = true
+		var zero T
+		v.Value = zero
+		return nil
+	}
+	return json.Unmarshal(data, &v.Value)
+}
+
+func (v Nullable[T]) IsZero() bool { return !v.Set }
+
+`)
+}
+
+func emitTypes(r *ir, pin, packageName string) []byte {
 	var b strings.Builder
 	b.WriteString(header(pin, "wire types"))
-	b.WriteString("package schema\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n)\n\n")
+	b.WriteString("package " + packageName + "\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n)\n\n")
 	b.WriteString("// Meta is the reserved _meta channel for extension data.\ntype Meta map[string]any\n\n")
+	if r.PreserveNull {
+		emitNullable(&b)
+	}
 
 	for _, td := range r.Defs {
 		writeDoc(&b, "", td.Doc)
@@ -266,7 +308,7 @@ func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 		}
 	}
 	if hasOpenVariant(td) {
-		fmt.Fprintf(b, "\tdefault:\n\t\tv.Other = &%sOther{Raw: append(json.RawMessage(nil), data...)}\n\t\treturn nil\n\t}\n", td.Name)
+		fmt.Fprintf(b, "\tdefault:\n\t\tv.Kind = %s(tag)\n\t\tv.Other = &%sOther{Raw: append(json.RawMessage(nil), data...)}\n\t\treturn nil\n\t}\n", kindType, td.Name)
 	} else {
 		fmt.Fprintf(b, "\tdefault:\n\t\treturn fmt.Errorf(\"%s: unknown %s tag %%q\", tag)\n\t}\n", td.Name, td.TagJSON)
 	}
@@ -413,10 +455,10 @@ func unexport(name string) string {
 	return strings.ToLower(name[:1]) + name[1:]
 }
 
-func emitMethods(r *ir, pin string) []byte {
+func emitMethods(r *ir, pin, packageName string) []byte {
 	var b strings.Builder
 	b.WriteString(header(pin, "method registry"))
-	b.WriteString("package schema\n\nimport \"reflect\"\n\n")
+	b.WriteString("package " + packageName + "\n\nimport \"reflect\"\n\n")
 
 	b.WriteString("// Sides classify which peer owns a method's API surface.\nconst (\n")
 	b.WriteString("\tSideAgent = \"agent\"    // requests are served by the agent\n")
@@ -471,10 +513,10 @@ func sideConst(side string) string {
 	}
 }
 
-func emitParity(r *ir, pin string) []byte {
+func emitParity(r *ir, pin, packageName string) []byte {
 	var b strings.Builder
 	b.WriteString(header(pin, "round-trip parity fixtures"))
-	b.WriteString("package schema\n\nimport \"reflect\"\n\n")
+	b.WriteString("package " + packageName + "\n\nimport \"reflect\"\n\n")
 	b.WriteString("var parityCases = []parityCase{\n")
 	for _, td := range r.Defs {
 		switch td.Kind {
