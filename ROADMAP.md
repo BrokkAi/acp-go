@@ -66,24 +66,19 @@ only remaining work.
   - explicit outbound `CallBatch` support,
   - initial initialize parameters validated before sibling dispatch by the
     protocol router.
+- Rust-shaped v2 session command surface:
+  - reusable agent-message projection with omitted/null/value patch semantics,
+  - per-session active-work tracker using running→idle completion,
+  - explicit `SessionHandle`,
+  - prompt acceptance, config-option replacement, and close commands,
+  - pending permission cancellation,
+  - exact Rust `CancelActiveWork` notification behavior plus an optional
+    cancellation-completion barrier,
+  - from-start resume replay after preinstalled handlers.
 
 ## Remaining Rust-parity gaps
 
-### 1. V2 session command surface
-
-The Rust SDK exposes a `V2Session` command handle and documents ownership
-boundaries explicitly.
-
-Work:
-
-- Add an explicit Go v2 session handle for prompt, config, cancel, and close.
-- Make `CancelActiveWork` send `session/cancel`, resolve pending permission
-  requests as cancelled, and wait for idle with `stopReason: cancelled`.
-- Add a resume helper which requires update/permission handlers to be installed
-  before replay can begin.
-- Keep update projection session-scoped; do not invent prompt or turn IDs.
-
-### 2. Protocol routing for client and proxy peers
+### 1. Protocol routing for client and proxy peers
 
 The agent-side v1/v2 router is implemented. Rust additionally has explicit
 client and proxy protocol connectors/routers.
@@ -94,7 +89,7 @@ Work:
 - Add proxy routing without converting successor traffic between versions.
 - Ensure future-version canonicalization and extension preservation match Rust.
 
-### 3. Unstable Rust feature surfaces
+### 2. Unstable Rust feature surfaces
 
 The Rust schema crate exposes separately gated feature surfaces beyond draft
 v2. Our generated packages currently cover the stable pinned artifacts.
@@ -107,7 +102,7 @@ Work, gated behind explicit Go package opt-ins where applicable:
 - unstable NES,
 - unstable tool-call names and end-turn token usage.
 
-### 4. Semantic validation parity
+### 3. Semantic validation parity
 
 Rust semantic newtypes enforce IDs, absolute paths, media types, and URI forms
 at the type boundary. Most Go generated types currently use string aliases.
@@ -119,7 +114,7 @@ Work:
 - Enforce absolute paths and required identifiers at typed facade boundaries.
 - Preserve unknown extension tags and raw `_meta` payloads.
 
-### 5. Draft-v2 ecosystem validation
+### 4. Draft-v2 ecosystem validation
 
 - Extend optional credential-backed CI to exercise the v2 runner against real
   adapters when they advertise v2.

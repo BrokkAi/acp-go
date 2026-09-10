@@ -152,6 +152,14 @@ v2 implementations. It selects the highest configured implementation compatible
 with the first initialize request, canonicalizes only that initialize frame, and
 does not convert subsequent traffic.
 
+Draft-v2 sessions can use `acpv2.NewSessionHandle` for Rust-shaped prompt,
+configuration, cancellation, and close commands. `acpv2.SessionTracker` owns
+connection-scoped update projections and active-work state; install it before
+session setup. `acpv2.CancellablePermissions` resolves pending permission
+requests as cancelled when active work is cancelled.
+`ResumeSessionFromStart` requires handlers to be installed before the resume
+request and returns only after replay updates have been applied in wire order.
+
 ## Process runner
 
 `github.com/BrokkAi/acp-go/runner` adds a process lifecycle, confined client file

@@ -55,8 +55,7 @@ func (s *SessionHandle) Prompt(ctx context.Context, prompt string) error {
 // PromptContent submits a prompt and returns after acceptance. Output and
 // completion remain independent session updates.
 func (s *SessionHandle) PromptContent(ctx context.Context, prompt []Content) error {
-	work := s.beginWork()
-	_ = work
+	s.beginWork()
 	return s.connection.PromptContent(
 		ctx,
 		s.initialization,

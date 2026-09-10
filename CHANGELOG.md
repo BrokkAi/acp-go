@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Added
+
+- A Rust-shaped draft-v2 session command handle covering prompt acceptance,
+  authoritative config-option replacement, close, session cancellation, and
+  optional cancellation completion.
+- Public v2 agent-message projection, active-work tracking, and per-session
+  update tracking.
+- Cancellable v2 permission hosting that resolves pending requests with the
+  protocol's cancelled outcome.
+- A from-start v2 resume helper that applies replay updates before returning
+  the resume response.
+
 ## 0.6.0 - 2026-09-10
 
 ### Added
