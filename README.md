@@ -104,9 +104,10 @@ update workflow.
 to the official `schema-v2.0.0-alpha.3` artifacts in
 [`schema/v2`](schema/v2). It supports initialization and version selection,
 `auth/login`/`auth/logout`, session creation/resume/list/delete/close,
-prompt acceptance, cancellation, MCP and additional-directory capability
-checks, and typed `session/update` dispatch. There is intentionally no v1/v2
-conversion layer. The generated v2 types use `Nullable[T]` where the draft
+prompt acceptance, cancellation, additional-directory capability checks, and
+typed `session/update` dispatch. There is intentionally no v1/v2
+conversion layer. The artifacts match Rust schema crate 1.7.0 byte for byte.
+The generated v2 types use `Nullable[T]` where the draft
 distinguishes omitted fields from explicit JSON null, such as message-content
 patches.
 
@@ -136,6 +137,17 @@ go run ./examples/v2-one-shot-client \
   -command 'go run ./examples/minimal-agent-v2' \
   -prompt 'Say hello using draft ACP v2.'
 ```
+
+MCP-over-ACP remains an explicit draft opt-in through
+`github.com/BrokkAi/acp-go/v2/mcp`, matching the Rust SDK's separately gated
+`unstable_mcp_over_acp` feature. Generated protocol versions and error codes use
+the schema's exact integer widths; in particular, `ProtocolVersion` is a
+`uint16`, so strings and values above 65535 fail to decode.
+
+`github.com/BrokkAi/acp-go/agentrouter` serves one endpoint with explicit v1 and
+v2 implementations. It selects the highest configured implementation compatible
+with the first initialize request, canonicalizes only that initialize frame, and
+does not convert subsequent traffic.
 
 ## Process runner
 

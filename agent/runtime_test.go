@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -160,9 +161,22 @@ func TestRuntimeRequiresAndAllowsInitializeOnlyOnce(t *testing.T) {
 		t.Fatalf("uninitialized error = %v", err)
 	}
 	initializeClient(t, connection, acp.Capabilities{})
-	_, err = connection.Initialize(ctx, acp.Capabilities{})
+	err = connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{
+		ProtocolVersion: acp.Version,
+	}, nil)
 	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "agent is already initialized" {
 		t.Fatalf("duplicate initialize error = %v", err)
+	}
+}
+
+func TestRuntimeRejectsMismatchedInitializeVersion(t *testing.T) {
+	connection := startRuntime(t, testAgent{}, nil, nil)
+	err := connection.Call(context.Background(), schema.InitializeMethodName, schema.InitializeRequest{
+		ProtocolVersion: 2,
+	}, nil)
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || !strings.Contains(rpcErr.Message, "only supports ACP protocol version 1") {
+		t.Fatalf("mismatched initialize error = %v", err)
 	}
 }
 

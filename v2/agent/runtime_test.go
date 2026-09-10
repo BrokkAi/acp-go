@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,6 +159,18 @@ func TestRuntimeRejectsInvalidAdvertisements(t *testing.T) {
 			t.Fatal("runtime accepted an agent without session capabilities")
 		}
 	})
+}
+
+func TestRuntimeRejectsV1InitializeOnV2Endpoint(t *testing.T) {
+	client := startRuntime(t, &echoAgent{cancelled: make(chan schema.CancelSessionNotification, 1)}, nil)
+	err := client.Call(context.Background(), schema.InitializeMethodName, schema.InitializeRequest{
+		ProtocolVersion: 1,
+		Info:            schema.Implementation{Name: "client", Version: "1"},
+	}, nil)
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || !strings.Contains(rpcErr.Message, "only supports ACP protocol version 2") {
+		t.Fatalf("mismatched initialize error = %v", err)
+	}
 }
 
 func TestRuntimeGatesClientElicitationByCapability(t *testing.T) {

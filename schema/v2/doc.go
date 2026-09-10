@@ -19,4 +19,6 @@
 // ACP v2 patch fields distinguish an omitted property from JSON null. Those
 // fields use Nullable[T], whose Set, Null, and Value members preserve all
 // three wire states: omitted, explicit null, and a concrete value.
+// Integer formats retain their JSON Schema wire width; ProtocolVersion is a
+// uint16 and ErrorCode is an int32.
 package v2

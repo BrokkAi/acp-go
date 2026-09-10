@@ -35,6 +35,9 @@ func (c *Connection) InitializeWithInfo(ctx context.Context, caps Capabilities, 
 	if info.Name == "" || info.Version == "" {
 		return result, fmt.Errorf("client name and version are required")
 	}
+	if err := c.beginInitialize(); err != nil {
+		return result, err
+	}
 	request := schema.InitializeRequest{
 		ClientCapabilities: &caps,
 		ClientInfo:         &info,
@@ -45,7 +48,29 @@ func (c *Connection) InitializeWithInfo(ctx context.Context, caps Capabilities, 
 		_ = c.Close()
 		err = fmt.Errorf("agent selected unsupported ACP version %d", result.ProtocolVersion)
 	}
+	c.completeInitialize(err == nil)
 	return result, err
+}
+
+func (c *Connection) beginInitialize() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.initOnce:
+		return fmt.Errorf("ACP connections may only be initialized once; reconnect to initialize again")
+	case c.initPending:
+		return fmt.Errorf("ACP initialization is already in progress on this connection")
+	default:
+		c.initPending = true
+		return nil
+	}
+}
+
+func (c *Connection) completeInitialize(success bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.initPending = false
+	c.initOnce = success
 }
 
 func (c *Connection) Authenticate(ctx context.Context, init Initialization, method string) error {

@@ -16,6 +16,8 @@
 //   - Enums are plain string or integer types with named constants, so
 //     unknown future values decode without error, matching the protocol's
 //     extensibility rules.
+//   - Integer formats retain their JSON Schema wire width (for example,
+//     ProtocolVersion is uint16 and ErrorCode is int32).
 //   - Union variants with unrecognized tags decode into the Other variant,
 //     preserving the raw payload for proxying.
 //   - The JSON-RPC routing envelopes (AgentRequest, AgentNotification, and

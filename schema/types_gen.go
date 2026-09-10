@@ -1620,7 +1620,7 @@ type Error struct {
 // Predefined error codes for common JSON-RPC and ACP-specific errors.
 // These codes follow the JSON-RPC 2.0 specification for standard errors
 // and use the reserved range (-32000 to -32099) for protocol-specific errors.
-type ErrorCode int64
+type ErrorCode int32
 
 const (
 	// Parse error: Invalid JSON was received by the server.
@@ -2441,7 +2441,7 @@ type PromptResponse struct {
 // Protocol version identifier.
 // This version is only bumped for breaking changes.
 // Non-breaking changes should be introduced via capabilities.
-type ProtocolVersion int64
+type ProtocolVersion uint16
 
 // Request to read content from a text file.
 // Only available if the client supports the fs.readTextFile capability.
@@ -2452,9 +2452,9 @@ type ReadTextFileRequest struct {
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
 	// Maximum number of lines to read.
-	Limit *int64 `json:"limit,omitempty"`
+	Limit *uint32 `json:"limit,omitempty"`
 	// Line number to start reading from (1-based).
-	Line *int64 `json:"line,omitempty"`
+	Line *uint32 `json:"line,omitempty"`
 	// Absolute path to the file to read.
 	Path string `json:"path"`
 	// The session ID for this request.
@@ -3665,10 +3665,10 @@ type StringPropertySchema struct {
 	Format *StringFormat `json:"format,omitempty"`
 	// Maximum string length.
 	// Optional. Omitted and null are equivalent and mean there is no maximum length constraint.
-	MaxLength *int64 `json:"maxLength,omitempty"`
+	MaxLength *uint32 `json:"maxLength,omitempty"`
 	// Minimum string length.
 	// Optional. Omitted and null are equivalent and mean there is no minimum length constraint.
-	MinLength *int64 `json:"minLength,omitempty"`
+	MinLength *uint32 `json:"minLength,omitempty"`
 	// Titled enum options for titled single-select enums.
 	// Optional. Omitted and null are equivalent and mean no titled single-select choices are
 	// declared by oneOf.
@@ -3702,7 +3702,7 @@ type TerminalExitStatus struct {
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
 	// The process exit code (may be null if terminated by signal).
-	ExitCode *int64 `json:"exitCode,omitempty"`
+	ExitCode *uint32 `json:"exitCode,omitempty"`
 	// The signal that terminated the process (may be null if exited normally).
 	Signal *string `json:"signal,omitempty"`
 }
@@ -3946,7 +3946,7 @@ type ToolCallLocation struct {
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
 	// Optional line number within the file.
-	Line *int64 `json:"line,omitempty"`
+	Line *uint32 `json:"line,omitempty"`
 	// The absolute file path being accessed or modified.
 	Path string `json:"path"`
 }
@@ -4072,7 +4072,7 @@ type WaitForTerminalExitResponse struct {
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
 	// The process exit code (may be null if terminated by signal).
-	ExitCode *int64 `json:"exitCode,omitempty"`
+	ExitCode *uint32 `json:"exitCode,omitempty"`
 	// The signal that terminated the process (may be null if exited normally).
 	Signal *string `json:"signal,omitempty"`
 }

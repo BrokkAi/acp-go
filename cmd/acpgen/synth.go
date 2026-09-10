@@ -145,7 +145,7 @@ func synthValue(r *ir, f field, full bool, depth map[string]int) (string, error)
 		return synthValue(r, f, full, depth)
 	case typ == "string":
 		return `""`, nil
-	case typ == "int64" || typ == "uint64":
+	case strings.HasPrefix(typ, "int") || strings.HasPrefix(typ, "uint"):
 		return "0", nil
 	case typ == "float64":
 		return "0.5", nil
@@ -188,7 +188,7 @@ func synthElem(r *ir, elem string, depth map[string]int) (string, error) {
 	switch elem {
 	case "string":
 		return `""`, nil
-	case "int64", "uint64":
+	case "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64":
 		return "0", nil
 	case "float64":
 		return "0.5", nil

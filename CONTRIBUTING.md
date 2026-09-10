@@ -84,6 +84,12 @@ output after regenerating both pins proves the checked-in files match them.
 The generator fails loudly on schema constructs it cannot model rather than
 guessing.
 
+The behavioral reference is Rust `agent-client-protocol` 2.1.0 with
+`agent-client-protocol-schema = "=1.7.0"`. When the Rust SDK changes that pin,
+update both acp-go artifact pins in the same change and record generated API
+differences in [CHANGELOG.md](CHANGELOG.md). Do not track schema-repository
+`main` ahead of the Rust SDK.
+
 ## Licensing and dependencies
 
 This project uses [Apache-2.0](LICENSE). By intentionally submitting a

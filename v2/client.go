@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sync"
 
 	"github.com/BrokkAi/acp-go"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
@@ -29,10 +30,34 @@ type (
 // Generic Call and Notify remain available for protocol extensions.
 type Connection struct {
 	*acp.Connection
+	mu           sync.Mutex
+	initialized  bool
+	initializing bool
 }
 
 func Connect(in io.ReadCloser, out io.WriteCloser, onRequest acp.Handler, onNotification acp.Notifications) *Connection {
 	return &Connection{Connection: acp.Connect(in, out, onRequest, onNotification)}
+}
+
+func (c *Connection) beginInitialize() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.initialized:
+		return fmt.Errorf("ACP connections may only be initialized once; reconnect to initialize again")
+	case c.initializing:
+		return fmt.Errorf("ACP initialization is already in progress on this connection")
+	default:
+		c.initializing = true
+		return nil
+	}
+}
+
+func (c *Connection) completeInitialize(success bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.initializing = false
+	c.initialized = success
 }
 
 func (c *Connection) Initialize(ctx context.Context, capabilities Capabilities) (Initialization, error) {
@@ -44,6 +69,9 @@ func (c *Connection) InitializeWithInfo(ctx context.Context, capabilities Capabi
 	if info.Name == "" || info.Version == "" {
 		return result, fmt.Errorf("client name and version are required")
 	}
+	if err := c.beginInitialize(); err != nil {
+		return result, err
+	}
 	request := schema.InitializeRequest{
 		Capabilities:    &capabilities,
 		Info:            info,
@@ -54,8 +82,15 @@ func (c *Connection) InitializeWithInfo(ctx context.Context, capabilities Capabi
 	}
 	if result.ProtocolVersion != Version {
 		_ = c.Close()
-		return result, fmt.Errorf("agent selected unsupported ACP version %d", result.ProtocolVersion)
+		err := fmt.Errorf("agent selected unsupported ACP version %d", result.ProtocolVersion)
+		c.completeInitialize(false)
+		return result, err
 	}
+	if result.Info.Name == "" || result.Info.Version == "" {
+		c.completeInitialize(false)
+		return result, fmt.Errorf("agent initialize response info requires name and version")
+	}
+	c.completeInitialize(true)
 	return result, nil
 }
 
@@ -99,7 +134,6 @@ func findAgentAuthMethod(initialization Initialization, method string) (schema.A
 // NewSessionOptions carries optional fields for session/new.
 type NewSessionOptions struct {
 	AdditionalDirectories []string
-	MCPServers            []schema.McpServer
 }
 
 func (c *Connection) NewSession(ctx context.Context, directory string) (Session, error) {
@@ -117,13 +151,9 @@ func (c *Connection) NewSessionWithOptions(ctx context.Context, initialization I
 	if err := validateAdditionalDirectories(initialization, options.AdditionalDirectories); err != nil {
 		return session, err
 	}
-	if err := validateMCPServers(initialization, options.MCPServers); err != nil {
-		return session, err
-	}
 	request := schema.NewSessionRequest{
 		Cwd:                   schema.AbsolutePath(directory),
 		AdditionalDirectories: absolutePaths(options.AdditionalDirectories),
-		MCPServers:            options.MCPServers,
 	}
 	if err := c.Call(ctx, schema.SessionNewMethodName, request, &session); err != nil {
 		return session, err
@@ -145,10 +175,10 @@ func (c *Connection) ResumeSession(ctx context.Context, initialization Initializ
 	if request.SessionID == "" {
 		return result, fmt.Errorf("session ID is required")
 	}
-	if err := validateAdditionalDirectories(initialization, absoluteStrings(request.AdditionalDirectories)); err != nil {
-		return result, err
+	if len(request.MCPServers) > 0 {
+		return result, fmt.Errorf("MCP servers require the explicit github.com/BrokkAi/acp-go/v2/mcp package")
 	}
-	if err := validateMCPServers(initialization, request.MCPServers); err != nil {
+	if err := validateAdditionalDirectories(initialization, absoluteStrings(request.AdditionalDirectories)); err != nil {
 		return result, err
 	}
 	return result, c.Call(ctx, schema.SessionResumeMethodName, request, &result)
@@ -251,37 +281,6 @@ func validateAdditionalDirectories(initialization Initialization, directories []
 	for _, directory := range directories {
 		if err := validateAbsolutePath(directory); err != nil {
 			return err
-		}
-	}
-	return nil
-}
-
-func validateMCPServers(initialization Initialization, servers []schema.McpServer) error {
-	var capabilities *schema.McpCapabilities
-	if initialization.Capabilities != nil && initialization.Capabilities.Session != nil {
-		capabilities = initialization.Capabilities.Session.MCP
-	}
-	for i, server := range servers {
-		switch {
-		case server.Stdio != nil:
-			if capabilities == nil || capabilities.Stdio == nil {
-				return fmt.Errorf("agent did not advertise stdio MCP server support (server %d)", i)
-			}
-			if server.Stdio.Name == "" || server.Stdio.Command == "" {
-				return fmt.Errorf("stdio MCP server %d requires a name and command", i)
-			}
-			if err := validateAbsolutePath(string(server.Stdio.Command)); err != nil {
-				return fmt.Errorf("stdio MCP server %d command path: %w", i, err)
-			}
-		case server.HTTP != nil:
-			if capabilities == nil || capabilities.HTTP == nil {
-				return fmt.Errorf("agent did not advertise HTTP MCP server support (server %d)", i)
-			}
-			if server.HTTP.Name == "" || server.HTTP.URL == "" {
-				return fmt.Errorf("HTTP MCP server %d requires a name and URL", i)
-			}
-		default:
-			return fmt.Errorf("MCP server %d has no supported transport variant", i)
 		}
 	}
 	return nil

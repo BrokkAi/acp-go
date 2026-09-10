@@ -135,7 +135,7 @@ func (h *Host) createTerminal(request schema.CreateTerminalRequest) (any, error)
 	go func() {
 		_ = t.command.Wait()
 		t.kill()
-		code := int64(t.command.ProcessState.ExitCode())
+		code := uint32(t.command.ProcessState.ExitCode())
 		t.status.ExitCode = &code
 		if status, ok := t.command.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
 			t.status.ExitCode = nil

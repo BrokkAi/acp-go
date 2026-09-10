@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Changed
+
+- Generated JSON Schema integer fields now use their exact wire widths. Most
+  visibly, v1 and v2 `ProtocolVersion` are `uint16` and error codes are
+  `int32`, matching the Rust schema crate.
+- Successful v1 and v2 client initialization is now allowed only once per
+  connection.
+- v1 and v2 agent runtimes reject mismatched initialize versions before invoking
+  the implementation.
+
+### Added
+
+- An explicit v1/v2 agent protocol router that selects the highest configured
+  compatible implementation and canonicalizes only the initial request.
+- An explicit draft MCP-over-ACP opt-in package at
+  `github.com/BrokkAi/acp-go/v2/mcp`; the core v2 session API no longer accepts
+  MCP servers directly.
+
 ## 0.4.0 - 2026-09-10
 
 ### Added

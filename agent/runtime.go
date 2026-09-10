@@ -193,6 +193,12 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 	if err != nil {
 		return nil, err
 	}
+	if request.ProtocolVersion != acp.Version {
+		return nil, &acp.RPCError{Code: -32600, Message: fmt.Sprintf(
+			"unsupported ACP protocol version %d; this endpoint only supports ACP protocol version %d",
+			request.ProtocolVersion, acp.Version,
+		)}
+	}
 	s.mu.Lock()
 	if s.initialized {
 		s.mu.Unlock()

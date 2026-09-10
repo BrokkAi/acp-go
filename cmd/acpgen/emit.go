@@ -163,7 +163,7 @@ func emitTypes(r *ir, pin, packageName string) []byte {
 				for _, v := range td.Variants {
 					writeDoc(&b, "\t", v.Doc)
 					value := fmt.Sprintf("%q", v.Const)
-					if td.Base == "int64" {
+					if strings.HasPrefix(td.Base, "int") || strings.HasPrefix(td.Base, "uint") {
 						value = v.Const
 					}
 					fmt.Fprintf(&b, "\t%s%s %s = %s\n", td.Name, v.GoName, td.Name, value)

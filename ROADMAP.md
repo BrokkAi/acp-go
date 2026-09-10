@@ -1,124 +1,140 @@
 # acp-go roadmap
 
-Goal: make this the canonical Go SDK for [Agent Client Protocol](https://agentclientprotocol.com/)
-v1 — coverage on par with the [reference Rust SDK](https://github.com/agentclientprotocol/rust-sdk),
-with Go-native ergonomics and zero external dependencies.
+Goal: make acp-go the canonical standard-library-only Go SDK for Agent Client
+Protocol, with v1 and draft-v2 behavior aligned to the
+[reference Rust SDK](https://github.com/agentclientprotocol/rust-sdk).
 
-## Why this position is open
+## Reference baseline
 
-The ACP project publishes versioned JSON Schema releases and maintains
-official SDKs for Kotlin, Java, Python, Rust, and TypeScript. There is no
-official Go SDK, and existing community bindings have stalled relative to the
-schema. The schema moves monthly (elicitation, boolean config options, and
-terminal auth all stabilized within recent releases), so any SDK that
-hand-transcribes types drifts. Our answer is mechanical: acp-go binds to the
-released schema artifacts and regenerates, making spec tracking a reviewed
-diff instead of a rewrite.
+The behavioral reference is:
+
+- Rust `agent-client-protocol` **2.1.0**
+- Rust `agent-client-protocol-schema` **exactly 1.7.0**
+- schema crate 1.7.0 contains:
+  - ACP v1 **`schema-v1.21.0`**
+  - draft ACP v2 **`schema-v2.0.0-alpha.3`**
+
+Our pinned artifacts are byte-for-byte identical to that Rust release. Do not
+track ACP repository `main` or a newer schema release until the Rust SDK moves
+its exact `=1.7.0` schema dependency.
 
 ## Status
 
-| Phase | Scope | Status |
-|-------|-------|--------|
-| 0 | Schema codegen pipeline + generated types + parity tests | Done (`832feae`, pinned `schema-v1.21.0`) |
-| 1 | Complete v1 client surface | Done |
-| 2 | Agent-side runtime | Done |
-| 3 | Trust and ecosystem | Done |
-| 4 | v2 draft | In progress (`schema-v2.0.0-alpha.3`) |
+| Area | Status |
+|---|---|
+| Schema generator, parity tests, exact Rust artifact pins | Done |
+| v1 client surface | Done |
+| v1 agent runtime and reference client host | Done |
+| Fuzzing, licenses, release discipline, optional real-agent CI | Done |
+| Draft-v2 schema, client, agent runtime, host adapters, one-shot runner | Done |
+| Rust-parity hardening | In progress |
 
-## Phase 1 — complete the v1 client
+Completed roadmap phases are retained in `CHANGELOG.md`; this file now tracks
+only remaining work.
 
-The runtime (`acp` package, `runner`) migrates onto the generated
-[schema](schema/) types; the hand-written wire structs retire. The v0.x
-series may break API for this; it lands in one release with a migration note.
+## Rust-parity work already closed
 
-- Typed `InitializeResponse`: agent capabilities (`loadSession`,
-  `promptCapabilities`, `mcpCapabilities`, `sessionCapabilities`,
-  `auth.logout`), `agentInfo`, full auth methods with names and types.
-- Session lifecycle: `session/load` (gated on `loadSession`),
-  `session/resume`, `session/close`, `session/list`, `session/delete`,
-  and `logout` (gated on `auth.logout`).
-- Full prompt content blocks: text, image, audio, resource,
-  resource_link — sent only when `promptCapabilities` allows.
-- Typed session-update callbacks for every kind: plan,
-  available commands, current mode, config option updates, session info,
-  usage/cost, and `user_message_chunk` replay on load.
-- Elicitation host support: `elicitation/create` form and URL modes with
-  accept/decline/cancel outcomes and `elicitation/complete`, advertised via
-  client capabilities.
-- MCP server configs (stdio always; http/sse per `mcpCapabilities`) and
-  `additionalDirectories` (gated on `sessionCapabilities`).
-- Typed error codes (`auth_required` -32000, resource not found -32002) so
-  callers can branch on cause.
-- Ergonomic constructors/accessors for union types (e.g. building a
-  `SessionUpdate` tool call without knowing the layout).
+- Separate v1 and v2 generated schema packages with no implicit conversion.
+- v1 client and agent runtimes.
+- Draft-v2 client and baseline agent runtime.
+- Typed permission and elicitation host adapters.
+- One-shot v2 runner with the reference update projection:
+  ignore until `running`, apply message chunks and patch snapshots, complete at
+  the next `idle`.
+- Explicit MCP-over-ACP opt-in through `github.com/BrokkAi/acp-go/v2/mcp`,
+  mirroring Rust's separate `unstable_mcp_over_acp` feature boundary.
+- Exact JSON Schema integer formats, notably Rust-compatible `uint16`
+  `ProtocolVersion` and `int32` error codes.
+- Successful initialization is allowed once on v1 and v2 client connections.
+- v1 and v2 agent endpoints reject mismatched initialize versions before user
+  handlers run.
+- Explicit agent protocol router:
+  - route version 1 to v1,
+  - route version 2 or a newer compatible version to v2,
+  - canonicalize a newer initialize request to selected v2 parameters,
+  - canonicalize v2 initialize parameters when only v1 is configured,
+  - never convert traffic after initialization.
 
-Acceptance: existing connection and runner tests pass on the generated
-types; new methods covered by round-trip tests against golden wire
-fixtures; capability gates tested with a simulated agent.
+## Remaining Rust-parity gaps
 
-## Phase 2 — agent-side runtime
+### 1. Transport batches and initialize compatibility
 
-Serve agents, not just drive them. Most SDK consumers write agents that
-want editor integration for free.
+The Rust JSON-RPC layer accepts and preserves JSON-RPC batches and validates
+same-version initialize parameters before dispatching siblings. Our transport
+currently accepts one JSON object per line and dispatches inbound requests
+concurrently.
 
-- An `Agent` interface covering initialize, session lifecycle, and prompt
-  turns, served over stdio by a runtime that owns the JSON-RPC loop.
-- Client-capability handler interfaces (filesystem, terminals, permissions,
-  elicitation) mirroring what the agent may call.
-- Reuse the runner's confined host implementations (workspace-rooted fs,
-  process-group terminals, auto-approve policy) as the reference client
-  host package, inverted for both sides.
-- Examples: a minimal agent, a minimal client, and driving real CLIs
-  (claude-code/gemini-style adapters).
+Work:
 
-## Phase 3 — trust and ecosystem
+- Accept JSON-RPC request/response/notification batches without changing the
+  line framing.
+- Preserve batch member identity and order where Rust does.
+- Reject an initialize batch only when Rust rejects it.
+- Preserve Rust's tested malformed-v2-initialize retry behavior while batching.
 
-- Integration tests against the official Claude Agent and Codex ACP adapters
-  in a manually enabled CI job; the default test path needs no credentials.
-- Fuzz the wire layer (`go test -fuzz`) on top of the malformed-frame handling,
-  with a weekly mutation campaign and seed coverage in every default run.
-- Track new schema releases as they ship; the update workflow is documented
-  in [CONTRIBUTING.md](CONTRIBUTING.md).
-- Semver and CHANGELOG discipline; the ACP community libraries page already
-  lists `acp-go`.
+### 2. V2 session command surface
 
-## Phase 4 — v2 draft
+The Rust SDK exposes a `V2Session` command handle and documents ownership
+boundaries explicitly.
 
-Generate and expose a separate v2 package from the published `schema/v2`
-artifacts. The reference Rust SDK already ships an explicit opt-in v2 module,
-so waiting for a final 2.0 tag would leave Go consumers behind adapters that
-can negotiate the draft. No cross-version conversion: per the schema team's
-guidance, SDKs expose explicit versioned implementations. The codegen built in
-Phase 0 makes tracking alpha releases a reviewed regeneration.
+Work:
 
-Current scope:
+- Add an explicit Go v2 session handle for prompt, config, cancel, and close.
+- Make `CancelActiveWork` send `session/cancel`, resolve pending permission
+  requests as cancelled, and wait for idle with `stopReason: cancelled`.
+- Add a resume helper which requires update/permission handlers to be installed
+  before replay can begin.
+- Keep update projection session-scoped; do not invent prompt or turn IDs.
 
-- Generated `schema/v2` bindings pinned to `schema-v2.0.0-alpha.3`.
-- A separate `/v2` client package for initialization, authentication, session
-  lifecycle, prompt submission, cancellation, and typed update dispatch.
-- A draft v2 agent runtime for the baseline session method surface, client
-  permission and elicitation callbacks, capability gating, and optional auth,
-  delete, and config-option dispatch.
-- Typed client-host adapters for v2 permissions and elicitation, installed
-  before session setup exactly as the reference SDK requires.
-- A v2 one-shot runner and example that mirror the reference client: wait for
-  `running`, project agent messages with patch semantics, then complete at the
-  next `idle` update. Permission requests default to explicit cancellation.
-- V2 prompt semantics: `session/prompt` returns after acceptance; completion is
-  reported by `state_update` notifications.
-- Track alpha releases as they ship; keep the package explicit and isolated
-  until the draft request surface stabilizes.
+### 3. Protocol routing for client and proxy peers
+
+The agent-side v1/v2 router is implemented. Rust additionally has explicit
+client and proxy protocol connectors/routers.
+
+Work:
+
+- Add a client-side protocol connector that chooses an explicit v1 or v2 client.
+- Add proxy routing without converting successor traffic between versions.
+- Ensure future-version canonicalization and extension preservation match Rust.
+
+### 4. Unstable Rust feature surfaces
+
+The Rust schema crate exposes separately gated feature surfaces beyond draft
+v2. Our generated packages currently cover the stable pinned artifacts.
+
+Work, gated behind explicit Go package opt-ins where applicable:
+
+- unstable LLM providers,
+- unstable plan operations,
+- unstable session fork/compaction/notices,
+- unstable NES,
+- unstable tool-call names and end-turn token usage.
+
+### 5. Semantic validation parity
+
+Rust semantic newtypes enforce IDs, absolute paths, media types, and URI forms
+at the type boundary. Most Go generated types currently use string aliases.
+
+Work:
+
+- Determine Go-native validation boundaries that do not add reflection-heavy
+  runtime overhead.
+- Enforce absolute paths and required identifiers at typed facade boundaries.
+- Preserve unknown extension tags and raw `_meta` payloads.
+
+### 6. Draft-v2 ecosystem validation
+
+- Extend optional credential-backed CI to exercise the v2 runner against real
+  adapters when they advertise v2.
+- Add protocol-router fixtures shared by v1 and v2 fake agents.
+- Track each Rust schema pin change as a reviewed regeneration and API diff.
 
 ## Guardrails
 
 - Standard library only; the dependency policy in
   [licenses/README.md](licenses/README.md) enforces it.
-- Open-world enums and preserved unknown tags: future spec values decode,
-  never error, per the protocol's extensibility rules.
-- No silent fallbacks: selections are acknowledged, capabilities gate
-  optional methods, and the generator fails loudly on constructs it cannot
-  model.
-- Generated files always match each pinned release; regeneration is
-  deterministic, so a clean tree after regenerating both v1 and v2 proves it.
-- Artifact (module) versions are independent of the negotiated
-  `protocolVersion`; wire compatibility comes from initialization.
+- Open-world enums and preserved unknown tags must continue to decode.
+- No silent fallbacks or v1/v2 conversion.
+- Capability-gated methods must fail before writing to the wire.
+- Generated files must remain byte-deterministic for both pinned artifacts.
+- The module version is independent of the negotiated wire version.

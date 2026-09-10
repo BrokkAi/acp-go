@@ -159,10 +159,11 @@ func classify(name string, def *rawSchema, root *rootSchema, preserveNull bool) 
 		return td, nil
 
 	case def.soleType() == "integer":
-		td.Kind, td.Base = kindNewtype, "int64"
-		if def.Format == "uint64" {
-			td.Base = "uint64"
+		base, err := integerGoType(def)
+		if err != nil {
+			return nil, err
 		}
+		td.Kind, td.Base = kindNewtype, base
 		return td, nil
 
 	case def.soleType() == "number":
@@ -181,7 +182,18 @@ func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *roo
 	// consts, a trailing non-const member makes the enum open.
 	if enums, base, ok := enumVariants(variants); ok {
 		if base == "integer" {
-			base = "int64"
+			formatted := def.Format
+			for _, variant := range variants {
+				if variant.Format != "" {
+					formatted = variant.Format
+					break
+				}
+			}
+			var err error
+			base, err = integerGoType(&rawSchema{Format: formatted})
+			if err != nil {
+				return nil, err
+			}
 		}
 		td.Kind, td.Base = kindEnum, base
 		for _, e := range enums {
@@ -481,10 +493,11 @@ func fieldFrom(prop string, ps *rawSchema, root *rootSchema, preserveNull bool) 
 		f.GoType = "string"
 
 	case inner.soleType() == "integer":
-		f.GoType = "int64"
-		if inner.Format == "uint64" {
-			f.GoType = "uint64"
+		base, err := integerGoType(inner)
+		if err != nil {
+			return f, err
 		}
+		f.GoType = base
 
 	case inner.soleType() == "number":
 		f.GoType = "float64"
@@ -548,16 +561,36 @@ func primitiveGoType(s *rawSchema) (string, error) {
 	case "string":
 		return "string", nil
 	case "integer":
-		if s.Format == "uint64" {
-			return "uint64", nil
-		}
-		return "int64", nil
+		return integerGoType(s)
 	case "number":
 		return "float64", nil
 	case "boolean":
 		return "bool", nil
 	default:
 		return "", fmt.Errorf("unsupported primitive type %q", t)
+	}
+}
+
+func integerGoType(s *rawSchema) (string, error) {
+	switch s.Format {
+	case "int8":
+		return "int8", nil
+	case "int16":
+		return "int16", nil
+	case "int32":
+		return "int32", nil
+	case "int64", "":
+		return "int64", nil
+	case "uint8":
+		return "uint8", nil
+	case "uint16":
+		return "uint16", nil
+	case "uint32":
+		return "uint32", nil
+	case "uint64":
+		return "uint64", nil
+	default:
+		return "", fmt.Errorf("unsupported integer format %q", s.Format)
 	}
 }
 
@@ -615,7 +648,8 @@ func (r *ir) resolveRefs() error {
 }
 
 var builtinGoTypes = map[string]bool{
-	"string": true, "int64": true, "uint64": true, "float64": true, "bool": true,
+	"string": true, "int8": true, "int16": true, "int32": true, "int64": true,
+	"uint8": true, "uint16": true, "uint32": true, "uint64": true, "float64": true, "bool": true,
 	"Meta": true, "any": true, "json.RawMessage": true, "map[string]any": true,
 	"map[string]string": true, "map[string]int64": true, "map[string]uint64": true,
 	"map[string]float64": true, "map[string]bool": true,

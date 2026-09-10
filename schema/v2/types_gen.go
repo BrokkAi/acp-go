@@ -1995,7 +1995,7 @@ type Error struct {
 // Predefined error codes for common JSON-RPC and ACP-specific errors.
 // These codes follow the JSON-RPC 2.0 specification for standard errors
 // and use the reserved range (-32000 to -32099) for protocol-specific errors.
-type ErrorCode int64
+type ErrorCode int32
 
 const (
 	// Parse error: Invalid JSON was received by the server.
@@ -2941,7 +2941,7 @@ type ProtocolLevelNotification struct {
 // Protocol version identifier.
 // This version is only bumped for breaking changes.
 // Non-breaking changes should be introduced via capabilities.
-type ProtocolVersion int64
+type ProtocolVersion uint16
 
 // Inclusive cursor describing where replayed session history should begin.
 // Replay includes the position identified by the cursor.
@@ -4572,10 +4572,10 @@ type StringPropertySchema struct {
 	Format *StringFormat `json:"format,omitempty"`
 	// Maximum string length.
 	// Optional. Omitted and null are equivalent and mean there is no maximum length constraint.
-	MaxLength Nullable[int64] `json:"maxLength,omitzero"`
+	MaxLength Nullable[uint32] `json:"maxLength,omitzero"`
 	// Minimum string length.
 	// Optional. Omitted and null are equivalent and mean there is no minimum length constraint.
-	MinLength Nullable[int64] `json:"minLength,omitzero"`
+	MinLength Nullable[uint32] `json:"minLength,omitzero"`
 	// Titled enum options for titled single-select enums.
 	// Must contain at least one option when present.
 	// Optional. Omitted and null are equivalent and mean no titled single-select choices are
@@ -4626,7 +4626,7 @@ type TerminalExitStatus struct {
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// Process exit code, when known. Omitted and null are equivalent.
-	ExitCode Nullable[int64] `json:"exitCode,omitzero"`
+	ExitCode Nullable[uint32] `json:"exitCode,omitzero"`
 	// Signal that terminated the process, when known.
 	// Agents should use the conventional platform signal name. POSIX examples
 	// include SIGTERM, SIGKILL, and SIGINT. Other platforms may use a
@@ -4906,7 +4906,7 @@ type ToolCallLocation struct {
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// Optional line number within the file.
-	Line Nullable[int64] `json:"line,omitzero"`
+	Line Nullable[uint32] `json:"line,omitzero"`
 	// The absolute file path being accessed or modified.
 	Path AbsolutePath `json:"path"`
 }

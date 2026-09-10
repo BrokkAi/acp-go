@@ -44,22 +44,24 @@ type Handler func(context.Context, string, json.RawMessage) (any, error)
 type Notifications func(string, json.RawMessage) error
 
 type Connection struct {
-	in        io.ReadCloser
-	out       io.WriteCloser
-	ctx       context.Context
-	cancel    context.CancelFunc
-	onRequest Handler
-	onNotify  Notifications
-	writes    chan outgoing
-	workers   chan struct{}
-	mu        sync.Mutex
-	sequence  uint64
-	pending   map[string]chan packet
-	inbound   map[string]context.CancelFunc
-	failure   error
-	once      sync.Once
-	loops     sync.WaitGroup
-	tasks     sync.WaitGroup
+	in          io.ReadCloser
+	out         io.WriteCloser
+	ctx         context.Context
+	cancel      context.CancelFunc
+	onRequest   Handler
+	onNotify    Notifications
+	writes      chan outgoing
+	workers     chan struct{}
+	mu          sync.Mutex
+	sequence    uint64
+	pending     map[string]chan packet
+	inbound     map[string]context.CancelFunc
+	failure     error
+	initOnce    bool
+	initPending bool
+	once        sync.Once
+	loops       sync.WaitGroup
+	tasks       sync.WaitGroup
 }
 
 // Connect owns both streams until Close. Frames are limited to 8 MiB; at most

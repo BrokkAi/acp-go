@@ -187,3 +187,30 @@ func TestClientIdentity(t *testing.T) {
 		t.Fatalf("wrong identity: %+v %v", info, err)
 	}
 }
+
+func TestClientAllowsOnlyOneSuccessfulInitialize(t *testing.T) {
+	c, peer := pipeClient(t, nil, nil)
+	responses := make(chan struct{}, 1)
+	go func() {
+		defer close(responses)
+		for range 1 {
+			var request packet
+			if err := json.NewDecoder(peer).Decode(&request); err != nil {
+				return
+			}
+			_ = json.NewEncoder(peer).Encode(packet{
+				Version: "2.0",
+				ID:      request.ID,
+				Result:  json.RawMessage(`{"protocolVersion":1}`),
+			})
+		}
+	}()
+	if _, err := c.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "once", Version: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "twice", Version: "1"}); err == nil ||
+		!strings.Contains(err.Error(), "may only be initialized once") {
+		t.Fatalf("duplicate initialize error = %v", err)
+	}
+	<-responses
+}

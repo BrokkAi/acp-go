@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,7 +129,6 @@ func TestV2SessionUpdateAdapter(t *testing.T) {
 func TestV2CapabilityGates(t *testing.T) {
 	session := Session{SessionID: "s"}
 	image := []Content{NewImageContent("aGk=", "image/png")}
-	unsupportedHTTP := schema.McpServer{HTTP: &schema.McpServerHttp{Name: "remote", URL: "https://example.test"}}
 	tests := []struct {
 		name string
 		run  func(*Connection) error
@@ -156,15 +156,6 @@ func TestV2CapabilityGates(t *testing.T) {
 			},
 		},
 		{
-			name: "http MCP server",
-			run: func(client *Connection) error {
-				_, err := client.NewSessionWithOptions(context.Background(), sessionInitialization(), "/repo", NewSessionOptions{
-					MCPServers: []schema.McpServer{unsupportedHTTP},
-				})
-				return err
-			},
-		},
-		{
 			name: "session delete",
 			run: func(client *Connection) error {
 				return client.DeleteSession(context.Background(), sessionInitialization(), "s")
@@ -181,6 +172,50 @@ func TestV2CapabilityGates(t *testing.T) {
 				t.Fatal("expected capability rejection")
 			}
 		})
+	}
+}
+
+func TestV2ClientAllowsOnlyOneSuccessfulInitialize(t *testing.T) {
+	client, server := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
+		if method != schema.InitializeMethodName {
+			return nil, &acp.RPCError{Code: -32601}
+		}
+		return sessionInitialization(), nil
+	}, nil)
+	_ = server
+	if _, err := client.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "once", Version: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "twice", Version: "1"}); err == nil ||
+		!strings.Contains(err.Error(), "may only be initialized once") {
+		t.Fatalf("duplicate initialize error = %v", err)
+	}
+}
+
+func TestV2ClientCanRetryMalformedInitializeResponse(t *testing.T) {
+	calls := 0
+	client, _ := pipeClient(t, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+		if method != schema.InitializeMethodName {
+			return nil, &acp.RPCError{Code: -32601}
+		}
+		calls++
+		if calls == 1 {
+			return schema.InitializeResponse{ProtocolVersion: Version}, nil
+		}
+		return sessionInitialization(), nil
+	}, nil)
+	if _, err := client.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "retry", Version: "1"}); err == nil {
+		t.Fatal("malformed initialize response accepted")
+	}
+	initialization, err := client.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "retry", Version: "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initialization.Info.Name != "test-agent" {
+		t.Fatalf("agent info = %+v", initialization.Info)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d", calls)
 	}
 }
 
