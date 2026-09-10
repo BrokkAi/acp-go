@@ -20,7 +20,7 @@ diff instead of a rewrite.
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 0 | Schema codegen pipeline + generated types + parity tests | Done (`832feae`, pinned `schema-v1.21.0`) |
-| 1 | Complete v1 client surface | Next |
+| 1 | Complete v1 client surface | Done |
 | 2 | Agent-side runtime | Planned |
 | 3 | Trust and ecosystem | Planned |
 | 4 | v2 draft | Planned |
