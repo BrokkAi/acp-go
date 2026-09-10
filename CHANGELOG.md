@@ -13,6 +13,8 @@ series, minor releases may contain breaking API changes.
 - A separate v2 client package for v2 initialization, authentication, session
   lifecycle, prompt acceptance, cancellation, capability checks, and typed
   session updates.
+- A draft v2 agent runtime for baseline sessions, prompt acceptance,
+  cancellation, optional lifecycle/config methods, and typed editor callbacks.
 - Generated open unions now retain the unknown discriminator in `Kind` as well
   as the raw payload in `Other`.
 - Generated v2 patch fields use `Nullable[T]` to distinguish omitted values,

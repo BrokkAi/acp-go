@@ -113,7 +113,14 @@ patches.
 ACP v2 changes prompt semantics: `session/prompt` returns after the agent
 accepts the turn, while completion is reported later through an idle
 `state_update`. The v1 runner and agent runtime remain under the root package
-until the v2 agent-side surface stabilizes.
+for stable applications. Draft v2 agents can use
+`github.com/BrokkAi/acp-go/v2/agent`; its `Agent` interface covers the baseline
+session methods, prompt acceptance, cancellation, and typed permission and
+elicitation callbacks.
+
+```sh
+go run ./examples/minimal-agent-v2
+```
 
 ## Process runner
 

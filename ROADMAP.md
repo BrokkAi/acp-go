@@ -96,10 +96,13 @@ Current scope:
 - Generated `schema/v2` bindings pinned to `schema-v2.0.0-alpha.3`.
 - A separate `/v2` client package for initialization, authentication, session
   lifecycle, prompt submission, cancellation, and typed update dispatch.
+- A draft v2 agent runtime for the baseline session method surface, client
+  permission and elicitation callbacks, capability gating, and optional auth,
+  delete, and config-option dispatch.
 - V2 prompt semantics: `session/prompt` returns after acceptance; completion is
   reported by `state_update` notifications.
-- Track alpha releases as they ship, then add the v2 agent runtime once the
-  request surface is sufficiently settled for a stable Go interface.
+- Track alpha releases as they ship; keep the package explicit and isolated
+  until the draft request surface stabilizes.
 
 ## Guardrails
 
