@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Added
+
+- Typed v2 client-host adapters for permission and elicitation requests.
+- A draft-v2 one-shot process runner that mirrors the reference SDK: updates
+  are installed before session setup, queued output is ignored until the
+  session reports running, agent messages honor chunk and `Nullable` patch
+  semantics, foreground work completes at the next idle update, and permission
+  requests default to explicit cancellation.
+- A `v2-one-shot-client` example modeled on the reference SDK example.
+
 ## 0.3.0 - 2026-09-10
 
 ### Added

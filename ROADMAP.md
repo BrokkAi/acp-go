@@ -99,6 +99,11 @@ Current scope:
 - A draft v2 agent runtime for the baseline session method surface, client
   permission and elicitation callbacks, capability gating, and optional auth,
   delete, and config-option dispatch.
+- Typed client-host adapters for v2 permissions and elicitation, installed
+  before session setup exactly as the reference SDK requires.
+- A v2 one-shot runner and example that mirror the reference client: wait for
+  `running`, project agent messages with patch semantics, then complete at the
+  next `idle` update. Permission requests default to explicit cancellation.
 - V2 prompt semantics: `session/prompt` returns after acceptance; completion is
   reported by `state_update` notifications.
 - Track alpha releases as they ship; keep the package explicit and isolated

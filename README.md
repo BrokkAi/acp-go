@@ -122,6 +122,21 @@ elicitation callbacks.
 go run ./examples/minimal-agent-v2
 ```
 
+`github.com/BrokkAi/acp-go/v2` also provides typed host adapters with
+`HandlePermissions`, `HandleElicitation`, and `HandleClientHost`; install them
+before `session/new` because updates and interactive requests can arrive before
+setup responses. `github.com/BrokkAi/acp-go/v2/runner` mirrors the reference
+SDK's one-shot client: it ignores queued updates until the matching session
+reports `running`, projects subsequent agent-message chunks and patch
+snapshots, completes at the next `idle` update, and cancels permission requests
+by default. Run the reference-shaped example with:
+
+```sh
+go run ./examples/v2-one-shot-client \
+  -command 'go run ./examples/minimal-agent-v2' \
+  -prompt 'Say hello using draft ACP v2.'
+```
+
 ## Process runner
 
 `github.com/BrokkAi/acp-go/runner` adds a process lifecycle, confined client file
