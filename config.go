@@ -5,89 +5,174 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/BrokkAi/acp-go/schema"
 )
 
-// ConfigOption describes an agent-advertised session selector. Unknown option
-// types and their values are preserved without requiring client support.
-type ConfigOption struct {
-	ID           string          `json:"id"`
-	Name         string          `json:"name"`
-	Category     string          `json:"category,omitempty"`
-	Type         string          `json:"type"`
-	CurrentValue json.RawMessage `json:"currentValue"`
-	Options      []ConfigValue   `json:"options,omitempty"`
-}
-
-type ConfigValue struct {
-	Value string `json:"value"`
-	Name  string `json:"name"`
-}
-
-func (s *Session) selector(category string) *ConfigOption {
-	for i := range s.ConfigOptions {
-		option := &s.ConfigOptions[i]
-		if option.Type == "select" && option.Category == category {
+func sessionSelector(session *Session, category schema.SessionConfigOptionCategory, conventionalID string) *schema.SessionConfigOption {
+	for i := range session.ConfigOptions {
+		option := &session.ConfigOptions[i]
+		if option.Select == nil {
+			continue
+		}
+		if option.Category != nil && *option.Category == category {
 			return option
 		}
 	}
-	// Categories are optional; conventional IDs also identify model/mode.
-	for i := range s.ConfigOptions {
-		option := &s.ConfigOptions[i]
-		if option.Type == "select" && option.ID == category && option.Category == "" {
+	for i := range session.ConfigOptions {
+		option := &session.ConfigOptions[i]
+		if option.Select == nil || option.Category != nil {
+			continue
+		}
+		if option.ID == schema.SessionConfigId(conventionalID) {
 			return option
 		}
 	}
 	return nil
 }
 
+// ConfigOptionsClientCapabilities advertises support for session config
+// options. Boolean support is an extension beyond flat selectors.
+func ConfigOptionsClientCapabilities(boolean bool) *schema.ClientSessionCapabilities {
+	capabilities := schema.ClientSessionCapabilities{}
+	capabilities.ConfigOptions = &schema.SessionConfigOptionsCapabilities{
+		Boolean: &schema.BooleanConfigOptionCapabilities{},
+	}
+	if !boolean {
+		capabilities.ConfigOptions.Boolean = nil
+	}
+	return &capabilities
+}
+
+func (c *Connection) SetMode(ctx context.Context, session *Session, mode string) error {
+	if session.Modes != nil {
+		for _, available := range session.Modes.AvailableModes {
+			if available.ID != schema.SessionModeId(mode) {
+				continue
+			}
+			var result schema.SetSessionModeResponse
+			err := c.Call(ctx, schema.SessionSetModeMethodName, schema.SetSessionModeRequest{
+				SessionID: session.SessionID, ModeID: schema.SessionModeId(mode),
+			}, &result)
+			if err == nil {
+				session.Modes.CurrentModeID = schema.SessionModeId(mode)
+			}
+			return err
+		}
+		return fmt.Errorf("unknown session mode %q", mode)
+	}
+	if option := sessionSelector(session, schema.SessionConfigOptionCategoryMode, "mode"); option != nil {
+		return c.setSelection(ctx, session, *option, mode)
+	}
+	return fmt.Errorf("agent did not advertise session modes")
+}
+
 // SetModel selects an advertised model and verifies the agent acknowledged it.
 // A rejected or unavailable selection must not silently use the default model.
-func (c *Connection) SetModel(ctx context.Context, s *Session, model string) error {
-	option := s.selector("model")
+func (c *Connection) SetModel(ctx context.Context, session *Session, model string) error {
+	option := sessionSelector(session, schema.SessionConfigOptionCategoryModel, "model")
 	if option == nil {
 		return fmt.Errorf("agent does not advertise ACP model selection; cannot select %q (update or choose an agent that supports session config options)", model)
 	}
-	return c.setSelection(ctx, s, *option, model)
+	return c.setSelection(ctx, session, *option, model)
 }
 
 // SetEffort uses the current model's advertised reasoning levels. Call after
 // SetModel because model selection may replace the available effort options.
-func (c *Connection) SetEffort(ctx context.Context, s *Session, effort string) error {
-	option := s.selector("thought_level")
-	if option == nil {
-		// Codex's conventional ID also works when categories are omitted.
-		option = s.selector("reasoning_effort")
-	}
+func (c *Connection) SetEffort(ctx context.Context, session *Session, effort string) error {
+	option := sessionSelector(session, schema.SessionConfigOptionCategoryThoughtLevel, "reasoning_effort")
 	if option == nil {
 		return fmt.Errorf("agent does not advertise ACP reasoning effort selection; cannot select %q (update or choose an agent that supports session config options)", effort)
 	}
-	return c.setSelection(ctx, s, *option, effort)
+	return c.setSelection(ctx, session, *option, effort)
 }
 
-func (c *Connection) setSelection(ctx context.Context, s *Session, option ConfigOption, value string) error {
+func (c *Connection) setSelection(ctx context.Context, session *Session, option schema.SessionConfigOption, value string) error {
+	choices, err := selectChoices(option.Select.Options)
+	if err != nil {
+		return err
+	}
 	var available []string
 	found := false
-	for _, choice := range option.Options {
-		available = append(available, choice.Value)
-		found = found || choice.Value == value
+	for _, choice := range choices {
+		available = append(available, string(choice.Value))
+		found = found || choice.Value == schema.SessionConfigValueId(value)
 	}
 	if !found {
 		return fmt.Errorf("unknown %s %q; available values: %s", option.Name, value, strings.Join(available, ", "))
 	}
-	var response struct {
-		ConfigOptions []ConfigOption `json:"configOptions"`
+	var response schema.SetSessionConfigOptionResponse
+	request := schema.SetSessionConfigOptionRequest{
+		SessionID: session.SessionID,
+		ConfigID:  option.ID,
+		ValueID: &schema.SetSessionConfigOptionRequestValueID{
+			Value: schema.SessionConfigValueId(value),
+		},
 	}
-	if err := c.Call(ctx, "session/set_config_option", map[string]string{"sessionId": s.ID, "configId": option.ID, "value": value}, &response); err != nil {
+	if err := c.Call(ctx, schema.SessionSetConfigOptionMethodName, request, &response); err != nil {
 		return fmt.Errorf("select %s %q: %w", option.Name, value, err)
 	}
-	s.ConfigOptions = response.ConfigOptions
-	for _, updated := range s.ConfigOptions {
-		if updated.ID == option.ID && updated.Type == "select" {
-			var current string
-			if json.Unmarshal(updated.CurrentValue, &current) == nil && current == value {
-				return nil
-			}
+	session.ConfigOptions = response.ConfigOptions
+	for _, updated := range session.ConfigOptions {
+		if updated.ID == option.ID && updated.Select != nil && updated.Select.CurrentValue == schema.SessionConfigValueId(value) {
+			return nil
 		}
 	}
 	return fmt.Errorf("agent did not confirm %s %q", option.Name, value)
+}
+
+// SetBooleanConfig sets an advertised boolean session configuration option
+// and verifies the agent's returned current value.
+func (c *Connection) SetBooleanConfig(ctx context.Context, session *Session, configID string, value bool) error {
+	for _, option := range session.ConfigOptions {
+		if option.ID != schema.SessionConfigId(configID) || option.Boolean == nil {
+			continue
+		}
+		var response schema.SetSessionConfigOptionResponse
+		request := schema.SetSessionConfigOptionRequest{
+			SessionID: session.SessionID,
+			ConfigID:  option.ID,
+			Boolean:   &schema.SetSessionConfigOptionRequestBoolean{Value: value},
+		}
+		if err := c.Call(ctx, schema.SessionSetConfigOptionMethodName, request, &response); err != nil {
+			return fmt.Errorf("set %s %t: %w", option.Name, value, err)
+		}
+		session.ConfigOptions = response.ConfigOptions
+		for _, updated := range session.ConfigOptions {
+			if updated.ID == option.ID && updated.Boolean != nil && updated.Boolean.CurrentValue == value {
+				return nil
+			}
+		}
+		return fmt.Errorf("agent did not confirm %s %t", option.Name, value)
+	}
+	return fmt.Errorf("agent did not advertise boolean session config option %q", configID)
+}
+
+func selectChoices(value any) ([]schema.SessionConfigSelectOption, error) {
+	if value == nil {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var flat []schema.SessionConfigSelectOption
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &items); err != nil || len(items) == 0 {
+		return nil, err
+	}
+	if _, grouped := items[0]["group"]; !grouped {
+		if err := json.Unmarshal(encoded, &flat); err == nil {
+			return flat, nil
+		}
+	}
+	var grouped []schema.SessionConfigSelectGroup
+	if err := json.Unmarshal(encoded, &grouped); err != nil {
+		return nil, fmt.Errorf("unsupported session selector options: %w", err)
+	}
+	var choices []schema.SessionConfigSelectOption
+	for _, group := range grouped {
+		choices = append(choices, group.Options...)
+	}
+	return choices, nil
 }

@@ -3,8 +3,11 @@
 A small, standard-library-only Go client for [Agent Client Protocol v1](https://agentclientprotocol.com/protocol/v1/overview), extracted from [release-bot](https://github.com/BrokkAi/release-bot) for reuse by release-bot and issue-bot.
 
 ```sh
-go get github.com/BrokkAi/acp-go@v0.1.0
+go get github.com/BrokkAi/acp-go@master
 ```
+
+The generated-schema API below is the unreleased `master` surface; it will be
+tagged in the next v0.x release.
 
 ```go
 connection := acp.Connect(stdout, stdin, handleRequest, handleNotification)
@@ -18,11 +21,30 @@ reason, err := connection.Prompt(ctx, session, "Inspect the project")
 ```
 
 The import path is `github.com/BrokkAi/acp-go`; its package name is `acp`.
+The runtime now uses the generated [`schema`](schema/) types directly: `Capabilities`,
+`Initialization`, `Session`, `Content`, `Update`, and `ClientInfo` are aliases
+into that package. This is an intentional v0.x API break. Use
+`acp.WorkspaceCapabilities(readFiles, writeFiles, terminal)` for the former
+boolean FS/terminal fields, `Session.SessionID` instead of `Session.ID`, and
+the content constructors (for example `acp.NewTextContent`) instead of
+hand-written discriminator fields.
+
 The caller owns launching the process and implementing the filesystem, terminal,
 and permission handlers it advertises. Capabilities default to disabled.
-Authentication, modes, model selection and reasoning effort are supported.
-Use `SetModel` before `SetEffort`: models may expose different effort choices.
+Authentication, modes (including generated mode state), model and boolean config
+selection, reasoning effort, prompt content blocks, MCP servers, additional
+directories, session load/resume/list/close/delete, logout, and typed error
+classification are supported. Optional methods and prompt content are checked
+against the agent's advertised capabilities before a request is sent. Use
+`SetModel` before `SetEffort`: models may expose different effort choices.
 Explicit selections must be acknowledged by the agent; they never silently fall back.
+
+`acp.SessionUpdates` adapts `session/update` notifications to the generated
+discriminated union. `acp.HandleElicitation`, the elicitation response
+constructors, `ElicitationComplete`, and `CombineNotifications` provide typed
+form/URL host support, including the agent's URL-completion notification.
+`NewSessionWithOptions`, `LoadSession`, and `ResumeSession` validate MCP
+transports and additional workspace roots against initialization capabilities.
 
 `Connect` owns and closes both streams. Notifications run in wire order before
 responses and must return promptly without calling back into the connection.

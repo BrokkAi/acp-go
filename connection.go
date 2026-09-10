@@ -1,5 +1,3 @@
-// Package acp implements the ACP v1 stdio client protocol using only Go's
-// standard library. Specification: https://agentclientprotocol.com/protocol/v1/overview
 package acp
 
 import (

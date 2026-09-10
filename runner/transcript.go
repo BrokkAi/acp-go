@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/schema"
 )
 
 // Stream records stay structured with --json; the console joins fragments into
@@ -56,74 +57,92 @@ type toolTranscript struct {
 }
 
 func (h *workspaceHost) showUpdate(event acp.Update) error {
-	u := event.Update
-	switch u.Kind {
-	case "agent_message_chunk", "agent_thought_chunk":
-		var content acp.Content
-		if err := json.Unmarshal(u.Content, &content); err != nil {
-			return err
+	update := event.Update
+	switch {
+	case update.AgentMessageChunk != nil || update.AgentThoughtChunk != nil:
+		chunk := update.AgentMessageChunk
+		source := "Agent"
+		if chunk == nil {
+			chunk = update.AgentThoughtChunk
+			source = "Thinking"
 		}
-		if content.Type == "text" {
-			source := "Agent"
-			if u.Kind == "agent_thought_chunk" {
-				source = "Thinking"
-			}
-			stream(h.log, source, event.SessionID, content.Text)
+		if chunk.Content.Text != nil {
+			stream(h.log, source, string(event.SessionID), chunk.Content.Text.Text)
 		}
-	case "tool_call", "tool_call_update":
-		tool := h.toolOutput[u.ToolCallID]
-		if tool == nil {
-			tool = &toolTranscript{title: u.ToolCallID}
-			h.toolOutput[u.ToolCallID] = tool
+	case update.ToolCall != nil:
+		tool := update.ToolCall
+		h.log.Info("Tool", "title", tool.Title)
+		h.showTool(tool.ToolCallID, tool.Title, tool.Status, tool.Content, tool.RawOutput, tool.Meta)
+	case update.ToolCallUpdate != nil:
+		tool := update.ToolCallUpdate
+		title := string(tool.ToolCallID)
+		if tool.Title != nil {
+			title = *tool.Title
 		}
-		if u.Title != "" {
-			tool.title = u.Title
-		}
-		if u.Kind == "tool_call" {
-			h.log.Info("Tool", "title", tool.title)
-		}
-		if u.Meta.TerminalOutput != nil {
-			tool.deltas = true
-			stream(h.log, "Tool output", u.ToolCallID, u.Meta.TerminalOutput.Data)
-		} else if !tool.deltas {
-			text := toolText(u.Content, u.RawOutput)
-			if tool.length > 0 && len(text) >= tool.length && sha256.Sum256([]byte(text[:tool.length])) == tool.digest {
-				stream(h.log, "Tool output", u.ToolCallID, text[tool.length:])
-			} else {
-				stream(h.log, "Tool output", u.ToolCallID, text)
-			}
-			if text != "" {
-				tool.length = len(text)
-				tool.digest = sha256.Sum256([]byte(text))
-			}
-		}
-		if u.Status == "completed" || u.Status == "failed" {
-			if u.Status == "failed" {
-				h.log.Error("Tool failed", "title", tool.title)
-			} else {
-				h.log.Info("Tool completed", "title", tool.title)
-			}
-		}
+		h.showTool(tool.ToolCallID, title, tool.Status, tool.Content, tool.RawOutput, tool.Meta)
 	}
 	return nil
 }
 
-func toolText(content, raw json.RawMessage) string {
-	var blocks []struct {
-		Type    string      `json:"type"`
-		Content acp.Content `json:"content"`
-		Path    string      `json:"path"`
-		OldText string      `json:"oldText"`
-		NewText string      `json:"newText"`
+func (h *workspaceHost) showTool(id schema.ToolCallId, title string, status *schema.ToolCallStatus, content []schema.ToolCallContent, rawOutput json.RawMessage, meta schema.Meta) {
+	tool := h.toolOutput[string(id)]
+	if tool == nil {
+		tool = &toolTranscript{title: string(id)}
+		h.toolOutput[string(id)] = tool
 	}
+	if title != "" {
+		tool.title = title
+	}
+	if delta := terminalOutputDelta(meta); delta != "" {
+		tool.deltas = true
+		stream(h.log, "Tool output", string(id), delta)
+	} else if !tool.deltas {
+		text := toolText(content, rawOutput)
+		if tool.length > 0 && len(text) >= tool.length && sha256.Sum256([]byte(text[:tool.length])) == tool.digest {
+			stream(h.log, "Tool output", string(id), text[tool.length:])
+		} else {
+			stream(h.log, "Tool output", string(id), text)
+		}
+		if text != "" {
+			tool.length = len(text)
+			tool.digest = sha256.Sum256([]byte(text))
+		}
+	}
+	switch {
+	case status == nil:
+	case *status == schema.ToolCallStatusCompleted:
+		h.log.Info("Tool completed", "title", tool.title)
+	case *status == schema.ToolCallStatusFailed:
+		h.log.Error("Tool failed", "title", tool.title)
+	}
+}
+
+func terminalOutputDelta(meta schema.Meta) string {
+	value, ok := meta["terminal_output_delta"]
+	if !ok {
+		return ""
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	var delta struct {
+		Data string `json:"data"`
+	}
+	if json.Unmarshal(encoded, &delta) != nil {
+		return ""
+	}
+	return delta.Data
+}
+
+func toolText(content []schema.ToolCallContent, raw json.RawMessage) string {
 	var text strings.Builder
-	if json.Unmarshal(content, &blocks) == nil {
-		for _, block := range blocks {
-			if block.Type == "content" && block.Content.Type == "text" {
-				text.WriteString(block.Content.Text)
-			} else if block.Type == "diff" {
-				text.WriteString("File: " + block.Path + "\n" + block.NewText + "\n")
-			}
+	for _, block := range content {
+		switch {
+		case block.Content != nil && block.Content.Content.Text != nil:
+			text.WriteString(block.Content.Content.Text.Text)
+		case block.Diff != nil:
+			text.WriteString("File: " + block.Diff.Path + "\n" + block.Diff.NewText + "\n")
 		}
 	}
 	if text.Len() > 0 {
