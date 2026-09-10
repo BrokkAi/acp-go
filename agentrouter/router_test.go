@@ -251,3 +251,81 @@ func TestRouterRejectsMalformedProtocolVersion(t *testing.T) {
 		t.Fatalf("response = %+v", response)
 	}
 }
+
+func TestRouterValidatesInitializeBeforeBatchDispatch(t *testing.T) {
+	requests := make(chan schema2.InitializeRequest, 1)
+	rw := startRouter(t, New().WithV2(&v2TestAgent{requests: requests}))
+	batch, err := json.Marshal([]map[string]any{
+		{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": 2}},
+		{"jsonrpc": "2.0", "id": 2, "method": "session/list", "params": map[string]any{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rw.Write(append(batch, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err := rw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var responses []struct {
+		ID    int `json:"id"`
+		Error *struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(rw).Decode(&responses); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses) != 2 || responses[0].ID != 1 || responses[1].ID != 2 ||
+		responses[0].Error == nil || responses[1].Error == nil ||
+		responses[0].Error.Code != -32602 || responses[1].Error.Code != -32602 {
+		t.Fatalf("responses = %+v", responses)
+	}
+	select {
+	case <-requests:
+		t.Fatal("invalid initialize handler ran")
+	default:
+	}
+}
+
+func TestRouterAcceptsInitialBatchAndPreservesFutureNotification(t *testing.T) {
+	requests := make(chan schema2.InitializeRequest, 1)
+	rw := startRouter(t, New().WithV2(&v2TestAgent{requests: requests}))
+	batch, err := json.Marshal([]map[string]any{
+		{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+			"protocolVersion": 2,
+			"info":            map[string]any{"name": "batch-client", "version": "1"},
+		}},
+		{"jsonrpc": "2.0", "method": "_future/notification", "params": map[string]any{"preserved": true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rw.Write(append(batch, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err := rw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var responses []struct {
+		ID     int `json:"id"`
+		Result *struct {
+			ProtocolVersion uint16 `json:"protocolVersion"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(rw).Decode(&responses); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses) != 1 || responses[0].ID != 1 || responses[0].Result == nil || responses[0].Result.ProtocolVersion != 2 {
+		t.Fatalf("responses = %+v", responses)
+	}
+	select {
+	case request := <-requests:
+		if request.Info.Name != "batch-client" {
+			t.Fatalf("initialize request = %+v", request)
+		}
+	default:
+		t.Fatal("initialize handler did not run")
+	}
+}

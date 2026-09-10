@@ -49,8 +49,11 @@ transports and additional workspace roots against initialization capabilities.
 responses and must return promptly without calling back into the connection.
 Requests run concurrently and must honor cancellation. Frames are bounded at
 8 MiB and incoming requests at 32. `Close` cancels and joins handlers.
-Generic `Call` and `Notify` permit extensions. This root package is v1-only;
-use the separate [`v2`](#draft-acp-v2) package for the draft protocol.
+Generic `Call`, `CallBatch`, and `Notify` permit extensions. Inbound and
+outgoing JSON-RPC batches retain member order where Rust does; request-bearing
+inbound batches receive one grouped response array, response batches route by
+ID, and malformed response-shaped members are ignored. This root transport is
+also used by the draft-v2 package, while its typed v1 facade remains v1-only.
 
 Run `go test -race ./...` and `go vet ./...`. No agent credentials are needed.
 The fuzz seed corpus runs as part of that command; see

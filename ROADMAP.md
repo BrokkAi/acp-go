@@ -54,25 +54,22 @@ only remaining work.
   - canonicalize a newer initialize request to selected v2 parameters,
   - canonicalize v2 initialize parameters when only v1 is configured,
   - never convert traffic after initialization.
+- JSON-RPC batch support:
+  - inbound request, notification, response, and mixed batches,
+  - one grouped response array for request-bearing batches,
+  - malformed response-shaped members ignored as Rust ignores them,
+  - malformed call-shaped members answered with Invalid Request,
+  - duplicate and overlapping inbound request IDs,
+  - response batches routed to pending calls by ID,
+  - batch completion waits for trailing notification handlers,
+  - an incomplete batch does not block independent standalone calls,
+  - explicit outbound `CallBatch` support,
+  - initial initialize parameters validated before sibling dispatch by the
+    protocol router.
 
 ## Remaining Rust-parity gaps
 
-### 1. Transport batches and initialize compatibility
-
-The Rust JSON-RPC layer accepts and preserves JSON-RPC batches and validates
-same-version initialize parameters before dispatching siblings. Our transport
-currently accepts one JSON object per line and dispatches inbound requests
-concurrently.
-
-Work:
-
-- Accept JSON-RPC request/response/notification batches without changing the
-  line framing.
-- Preserve batch member identity and order where Rust does.
-- Reject an initialize batch only when Rust rejects it.
-- Preserve Rust's tested malformed-v2-initialize retry behavior while batching.
-
-### 2. V2 session command surface
+### 1. V2 session command surface
 
 The Rust SDK exposes a `V2Session` command handle and documents ownership
 boundaries explicitly.
@@ -86,7 +83,7 @@ Work:
   before replay can begin.
 - Keep update projection session-scoped; do not invent prompt or turn IDs.
 
-### 3. Protocol routing for client and proxy peers
+### 2. Protocol routing for client and proxy peers
 
 The agent-side v1/v2 router is implemented. Rust additionally has explicit
 client and proxy protocol connectors/routers.
@@ -97,7 +94,7 @@ Work:
 - Add proxy routing without converting successor traffic between versions.
 - Ensure future-version canonicalization and extension preservation match Rust.
 
-### 4. Unstable Rust feature surfaces
+### 3. Unstable Rust feature surfaces
 
 The Rust schema crate exposes separately gated feature surfaces beyond draft
 v2. Our generated packages currently cover the stable pinned artifacts.
@@ -110,7 +107,7 @@ Work, gated behind explicit Go package opt-ins where applicable:
 - unstable NES,
 - unstable tool-call names and end-turn token usage.
 
-### 5. Semantic validation parity
+### 4. Semantic validation parity
 
 Rust semantic newtypes enforce IDs, absolute paths, media types, and URI forms
 at the type boundary. Most Go generated types currently use string aliases.
@@ -122,7 +119,7 @@ Work:
 - Enforce absolute paths and required identifiers at typed facade boundaries.
 - Preserve unknown extension tags and raw `_meta` payloads.
 
-### 6. Draft-v2 ecosystem validation
+### 5. Draft-v2 ecosystem validation
 
 - Extend optional credential-backed CI to exercise the v2 runner against real
   adapters when they advertise v2.

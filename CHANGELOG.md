@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Added
+
+- JSON-RPC batch ingress and grouped request responses, matching the reference
+  transport’s handling of requests, notifications, responses, malformed members,
+  duplicate IDs, trailing notification handlers, and independent standalone
+  calls.
+- `Connection.CallBatch` for outbound batch requests whose replies may arrive
+  individually or in a response batch.
+- Agent protocol-router validation of initial v1/v2 initialize batches before
+  sibling dispatch.
+
 ## 0.5.0 - 2026-09-10
 
 ### Changed

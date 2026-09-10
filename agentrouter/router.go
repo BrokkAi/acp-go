@@ -52,6 +52,9 @@ func (r *Agent) Serve(ctx context.Context, in io.ReadCloser, out io.WriteCloser)
 		}
 		return err
 	}
+	if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 && trimmed[0] == '[' {
+		return r.serveBatch(ctx, trimmed, reader, in, out)
+	}
 
 	frame, params, requested, routeErr := routeFrame(line)
 	if routeErr == nil {
@@ -121,6 +124,115 @@ func (r *Agent) Serve(ctx context.Context, in io.ReadCloser, out io.WriteCloser)
 	return nil
 }
 
+type routerBatchEntry struct {
+	raw          json.RawMessage
+	frame        wireFrame
+	valid        bool
+	responseOnly bool
+}
+
+func (r *Agent) serveBatch(ctx context.Context, line []byte, reader *bufio.Reader, in io.ReadCloser, out io.WriteCloser) error {
+	var rawEntries []json.RawMessage
+	if err := json.Unmarshal(line, &rawEntries); err != nil || len(rawEntries) == 0 {
+		return rejectInitialize(out, json.RawMessage("null"), errors.New("Invalid Request"))
+	}
+	entries := make([]routerBatchEntry, len(rawEntries))
+	for i, raw := range rawEntries {
+		entries[i].raw = raw
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &fields)
+		_, hasMethod := fields["method"]
+		_, hasResult := fields["result"]
+		_, hasError := fields["error"]
+		entries[i].responseOnly = !hasMethod && (hasResult || hasError)
+		if err := json.Unmarshal(raw, &entries[i].frame); err == nil &&
+			entries[i].frame.Version == "2.0" &&
+			(entries[i].frame.Method == "" || (len(entries[i].frame.ID) > 0 && string(entries[i].frame.ID) != "null")) {
+			entries[i].valid = true
+		}
+	}
+	first := -1
+	for i, entry := range entries {
+		if entry.responseOnly {
+			continue
+		}
+		first = i
+		break
+	}
+	if first < 0 {
+		return errors.New("initial response batch contained no initialize request")
+	}
+	if !entries[first].valid || entries[first].frame.Method != "initialize" {
+		return rejectInitializeEntries(out, entries, &routerError{code: -32600, err: errors.New("first ACP request must be initialize")})
+	}
+	frame := entries[first].frame
+	requested, err := protocolVersion(frame.Params)
+	if err != nil {
+		return rejectInitializeEntries(out, entries, &routerError{code: -32600, err: err})
+	}
+
+	var selected byte
+	switch {
+	case requested >= 2 && r.v2 != nil:
+		selected = 2
+	case requested >= 1 && r.v1 != nil:
+		selected = 1
+	default:
+		return rejectInitializeEntries(out, entries, &routerError{
+			code: -32600,
+			err:  fmt.Errorf("ACP protocol version %d is not configured", requested),
+		})
+	}
+
+	if selected == 2 {
+		var request schema2.InitializeRequest
+		if err := json.Unmarshal(frame.Params, &request); err != nil {
+			return rejectInitializeEntries(out, entries, &routerError{code: -32602, err: errors.New("invalid initialize params: " + err.Error())})
+		}
+		if err := validateV2Initialize(request); err != nil {
+			return rejectInitializeEntries(out, entries, &routerError{code: -32602, err: err})
+		}
+		if requested != 2 {
+			request.ProtocolVersion = 2
+			encoded, err := json.Marshal(request)
+			if err != nil {
+				return err
+			}
+			frame.Params = encoded
+		}
+	} else if requested != 1 {
+		var request schema2.InitializeRequest
+		if err := json.Unmarshal(frame.Params, &request); err != nil {
+			return rejectInitializeEntries(out, entries, &routerError{code: -32602, err: errors.New("invalid initialize params: " + err.Error())})
+		}
+		if err := validateV2Initialize(request); err != nil {
+			return rejectInitializeEntries(out, entries, &routerError{code: -32602, err: err})
+		}
+		converted, err := v1InitializeRequest(request)
+		if err != nil {
+			return err
+		}
+		encoded, err := json.Marshal(converted)
+		if err != nil {
+			return err
+		}
+		frame.Params = encoded
+	}
+	rewrittenEntry, err := json.Marshal(frame)
+	if err != nil {
+		return err
+	}
+	rawEntries[first] = rewrittenEntry
+	rewrittenBatch, err := json.Marshal(rawEntries)
+	if err != nil {
+		return err
+	}
+	if selected == 2 {
+		return agent2.New(r.v2).Serve(ctx, newPrefixedReader(rewrittenBatch, reader, in), out)
+	}
+	return agent.New(r.v1).Serve(ctx, newPrefixedReader(rewrittenBatch, reader, in), out)
+}
+
 type wireFrame struct {
 	Version string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -182,6 +294,59 @@ func routeFrame(line []byte) (wireFrame, json.RawMessage, uint16, error) {
 		return frame, nil, 0, errors.New("initialize protocolVersion must be a uint16")
 	}
 	return frame, frame.Params, version, nil
+}
+
+func protocolVersion(params json.RawMessage) (uint16, error) {
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(params, &values); err != nil {
+		return 0, errors.New("initialize params must be an object")
+	}
+	rawVersion, ok := values["protocolVersion"]
+	if !ok {
+		return 0, errors.New("initialize protocolVersion is required")
+	}
+	var version uint16
+	if err := json.Unmarshal(rawVersion, &version); err != nil {
+		return 0, errors.New("initialize protocolVersion must be a uint16")
+	}
+	return version, nil
+}
+
+type routerError struct {
+	code int
+	err  error
+}
+
+func (e *routerError) Error() string { return e.err.Error() }
+func (e *routerError) Unwrap() error { return e.err }
+
+func rejectInitializeEntries(out io.Writer, entries []routerBatchEntry, initializeError *routerError) error {
+	responses := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		var response map[string]any
+		id := any(nil)
+		if entry.valid && len(entry.frame.ID) > 0 {
+			_ = json.Unmarshal(entry.frame.ID, &id)
+		}
+		if !entry.valid && !entry.responseOnly {
+			response = map[string]any{
+				"jsonrpc": "2.0", "id": nil,
+				"error": map[string]any{"code": -32600, "message": "Invalid Request"},
+			}
+		} else if entry.valid && entry.frame.Method != "" && len(entry.frame.ID) > 0 {
+			response = map[string]any{
+				"jsonrpc": "2.0", "id": id,
+				"error": map[string]any{"code": initializeError.code, "message": initializeError.Error()},
+			}
+		} else {
+			continue
+		}
+		responses = append(responses, response)
+	}
+	if len(responses) == 0 {
+		return nil
+	}
+	return json.NewEncoder(out).Encode(responses)
 }
 
 func v1InitializeRequest(request schema2.InitializeRequest) (schema1.InitializeRequest, error) {
