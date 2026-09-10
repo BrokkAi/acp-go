@@ -97,7 +97,7 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	}
 	defer transcript.Close()
 
-	state := newRunState()
+	tracker := acpv2.NewSessionTracker()
 	host := newRunHost(r.Config.Permissions, r.Config.Elicitation, transcript)
 	log.Info("Starting ACP v2 agent",
 		"command", strings.Join(r.Config.Agent.Command, " "),
@@ -133,7 +133,7 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 		if err := host.Record(map[string]any{"event": "session_update", "update": update}); err != nil {
 			return err
 		}
-		state.notification(update)
+		tracker.Observe(update)
 		return nil
 	}))
 	started := time.Now()
@@ -178,7 +178,7 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	if err != nil {
 		return result, fmt.Errorf("create ACP v2 session (check agent login): %w", err)
 	}
-	idle := state.wait(session.SessionID)
+	work := tracker.BeginWork(session.SessionID)
 	phase = "session/prompt"
 	if err := connection.Prompt(ctx, initialization, session, prompt); err != nil {
 		return result, err
@@ -186,9 +186,9 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	promptAccepted = true
 	phase = "wait-for-idle"
 	select {
-	case <-idle:
-		text, stopReason := state.result(session.SessionID)
-		result = Result{Text: text, StopReason: stopReason}
+	case <-work.Done():
+		workResult := work.Result()
+		result = Result{Text: workResult.Text, StopReason: workResult.StopReason}
 	case <-ctx.Done():
 		return result, ctx.Err()
 	case <-connection.Done():
