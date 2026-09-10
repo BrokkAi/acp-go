@@ -2,7 +2,6 @@ package runner
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,10 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/clienthost"
 	"github.com/BrokkAi/acp-go/internal/osrun"
 	"github.com/BrokkAi/acp-go/schema"
 )
@@ -79,12 +78,12 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 	if err != nil {
 		return result, err
 	}
-	defer host.close()
-	host.autoApprove = a.Config.AutoApprove
+	defer host.Close()
+	host.SetAutoApprove(a.Config.AutoApprove)
 	a.Log.Info("Starting agent", "command", strings.Join(a.Config.Agent.Command, " "), "transcript", transcript.Name())
 	cmd := osrun.StartCommand(context.Background(), a.Config.Directory, a.Config.Agent.Command, a.Config.Agent.Environment)
 	diagnostics := &osrun.Tail{Capacity: 64 << 10}
-	cmd.Stderr = io.MultiWriter(diagnostics, &transcriptWriter{log: a.Log, source: "Agent stderr", record: host.record})
+	cmd.Stderr = io.MultiWriter(diagnostics, host.ProcessWriter("Agent stderr", ""))
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return result, err
@@ -102,12 +101,12 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 		_ = osrun.Kill(cmd)
 		_ = cmd.Wait()
 		text, _ := diagnostics.Text()
-		_ = host.record(map[string]string{"stderr": text})
+		_ = host.Record(map[string]string{"stderr": text})
 		if runErr != nil && text != "" {
 			runErr = fmt.Errorf("%w\nAgent diagnostics: %s", runErr, text)
 		}
 	}()
-	connection := acp.Connect(out, in, host.request, host.notification)
+	connection := acp.Connect(out, in, host.Request, host.Notification)
 	phase := "initialize"
 	started := time.Now()
 	defer func() {
@@ -121,7 +120,7 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 		if err := connection.Err(); err != nil {
 			record["transport_error"] = err.Error()
 		}
-		_ = host.record(record)
+		_ = host.Record(record)
 		_ = connection.Close()
 	}()
 	capabilities := acp.WorkspaceCapabilities(true, true, true)
@@ -141,9 +140,7 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 	if err != nil {
 		return result, fmt.Errorf("create ACP session (check agent login): %w", err)
 	}
-	host.mu.Lock()
-	host.session = session.SessionID
-	host.mu.Unlock()
+	host.SetSession(session.SessionID)
 	if a.Config.Agent.Mode != "" {
 		phase = "select mode"
 		if err := connection.SetMode(ctx, &session, a.Config.Agent.Mode); err != nil {
@@ -165,7 +162,7 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 		a.Log.Info("Using reasoning effort", "effort", a.Config.Agent.Effort)
 	}
 	a.Log.Info("agent session", "id", session.SessionID, "transcript", transcript.Name())
-	if err := host.record(map[string]string{"prompt": prompt}); err != nil {
+	if err := host.Record(map[string]string{"prompt": prompt}); err != nil {
 		return result, err
 	}
 	phase = "session/prompt"
@@ -177,224 +174,20 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 	if reason != schema.StopReasonEndTurn {
 		return result, fmt.Errorf("agent stopped with %s", reason)
 	}
-	host.mu.Lock()
-	logErr := host.logError
-	host.mu.Unlock()
-	if logErr != nil {
+	if logErr := host.LogErr(); logErr != nil {
 		return result, logErr
 	}
-	text, truncated := host.answer.Text()
+	text, truncated := host.Answer()
 	if truncated {
 		return "", errors.New("agent answer exceeded 2 MiB")
 	}
 	return text, nil
 }
 
-type workspaceHost struct {
-	autoApprove bool
-	ctx         context.Context
-	cancel      context.CancelFunc
-	root        *os.Root
-	directory   string
-	mu          sync.Mutex
-	session     schema.SessionId
-	log         *slog.Logger
-	transcript  *json.Encoder
-	logError    error
-	answer      osrun.Tail
-	terminals   map[string]*commandTerminal
-	next        uint64
-	closing     bool
-	toolOutput  map[string]*toolTranscript
-}
-
-func newHost(ctx context.Context, dir string, output io.Writer, log *slog.Logger) (*workspaceHost, error) {
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	return &workspaceHost{ctx: ctx, cancel: cancel, root: root, directory: dir, log: log, transcript: json.NewEncoder(output), answer: osrun.Tail{Capacity: 2 << 20}, terminals: make(map[string]*commandTerminal), toolOutput: make(map[string]*toolTranscript)}, nil
-}
-
-func (h *workspaceHost) record(value any) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.logError == nil {
-		h.logError = h.transcript.Encode(value)
-	}
-	return h.logError
-}
-
-func (h *workspaceHost) notification(method string, raw json.RawMessage) error {
-	if method != schema.SessionUpdateMethodName {
-		return nil
-	}
-	var update acp.Update
-	if err := json.Unmarshal(raw, &update); err != nil {
-		return err
-	}
-	h.mu.Lock()
-	session := h.session
-	h.mu.Unlock()
-	if session != "" && update.SessionID != session {
-		return nil
-	}
-	if err := h.record(json.RawMessage(raw)); err != nil {
-		return err
-	}
-	if chunk := update.Update.AgentMessageChunk; chunk != nil && chunk.Content.Text != nil {
-		_, _ = h.answer.Write([]byte(chunk.Content.Text.Text))
-	}
-	return h.showUpdate(update)
-}
-
-func (h *workspaceHost) validSession(session schema.SessionId) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.session != "" && h.session == session
-}
-
-func (h *workspaceHost) request(ctx context.Context, method string, raw json.RawMessage) (any, error) {
-	switch method {
-	case schema.SessionRequestPermissionMethodName:
-		var request schema.RequestPermissionRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
-		}
-		if !h.validSession(request.SessionID) {
-			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
-		}
-		return h.permission(ctx, raw, request)
-	case schema.FsReadTextFileMethodName:
-		var request schema.ReadTextFileRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
-		}
-		if !h.validSession(request.SessionID) {
-			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
-		}
-		if err := h.hostContext(); err != nil {
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return h.readFile(request)
-	case schema.FsWriteTextFileMethodName:
-		var request schema.WriteTextFileRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
-		}
-		if !h.validSession(request.SessionID) {
-			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
-		}
-		if err := h.hostContext(); err != nil {
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return h.writeFile(request)
-	case schema.TerminalCreateMethodName,
-		schema.TerminalOutputMethodName,
-		schema.TerminalWaitForExitMethodName,
-		schema.TerminalKillMethodName,
-		schema.TerminalReleaseMethodName:
-		return h.terminal(ctx, method, raw)
-	default:
-		return nil, &acp.RPCError{Code: -32601, Message: "unsupported method: " + method}
-	}
-}
-
-func (h *workspaceHost) hostContext() error {
-	return h.ctx.Err()
-}
-
-func (h *workspaceHost) permission(ctx context.Context, raw json.RawMessage, request schema.RequestPermissionRequest) (any, error) {
-	cancelled := schema.RequestPermissionResponse{Outcome: schema.RequestPermissionOutcome{
-		Cancelled: &schema.RequestPermissionOutcomeCancelled{},
-	}}
-	if !h.autoApprove || ctx.Err() != nil || h.ctx.Err() != nil {
-		return cancelled, nil
-	}
-	for _, kind := range []schema.PermissionOptionKind{
-		schema.PermissionOptionKindAllowOnce,
-		schema.PermissionOptionKindAllowAlways,
-	} {
-		for _, option := range request.Options {
-			if option.Kind != kind {
-				continue
-			}
-			if err := h.record(map[string]any{"permission_request": raw, "selected": option.OptionID}); err != nil {
-				return nil, err
-			}
-			return schema.RequestPermissionResponse{Outcome: schema.RequestPermissionOutcome{
-				Selected: &schema.SelectedPermissionOutcome{OptionID: option.OptionID},
-			}}, nil
-		}
-	}
-	return cancelled, nil
-}
-
-func (h *workspaceHost) relative(path string) (string, error) {
-	if !filepath.IsAbs(path) {
-		return "", errors.New("ACP file and terminal paths must be absolute")
-	}
-	rel, err := filepath.Rel(h.directory, path)
-	if err != nil {
-		return "", err
-	}
-	if rel != "." && !filepath.IsLocal(rel) {
-		return "", errors.New("path lies outside the checkout")
-	}
-	return rel, nil
-}
-
-func (h *workspaceHost) writeFile(request schema.WriteTextFileRequest) (any, error) {
-	path, err := h.relative(request.Path)
-	if err != nil {
-		return nil, err
-	}
-	if err := h.root.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return nil, err
-	}
-	if err := h.root.WriteFile(path, []byte(request.Content), 0644); err != nil {
-		return nil, err
-	}
-	return schema.WriteTextFileResponse{}, nil
-}
-
-func (h *workspaceHost) readFile(request schema.ReadTextFileRequest) (any, error) {
-	path, err := h.relative(request.Path)
-	if err != nil {
-		return nil, err
-	}
-	f, err := h.root.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, (4<<20)+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(b) > 4<<20 {
-		return nil, errors.New("file exceeds 4 MiB; inspect it through a terminal")
-	}
-	lines := strings.Split(string(b), "\n")
-	first, last := 0, len(lines)
-	if request.Line != nil {
-		if *request.Line < 1 {
-			return nil, errors.New("line must be at least 1")
-		}
-		first = min(last, int(*request.Line)-1)
-	}
-	if request.Limit != nil {
-		if *request.Limit < 0 {
-			return nil, errors.New("limit cannot be negative")
-		}
-		last = first + min(last-first, int(*request.Limit))
-	}
-	return schema.ReadTextFileResponse{Content: strings.Join(lines[first:last], "\n")}, nil
+func newHost(ctx context.Context, directory string, transcript io.Writer, logger *slog.Logger) (*clienthost.Host, error) {
+	return clienthost.Open(ctx, clienthost.Config{
+		Directory:  directory,
+		Logger:     logger,
+		Transcript: transcript,
+	})
 }

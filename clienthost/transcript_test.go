@@ -1,4 +1,4 @@
-package runner
+package clienthost
 
 import (
 	"bytes"
@@ -10,14 +10,18 @@ import (
 	"testing"
 )
 
+func newHost(ctx context.Context, directory string, transcript io.Writer, logger *slog.Logger) (*Host, error) {
+	return Open(ctx, Config{Directory: directory, Transcript: transcript, Logger: logger})
+}
+
 func TestTranscriptStreamsMessagesAndDeduplicatesToolSnapshots(t *testing.T) {
 	var output, saved bytes.Buffer
 	h, err := newHost(context.Background(), t.TempDir(), &saved, slog.New(slog.NewJSONHandler(&output, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer h.close()
-	h.session = "s"
+	defer h.Close()
+	h.SetSession("s")
 	updates := []string{
 		`{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Checking "}}`,
 		`{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"the build.\n"}}`,
@@ -32,7 +36,7 @@ func TestTranscriptStreamsMessagesAndDeduplicatesToolSnapshots(t *testing.T) {
 		`{"sessionUpdate":"tool_call_update","toolCallId":"read","content":[{"type":"content","content":{"type":"text","text":"file contents\n"}}]}`,
 	}
 	for _, update := range updates {
-		if err := h.notification("session/update", json.RawMessage(`{"sessionId":"s","update":`+update+`}`)); err != nil {
+		if err := h.Notification("session/update", json.RawMessage(`{"sessionId":"s","update":`+update+`}`)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -68,7 +72,7 @@ func TestTranscriptStreamsMessagesAndDeduplicatesToolSnapshots(t *testing.T) {
 	if bytes.Count(saved.Bytes(), []byte(`"sessionId":"s"`)) != len(updates) {
 		t.Fatal("console output replaced the durable full transcript")
 	}
-	answer, _ := h.answer.Text()
+	answer, _ := h.Answer()
 	if answer != messages.String() {
 		t.Fatal("thoughts or tool output contaminated the release receipt")
 	}
@@ -76,7 +80,14 @@ func TestTranscriptStreamsMessagesAndDeduplicatesToolSnapshots(t *testing.T) {
 
 func TestTranscriptWriterPreservesSplitUTF8(t *testing.T) {
 	var output bytes.Buffer
-	w := &transcriptWriter{log: slog.New(slog.NewJSONHandler(&output, nil)), source: "Agent stderr"}
+	h, err := Open(context.Background(), Config{
+		Directory: t.TempDir(), Logger: slog.New(slog.NewJSONHandler(&output, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	w := h.ProcessWriter("Agent stderr", "")
 	for _, b := range []byte("error: café\n") {
 		_, _ = w.Write([]byte{b})
 	}

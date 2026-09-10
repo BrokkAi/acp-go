@@ -54,6 +54,35 @@ Generic `Call` and `Notify` permit extensions. ACP v2 is not supported.
 
 Run `go test -race ./...` and `go vet ./...`. No agent credentials are needed.
 
+## Agent runtime
+
+`github.com/BrokkAi/acp-go/agent` serves an agent over stdio. Implement the
+mandatory `agent.Agent` interface (`Initialize`, `NewSession`, and `Prompt`);
+optional lifecycle and config methods are discovered as narrow interfaces such
+as `SessionLoader`, `SessionCloser`, and `ConfigOptionSetter`. During a prompt,
+call `SessionUpdater.Update` to emit typed `session/update` notifications. The
+runtime enforces protocol initialization, dispatches generated request/response
+types, maps `session/cancel` to prompt-context cancellation, and rejects optional
+methods omitted from the agent's advertised capabilities.
+
+The same package gives agents typed `agent.Client` methods for filesystem,
+permission, terminal, and elicitation callbacks. Client applications can compose
+typed hosts with `agent.HandleFilesystem`, `HandleTerminal`,
+`HandlePermissions`, and `HandleElicitation`.
+`github.com/BrokkAi/acp-go/clienthost` is the reference workspace-confined host
+used by the runner: rooted filesystem access, process-group terminals, bounded
+output, opt-in auto-approval, slog streaming, and JSONL transcripts.
+
+Runnable examples are included:
+
+```sh
+go run ./examples/minimal-client -agent-command 'go run ./examples/minimal-agent' -prompt hello
+go run ./examples/drive-cli -command 'go run ./examples/minimal-agent' -prompt hello
+```
+
+`drive-cli` accepts the same mode/model/effort/auth options commonly needed by
+external CLI adapters; substitute the real agent command for the minimal agent.
+
 ## Wire schema
 
 `github.com/BrokkAi/acp-go/schema` provides typed constants, request and

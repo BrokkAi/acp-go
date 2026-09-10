@@ -1,4 +1,4 @@
-package runner
+package clienthost
 
 import (
 	"context"
@@ -29,19 +29,19 @@ func TestWorkspaceCannotEscapeAndCancelledPermission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer h.close()
-	h.session = "s"
+	defer h.Close()
+	h.SetSession("s")
 	for _, path := range []string{path, filepath.Join(dir, "link", "private"), "relative"} {
 		params, _ := json.Marshal(map[string]string{"sessionId": "s", "path": path, "content": "overwrite"})
 		for _, method := range []string{"fs/read_text_file", "fs/write_text_file"} {
-			if _, err := h.request(context.Background(), method, params); err == nil {
+			if _, err := h.Request(context.Background(), method, params); err == nil {
 				t.Fatalf("escaped root using %s %s", method, path)
 			}
 		}
 	}
-	h.cancel()
+	h.Close()
 	params := json.RawMessage(`{"sessionId":"s","options":[{"kind":"allow_once","optionId":"yes"}]}`)
-	result, err := h.request(context.Background(), "session/request_permission", params)
+	result, err := h.Request(context.Background(), "session/request_permission", params)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,12 +56,12 @@ func TestPermissionsRequireExplicitOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer h.close()
-	h.session = "s"
+	defer h.Close()
+	h.SetSession("s")
 	raw := json.RawMessage(`{"sessionId":"s","options":[{"kind":"allow_once","optionId":"yes"}]}`)
 	for _, allow := range []bool{false, true} {
-		h.autoApprove = allow
-		result, err := h.request(context.Background(), "session/request_permission", raw)
+		h.SetAutoApprove(allow)
+		result, err := h.Request(context.Background(), "session/request_permission", raw)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,4 +1,4 @@
-package runner
+package clienthost
 
 import (
 	"context"
@@ -25,7 +25,7 @@ type commandTerminal struct {
 
 func (t *commandTerminal) kill() { t.once.Do(func() { _ = osrun.Kill(t.command) }) }
 
-func (h *workspaceHost) terminal(ctx context.Context, method string, raw json.RawMessage) (any, error) {
+func (h *Host) terminal(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 	switch method {
 	case schema.TerminalCreateMethodName:
 		var request schema.CreateTerminalRequest
@@ -35,7 +35,7 @@ func (h *workspaceHost) terminal(ctx context.Context, method string, raw json.Ra
 		if !h.validSession(request.SessionID) {
 			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
 		}
-		if err := h.hostContext(); err != nil {
+		if err := h.ready(); err != nil {
 			return nil, err
 		}
 		if err := ctx.Err(); err != nil {
@@ -83,7 +83,7 @@ func (h *workspaceHost) terminal(ctx context.Context, method string, raw json.Ra
 	}
 }
 
-func (h *workspaceHost) createTerminal(request schema.CreateTerminalRequest) (any, error) {
+func (h *Host) createTerminal(request schema.CreateTerminalRequest) (any, error) {
 	if request.Command == "" {
 		return nil, fmt.Errorf("terminal command is required")
 	}
@@ -98,7 +98,7 @@ func (h *workspaceHost) createTerminal(request schema.CreateTerminalRequest) (an
 		}
 		directory = resolved
 	}
-	limit := 1 << 20
+	limit := defaultTerminalOutput
 	if request.OutputByteLimit != nil {
 		outputLimit := *request.OutputByteLimit
 		if outputLimit > uint64(limit) {
@@ -121,12 +121,12 @@ func (h *workspaceHost) createTerminal(request schema.CreateTerminalRequest) (an
 	if h.closing || h.ctx.Err() != nil {
 		return nil, context.Canceled
 	}
-	if len(h.terminals) >= 32 {
+	if len(h.terminals) >= maxTerminals {
 		return nil, fmt.Errorf("release unused terminals before starting more")
 	}
 	h.next++
 	id := fmt.Sprintf("t%d", h.next)
-	t.command.Stdout = io.MultiWriter(&t.tail, &transcriptWriter{log: h.log, source: "Command output", id: id, record: h.record})
+	t.command.Stdout = io.MultiWriter(&t.tail, h.newProcessWriter("Command output", id))
 	t.command.Stderr = t.command.Stdout
 	if err := t.command.Start(); err != nil {
 		return nil, err
@@ -134,8 +134,6 @@ func (h *workspaceHost) createTerminal(request schema.CreateTerminalRequest) (an
 	h.terminals[id] = t
 	go func() {
 		_ = t.command.Wait()
-		// Reap any descendants holding pipes, then retire the process group
-		// so a later release cannot signal a recycled PID.
 		t.kill()
 		code := int64(t.command.ProcessState.ExitCode())
 		t.status.ExitCode = &code
@@ -149,7 +147,7 @@ func (h *workspaceHost) createTerminal(request schema.CreateTerminalRequest) (an
 	return schema.CreateTerminalResponse{TerminalID: schema.TerminalId(id)}, nil
 }
 
-func (h *workspaceHost) terminalOutput(request schema.TerminalOutputRequest) (any, error) {
+func (h *Host) terminalOutput(request schema.TerminalOutputRequest) (any, error) {
 	h.mu.Lock()
 	t := h.terminals[string(request.TerminalID)]
 	h.mu.Unlock()
@@ -167,7 +165,7 @@ func (h *workspaceHost) terminalOutput(request schema.TerminalOutputRequest) (an
 	return result, nil
 }
 
-func (h *workspaceHost) waitForTerminal(ctx context.Context, request schema.WaitForTerminalExitRequest) (any, error) {
+func (h *Host) waitForTerminal(ctx context.Context, request schema.WaitForTerminalExitRequest) (any, error) {
 	h.mu.Lock()
 	t := h.terminals[string(request.TerminalID)]
 	h.mu.Unlock()
@@ -184,7 +182,7 @@ func (h *workspaceHost) waitForTerminal(ctx context.Context, request schema.Wait
 	}
 }
 
-func (h *workspaceHost) killTerminal(request schema.KillTerminalRequest) (any, error) {
+func (h *Host) killTerminal(request schema.KillTerminalRequest) (any, error) {
 	h.mu.Lock()
 	t := h.terminals[string(request.TerminalID)]
 	h.mu.Unlock()
@@ -195,7 +193,7 @@ func (h *workspaceHost) killTerminal(request schema.KillTerminalRequest) (any, e
 	return schema.KillTerminalResponse{}, nil
 }
 
-func (h *workspaceHost) releaseTerminal(request schema.ReleaseTerminalRequest) (any, error) {
+func (h *Host) releaseTerminal(request schema.ReleaseTerminalRequest) (any, error) {
 	h.mu.Lock()
 	t := h.terminals[string(request.TerminalID)]
 	h.mu.Unlock()
@@ -208,20 +206,4 @@ func (h *workspaceHost) releaseTerminal(request schema.ReleaseTerminalRequest) (
 	delete(h.terminals, string(request.TerminalID))
 	h.mu.Unlock()
 	return schema.ReleaseTerminalResponse{}, nil
-}
-
-func (h *workspaceHost) close() {
-	h.cancel()
-	h.mu.Lock()
-	h.closing = true
-	terminals := make([]*commandTerminal, 0, len(h.terminals))
-	for _, terminal := range h.terminals {
-		terminals = append(terminals, terminal)
-	}
-	h.mu.Unlock()
-	for _, terminal := range terminals {
-		terminal.kill()
-		<-terminal.finished
-	}
-	_ = h.root.Close()
 }

@@ -1,4 +1,4 @@
-package runner
+package clienthost
 
 import (
 	"context"
@@ -15,8 +15,8 @@ func TestTerminalOutputByteLimitIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer h.close()
-	h.session = schema.SessionId("session")
+	defer h.Close()
+	h.SetSession(schema.SessionId("session"))
 
 	var request schema.CreateTerminalRequest
 	if err := json.Unmarshal([]byte(`{"outputByteLimit":-1}`), &request); err == nil {
@@ -59,11 +59,11 @@ func TestTerminalHostUsesGeneratedRequestAndResponseTypes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer h.close()
-	h.session = schema.SessionId("session")
+	defer h.Close()
+	h.SetSession(schema.SessionId("session"))
 
 	createRaw := json.RawMessage(`{"sessionId":"session","command":"printf","args":["typed terminal\n"]}`)
-	createdValue, err := h.request(context.Background(), schema.TerminalCreateMethodName, createRaw)
+	createdValue, err := h.Request(context.Background(), schema.TerminalCreateMethodName, createRaw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestTerminalHostUsesGeneratedRequestAndResponseTypes(t *testing.T) {
 	id := string(created.TerminalID)
 
 	waitRaw := json.RawMessage(`{"sessionId":"session","terminalId":"` + id + `"}`)
-	waitedValue, err := h.request(context.Background(), schema.TerminalWaitForExitMethodName, waitRaw)
+	waitedValue, err := h.Request(context.Background(), schema.TerminalWaitForExitMethodName, waitRaw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestTerminalHostUsesGeneratedRequestAndResponseTypes(t *testing.T) {
 		t.Fatalf("unexpected exit response: %#v", waitedValue)
 	}
 
-	outputValue, err := h.request(context.Background(), schema.TerminalOutputMethodName, waitRaw)
+	outputValue, err := h.Request(context.Background(), schema.TerminalOutputMethodName, waitRaw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestTerminalHostUsesGeneratedRequestAndResponseTypes(t *testing.T) {
 	if !ok || output.Output != "typed terminal\n" || output.ExitStatus == nil {
 		t.Fatalf("unexpected output response: %#v", outputValue)
 	}
-	if _, err = h.request(context.Background(), schema.TerminalReleaseMethodName, waitRaw); err != nil {
+	if _, err = h.Request(context.Background(), schema.TerminalReleaseMethodName, waitRaw); err != nil {
 		t.Fatal(err)
 	}
 }

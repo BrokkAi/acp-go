@@ -21,8 +21,8 @@ diff instead of a rewrite.
 |-------|-------|--------|
 | 0 | Schema codegen pipeline + generated types + parity tests | Done (`832feae`, pinned `schema-v1.21.0`) |
 | 1 | Complete v1 client surface | Done |
-| 2 | Agent-side runtime | Planned |
-| 3 | Trust and ecosystem | Planned |
+| 2 | Agent-side runtime | Done |
+| 3 | Trust and ecosystem | Next |
 | 4 | v2 draft | Planned |
 
 ## Phase 1 — complete the v1 client

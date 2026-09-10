@@ -1,8 +1,9 @@
-package runner
+package clienthost
 
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -12,8 +13,12 @@ import (
 	"github.com/BrokkAi/acp-go/schema"
 )
 
-// Stream records stay structured with --json; the console joins fragments into
-// continuous text instead of printing a timestamp and escaped string per token.
+// ProcessWriter returns a writer that logs complete UTF-8 process chunks and
+// records them in the transcript.
+func (h *Host) ProcessWriter(source, id string) io.Writer {
+	return h.newProcessWriter(source, id)
+}
+
 func stream(log *slog.Logger, source, id, text string) {
 	if text != "" {
 		log.Info("agent transcript", "source", source, "stream_id", id, "text", text)
@@ -41,12 +46,18 @@ func (w *transcriptWriter) Write(data []byte) (int, error) {
 	text := strings.ToValidUTF8(string(w.pending[:end]), "�")
 	stream(w.log, w.source, w.id, text)
 	w.pending = append(w.pending[:0], w.pending[end:]...)
-	if text != "" && w.record != nil {
-		if err := w.record(map[string]string{"event": "process_output", "source": w.source, "stream_id": w.id, "text": text}); err != nil {
+	if text != "" {
+		if err := w.record(map[string]string{
+			"event": "process_output", "source": w.source, "stream_id": w.id, "text": text,
+		}); err != nil {
 			return n, err
 		}
 	}
 	return n, nil
+}
+
+func (h *Host) newProcessWriter(source, id string) *transcriptWriter {
+	return &transcriptWriter{log: h.logger, source: source, id: id, record: h.Record}
 }
 
 type toolTranscript struct {
@@ -56,7 +67,7 @@ type toolTranscript struct {
 	deltas bool
 }
 
-func (h *workspaceHost) showUpdate(event acp.Update) error {
+func (h *Host) showUpdate(event acp.Update) error {
 	update := event.Update
 	switch {
 	case update.AgentMessageChunk != nil || update.AgentThoughtChunk != nil:
@@ -67,11 +78,11 @@ func (h *workspaceHost) showUpdate(event acp.Update) error {
 			source = "Thinking"
 		}
 		if chunk.Content.Text != nil {
-			stream(h.log, source, string(event.SessionID), chunk.Content.Text.Text)
+			stream(h.logger, source, string(event.SessionID), chunk.Content.Text.Text)
 		}
 	case update.ToolCall != nil:
 		tool := update.ToolCall
-		h.log.Info("Tool", "title", tool.Title)
+		h.logger.Info("Tool", "title", tool.Title)
 		h.showTool(tool.ToolCallID, tool.Title, tool.Status, tool.Content, tool.RawOutput, tool.Meta)
 	case update.ToolCallUpdate != nil:
 		tool := update.ToolCallUpdate
@@ -84,7 +95,7 @@ func (h *workspaceHost) showUpdate(event acp.Update) error {
 	return nil
 }
 
-func (h *workspaceHost) showTool(id schema.ToolCallId, title string, status *schema.ToolCallStatus, content []schema.ToolCallContent, rawOutput json.RawMessage, meta schema.Meta) {
+func (h *Host) showTool(id schema.ToolCallId, title string, status *schema.ToolCallStatus, content []schema.ToolCallContent, rawOutput json.RawMessage, meta schema.Meta) {
 	tool := h.toolOutput[string(id)]
 	if tool == nil {
 		tool = &toolTranscript{title: string(id)}
@@ -95,13 +106,13 @@ func (h *workspaceHost) showTool(id schema.ToolCallId, title string, status *sch
 	}
 	if delta := terminalOutputDelta(meta); delta != "" {
 		tool.deltas = true
-		stream(h.log, "Tool output", string(id), delta)
+		stream(h.logger, "Tool output", string(id), delta)
 	} else if !tool.deltas {
 		text := toolText(content, rawOutput)
 		if tool.length > 0 && len(text) >= tool.length && sha256.Sum256([]byte(text[:tool.length])) == tool.digest {
-			stream(h.log, "Tool output", string(id), text[tool.length:])
+			stream(h.logger, "Tool output", string(id), text[tool.length:])
 		} else {
-			stream(h.log, "Tool output", string(id), text)
+			stream(h.logger, "Tool output", string(id), text)
 		}
 		if text != "" {
 			tool.length = len(text)
@@ -111,9 +122,9 @@ func (h *workspaceHost) showTool(id schema.ToolCallId, title string, status *sch
 	switch {
 	case status == nil:
 	case *status == schema.ToolCallStatusCompleted:
-		h.log.Info("Tool completed", "title", tool.title)
+		h.logger.Info("Tool completed", "title", tool.title)
 	case *status == schema.ToolCallStatusFailed:
-		h.log.Error("Tool failed", "title", tool.title)
+		h.logger.Error("Tool failed", "title", tool.title)
 	}
 }
 
