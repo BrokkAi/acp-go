@@ -2,31 +2,13 @@ package acp
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"testing"
 
 	"github.com/BrokkAi/acp-go/schema"
 )
 
-var errInvalidAuthWire = errors.New("invalid authenticate wire frame")
-
-func TestAuthenticateUsesGeneratedAuthMethodUnion(t *testing.T) {
-	c, peer := pipeClient(t, nil, nil)
-	peerDone := make(chan error, 1)
-	go func() {
-		defer close(peerDone)
-		var request packet
-		if err := json.NewDecoder(peer).Decode(&request); err != nil {
-			peerDone <- err
-			return
-		}
-		if request.Method != schema.AuthenticateMethodName || string(request.Params) != `{"methodId":"agent"}` {
-			peerDone <- errInvalidAuthWire
-			return
-		}
-		peerDone <- json.NewEncoder(peer).Encode(packet{Version: "2.0", ID: request.ID, Result: json.RawMessage(`{}`)})
-	}()
+func TestAuthenticateSendsOnlyAdvertisedAgentMethod(t *testing.T) {
+	c, requests := singleRequestFixture(t, `{}`)
 	init := Initialization{AuthMethods: []schema.AuthMethod{
 		{Agent: &schema.AuthMethodAgent{ID: "agent", Name: "Agent"}},
 		{Terminal: &schema.AuthMethodTerminal{ID: "terminal", Name: "Terminal"}},
@@ -34,13 +16,43 @@ func TestAuthenticateUsesGeneratedAuthMethodUnion(t *testing.T) {
 	if err := c.Authenticate(context.Background(), init, "agent"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Authenticate(context.Background(), init, "terminal"); err == nil {
-		t.Fatal("terminal authentication was sent over the unattended connection")
+	request := receiveRequest(t, requests)
+	if request.Method != schema.AuthenticateMethodName || string(request.rawParams) != `{"methodId":"agent"}` {
+		t.Fatalf("unexpected authenticate request: %s %s", request.Method, request.rawParams)
 	}
-	if err := c.Authenticate(context.Background(), init, "missing"); err == nil {
-		t.Fatal("unadvertised authentication method was accepted")
+}
+
+func TestAuthenticateRejectsWithoutWritingToWire(t *testing.T) {
+	agent := Initialization{AuthMethods: []schema.AuthMethod{
+		{Agent: &schema.AuthMethodAgent{ID: "agent", Name: "Agent"}},
+		{Terminal: &schema.AuthMethodTerminal{ID: "terminal", Name: "Terminal"}},
+	}}
+	invalidUnion := Initialization{AuthMethods: []schema.AuthMethod{{}}}
+	tests := []struct {
+		name   string
+		init   Initialization
+		method string
+		want   string
+	}{
+		{"empty method", agent, "", "authentication method is required"},
+		{"empty advertised list", Initialization{}, "agent", `agent did not advertise authentication method "agent"`},
+		{"both-nil union", invalidUnion, "agent", `agent did not advertise authentication method "agent"`},
+		{"terminal method", agent, "terminal", "authentication terminal is terminal-based and must be completed outside this connection"},
+		{"missing method", agent, "missing", `agent did not advertise authentication method "missing"`},
 	}
-	if err := <-peerDone; err != nil {
-		t.Fatal(err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c, peer := pipeClient(t, nil, nil)
+			wireRequests := unexpectedRequestRecorder(t, peer)
+			err := c.Authenticate(context.Background(), test.init, test.method)
+			if err == nil || err.Error() != test.want {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+			select {
+			case request := <-wireRequests:
+				t.Fatalf("wrote %s request to wire: %s", request.Method, request.Params)
+			default:
+			}
+		})
 	}
 }

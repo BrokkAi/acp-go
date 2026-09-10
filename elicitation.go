@@ -46,6 +46,9 @@ func HandleElicitation(next Handler, elicitation ElicitationHandler) Handler {
 			}
 			return next(ctx, method, raw)
 		}
+		if elicitation == nil {
+			return nil, &RPCError{Code: -32601, Message: "elicitation support is not configured"}
+		}
 		var request schema.CreateElicitationRequest
 		if err := json.Unmarshal(raw, &request); err != nil {
 			return nil, &RPCError{Code: -32602, Message: err.Error()}

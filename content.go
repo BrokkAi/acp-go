@@ -86,6 +86,25 @@ func validatePromptCapabilities(init Initialization, prompt []Content) error {
 		embedded = capabilities.EmbeddedContext != nil && *capabilities.EmbeddedContext
 	}
 	for i, block := range prompt {
+		variants := 0
+		if block.Text != nil {
+			variants++
+		}
+		if block.Image != nil {
+			variants++
+		}
+		if block.Audio != nil {
+			variants++
+		}
+		if block.ResourceLink != nil {
+			variants++
+		}
+		if block.Resource != nil {
+			variants++
+		}
+		if variants != 1 {
+			return fmt.Errorf("prompt block %d has %d content variants, exactly one is required", i, variants)
+		}
 		switch {
 		case block.Text != nil || block.ResourceLink != nil:
 			// Text and resource links are protocol v1 baseline capabilities.

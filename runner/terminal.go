@@ -100,7 +100,11 @@ func (h *workspaceHost) createTerminal(request schema.CreateTerminalRequest) (an
 	}
 	limit := 1 << 20
 	if request.OutputByteLimit != nil {
-		limit = min(limit, int(*request.OutputByteLimit))
+		outputLimit := *request.OutputByteLimit
+		if outputLimit > uint64(limit) {
+			outputLimit = uint64(limit)
+		}
+		limit = int(outputLimit)
 	}
 	env := make(map[string]string)
 	for _, variable := range request.Env {

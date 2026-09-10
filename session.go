@@ -16,9 +16,16 @@ type NewSessionOptions struct {
 	MCPServers            []schema.McpServer
 }
 
-func absolute(path string) error {
+func requireAbsolutePath(path string) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("ACP path must be absolute: %q", path)
+	}
+	return nil
+}
+
+func requireCapability(supported bool, method string) error {
+	if !supported {
+		return fmt.Errorf("agent did not advertise %s support", method)
 	}
 	return nil
 }
@@ -27,19 +34,16 @@ func validateAdditionalDirectories(init Initialization, directories []string) er
 	if len(directories) == 0 {
 		return nil
 	}
-	var capabilities *schema.SessionCapabilities
-	if init.AgentCapabilities != nil {
-		capabilities = init.AgentCapabilities.SessionCapabilities
-	}
-	if capabilities == nil || capabilities.AdditionalDirectories == nil {
+	if init.AgentCapabilities == nil {
 		return fmt.Errorf("agent did not advertise additionalDirectories support")
 	}
 	for _, directory := range directories {
-		if err := absolute(directory); err != nil {
+		if err := requireAbsolutePath(directory); err != nil {
 			return err
 		}
 	}
-	return nil
+	capabilities := init.AgentCapabilities.SessionCapabilities
+	return requireCapability(capabilities != nil && capabilities.AdditionalDirectories != nil, "additionalDirectories")
 }
 
 func validateMCPServers(init Initialization, servers []schema.McpServer) error {
@@ -78,7 +82,7 @@ func validateMCPServers(init Initialization, servers []schema.McpServer) error {
 
 func (c *Connection) NewSessionWithOptions(ctx context.Context, init Initialization, directory string, options NewSessionOptions) (Session, error) {
 	var session Session
-	if err := absolute(directory); err != nil {
+	if err := requireAbsolutePath(directory); err != nil {
 		return session, err
 	}
 	if err := validateAdditionalDirectories(init, options.AdditionalDirectories); err != nil {
@@ -106,14 +110,14 @@ func (c *Connection) NewSessionWithOptions(ctx context.Context, init Initializat
 
 func (c *Connection) LoadSession(ctx context.Context, init Initialization, request schema.LoadSessionRequest) (schema.LoadSessionResponse, error) {
 	var result schema.LoadSessionResponse
-	var load *bool
-	if init.AgentCapabilities != nil {
-		load = init.AgentCapabilities.LoadSession
+	var load bool
+	if init.AgentCapabilities != nil && init.AgentCapabilities.LoadSession != nil {
+		load = *init.AgentCapabilities.LoadSession
 	}
-	if load == nil || !*load {
-		return result, fmt.Errorf("agent did not advertise session/load support")
+	if err := requireCapability(load, schema.SessionLoadMethodName); err != nil {
+		return result, err
 	}
-	if err := absolute(request.Cwd); err != nil {
+	if err := requireAbsolutePath(request.Cwd); err != nil {
 		return result, err
 	}
 	if request.SessionID == "" {
@@ -137,10 +141,10 @@ func (c *Connection) ResumeSession(ctx context.Context, init Initialization, req
 	if init.AgentCapabilities != nil {
 		capabilities = init.AgentCapabilities.SessionCapabilities
 	}
-	if capabilities == nil || capabilities.Resume == nil {
-		return result, fmt.Errorf("agent did not advertise session/resume support")
+	if err := requireCapability(capabilities != nil && capabilities.Resume != nil, schema.SessionResumeMethodName); err != nil {
+		return result, err
 	}
-	if err := absolute(request.Cwd); err != nil {
+	if err := requireAbsolutePath(request.Cwd); err != nil {
 		return result, err
 	}
 	if request.SessionID == "" {
@@ -155,19 +159,19 @@ func (c *Connection) ResumeSession(ctx context.Context, init Initialization, req
 	return result, c.Call(ctx, schema.SessionResumeMethodName, request, &result)
 }
 
-func (c *Connection) CloseSession(ctx context.Context, init Initialization, sessionID string) error {
+func (c *Connection) CloseSession(ctx context.Context, init Initialization, sessionID SessionID) error {
 	var capabilities *schema.SessionCapabilities
 	if init.AgentCapabilities != nil {
 		capabilities = init.AgentCapabilities.SessionCapabilities
 	}
-	if capabilities == nil || capabilities.Close == nil {
-		return fmt.Errorf("agent did not advertise session/close support")
+	if err := requireCapability(capabilities != nil && capabilities.Close != nil, schema.SessionCloseMethodName); err != nil {
+		return err
 	}
 	if sessionID == "" {
 		return fmt.Errorf("session ID is required")
 	}
 	var result schema.CloseSessionResponse
-	return c.Call(ctx, schema.SessionCloseMethodName, schema.CloseSessionRequest{SessionID: schema.SessionId(sessionID)}, &result)
+	return c.Call(ctx, schema.SessionCloseMethodName, schema.CloseSessionRequest{SessionID: sessionID}, &result)
 }
 
 func (c *Connection) ListSessions(ctx context.Context, init Initialization, request schema.ListSessionsRequest) (schema.ListSessionsResponse, error) {
@@ -176,30 +180,30 @@ func (c *Connection) ListSessions(ctx context.Context, init Initialization, requ
 	if init.AgentCapabilities != nil {
 		capabilities = init.AgentCapabilities.SessionCapabilities
 	}
-	if capabilities == nil || capabilities.List == nil {
-		return result, fmt.Errorf("agent did not advertise session/list support")
+	if err := requireCapability(capabilities != nil && capabilities.List != nil, schema.SessionListMethodName); err != nil {
+		return result, err
 	}
 	if request.Cwd != nil {
-		if err := absolute(*request.Cwd); err != nil {
+		if err := requireAbsolutePath(*request.Cwd); err != nil {
 			return result, err
 		}
 	}
 	return result, c.Call(ctx, schema.SessionListMethodName, request, &result)
 }
 
-func (c *Connection) DeleteSession(ctx context.Context, init Initialization, sessionID string) error {
+func (c *Connection) DeleteSession(ctx context.Context, init Initialization, sessionID SessionID) error {
 	var capabilities *schema.SessionCapabilities
 	if init.AgentCapabilities != nil {
 		capabilities = init.AgentCapabilities.SessionCapabilities
 	}
-	if capabilities == nil || capabilities.Delete == nil {
-		return fmt.Errorf("agent did not advertise session/delete support")
+	if err := requireCapability(capabilities != nil && capabilities.Delete != nil, schema.SessionDeleteMethodName); err != nil {
+		return err
 	}
 	if sessionID == "" {
 		return fmt.Errorf("session ID is required")
 	}
 	var result schema.DeleteSessionResponse
-	return c.Call(ctx, schema.SessionDeleteMethodName, schema.DeleteSessionRequest{SessionID: schema.SessionId(sessionID)}, &result)
+	return c.Call(ctx, schema.SessionDeleteMethodName, schema.DeleteSessionRequest{SessionID: sessionID}, &result)
 }
 
 func (c *Connection) Logout(ctx context.Context, init Initialization) error {
@@ -224,7 +228,7 @@ func (c *Connection) PromptContent(ctx context.Context, init Initialization, ses
 	}
 	request := schema.PromptRequest{SessionID: session.SessionID, Prompt: prompt}
 	err := c.Call(ctx, schema.SessionPromptMethodName, request, &result)
-	if ctx.Err() != nil {
+	if err != nil && ctx.Err() != nil {
 		cancelCtx, stop := context.WithTimeout(context.Background(), 250*time.Millisecond)
 		_ = c.Notify(cancelCtx, schema.SessionCancelMethodName, schema.CancelNotification{SessionID: session.SessionID})
 		stop()
@@ -232,11 +236,11 @@ func (c *Connection) PromptContent(ctx context.Context, init Initialization, ses
 	return result.StopReason, err
 }
 
-func (c *Connection) CancelSession(ctx context.Context, sessionID string) error {
+func (c *Connection) CancelSession(ctx context.Context, sessionID SessionID) error {
 	if sessionID == "" {
 		return fmt.Errorf("session ID is required")
 	}
-	return c.Notify(ctx, schema.SessionCancelMethodName, schema.CancelNotification{SessionID: schema.SessionId(sessionID)})
+	return c.Notify(ctx, schema.SessionCancelMethodName, schema.CancelNotification{SessionID: sessionID})
 }
 
 // SessionUpdates adapts the raw connection notification callback to the

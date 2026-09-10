@@ -19,6 +19,7 @@ type (
 	Capabilities   = schema.ClientCapabilities
 	Initialization = schema.InitializeResponse
 	Session        = schema.NewSessionResponse
+	SessionID      = schema.SessionId
 	Content        = schema.ContentBlock
 	Update         = schema.SessionNotification
 	ClientInfo     = schema.Implementation
@@ -48,6 +49,9 @@ func (c *Connection) InitializeWithInfo(ctx context.Context, caps Capabilities, 
 }
 
 func (c *Connection) Authenticate(ctx context.Context, init Initialization, method string) error {
+	if method == "" {
+		return fmt.Errorf("authentication method is required")
+	}
 	for i := range init.AuthMethods {
 		advertised := &init.AuthMethods[i]
 		id := schema.AuthMethodId(method)

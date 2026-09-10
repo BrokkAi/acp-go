@@ -121,3 +121,15 @@ func TestElicitationOutcomeConstructors(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleElicitationWithoutConfiguredHandler(t *testing.T) {
+	handler := HandleElicitation(nil, nil)
+	value, err := handler(context.Background(), schema.ElicitationCreateMethodName, json.RawMessage(`{"mode":"url","sessionId":"session","message":"authenticate"}`))
+	if value != nil || err == nil {
+		t.Fatalf("value = %v, err = %v", value, err)
+	}
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32601 || rpcErr.Message != "elicitation support is not configured" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

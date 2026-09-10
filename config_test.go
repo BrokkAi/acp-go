@@ -73,6 +73,28 @@ func TestSessionConfigSelectorsAndBooleanWire(t *testing.T) {
 	}
 }
 
+func TestSetModeRejectsUnknownAndUnadvertisedModes(t *testing.T) {
+	c, peer := pipeClient(t, nil, nil)
+	wireRequests := unexpectedRequestRecorder(t, peer)
+	session := Session{SessionID: "session", Modes: &schema.SessionModeState{
+		AvailableModes: []schema.SessionMode{{ID: "plan", Name: "Plan"}},
+	}}
+	err := c.SetMode(context.Background(), &session, "code")
+	if err == nil || err.Error() != `unknown session mode "code"` {
+		t.Fatalf("unknown mode error = %v", err)
+	}
+	session.Modes = nil
+	err = c.SetMode(context.Background(), &session, "plan")
+	if err == nil || err.Error() != "agent did not advertise session modes" {
+		t.Fatalf("unadvertised mode error = %v", err)
+	}
+	select {
+	case request := <-wireRequests:
+		t.Fatalf("mode validation wrote %s request to wire: %s", request.Method, request.Params)
+	default:
+	}
+}
+
 func categoryPtr(value schema.SessionConfigOptionCategory) *schema.SessionConfigOptionCategory {
 	return &value
 }
