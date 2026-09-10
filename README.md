@@ -53,6 +53,9 @@ Requests run concurrently and must honor cancellation. Frames are bounded at
 Generic `Call` and `Notify` permit extensions. ACP v2 is not supported.
 
 Run `go test -race ./...` and `go vet ./...`. No agent credentials are needed.
+The fuzz seed corpus runs as part of that command; see
+[CONTRIBUTING.md](CONTRIBUTING.md) for longer campaigns and opt-in tests
+against real ACP agents.
 
 ## Agent runtime
 

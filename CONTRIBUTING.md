@@ -33,6 +33,34 @@ documentation changes need a diff and link review. Tests should use temporary
 repositories and simulated agents, without publishing releases or requiring
 live credentials.
 
+### Optional wire fuzzing
+
+The default test suite runs the fuzz seed corpus. To run a mutation campaign
+locally:
+
+```sh
+go test -run '^$' -fuzz FuzzConnectionFrame -fuzztime 2m .
+```
+
+Commit any minimized regression corpus beside the fuzz target. Do not commit
+the generated build cache.
+
+### Credential-backed integration tests
+
+Integration tests are behind the `integration` build tag and skip when no agent
+is configured. They are never run by the default test command. To run one:
+
+```sh
+ACP_INTEGRATION_AGENT='["npx","-y","@agentclientprotocol/codex-acp"]' \
+ACP_INTEGRATION_AUTH_METHOD='api-key' \
+ACP_INTEGRATION_REQUIRED_ENV='OPENAI_API_KEY' \
+go test -tags integration -run TestRealAgentPrompt -v ./integration
+```
+
+The command must be encoded as a JSON argv array so paths and arguments do not
+need shell quoting. Keep prompts small and non-destructive, use temporary
+workspaces, and never enable auto-approval for third-party integration tests.
+
 ## Schema generation
 
 The `schema` package is generated from the pinned ACP JSON Schema release
@@ -61,3 +89,17 @@ Dependency versions, legal texts, generated tables, and bundled assets require
 license review. Follow [licenses/README.md](licenses/README.md), update the
 reviewed policy and notices together, and commit `go.mod` and `go.sum` when
 dependencies change. Do not add local replacement directives to a release.
+
+## Releases
+
+Keep [CHANGELOG.md](CHANGELOG.md) current with every user-visible change.
+Before tagging:
+
+1. Run the full default validation command suite and schema regeneration check.
+2. Rename `Unreleased` to the next Semver version and release date.
+3. Confirm the dependency policy, notices, and third-party tables still pass.
+4. Create an annotated tag (`git tag -a v0.2.0 -m "..."`), push the branch and
+   tag, and verify module consumers can resolve the tag.
+
+During `0.x`, breaking Go API changes require a minor version bump. Once the
+public API stabilizes, follow normal Semver compatibility rules.

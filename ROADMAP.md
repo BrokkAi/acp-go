@@ -73,14 +73,14 @@ want editor integration for free.
 
 ## Phase 3 — trust and ecosystem
 
-- Integration tests against real agents in CI (separate optional job; the
-  default test path needs no credentials).
-- Fuzz the wire layer (`go test -fuzz`) on top of the malformed-frame
-  handling.
+- Integration tests against the official Claude Agent and Codex ACP adapters
+  in a manually enabled CI job; the default test path needs no credentials.
+- Fuzz the wire layer (`go test -fuzz`) on top of the malformed-frame handling,
+  with a weekly mutation campaign and seed coverage in every default run.
 - Track new schema releases as they ship; the update workflow is documented
   in [CONTRIBUTING.md](CONTRIBUTING.md).
-- Semver and CHANGELOG discipline; request listing on the ACP community
-  libraries page once Phase 2 ships.
+- Semver and CHANGELOG discipline; the ACP community libraries page already
+  lists `acp-go`.
 
 ## Phase 4 — v2 draft
 

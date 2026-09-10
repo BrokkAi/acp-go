@@ -1,5 +1,19 @@
 name: CI
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "15 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      run-fuzz:
+        description: Run the longer wire fuzzing campaign
+        type: boolean
+        default: false
+      run-integration:
+        description: Run credential-backed real-agent tests
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -19,3 +33,46 @@ jobs:
       - run: go test -race ./...
       - run: go vet ./...
       - run: python3 -m unittest discover -s scripts -p '*_test.py'
+
+  fuzz:
+    if: github.event_name == 'schedule' || inputs.run-fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go test -run '^$' -fuzz FuzzConnectionFrame -fuzztime 2m .
+
+  integration:
+    if: github.event_name == 'workflow_dispatch' && inputs.run-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agent: claude-agent
+            command: '["npx","-y","@agentclientprotocol/claude-agent-acp"]'
+            auth-method: ""
+            required-env: ANTHROPIC_API_KEY
+          - agent: codex
+            command: '["npx","-y","@agentclientprotocol/codex-acp"]'
+            auth-method: api-key
+            required-env: OPENAI_API_KEY
+    env:
+      ACP_INTEGRATION_AGENT: ${{ matrix.command }}
+      ACP_INTEGRATION_AUTH_METHOD: ${{ matrix.auth-method }}
+      ACP_INTEGRATION_REQUIRED_ENV: ${{ matrix.required-env }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      NO_BROWSER: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go test -tags integration -run TestRealAgentPrompt -v ./integration
