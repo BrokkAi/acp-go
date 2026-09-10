@@ -6,7 +6,7 @@ A small, standard-library-only Go client for [Agent Client Protocol v1](https://
 go get github.com/BrokkAi/acp-go@master
 ```
 
-The generated-schema API below is the v0.2.0 surface.
+The generated-schema API below is the v0.2 surface.
 
 ```go
 connection := acp.Connect(stdout, stdin, handleRequest, handleNotification)

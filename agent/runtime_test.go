@@ -232,7 +232,7 @@ func TestSessionCancelNotificationCancelsActivePrompt(t *testing.T) {
 	}
 	select {
 	case <-cancelled:
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("session cancellation hook was not called")
 	}
 }

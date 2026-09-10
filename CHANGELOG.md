@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## 0.2.1 - 2026-09-10
+
+### Fixed
+
+- Made the agent runtime's session-cancel hook test wait for the concurrently
+  invoked optional hook, removing a narrow CI race.
+
 ## 0.2.0 - 2026-09-10
 
 ### Added
