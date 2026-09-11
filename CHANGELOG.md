@@ -12,6 +12,12 @@ series, minor releases may contain breaking API changes.
   reconnection, and no-retry-on-v2-rejection behavior.
 - An exact-match proxy protocol router that preserves the complete initial
   `_proxy/initialize` frame and rejects unsupported future versions.
+- Generated v1 and v2 unstable-schema packages pinned to the exact Rust schema
+  1.7.0 unstable artifacts. They collectively expose optional providers, plan
+  operations, session fork/compaction, NES, MCP-over-ACP, tool-call names, and
+  end-turn token usage without changing the stable packages.
+- Method registry support for bidirectional methods that have both request and
+  notification payloads, matching Rust `mcp/message`.
 
 ## 0.7.0 - 2026-09-10
 

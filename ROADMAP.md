@@ -87,21 +87,34 @@ only remaining work.
   - validate the selected initialize schema,
   - preserve the complete initial single or batch frame without canonicalization,
   - reject future versions rather than downgrading.
+- Unstable schema surfaces from the exact Rust 1.7.0 unstable artifacts:
+  - v1 and v2 generated bindings in explicit import-only packages,
+  - LLM providers,
+  - plan operations,
+  - session fork and compaction,
+  - NES,
+  - MCP-over-ACP,
+  - tool-call names,
+  - end-turn token usage,
+  - bidirectional `mcp/message` request/notification registry metadata.
 
 ## Remaining Rust-parity gaps
 
-### 1. Unstable Rust feature surfaces
+### 1. Optional typed facades for unstable methods
 
-The Rust schema crate exposes separately gated feature surfaces beyond draft
-v2. Our generated packages currently cover the stable pinned artifacts.
+The generated unstable schema packages expose every request, response, and
+notification type, and applications can already use the generic `Call`,
+`CallBatch`, and `Notify` transport APIs with those generated types. Rust also
+provides fluent builder/dispatch integration for each optional feature.
 
-Work, gated behind explicit Go package opt-ins where applicable:
+Work:
 
-- unstable LLM providers,
-- unstable plan operations,
-- unstable session fork/compaction/notices,
-- unstable NES,
-- unstable tool-call names and end-turn token usage.
+- Add narrow typed client facades where generated methods benefit from
+  capability checks or composite semantics.
+- Add optional agent dispatch interfaces for providers, fork, NES, and
+  MCP-over-ACP.
+- Keep every facade behind an explicit package import; do not expose unstable
+  methods through the stable v1/v2 facades.
 
 ### 2. Semantic validation parity
 

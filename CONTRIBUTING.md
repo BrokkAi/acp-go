@@ -75,6 +75,10 @@ go run ./cmd/acpgen -update <version> \
   -out schema/v2 -package v2           # e.g. 2.0.0-alpha.3
 go run ./cmd/acpgen -schema schema/v2/schema.json \
   -meta schema/v2/meta.json -out schema/v2 -package v2
+go run ./cmd/acpgen -schema schema/unstable/schema.json \
+  -meta schema/unstable/meta.json -out schema/unstable -package unstable
+go run ./cmd/acpgen -schema schema/v2/unstable/schema.json \
+  -meta schema/v2/unstable/meta.json -out schema/v2/unstable -package unstable
 go test -race ./schema/
 ```
 
@@ -101,6 +105,10 @@ Dependency versions, legal texts, generated tables, and bundled assets require
 license review. Follow [licenses/README.md](licenses/README.md), update the
 reviewed policy and notices together, and commit `go.mod` and `go.sum` when
 dependencies change. Do not add local replacement directives to a release.
+
+The `schema/unstable` and `schema/v2/unstable` packages are generated from the
+same Rust 1.7.0 release's `.unstable.json` artifacts. They intentionally expose
+the combined optional Rust feature surface as an explicit import boundary.
 
 ## Releases
 

@@ -101,6 +101,13 @@ tests, so tracking a new schema release is a reviewed regeneration rather
 than hand transcription. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
 update workflow.
 
+`schema/unstable` and `schema/v2/unstable` are separate opt-in packages
+generated from Rust schema crate 1.7.0's unstable artifacts. They expose the
+combined optional feature surface, including LLM providers, MCP-over-ACP, NES,
+plan operations, session fork/compaction/notices, tool-call names, and
+end-turn token usage. The stable `schema` and `schema/v2` packages do not
+import or expose those generated types.
+
 ## Draft ACP v2
 
 `github.com/BrokkAi/acp-go/v2` is a separate draft client for ACP v2, pinned

@@ -55,12 +55,13 @@ type typeDef struct {
 }
 
 type methodDesc struct {
-	Name         string
-	GoName       string
-	Side         string // "agent", "client", or "protocol"
-	Params       string // params def name, ""
-	Result       string // result def name, ""
-	Notification bool
+	Name               string
+	GoName             string
+	Side               string // "agent", "client", "both", or "protocol"
+	Params             string // request/notification params def name, ""
+	NotificationParams string // distinct bidirectional notification params, ""
+	Result             string // result def name, ""
+	Notification       bool
 }
 
 type ir struct {
@@ -726,9 +727,8 @@ func countKey(m map[string]bool, key string) int {
 
 func (r *ir) buildMethods(meta *metaFile) error {
 	type entry struct {
-		side           string
-		params, result string
-		notification   bool
+		side, params, notificationParams, result string
+		notification                             bool
 	}
 	entries := map[string]*entry{}
 	for _, td := range r.Defs {
@@ -750,10 +750,10 @@ func (r *ir) buildMethods(meta *metaFile) error {
 			}
 			e.result = td.Name
 		case strings.HasSuffix(td.Name, "Notification"):
-			if e.params != "" {
+			if e.notificationParams != "" {
 				return fmt.Errorf("method %s has multiple param defs", td.Method)
 			}
-			e.params, e.notification = td.Name, true
+			e.notificationParams, e.notification = td.Name, true
 		default:
 			if e.params != "" {
 				return fmt.Errorf("method %s has multiple param defs", td.Method)
@@ -763,6 +763,18 @@ func (r *ir) buildMethods(meta *metaFile) error {
 	}
 
 	sideOf := func(method string) (string, error) {
+		agentSide, clientSide := false, false
+		for _, m := range meta.AgentMethods {
+			agentSide = agentSide || m == method
+		}
+		for _, m := range meta.ClientMethods {
+			clientSide = clientSide || m == method
+		}
+		if agentSide {
+			if clientSide {
+				return "both", nil
+			}
+		}
 		for _, m := range meta.AgentMethods {
 			if m == method {
 				return "agent", nil
@@ -792,12 +804,18 @@ func (r *ir) buildMethods(meta *metaFile) error {
 		if err != nil {
 			return err
 		}
+		if e.params == "" {
+			e.params = e.notificationParams
+		} else if e.notification && e.notificationParams == "" {
+			e.notificationParams = e.params
+		}
 		if e.side != "" && e.side != side {
 			return fmt.Errorf("method %s: x-side %q contradicts meta.json side %q", m, e.side, side)
 		}
 		r.Methods = append(r.Methods, methodDesc{
 			Name: m, GoName: methodGoName(m), Side: side,
-			Params: e.params, Result: e.result, Notification: e.notification,
+			Params: e.params, NotificationParams: e.notificationParams,
+			Result: e.result, Notification: e.notification,
 		})
 	}
 	// Protocol-level notifications (e.g. $/cancel_request) have typed params
@@ -807,7 +825,8 @@ func (r *ir) buildMethods(meta *metaFile) error {
 			continue
 		}
 		r.Methods = append(r.Methods, methodDesc{
-			Name: m, GoName: methodGoName(key), Side: "protocol", Notification: true,
+			Name: m, GoName: methodGoName(key), Side: "protocol",
+			NotificationParams: "", Notification: true,
 		})
 	}
 	return nil

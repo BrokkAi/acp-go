@@ -464,6 +464,7 @@ func emitMethods(r *ir, pin, packageName string) []byte {
 	b.WriteString("\tSideAgent = \"agent\"    // requests are served by the agent\n")
 	b.WriteString("\tSideClient = \"client\"   // requests are served by the client\n")
 	b.WriteString("\tSideProtocol = \"protocol\" // connection-level notifications\n")
+	b.WriteString("\tSideBoth = \"both\" // either peer may send the request or notification\n")
 	b.WriteString(")\n\n")
 
 	b.WriteString("const (\n")
@@ -475,11 +476,12 @@ func emitMethods(r *ir, pin, packageName string) []byte {
 	b.WriteString(`// Method describes one ACP wire method: its name, owning side, the schema
 // types of its parameters and result, and whether it is a notification.
 type Method struct {
-	Name         string
-	Side         string
-	Params       reflect.Type // nil when the method takes no typed params
-	Result       reflect.Type // nil for notifications and empty results
-	Notification bool
+	Name                string
+	Side                string
+	Params              reflect.Type // nil when the method takes no typed request params
+	NotificationParams  reflect.Type // distinct notification params for bidirectional methods
+	Result              reflect.Type // nil for notifications and empty results
+	Notification        bool
 }
 
 // Methods indexes every method in the pinned schema release by wire name.
@@ -489,6 +491,9 @@ var Methods = map[string]Method{
 		fmt.Fprintf(&b, "\t%q: {Name: %q, Side: %s", m.Name, m.Name, sideConst(m.Side))
 		if m.Params != "" {
 			fmt.Fprintf(&b, ", Params: reflect.TypeOf(&%s{}).Elem()", m.Params)
+		}
+		if m.NotificationParams != "" && m.NotificationParams != m.Params {
+			fmt.Fprintf(&b, ", NotificationParams: reflect.TypeOf(&%s{}).Elem()", m.NotificationParams)
 		}
 		if m.Result != "" {
 			fmt.Fprintf(&b, ", Result: reflect.TypeOf(&%s{}).Elem()", m.Result)
@@ -508,6 +513,8 @@ func sideConst(side string) string {
 		return "SideAgent"
 	case "client":
 		return "SideClient"
+	case "both":
+		return "SideBoth"
 	default:
 		return "SideProtocol"
 	}

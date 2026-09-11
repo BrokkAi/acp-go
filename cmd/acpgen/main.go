@@ -9,8 +9,9 @@
 //
 // The schema releases live at
 // https://github.com/agentclientprotocol/agent-client-protocol/releases,
-// tagged schema-v<version>, with schema.json and meta.json attached. Both the
-// stable v1 and draft-v2 releases can be generated as separate packages.
+// tagged schema-v<version>, with schema.json/meta.json and their unstable
+// counterparts attached. Stable v1, draft-v2, and either unstable artifact can
+// be generated as separate packages.
 package main
 
 import (
@@ -30,6 +31,7 @@ func main() {
 	metaPath := flag.String("meta", "schema/meta.json", "path to the pinned meta.json")
 	outDir := flag.String("out", "schema", "directory receiving generated files")
 	packageName := flag.String("package", "schema", "Go package name for generated files")
+	unstable := flag.Bool("unstable", false, "download schema.unstable.json and meta.unstable.json")
 	flag.Parse()
 
 	if *update != "" {
@@ -38,8 +40,13 @@ func main() {
 			version = "schema-v" + version
 		}
 		base := "https://github.com/agentclientprotocol/agent-client-protocol/releases/download/" + version + "/"
-		fetch(base+"meta.json", *metaPath)
-		fetch(base+"schema.json", *schemaPath)
+		metaArtifact, schemaArtifact := "meta.json", "schema.json"
+		if *unstable {
+			metaArtifact, schemaArtifact = "meta.unstable.json", "schema.unstable.json"
+			version += "-unstable"
+		}
+		fetch(base+metaArtifact, *metaPath)
+		fetch(base+schemaArtifact, *schemaPath)
 		if err := os.WriteFile(filepath.Join(filepath.Dir(*schemaPath), "VERSION"), []byte(version+"\n"), 0o644); err != nil {
 			fatal(err)
 		}
