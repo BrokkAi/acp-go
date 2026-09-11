@@ -75,21 +75,22 @@ only remaining work.
   - exact Rust `CancelActiveWork` notification behavior plus an optional
     cancellation-completion barrier,
   - from-start resume replay after preinstalled handlers.
+- Explicit client protocol connector:
+  - select the highest configured v1/v2 client implementation,
+  - start with an individual initialize request,
+  - reuse the existing agent connection only when v2 initialization is
+    losslessly representable as the configured v1 initialization,
+  - reconnect with fresh factories when parameters differ,
+  - surface v2 rejection without silently retrying as v1.
+- Exact-match proxy protocol router:
+  - select only the configured exact v1/v2 `_proxy/initialize` version,
+  - validate the selected initialize schema,
+  - preserve the complete initial single or batch frame without canonicalization,
+  - reject future versions rather than downgrading.
 
 ## Remaining Rust-parity gaps
 
-### 1. Protocol routing for client and proxy peers
-
-The agent-side v1/v2 router is implemented. Rust additionally has explicit
-client and proxy protocol connectors/routers.
-
-Work:
-
-- Add a client-side protocol connector that chooses an explicit v1 or v2 client.
-- Add proxy routing without converting successor traffic between versions.
-- Ensure future-version canonicalization and extension preservation match Rust.
-
-### 2. Unstable Rust feature surfaces
+### 1. Unstable Rust feature surfaces
 
 The Rust schema crate exposes separately gated feature surfaces beyond draft
 v2. Our generated packages currently cover the stable pinned artifacts.
@@ -102,7 +103,7 @@ Work, gated behind explicit Go package opt-ins where applicable:
 - unstable NES,
 - unstable tool-call names and end-turn token usage.
 
-### 3. Semantic validation parity
+### 2. Semantic validation parity
 
 Rust semantic newtypes enforce IDs, absolute paths, media types, and URI forms
 at the type boundary. Most Go generated types currently use string aliases.
@@ -114,7 +115,7 @@ Work:
 - Enforce absolute paths and required identifiers at typed facade boundaries.
 - Preserve unknown extension tags and raw `_meta` payloads.
 
-### 4. Draft-v2 ecosystem validation
+### 3. Draft-v2 ecosystem validation
 
 - Extend optional credential-backed CI to exercise the v2 runner against real
   adapters when they advertise v2.

@@ -457,6 +457,9 @@ func v1InitializeRequest(request schema2.InitializeRequest) (schema1.InitializeR
 			}
 		}
 		if auth := request.Capabilities.Auth; auth != nil && auth.Terminal != nil {
+			if auth.Terminal.Meta.Set {
+				return schema1.InitializeRequest{}, errors.New("v2 terminal authentication metadata is not representable in v1")
+			}
 			terminal := true
 			capabilities.Auth = &schema1.AuthCapabilities{Terminal: &terminal}
 		}

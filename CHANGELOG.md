@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Added
+
+- An explicit v1/v2 client protocol connector with Rust-compatible matching,
+  reconnection, and no-retry-on-v2-rejection behavior.
+- An exact-match proxy protocol router that preserves the complete initial
+  `_proxy/initialize` frame and rejects unsupported future versions.
+
 ## 0.7.0 - 2026-09-10
 
 ### Added

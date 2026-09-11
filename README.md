@@ -152,6 +152,15 @@ v2 implementations. It selects the highest configured implementation compatible
 with the first initialize request, canonicalizes only that initialize frame, and
 does not convert subsequent traffic.
 
+`github.com/BrokkAi/acp-go/clientrouter` owns the transport needed for explicit
+client-side selection. It starts the highest configured implementation and
+follows the Rust fallback rules: reuse an existing v1-negotiated agent
+connection only for losslessly identical initialization, otherwise reconnect
+with fresh factories, and never turn a v2 rejection into a silent v1 retry.
+`github.com/BrokkAi/acp-go/proxyrouter` requires an exact configured
+`_proxy/initialize` version and hands the complete initial frame to the selected
+implementation without downgrading or cross-version conversion.
+
 Draft-v2 sessions can use `acpv2.NewSessionHandle` for Rust-shaped prompt,
 configuration, cancellation, and close commands. `acpv2.SessionTracker` owns
 connection-scoped update projections and active-work state; install it before
