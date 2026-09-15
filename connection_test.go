@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -213,4 +214,112 @@ func TestClientAllowsOnlyOneSuccessfulInitialize(t *testing.T) {
 		t.Fatalf("duplicate initialize error = %v", err)
 	}
 	<-responses
+}
+
+// The peer can consume a response before its Write call returns.
+type delayedResponseWriter struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (w *delayedResponseWriter) Write(p []byte) (int, error) {
+	n, err := w.Conn.Write(p)
+	if err == nil {
+		<-w.closed
+	}
+	return n, err
+}
+func (w *delayedResponseWriter) Close() error {
+	w.once.Do(func() { close(w.closed) })
+	return w.Conn.Close()
+}
+
+func TestReplacementAfterDeliveredResponse(t *testing.T) {
+	local, peer := net.Pipe()
+	_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
+	writer := &delayedResponseWriter{Conn: local, closed: make(chan struct{})}
+	started := make(chan string, 33)
+	finish := make(chan struct{})
+	c := Connect(local, writer, func(ctx context.Context, method string, _ json.RawMessage) (any, error) {
+		started <- method
+		if method == "first" {
+			select {
+			case <-finish:
+			case <-ctx.Done():
+			}
+		} else {
+			<-ctx.Done()
+		}
+		return nil, ctx.Err()
+	}, nil)
+	defer c.Close()
+	defer peer.Close()
+	encoder := json.NewEncoder(peer)
+	for i := 0; i < 32; i++ {
+		method := "held"
+		if i == 0 {
+			method = "first"
+		}
+		if err := encoder.Encode(packet{Version: "2.0", ID: json.RawMessage(fmt.Sprint(i)), Method: method}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("handler did not start")
+		}
+	}
+	close(finish)
+	var response packet
+	if err := json.NewDecoder(peer).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if string(response.ID) != "0" {
+		t.Fatalf("unexpected response: %+v", response)
+	}
+	if err := encoder.Encode(packet{Version: "2.0", ID: json.RawMessage("32"), Method: "replacement"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case method := <-started:
+		if method != "replacement" {
+			t.Fatalf("unexpected handler %q", method)
+		}
+	case <-c.Done():
+		t.Fatalf("valid replacement closed connection: %v", c.Err())
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not start")
+	}
+}
+
+func TestIncomingRequestConcurrencyLimit(t *testing.T) {
+	started := make(chan struct{}, 32)
+	c, peer := pipeClient(t, func(ctx context.Context, _ string, _ json.RawMessage) (any, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}, nil)
+	encoder := json.NewEncoder(peer)
+	for i := 0; i < 32; i++ {
+		if err := encoder.Encode(packet{Version: "2.0", ID: json.RawMessage(fmt.Sprint(i)), Method: "hold"}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("handler did not start")
+		}
+	}
+	if err := encoder.Encode(packet{Version: "2.0", ID: json.RawMessage("32"), Method: "overflow"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c.Done():
+		if err := c.Err(); err == nil || !strings.Contains(err.Error(), "too many simultaneous") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrency limit was not enforced")
+	}
 }

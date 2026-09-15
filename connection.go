@@ -272,9 +272,11 @@ func (c *Connection) startRequest(p packet) {
 	c.tasks.Add(1)
 	go func() {
 		defer c.tasks.Done()
-		defer func() { cancel(); c.releaseWorker() }()
+		defer cancel()
 		response := c.executeRequest(ctx, p)
 		c.unregisterInbound(string(p.ID), generation)
+		// Free handler capacity before the peer can observe the response.
+		c.releaseWorker()
 		_ = c.send(c.ctx, response)
 	}()
 }

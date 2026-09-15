@@ -78,6 +78,8 @@ typed hosts with `agent.HandleFilesystem`, `HandleTerminal`,
 `github.com/BrokkAi/acp-go/clienthost` is the reference workspace-confined host
 used by the runner: rooted filesystem access, process-group terminals, bounded
 output, opt-in auto-approval, slog streaming, and JSONL transcripts.
+Text-file reads accept only regular files; FIFOs and other special files are
+rejected without waiting for data.
 
 Runnable examples are included:
 
