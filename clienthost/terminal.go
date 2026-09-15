@@ -87,14 +87,18 @@ func (h *Host) createTerminal(request schema.CreateTerminalRequest) (any, error)
 	if request.Command == "" {
 		return nil, fmt.Errorf("terminal command is required")
 	}
-	directory := h.directory
+	directory := h.resolvedDirectory
 	if request.Cwd != nil {
 		resolved, err := filepath.EvalSymlinks(*request.Cwd)
 		if err != nil {
 			return nil, err
 		}
-		if _, err := h.relative(resolved); err != nil {
+		rel, err := filepath.Rel(h.resolvedDirectory, resolved)
+		if err != nil {
 			return nil, err
+		}
+		if rel != "." && !filepath.IsLocal(rel) {
+			return nil, fmt.Errorf("path lies outside the workspace")
 		}
 		directory = resolved
 	}

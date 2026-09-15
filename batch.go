@@ -230,10 +230,10 @@ func (c *Connection) startBatchRequest(p packet) <-chan packet {
 	ctx, cancel := context.WithCancel(c.ctx)
 	generation := c.registerInbound(string(p.ID), cancel)
 	go func() {
-		defer c.releaseWorker()
 		response := c.executeRequest(ctx, p)
 		cancel()
 		c.unregisterInbound(string(p.ID), generation)
+		c.releaseWorker()
 		result <- response
 	}()
 	return result

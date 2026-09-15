@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/osrun"
@@ -43,11 +44,12 @@ type Config struct {
 }
 
 type Host struct {
-	autoApprove bool
-	ctx         context.Context
-	cancel      context.CancelFunc
-	root        *os.Root
-	directory   string
+	autoApprove       bool
+	ctx               context.Context
+	cancel            context.CancelFunc
+	root              *os.Root
+	directory         string
+	resolvedDirectory string
 
 	mu         sync.Mutex
 	session    schema.SessionId
@@ -65,7 +67,11 @@ func Open(parent context.Context, config Config) (*Host, error) {
 	if !filepath.IsAbs(config.Directory) {
 		return nil, fmt.Errorf("client host directory must be absolute: %q", config.Directory)
 	}
-	root, err := os.OpenRoot(config.Directory)
+	resolvedDirectory, err := filepath.EvalSymlinks(config.Directory)
+	if err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(resolvedDirectory)
 	if err != nil {
 		return nil, err
 	}
@@ -80,16 +86,17 @@ func Open(parent context.Context, config Config) (*Host, error) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	return &Host{
-		autoApprove: config.AutoApprove,
-		ctx:         ctx,
-		cancel:      cancel,
-		root:        root,
-		directory:   config.Directory,
-		logger:      config.Logger,
-		transcript:  json.NewEncoder(config.Transcript),
-		answer:      osrun.Tail{Capacity: config.AnswerCapacity},
-		terminals:   make(map[string]*commandTerminal),
-		toolOutput:  make(map[string]*toolTranscript),
+		autoApprove:       config.AutoApprove,
+		ctx:               ctx,
+		cancel:            cancel,
+		root:              root,
+		directory:         config.Directory,
+		resolvedDirectory: resolvedDirectory,
+		logger:            config.Logger,
+		transcript:        json.NewEncoder(config.Transcript),
+		answer:            osrun.Tail{Capacity: config.AnswerCapacity},
+		terminals:         make(map[string]*commandTerminal),
+		toolOutput:        make(map[string]*toolTranscript),
 	}, nil
 }
 
@@ -273,11 +280,20 @@ func (h *Host) readFile(request schema.ReadTextFileRequest) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := h.root.Open(path)
+	// Nonblocking open avoids waiting for a FIFO writer before we can inspect
+	// the descriptor. Check the opened file, not the path, to avoid a stat/open race.
+	f, err := h.root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("text file reads require a regular file")
+	}
 	b, err := io.ReadAll(io.LimitReader(f, defaultFileReadLimit+1))
 	if err != nil {
 		return nil, err

@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
-## Unreleased
+## 0.8.0 - 2026-09-15
 
 ### Added
 
@@ -18,6 +18,15 @@ series, minor releases may contain breaking API changes.
   end-turn token usage without changing the stable packages.
 - Method registry support for bidirectional methods that have both request and
   notification payloads, matching Rust `mcp/message`.
+
+### Fixed
+
+- Reject non-regular text-file reads without blocking on FIFOs, preventing
+  filesystem callbacks from trapping runner shutdown.
+- Release completed request slots before responses become visible to peers,
+  allowing replacement requests at the 32-handler concurrency limit.
+- Resolve terminal workspace roots consistently so explicit working directories
+  work through symlinks while paths outside the workspace remain rejected.
 
 ## 0.7.0 - 2026-09-10
 
