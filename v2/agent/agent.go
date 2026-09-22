@@ -32,11 +32,19 @@ type Client interface {
 }
 
 // Agent implements the baseline draft-v2 surface. session/prompt only
-// acknowledges acceptance; agents continue work and later report idle through
-// SessionUpdater.
+// acknowledges that the user message was inserted into the conversation;
+// agents continue work and later report idle through SessionUpdater.
+//
+// Prompt must return a PromptResponse whose MessageID identifies the inserted
+// user message. The field is required and non-empty on the wire, and the
+// matching user_message session update must carry the same identifier. That
+// update may be emitted before or after Prompt returns. The runtime refuses to
+// answer session/prompt when MessageID is empty rather than sending an invalid
+// response.
 type Agent interface {
 	Initialize(context.Context, Client, schema.InitializeRequest) (schema.InitializeResponse, error)
 	NewSession(context.Context, Client, schema.NewSessionRequest) (schema.NewSessionResponse, error)
+	// Prompt must return a non-empty PromptResponse.MessageID.
 	Prompt(context.Context, Client, schema.PromptRequest, SessionUpdater) (schema.PromptResponse, error)
 	ListSessions(context.Context, Client, schema.ListSessionsRequest) (schema.ListSessionsResponse, error)
 	ResumeSession(context.Context, Client, schema.ResumeSessionRequest) (schema.ResumeSessionResponse, error)

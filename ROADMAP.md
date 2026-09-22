@@ -8,15 +8,15 @@ Protocol, with v1 and draft-v2 behavior aligned to the
 
 The behavioral reference is:
 
-- Rust `agent-client-protocol` **2.1.0**
-- Rust `agent-client-protocol-schema` **exactly 1.7.0**
-- schema crate 1.7.0 contains:
-  - ACP v1 **`schema-v1.21.0`**
-  - draft ACP v2 **`schema-v2.0.0-alpha.3`**
+- Rust `agent-client-protocol` **2.2.0**
+- Rust `agent-client-protocol-schema` **exactly 1.9.1**
+- schema crate 1.9.1 contains:
+  - ACP v1 **`schema-v1.23.0`**
+  - draft ACP v2 **`schema-v2.0.0-alpha.5`**
 
 Our pinned artifacts are byte-for-byte identical to that Rust release. Do not
 track ACP repository `main` or a newer schema release until the Rust SDK moves
-its exact `=1.7.0` schema dependency.
+its exact `=1.9.1` schema dependency.
 
 ## Status
 
@@ -45,6 +45,11 @@ only remaining work.
   mirroring Rust's separate `unstable_mcp_over_acp` feature boundary.
 - Exact JSON Schema integer formats, notably Rust-compatible `uint16`
   `ProtocolVersion` and `int32` error codes.
+- Stable programmatic tool-call names in v1 and draft v2, surfaced by the
+  reference client host with `tool_call_update` patch semantics.
+- Required draft-v2 prompt acceptance identity: the client returns the
+  response's `messageId` and the agent runtime refuses to answer
+  `session/prompt` without one.
 - Successful initialization is allowed once on v1 and v2 client connections.
 - v1 and v2 agent endpoints reject mismatched initialize versions before user
   handlers run.
@@ -87,14 +92,13 @@ only remaining work.
   - validate the selected initialize schema,
   - preserve the complete initial single or batch frame without canonicalization,
   - reject future versions rather than downgrading.
-- Unstable schema surfaces from the exact Rust 1.7.0 unstable artifacts:
+- Unstable schema surfaces from the exact Rust 1.9.1 unstable artifacts:
   - v1 and v2 generated bindings in explicit import-only packages,
   - LLM providers,
   - plan operations,
-  - session fork and compaction,
+  - session fork, compaction, and notices,
   - NES,
   - MCP-over-ACP,
-  - tool-call names,
   - end-turn token usage,
   - bidirectional `mcp/message` request/notification registry metadata.
 

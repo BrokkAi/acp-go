@@ -36,7 +36,7 @@ func (a *echoAgent) Prompt(_ context.Context, _ Client, request schema.PromptReq
 	}
 	content := []schema.ContentBlock{{Text: &schema.TextContent{Text: message}}}
 	for _, update := range []schema.SessionUpdate{
-		{UserMessage: &schema.UserMessage{MessageID: "user"}},
+		{UserMessage: &schema.UserMessage{MessageID: "user", Content: schema.Nullable[[]schema.ContentBlock]{Set: true, Value: request.Prompt}}},
 		{StateUpdate: &schema.StateUpdate{Running: &schema.RunningStateUpdate{}}},
 		{AgentMessage: &schema.AgentMessage{
 			MessageID: "agent",
@@ -48,7 +48,7 @@ func (a *echoAgent) Prompt(_ context.Context, _ Client, request schema.PromptReq
 			return schema.PromptResponse{}, err
 		}
 	}
-	return schema.PromptResponse{}, nil
+	return schema.PromptResponse{MessageID: "user"}, nil
 }
 
 func (a *echoAgent) ListSessions(context.Context, Client, schema.ListSessionsRequest) (schema.ListSessionsResponse, error) {
@@ -107,8 +107,12 @@ func TestRuntimeServesBaselineV2Lifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Prompt(ctx, initialization, session, "hello v2"); err != nil {
+	messageID, err := client.Prompt(ctx, initialization, session, "hello v2")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if messageID != "user" {
+		t.Fatalf("user message ID = %q", messageID)
 	}
 	var sawAgentMessage, sawIdle bool
 	for i := 0; i < 4; i++ {
@@ -184,7 +188,7 @@ func TestRuntimeGatesClientElicitationByCapability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = client.Prompt(ctx, initialization, session, "hello")
+	_, err = client.Prompt(ctx, initialization, session, "hello")
 	var rpcErr *acp.RPCError
 	if !errors.As(err, &rpcErr) || rpcErr.Code != -32601 {
 		t.Fatalf("prompt error = %v", err)
@@ -203,5 +207,39 @@ func (a *gatingAgent) Prompt(ctx context.Context, client Client, request schema.
 	_, err := client.CreateElicitation(ctx, schema.CreateElicitationRequest{
 		URL: &schema.ElicitationUrlMode{Session: &schema.ElicitationSessionScope{SessionID: request.SessionID}},
 	})
-	return schema.PromptResponse{}, err
+	if err != nil {
+		return schema.PromptResponse{}, err
+	}
+	return schema.PromptResponse{MessageID: "user"}, nil
+}
+
+type unidentifiedPromptAgent struct{ *echoAgent }
+
+func (a *unidentifiedPromptAgent) Prompt(context.Context, Client, schema.PromptRequest, SessionUpdater) (schema.PromptResponse, error) {
+	return schema.PromptResponse{}, nil
+}
+
+// TestRuntimeRejectsPromptResponseWithoutUserMessageID keeps an invalid
+// acceptance off the wire. schema-v2.0.0-alpha.5 requires
+// PromptResponse.messageId, so an implementation that leaves it empty must
+// fail loudly instead of sending "messageId": "".
+func TestRuntimeRejectsPromptResponseWithoutUserMessageID(t *testing.T) {
+	client := startRuntime(t, &unidentifiedPromptAgent{&echoAgent{}}, nil)
+	ctx := context.Background()
+	initialization, err := client.InitializeWithInfo(ctx, acpv2.Capabilities{}, acpv2.ClientInfo{Name: "test-client", Version: "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.NewSessionWithOptions(ctx, initialization, "/repo", acpv2.NewSessionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Prompt(ctx, initialization, session, "hello")
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32603 {
+		t.Fatalf("prompt error = %v", err)
+	}
+	if !strings.Contains(rpcErr.Message, "user message ID") {
+		t.Fatalf("prompt error message = %q", rpcErr.Message)
+	}
 }

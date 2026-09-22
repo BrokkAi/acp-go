@@ -41,9 +41,12 @@ type Config struct {
 
 // Result contains the projected agent text and the stop reason from the idle
 // state update. A nil StopReason means the agent reported idle without one.
+// UserMessageID is the ID the agent assigned to the inserted user message when
+// it accepted the prompt.
 type Result struct {
-	Text       string
-	StopReason *schema.StopReason
+	Text          string
+	StopReason    *schema.StopReason
+	UserMessageID schema.MessageId
 }
 
 type Runner struct {
@@ -180,15 +183,21 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	}
 	work := tracker.BeginWork(session.SessionID)
 	phase = "session/prompt"
-	if err := connection.Prompt(ctx, initialization, session, prompt); err != nil {
+	userMessageID, err := connection.Prompt(ctx, initialization, session, prompt)
+	if err != nil {
 		return result, err
 	}
 	promptAccepted = true
+	_ = host.Record(map[string]any{"event": "prompt_accepted", "user_message_id": userMessageID})
 	phase = "wait-for-idle"
 	select {
 	case <-work.Done():
 		workResult := work.Result()
-		result = Result{Text: workResult.Text, StopReason: workResult.StopReason}
+		result = Result{
+			Text:          workResult.Text,
+			StopReason:    workResult.StopReason,
+			UserMessageID: userMessageID,
+		}
 	case <-ctx.Done():
 		return result, ctx.Err()
 	case <-connection.Done():

@@ -4,6 +4,43 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## 0.9.0 - 2026-09-22
+
+### Changed
+
+- Track the Rust SDK's new schema pin. The behavioral reference is now Rust
+  `agent-client-protocol` 2.2.0 with `agent-client-protocol-schema = "=1.9.1"`,
+  so the pinned artifacts move from `schema-v1.21.0` to `schema-v1.23.0` and
+  from `schema-v2.0.0-alpha.3` to `schema-v2.0.0-alpha.5`. All four generated
+  packages were regenerated from the exact Rust 1.9.1 artifacts.
+- Draft-v2 `session/prompt` now reports the identity of the user message it
+  inserted. `schema-v2.0.0-alpha.5` makes `PromptResponse.messageId` required
+  and non-null, so `v2.Connection.Prompt`, `v2.Connection.PromptContent`,
+  `v2.SessionHandle.Prompt`, and `v2.SessionHandle.PromptContent` return a
+  `MessageID` alongside the error, and `v2/runner.Result` gains
+  `UserMessageID`. This is a breaking API change in the draft-v2 packages; the
+  stable v1 surface is unchanged.
+
+### Added
+
+- Programmatic tool-call names are now part of the stable v1 and v2 schema
+  packages, following schema 1.8.0. `clienthost` logs the name with each tool
+  call and keeps it across updates that omit it.
+- Session notices reach `schema/unstable` and `schema/v2/unstable`, including
+  the `notice` session update, `NoticeSeverity`, and the v1 client
+  `notices` session capability. Earlier releases documented notices as
+  available; they were not present in the 1.7.0 artifacts this project pinned.
+
+### Fixed
+
+- The draft-v2 agent runtime refuses to answer `session/prompt` when an
+  implementation returns an empty `MessageID`, and the v2 client rejects an
+  acceptance that omits it. Both previously passed an invalid empty identifier
+  through as a success.
+- `clienthost` no longer replaces a tool call's title with its tool-call ID
+  when a `tool_call_update` omits the title. Omitted title and name fields are
+  patch fields and leave the retained value unchanged.
+
 ## 0.8.1 - 2026-09-22
 
 ### Fixed

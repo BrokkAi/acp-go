@@ -106,3 +106,50 @@ func TestTranscriptWriterPreservesSplitUTF8(t *testing.T) {
 		t.Fatalf("damaged UTF-8 output: %q", text.String())
 	}
 }
+
+// TestTranscriptRetainsToolCallName covers tool_call_update patch semantics for
+// both the title and the programmatic tool name that ACP stabilized in
+// schema-v1.23.0. An update that omits either field leaves the retained value
+// unchanged, so completion still reports the original title and the name.
+func TestTranscriptRetainsToolCallName(t *testing.T) {
+	var output, saved bytes.Buffer
+	h, err := newHost(context.Background(), t.TempDir(), &saved, slog.New(slog.NewJSONHandler(&output, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	h.SetSession("s")
+	updates := []string{
+		`{"sessionUpdate":"tool_call","toolCallId":"build","title":"go test ./...","name":"run_tests","status":"in_progress"}`,
+		`{"sessionUpdate":"tool_call_update","toolCallId":"build","status":"completed"}`,
+		`{"sessionUpdate":"tool_call","toolCallId":"anonymous","title":"unnamed tool"}`,
+		`{"sessionUpdate":"tool_call_update","toolCallId":"anonymous","status":"completed"}`,
+	}
+	for _, update := range updates {
+		if err := h.Notification("session/update", json.RawMessage(`{"sessionId":"s","update":`+update+`}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := map[string]string{}
+	decoder := json.NewDecoder(&output)
+	for {
+		var entry map[string]any
+		if err := decoder.Decode(&entry); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if entry["msg"] != "Tool completed" {
+			continue
+		}
+		title, _ := entry["title"].(string)
+		name, _ := entry["name"].(string)
+		names[title] = name
+	}
+	if got := names["go test ./..."]; got != "run_tests" {
+		t.Errorf("named tool completion name = %q", got)
+	}
+	if got, ok := names["unnamed tool"]; !ok || got != "" {
+		t.Errorf("unnamed tool completion name = %q (present %v)", got, ok)
+	}
+}

@@ -44,6 +44,7 @@ func main() {
 		panic(err)
 	}
 	fmt.Println(result.Text)
+	fmt.Fprintln(os.Stderr, "Accepted user message:", result.UserMessageID)
 	if result.StopReason != nil {
 		fmt.Fprintln(os.Stderr, "Session is idle:", *result.StopReason)
 	}

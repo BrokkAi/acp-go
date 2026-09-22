@@ -93,7 +93,7 @@ func TestSessionHandleCommandsAndCancellation(t *testing.T) {
 						return nil, err
 					}
 				}
-				return schema.PromptResponse{}, nil
+				return schema.PromptResponse{MessageID: "user-message"}, nil
 			case schema.SessionSetConfigOptionMethodName:
 				var request schema.SetSessionConfigOptionRequest
 				if err := json.Unmarshal(raw, &request); err != nil {
@@ -148,8 +148,12 @@ func TestSessionHandleCommandsAndCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := handle.Prompt(ctx, "hello"); err != nil {
+	messageID, err := handle.Prompt(ctx, "hello")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if messageID != "user-message" {
+		t.Fatalf("user message ID = %q", messageID)
 	}
 	result, err := handle.WaitForIdle(ctx)
 	if err != nil {
@@ -167,7 +171,7 @@ func TestSessionHandleCommandsAndCancellation(t *testing.T) {
 		t.Fatalf("options = %+v", options)
 	}
 
-	if err := handle.Prompt(ctx, "long work"); err != nil {
+	if _, err := handle.Prompt(ctx, "long work"); err != nil {
 		t.Fatal(err)
 	}
 	cancelled, err := handle.CancelActiveWorkAndWait(ctx)

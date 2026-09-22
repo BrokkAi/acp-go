@@ -25,14 +25,21 @@ func (echoAgent) NewSession(context.Context, agent.Client, schema.NewSessionRequ
 	return schema.NewSessionResponse{SessionID: "minimal-v2-session"}, nil
 }
 
+// Prompt inserts the user message into the conversation, echoes it under the
+// same ID, and returns that ID. ACP v2 requires the response to identify the
+// inserted message.
 func (echoAgent) Prompt(_ context.Context, _ agent.Client, request schema.PromptRequest, updates agent.SessionUpdater) (schema.PromptResponse, error) {
 	text := ""
 	if len(request.Prompt) == 1 && request.Prompt[0].Text != nil {
 		text = request.Prompt[0].Text.Text
 	}
+	userMessageID := schema.MessageId("user-message")
 	content := []schema.ContentBlock{{Text: &schema.TextContent{Text: text}}}
 	for _, update := range []schema.SessionUpdate{
-		{UserMessage: &schema.UserMessage{MessageID: "user-message"}},
+		{UserMessage: &schema.UserMessage{
+			MessageID: userMessageID,
+			Content:   schema.Nullable[[]schema.ContentBlock]{Set: true, Value: request.Prompt},
+		}},
 		{StateUpdate: &schema.StateUpdate{Running: &schema.RunningStateUpdate{}}},
 		{AgentMessage: &schema.AgentMessage{
 			MessageID: "agent-message",
@@ -44,7 +51,7 @@ func (echoAgent) Prompt(_ context.Context, _ agent.Client, request schema.Prompt
 			return schema.PromptResponse{}, err
 		}
 	}
-	return schema.PromptResponse{}, nil
+	return schema.PromptResponse{MessageID: userMessageID}, nil
 }
 
 func (echoAgent) ListSessions(context.Context, agent.Client, schema.ListSessionsRequest) (schema.ListSessionsResponse, error) {

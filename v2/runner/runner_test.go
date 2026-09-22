@@ -86,7 +86,7 @@ func (a *echoV2Agent) Prompt(_ context.Context, client agentv2.Client, request s
 	}}); err != nil {
 		return schema.PromptResponse{}, err
 	}
-	return schema.PromptResponse{}, nil
+	return schema.PromptResponse{MessageID: "user-message"}, nil
 }
 
 func requestPermission(sessionID schema.SessionId, client agentv2.Client) (schema.RequestPermissionResponse, error) {
@@ -133,5 +133,8 @@ func TestRunnerWaitsForRunningThenIdle(t *testing.T) {
 	}
 	if result.StopReason == nil || *result.StopReason != schema.StopReasonEndTurn {
 		t.Fatalf("stop reason = %+v", result.StopReason)
+	}
+	if result.UserMessageID != "user-message" {
+		t.Fatalf("user message ID = %q", result.UserMessageID)
 	}
 }

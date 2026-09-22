@@ -21,6 +21,7 @@ type (
 	Initialization = schema.InitializeResponse
 	Session        = schema.NewSessionResponse
 	SessionID      = schema.SessionId
+	MessageID      = schema.MessageId
 	Content        = schema.ContentBlock
 	Update         = schema.UpdateSessionNotification
 	ClientInfo     = schema.Implementation
@@ -184,27 +185,36 @@ func (c *Connection) ResumeSession(ctx context.Context, initialization Initializ
 	return result, c.Call(ctx, schema.SessionResumeMethodName, request, &result)
 }
 
-func (c *Connection) Prompt(ctx context.Context, initialization Initialization, session Session, prompt string) error {
+func (c *Connection) Prompt(ctx context.Context, initialization Initialization, session Session, prompt string) (MessageID, error) {
 	return c.PromptContent(ctx, initialization, session, []Content{NewTextContent(prompt)})
 }
 
-// PromptContent submits a prompt and returns once the agent accepts it. In
-// ACP v2, foreground completion is reported later through idle state updates.
-func (c *Connection) PromptContent(ctx context.Context, initialization Initialization, session Session, prompt []Content) error {
+// PromptContent submits a prompt and returns once the agent inserts the user
+// message into the conversation. The returned ID identifies that message; the
+// matching user_message session update carries the same ID and may arrive
+// before or after this call returns. In ACP v2, foreground completion is
+// reported later through idle state updates.
+func (c *Connection) PromptContent(ctx context.Context, initialization Initialization, session Session, prompt []Content) (MessageID, error) {
 	if err := requireSessionCapabilities(initialization); err != nil {
-		return err
+		return "", err
 	}
 	if session.SessionID == "" {
-		return fmt.Errorf("session ID is required")
+		return "", fmt.Errorf("session ID is required")
 	}
 	if err := validatePromptContent(initialization, prompt); err != nil {
-		return err
+		return "", err
 	}
 	var result schema.PromptResponse
-	return c.Connection.Call(ctx, schema.SessionPromptMethodName, schema.PromptRequest{
+	if err := c.Connection.Call(ctx, schema.SessionPromptMethodName, schema.PromptRequest{
 		SessionID: session.SessionID,
 		Prompt:    prompt,
-	}, &result)
+	}, &result); err != nil {
+		return "", err
+	}
+	if result.MessageID == "" {
+		return "", fmt.Errorf("agent accepted the prompt without the required user message ID")
+	}
+	return result.MessageID, nil
 }
 
 func (c *Connection) CancelSession(ctx context.Context, sessionID SessionID) error {

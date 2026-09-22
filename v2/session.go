@@ -48,13 +48,14 @@ func NewSessionHandle(connection *Connection, initialization Initialization, ses
 
 func (s *SessionHandle) ID() SessionID { return s.sessionID }
 
-func (s *SessionHandle) Prompt(ctx context.Context, prompt string) error {
+func (s *SessionHandle) Prompt(ctx context.Context, prompt string) (MessageID, error) {
 	return s.PromptContent(ctx, []Content{NewTextContent(prompt)})
 }
 
-// PromptContent submits a prompt and returns after acceptance. Output and
-// completion remain independent session updates.
-func (s *SessionHandle) PromptContent(ctx context.Context, prompt []Content) error {
+// PromptContent submits a prompt and returns the ID of the user message the
+// agent inserted into the conversation. Output and completion remain
+// independent session updates.
+func (s *SessionHandle) PromptContent(ctx context.Context, prompt []Content) (MessageID, error) {
 	s.beginWork()
 	return s.connection.PromptContent(
 		ctx,

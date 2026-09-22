@@ -68,7 +68,7 @@ func TestV2LifecycleAndSessionUpdates(t *testing.T) {
 		case schema.SessionPromptMethodName:
 			request := decode[schema.PromptRequest](t, raw)
 			prompts <- request
-			return schema.PromptResponse{}, nil
+			return schema.PromptResponse{MessageID: "user-1"}, nil
 		default:
 			t.Errorf("unexpected method %q", method)
 			return nil, &acp.RPCError{Code: -32601}
@@ -90,8 +90,12 @@ func TestV2LifecycleAndSessionUpdates(t *testing.T) {
 	if session.SessionID != "v2-session" {
 		t.Fatalf("session ID = %q", session.SessionID)
 	}
-	if err := client.Prompt(ctx, initialization, session, "v2 hello"); err != nil {
+	messageID, err := client.Prompt(ctx, initialization, session, "v2 hello")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if messageID != "user-1" {
+		t.Fatalf("user message ID = %q", messageID)
 	}
 	prompt := <-prompts
 	if len(prompt.Prompt) != 1 || prompt.Prompt[0].Text == nil || prompt.Prompt[0].Text.Text != "v2 hello" {
@@ -143,7 +147,8 @@ func TestV2CapabilityGates(t *testing.T) {
 		{
 			name: "image prompt",
 			run: func(client *Connection) error {
-				return client.PromptContent(context.Background(), sessionInitialization(), session, image)
+				_, err := client.PromptContent(context.Background(), sessionInitialization(), session, image)
+				return err
 			},
 		},
 		{
@@ -245,5 +250,41 @@ func TestV2AuthLoginUsesAdvertisedAgentMethod(t *testing.T) {
 	}}
 	if err := client.AuthLogin(context.Background(), terminal, "console"); err == nil {
 		t.Fatal("terminal authentication method was sent over auth/login")
+	}
+}
+
+// TestV2PromptRejectsMissingUserMessageID covers schema-v2.0.0-alpha.5, which
+// makes PromptResponse.messageId required. An agent that omits it has not
+// identified the inserted user message, so acceptance cannot be reported as a
+// success.
+func TestV2PromptRejectsMissingUserMessageID(t *testing.T) {
+	client, _ := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
+		switch method {
+		case schema.InitializeMethodName:
+			return sessionInitialization(), nil
+		case schema.SessionNewMethodName:
+			return schema.NewSessionResponse{SessionID: "v2-session"}, nil
+		case schema.SessionPromptMethodName:
+			return json.RawMessage(`{}`), nil
+		default:
+			return nil, &acp.RPCError{Code: -32601}
+		}
+	}, nil)
+
+	ctx := context.Background()
+	initialization, err := client.InitializeWithInfo(ctx, Capabilities{}, ClientInfo{Name: "fixture-client", Version: "2.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.NewSessionWithOptions(ctx, initialization, "/fixture/workspace", NewSessionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID, err := client.Prompt(ctx, initialization, session, "v2 hello")
+	if err == nil {
+		t.Fatalf("prompt accepted without a user message ID: %q", messageID)
+	}
+	if !strings.Contains(err.Error(), "user message ID") {
+		t.Fatalf("prompt error = %v", err)
 	}
 }

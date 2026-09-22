@@ -148,7 +148,14 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 			return nil, err
 		}
 		updates := &sessionUpdater{connection: s.client.connection(), sessionID: request.SessionID}
-		return s.agent.Prompt(ctx, s.client, request, updates)
+		response, err := s.agent.Prompt(ctx, s.client, request, updates)
+		if err != nil {
+			return nil, err
+		}
+		if response.MessageID == "" {
+			return nil, &acp.RPCError{Code: -32603, Message: "agent returned a prompt response without the required user message ID"}
+		}
+		return response, nil
 	case schema.SessionSetConfigOptionMethodName:
 		implementation, ok := s.agent.(ConfigOptionSetter)
 		if !ok {

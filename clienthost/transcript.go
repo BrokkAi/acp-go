@@ -62,6 +62,7 @@ func (h *Host) newProcessWriter(source, id string) *transcriptWriter {
 
 type toolTranscript struct {
 	title  string
+	name   string
 	length int
 	digest [sha256.Size]byte
 	deltas bool
@@ -82,27 +83,30 @@ func (h *Host) showUpdate(event acp.Update) error {
 		}
 	case update.ToolCall != nil:
 		tool := update.ToolCall
-		h.logger.Info("Tool", "title", tool.Title)
-		h.showTool(tool.ToolCallID, tool.Title, tool.Status, tool.Content, tool.RawOutput, tool.Meta)
+		h.logger.Info("Tool", "title", tool.Title, "name", optionalString(tool.Name))
+		h.showTool(tool.ToolCallID, &tool.Title, tool.Name, tool.Status, tool.Content, tool.RawOutput, tool.Meta)
 	case update.ToolCallUpdate != nil:
 		tool := update.ToolCallUpdate
-		title := string(tool.ToolCallID)
-		if tool.Title != nil {
-			title = *tool.Title
-		}
-		h.showTool(tool.ToolCallID, title, tool.Status, tool.Content, tool.RawOutput, tool.Meta)
+		h.showTool(tool.ToolCallID, tool.Title, tool.Name, tool.Status, tool.Content, tool.RawOutput, tool.Meta)
 	}
 	return nil
 }
 
-func (h *Host) showTool(id schema.ToolCallId, title string, status *schema.ToolCallStatus, content []schema.ToolCallContent, rawOutput json.RawMessage, meta schema.Meta) {
+// showTool renders one tool call. title and name follow the protocol's patch
+// semantics for tool_call_update: an omitted field leaves the retained value
+// unchanged. name is the programmatic tool name ACP stabilized in
+// schema-v1.23.0.
+func (h *Host) showTool(id schema.ToolCallId, title, name *string, status *schema.ToolCallStatus, content []schema.ToolCallContent, rawOutput json.RawMessage, meta schema.Meta) {
 	tool := h.toolOutput[string(id)]
 	if tool == nil {
 		tool = &toolTranscript{title: string(id)}
 		h.toolOutput[string(id)] = tool
 	}
-	if title != "" {
-		tool.title = title
+	if title != nil && *title != "" {
+		tool.title = *title
+	}
+	if name != nil {
+		tool.name = *name
 	}
 	if delta := terminalOutputDelta(meta); delta != "" {
 		tool.deltas = true
@@ -122,10 +126,17 @@ func (h *Host) showTool(id schema.ToolCallId, title string, status *schema.ToolC
 	switch {
 	case status == nil:
 	case *status == schema.ToolCallStatusCompleted:
-		h.logger.Info("Tool completed", "title", tool.title)
+		h.logger.Info("Tool completed", "title", tool.title, "name", tool.name)
 	case *status == schema.ToolCallStatusFailed:
-		h.logger.Error("Tool failed", "title", tool.title)
+		h.logger.Error("Tool failed", "title", tool.title, "name", tool.name)
 	}
+}
+
+func optionalString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func terminalOutputDelta(meta schema.Meta) string {
