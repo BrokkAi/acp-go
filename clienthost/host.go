@@ -57,10 +57,16 @@ type Host struct {
 	transcript *json.Encoder
 	logError   error
 	answer     osrun.Tail
-	terminals  map[string]*commandTerminal
-	next       uint64
-	closing    bool
-	toolOutput map[string]*toolTranscript
+	// answerMessage is the messageId of the last agent message chunk written to
+	// answer, and answered records that at least one chunk has been written.
+	// A change in messageId starts a new message, which Answer has to keep
+	// apart from the one before it.
+	answerMessage string
+	answered      bool
+	terminals     map[string]*commandTerminal
+	next          uint64
+	closing       bool
+	toolOutput    map[string]*toolTranscript
 }
 
 func Open(parent context.Context, config Config) (*Host, error) {
@@ -131,6 +137,30 @@ func (h *Host) Answer() (string, bool) {
 	return h.answer.Text()
 }
 
+// writeAnswer appends one agent message chunk to the retained answer, starting
+// a new line whenever the agent starts a new message.
+//
+// The protocol says a change in messageId means a new message has begun, and
+// an agent is free to end a message without a trailing newline. Concatenating
+// the chunks regardless ran the end of one message into the start of the next,
+// so a client reading the agent's final answer off the last line saw it welded
+// to the commentary before it. Chunks of the same message are still joined
+// exactly as they arrive, and an agent that omits messageId keeps the previous
+// single-buffer behavior.
+func (h *Host) writeAnswer(chunk *schema.ContentChunk) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	id := ""
+	if chunk.MessageID != nil {
+		id = string(*chunk.MessageID)
+	}
+	if h.answered && id != "" && id != h.answerMessage {
+		_, _ = h.answer.Write([]byte("\n"))
+	}
+	_, _ = h.answer.Write([]byte(chunk.Content.Text.Text))
+	h.answerMessage, h.answered = id, true
+}
+
 func (h *Host) Logger() *slog.Logger { return h.logger }
 
 func (h *Host) Notification(method string, raw json.RawMessage) error {
@@ -151,7 +181,7 @@ func (h *Host) Notification(method string, raw json.RawMessage) error {
 		return err
 	}
 	if chunk := update.Update.AgentMessageChunk; chunk != nil && chunk.Content.Text != nil {
-		_, _ = h.answer.Write([]byte(chunk.Content.Text.Text))
+		h.writeAnswer(chunk)
 	}
 	return h.showUpdate(update)
 }
