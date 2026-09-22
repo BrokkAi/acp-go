@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## 0.8.1 - 2026-09-22
+
+### Fixed
+
+- `clienthost.Host.Answer` now starts a new line when the agent starts a new
+  message, instead of running the end of one message into the start of the
+  next. The protocol says a change in `messageId` begins a new message, and an
+  agent may end one without a trailing newline, so a client reading the final
+  answer off the last line could see it welded to the commentary before it.
+  Chunks of a single message are still joined exactly as they arrive, and an
+  agent that omits `messageId` keeps the previous single-buffer behavior.
+
 ## 0.8.0 - 2026-09-15
 
 ### Added
