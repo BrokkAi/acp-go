@@ -42,9 +42,35 @@ type Runner struct {
 	Log    *slog.Logger
 }
 
+// Setup phases reported in SetupError.Phase. They match the phase recorded in
+// the session transcript's session_end event.
+const (
+	// PhaseLaunch covers configuration checks, the state directory,
+	// transcript, client host, and starting the agent process.
+	PhaseLaunch       = "launch"
+	PhaseInitialize   = "initialize"
+	PhaseAuthenticate = "authenticate"
+	PhaseSessionNew   = "session/new"
+	PhaseSelectMode   = "select mode"
+	PhaseSelectModel  = "select model"
+	PhaseSelectEffort = "select effort"
+	// PhasePrompt covers recording the prompt in the transcript before it is
+	// sent. Failures after the prompt is sent are not setup errors.
+	PhasePrompt = "session/prompt"
+)
+
 // Setup failures happen before any release prompt reaches the agent. Retrying
 // unchanged startup settings cannot repair them and must not spend release tries.
-type SetupError struct{ Err error }
+//
+// Phase names the step that failed (one of the Phase constants). Selection
+// failures can be classified further with errors.As against
+// *acp.UnknownSelectionError (the value is not offered),
+// *acp.UnsupportedSelectionError (the agent advertises no such selector), or
+// *acp.RPCError (the agent rejected the request).
+type SetupError struct {
+	Err   error
+	Phase string
+}
 
 func (e *SetupError) Error() string { return "agent setup failed before prompt: " + e.Err.Error() }
 func (e *SetupError) Unwrap() error { return e.Err }
@@ -57,12 +83,13 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 		a.Config.ClientInfo = acp.ClientInfo{Name: "acp-go-runner", Version: "0.1.0"}
 	}
 	if len(a.Config.Agent.Command) == 0 || a.Config.Agent.Command[0] == "" {
-		return "", &SetupError{errors.New("agent command is required")}
+		return "", &SetupError{Err: errors.New("agent command is required"), Phase: PhaseLaunch}
 	}
 	promptStarted := false
+	phase := PhaseLaunch
 	defer func() {
 		if runErr != nil && !promptStarted {
-			runErr = &SetupError{runErr}
+			runErr = &SetupError{Err: runErr, Phase: phase}
 		}
 	}()
 	dir := filepath.Join(a.Config.StateDirectory, "sessions")
@@ -107,7 +134,7 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 		}
 	}()
 	connection := acp.Connect(out, in, host.Request, host.Notification)
-	phase := "initialize"
+	phase = PhaseInitialize
 	started := time.Now()
 	defer func() {
 		record := map[string]any{"event": "session_end", "phase": phase, "elapsed": time.Since(started).String()}
@@ -130,42 +157,42 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 		return result, err
 	}
 	if a.Config.Agent.AuthMethod != "" {
-		phase = "authenticate"
+		phase = PhaseAuthenticate
 		if err := connection.Authenticate(ctx, init, a.Config.Agent.AuthMethod); err != nil {
 			return result, err
 		}
 	}
-	phase = "session/new"
+	phase = PhaseSessionNew
 	session, err := connection.NewSession(ctx, a.Config.Directory)
 	if err != nil {
 		return result, fmt.Errorf("create ACP session (check agent login): %w", err)
 	}
 	host.SetSession(session.SessionID)
 	if a.Config.Agent.Mode != "" {
-		phase = "select mode"
+		phase = PhaseSelectMode
 		if err := connection.SetMode(ctx, &session, a.Config.Agent.Mode); err != nil {
 			return result, err
 		}
 	}
 	if a.Config.Agent.Model != "" {
-		phase = "select model"
+		phase = PhaseSelectModel
 		if err := connection.SetModel(ctx, &session, a.Config.Agent.Model); err != nil {
 			return result, err
 		}
 		a.Log.Info("Using model", "model", a.Config.Agent.Model)
 	}
 	if a.Config.Agent.Effort != "" {
-		phase = "select effort"
+		phase = PhaseSelectEffort
 		if err := connection.SetEffort(ctx, &session, a.Config.Agent.Effort); err != nil {
 			return result, err
 		}
 		a.Log.Info("Using reasoning effort", "effort", a.Config.Agent.Effort)
 	}
 	a.Log.Info("agent session", "id", session.SessionID, "transcript", transcript.Name())
+	phase = PhasePrompt
 	if err := host.Record(map[string]string{"prompt": prompt}); err != nil {
 		return result, err
 	}
-	phase = "session/prompt"
 	promptStarted = true
 	reason, err := connection.Prompt(ctx, session, prompt)
 	if err != nil {

@@ -191,7 +191,13 @@ operations, terminal callbacks, streaming slog output and private JSONL transcri
 receipt parsing and workflow policy. Set `Config.AutoApprove` explicitly to allow
 permission requests for unattended operation. It defaults to false. This is not
 an OS sandbox: agents and terminal commands inherit the caller's permissions.
-`SetupError` distinguishes failures before a prompt from failures during work.
+`SetupError` distinguishes failures before a prompt from failures during work,
+and its `Phase` field names the step that failed (`runner.PhaseSelectModel`,
+`runner.PhaseSelectEffort`, and so on). Use `errors.As` with
+`*acp.UnknownSelectionError` (the value is not offered; `Available` lists the
+advertised values), `*acp.UnsupportedSelectionError` (the agent advertises no
+such selector), or `*acp.RPCError` (the agent rejected the request) to classify
+selection failures.
 
 ## Contributing
 

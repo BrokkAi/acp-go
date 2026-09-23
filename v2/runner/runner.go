@@ -54,8 +54,25 @@ type Runner struct {
 	Log    *slog.Logger
 }
 
-// SetupError marks failures before the agent accepts a prompt.
-type SetupError struct{ Err error }
+// Setup phases reported in SetupError.Phase. They match the phase recorded in
+// the session transcript's session_end event.
+const (
+	// PhaseLaunch covers configuration checks, the state directory,
+	// transcript, and starting the agent process.
+	PhaseLaunch       = "launch"
+	PhaseInitialize   = "initialize"
+	PhaseAuthenticate = "authenticate"
+	PhaseSessionNew   = "session/new"
+	// PhasePrompt covers session/prompt until the agent accepts the prompt.
+	PhasePrompt = "session/prompt"
+)
+
+// SetupError marks failures before the agent accepts a prompt. Phase names the
+// step that failed (one of the Phase constants).
+type SetupError struct {
+	Err   error
+	Phase string
+}
 
 func (e *SetupError) Error() string { return "agent setup failed before prompt: " + e.Err.Error() }
 func (e *SetupError) Unwrap() error { return e.Err }
@@ -69,34 +86,34 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 		r.Config.ClientInfo = acpv2.ClientInfo{Name: "acp-go-v2-runner", Version: "0.3.0"}
 	}
 	if len(r.Config.Agent.Command) == 0 || r.Config.Agent.Command[0] == "" {
-		return result, &SetupError{errors.New("agent command is required")}
+		return result, &SetupError{Err: errors.New("agent command is required"), Phase: PhaseLaunch}
 	}
 	directory := r.Config.Directory
 	if directory == "" {
 		absolute, err := filepath.Abs(".")
 		if err != nil {
-			return result, &SetupError{err}
+			return result, &SetupError{Err: err, Phase: PhaseLaunch}
 		}
 		directory = absolute
 	} else if !filepath.IsAbs(directory) {
-		return result, &SetupError{fmt.Errorf("workspace directory must be absolute: %q", directory)}
+		return result, &SetupError{Err: fmt.Errorf("workspace directory must be absolute: %q", directory), Phase: PhaseLaunch}
 	}
 
 	stateDirectory := r.Config.StateDirectory
 	if stateDirectory == "" {
 		created, err := os.MkdirTemp("", "acp-go-v2-state-")
 		if err != nil {
-			return result, &SetupError{err}
+			return result, &SetupError{Err: err, Phase: PhaseLaunch}
 		}
 		stateDirectory = created
 		defer os.RemoveAll(stateDirectory)
 	}
 	if err := os.MkdirAll(filepath.Join(stateDirectory, "sessions"), 0o700); err != nil {
-		return result, &SetupError{err}
+		return result, &SetupError{Err: err, Phase: PhaseLaunch}
 	}
 	transcript, err := os.CreateTemp(filepath.Join(stateDirectory, "sessions"), "session-*.jsonl")
 	if err != nil {
-		return result, &SetupError{err}
+		return result, &SetupError{Err: err, Phase: PhaseLaunch}
 	}
 	defer transcript.Close()
 
@@ -111,14 +128,14 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	command.Stderr = diagnostics
 	stdin, err := command.StdinPipe()
 	if err != nil {
-		return result, &SetupError{err}
+		return result, &SetupError{Err: err, Phase: PhaseLaunch}
 	}
 	stdout, err := command.StdoutPipe()
 	if err != nil {
-		return result, &SetupError{err}
+		return result, &SetupError{Err: err, Phase: PhaseLaunch}
 	}
 	if err := command.Start(); err != nil {
-		return result, &SetupError{fmt.Errorf("launch ACP v2 agent: %w", err)}
+		return result, &SetupError{Err: fmt.Errorf("launch ACP v2 agent: %w", err), Phase: PhaseLaunch}
 	}
 	defer func() {
 		_ = osrun.Kill(command)
@@ -140,7 +157,7 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 		return nil
 	}))
 	started := time.Now()
-	phase := "initialize"
+	phase := PhaseInitialize
 	promptAccepted := false
 	defer func() {
 		record := map[string]any{"event": "session_end", "phase": phase, "elapsed": time.Since(started).String()}
@@ -158,7 +175,7 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	}()
 	defer func() {
 		if runErr != nil && !promptAccepted {
-			runErr = &SetupError{runErr}
+			runErr = &SetupError{Err: runErr, Phase: phase}
 		}
 	}()
 
@@ -171,18 +188,18 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 		return result, err
 	}
 	if r.Config.Agent.AuthMethod != "" {
-		phase = "authenticate"
+		phase = PhaseAuthenticate
 		if err := connection.AuthLogin(ctx, initialization, r.Config.Agent.AuthMethod); err != nil {
 			return result, err
 		}
 	}
-	phase = "session/new"
+	phase = PhaseSessionNew
 	session, err := connection.NewSessionWithOptions(ctx, initialization, directory, acpv2.NewSessionOptions{})
 	if err != nil {
 		return result, fmt.Errorf("create ACP v2 session (check agent login): %w", err)
 	}
 	work := tracker.BeginWork(session.SessionID)
-	phase = "session/prompt"
+	phase = PhasePrompt
 	userMessageID, err := connection.Prompt(ctx, initialization, session, prompt)
 	if err != nil {
 		return result, err

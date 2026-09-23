@@ -3,8 +3,10 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -12,11 +14,17 @@ import (
 	agentv2 "github.com/BrokkAi/acp-go/v2/agent"
 )
 
-const testAgentEnv = "ACP_GO_V2_RUNNER_TEST_AGENT"
+const (
+	testAgentEnv       = "ACP_GO_V2_RUNNER_TEST_AGENT"
+	testFailSessionEnv = "ACP_GO_V2_RUNNER_TEST_FAIL_SESSION"
+)
 
 func TestMain(m *testing.M) {
 	if os.Getenv(testAgentEnv) == "1" {
-		implementation := &echoV2Agent{}
+		implementation := &echoV2Agent{failSession: os.Getenv(testFailSessionEnv) == "1"}
+		if implementation.failSession {
+			fmt.Fprintln(os.Stderr, "v2 runner test diagnostics")
+		}
 		if err := agentv2.New(implementation).Serve(context.Background(), os.Stdin, os.Stdout); err != nil {
 			panic(err)
 		}
@@ -26,7 +34,8 @@ func TestMain(m *testing.M) {
 }
 
 type echoV2Agent struct {
-	closed atomic.Bool
+	closed      atomic.Bool
+	failSession bool
 }
 
 func (a *echoV2Agent) Initialize(context.Context, agentv2.Client, schema.InitializeRequest) (schema.InitializeResponse, error) {
@@ -38,6 +47,9 @@ func (a *echoV2Agent) Initialize(context.Context, agentv2.Client, schema.Initial
 }
 
 func (a *echoV2Agent) NewSession(ctx context.Context, client agentv2.Client, request schema.NewSessionRequest) (schema.NewSessionResponse, error) {
+	if a.failSession {
+		return schema.NewSessionResponse{}, errors.New("session refused by test agent")
+	}
 	err := client.Notify(ctx, schema.SessionUpdateMethodName, schema.UpdateSessionNotification{
 		SessionID: "v2-runner-session",
 		Update: schema.SessionUpdate{StateUpdate: &schema.StateUpdate{
@@ -136,5 +148,36 @@ func TestRunnerWaitsForRunningThenIdle(t *testing.T) {
 	}
 	if result.UserMessageID != "user-message" {
 		t.Fatalf("user message ID = %q", result.UserMessageID)
+	}
+}
+
+func TestSetupErrorReportsPhase(t *testing.T) {
+	_, err := Runner{Config: Config{Directory: "relative", Agent: AgentConfig{Command: []string{os.Args[0]}}}}.Execute(context.Background(), "hello")
+	var setup *SetupError
+	if !errors.As(err, &setup) || setup.Phase != PhaseLaunch {
+		t.Fatalf("error %v, setup %+v", err, setup)
+	}
+	if err.Error() != `agent setup failed before prompt: workspace directory must be absolute: "relative"` {
+		t.Fatalf("error text = %q", err.Error())
+	}
+
+	_, err = Runner{
+		Config: Config{
+			Directory: t.TempDir(),
+			Agent: AgentConfig{
+				Command:     []string{os.Args[0]},
+				Environment: map[string]string{testAgentEnv: "1", testFailSessionEnv: "1"},
+			},
+		},
+		Log: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}.Execute(context.Background(), "hello")
+	setup = nil
+	// The diagnostics defer wraps the setup error with %w.
+	if !errors.As(err, &setup) || setup.Phase != PhaseSessionNew {
+		t.Fatalf("error %v, setup %+v", err, setup)
+	}
+	if !strings.HasPrefix(err.Error(), "agent setup failed before prompt: create ACP v2 session (check agent login): ") ||
+		!strings.HasSuffix(err.Error(), "\nAgent diagnostics: v2 runner test diagnostics\n") {
+		t.Fatalf("error text = %q", err.Error())
 	}
 }
