@@ -42,34 +42,41 @@ type Runner struct {
 	Log    *slog.Logger
 }
 
-// Setup phases reported in SetupError.Phase. They match the phase recorded in
-// the session transcript's session_end event.
+// Phase names a setup step reported in SetupError.Phase. Values match the
+// phase recorded in the session transcript's session_end event.
+type Phase string
+
 const (
 	// PhaseLaunch covers configuration checks, the state directory,
 	// transcript, client host, and starting the agent process.
-	PhaseLaunch       = "launch"
-	PhaseInitialize   = "initialize"
-	PhaseAuthenticate = "authenticate"
-	PhaseSessionNew   = "session/new"
-	PhaseSelectMode   = "select mode"
-	PhaseSelectModel  = "select model"
-	PhaseSelectEffort = "select effort"
+	PhaseLaunch       Phase = "launch"
+	PhaseInitialize   Phase = "initialize"
+	PhaseAuthenticate Phase = "authenticate"
+	PhaseSessionNew   Phase = "session/new"
+	PhaseSelectMode   Phase = "select mode"
+	PhaseSelectModel  Phase = "select model"
+	PhaseSelectEffort Phase = "select effort"
 	// PhasePrompt covers recording the prompt in the transcript before it is
-	// sent. Failures after the prompt is sent are not setup errors.
-	PhasePrompt = "session/prompt"
+	// sent. Transcript write errors are sticky, so a failure here may come from
+	// an earlier transcript write. Failures after the prompt is sent are not
+	// setup errors.
+	PhasePrompt Phase = "session/prompt"
 )
 
 // Setup failures happen before any release prompt reaches the agent. Retrying
 // unchanged startup settings cannot repair them and must not spend release tries.
 //
-// Phase names the step that failed (one of the Phase constants). Selection
-// failures can be classified further with errors.As against
-// *acp.UnknownSelectionError (the value is not offered),
-// *acp.UnsupportedSelectionError (the agent advertises no such selector), or
-// *acp.RPCError (the agent rejected the request).
+// Phase names the step that failed. Some selection failures can be classified
+// further with errors.As: *acp.UnknownSelectionError means the value is not
+// offered, *acp.UnsupportedSelectionError means the agent advertises no such
+// selector, and *acp.RPCError means the agent returned a JSON-RPC error. Other
+// failures stay untyped, including an agent that does not confirm the
+// selection, malformed selector options, transport and context errors, and the
+// legacy "unknown session mode" error, so a failure matching none of these is
+// not necessarily an agent rejection.
 type SetupError struct {
 	Err   error
-	Phase string
+	Phase Phase
 }
 
 func (e *SetupError) Error() string { return "agent setup failed before prompt: " + e.Err.Error() }
@@ -211,7 +218,8 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 	return text, nil
 }
 
-func newHost(ctx context.Context, directory string, transcript io.Writer, logger *slog.Logger) (*clienthost.Host, error) {
+// newHost is a variable so tests can substitute the transcript writer.
+var newHost = func(ctx context.Context, directory string, transcript io.Writer, logger *slog.Logger) (*clienthost.Host, error) {
 	return clienthost.Open(ctx, clienthost.Config{
 		Directory:  directory,
 		Logger:     logger,

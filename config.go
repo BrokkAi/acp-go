@@ -14,7 +14,9 @@ import (
 // the selector the caller asked for (for example
 // schema.SessionConfigOptionCategoryModel from SetModel), which also covers
 // selectors matched by their conventional ID rather than an advertised
-// category. No request is sent to the agent when this error is returned.
+// category. Available lists the advertised values in order and is nil when the
+// selector offers none. No request is sent to the agent when this error is
+// returned.
 type UnknownSelectionError struct {
 	Category  schema.SessionConfigOptionCategory
 	ConfigID  schema.SessionConfigId
@@ -30,7 +32,8 @@ func (e *UnknownSelectionError) Error() string {
 // UnsupportedSelectionError reports that the agent advertises no selector for
 // the requested category, so the value could not be selected at all. Category
 // is schema.SessionConfigOptionCategoryMode, SessionConfigOptionCategoryModel,
-// or SessionConfigOptionCategoryThoughtLevel (reasoning effort).
+// or SessionConfigOptionCategoryThoughtLevel (reasoning effort). Value is the
+// requested value; the mode message does not include it.
 type UnsupportedSelectionError struct {
 	Category schema.SessionConfigOptionCategory
 	Value    string
@@ -42,10 +45,9 @@ func (e *UnsupportedSelectionError) Error() string {
 		return "agent did not advertise session modes"
 	case schema.SessionConfigOptionCategoryModel:
 		return fmt.Sprintf("agent does not advertise ACP model selection; cannot select %q (update or choose an agent that supports session config options)", e.Value)
-	case schema.SessionConfigOptionCategoryThoughtLevel:
+	default:
 		return fmt.Sprintf("agent does not advertise ACP reasoning effort selection; cannot select %q (update or choose an agent that supports session config options)", e.Value)
 	}
-	return fmt.Sprintf("agent does not advertise ACP %s selection; cannot select %q", e.Category, e.Value)
 }
 
 func sessionSelector(session *Session, category schema.SessionConfigOptionCategory, conventionalID string) *schema.SessionConfigOption {

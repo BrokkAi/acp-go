@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -12,17 +13,22 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/agent"
+	"github.com/BrokkAi/acp-go/clienthost"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
 const (
 	testAgentEnv     = "ACP_GO_RUNNER_TEST_AGENT"
 	testSelectorsEnv = "ACP_GO_RUNNER_TEST_SELECTORS"
+	testFailInitEnv  = "ACP_GO_RUNNER_TEST_FAIL_INITIALIZE"
 )
 
 func TestMain(m *testing.M) {
 	if os.Getenv(testAgentEnv) == "1" {
-		implementation := &echoTestAgent{selectors: os.Getenv(testSelectorsEnv) == "1"}
+		implementation := &echoTestAgent{
+			selectors: os.Getenv(testSelectorsEnv) == "1",
+			failInit:  os.Getenv(testFailInitEnv) == "1",
+		}
 		if implementation.selectors {
 			fmt.Fprintln(os.Stderr, "runner test diagnostics")
 		}
@@ -40,10 +46,14 @@ func TestMain(m *testing.M) {
 type echoTestAgent struct {
 	sessions  int
 	selectors bool
+	failInit  bool
 	model     string
 }
 
 func (a *echoTestAgent) Initialize(context.Context, agent.Client, schema.InitializeRequest) (schema.InitializeResponse, error) {
+	if a.failInit {
+		return schema.InitializeResponse{}, errors.New("initialize refused by test agent")
+	}
 	return schema.InitializeResponse{
 		ProtocolVersion: 1,
 		AgentInfo:       &schema.Implementation{Name: "runner-test-agent", Version: "test"},
@@ -147,7 +157,7 @@ func runSelection(t *testing.T, selectors bool, model, effort string) error {
 	return err
 }
 
-func setupPhase(t *testing.T, err error, phase string) {
+func setupPhase(t *testing.T, err error, phase Phase) {
 	t.Helper()
 	var setup *SetupError
 	if !errors.As(err, &setup) {
@@ -228,4 +238,50 @@ func TestSetupErrorReportsLaunchPhase(t *testing.T) {
 		Agent:          AgentConfig{Command: []string{filepath.Join(t.TempDir(), "missing-agent")}},
 	}}.Execute(context.Background(), "hello")
 	setupPhase(t, err, PhaseLaunch)
+}
+
+func testRunner(t *testing.T, environment map[string]string, authMethod string) Runner {
+	t.Helper()
+	environment[testAgentEnv] = "1"
+	return Runner{
+		Config: Config{
+			Directory:      t.TempDir(),
+			StateDirectory: t.TempDir(),
+			Agent: AgentConfig{
+				Command:     []string{os.Args[0]},
+				Environment: environment,
+				AuthMethod:  authMethod,
+			},
+		},
+		Log: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+}
+
+func TestSetupErrorReportsInitializeAndAuthenticatePhases(t *testing.T) {
+	_, err := testRunner(t, map[string]string{testFailInitEnv: "1"}, "").Execute(context.Background(), "hello")
+	setupPhase(t, err, PhaseInitialize)
+	var rpc *acp.RPCError
+	if !errors.As(err, &rpc) {
+		t.Fatalf("initialize error %v does not wrap *acp.RPCError", err)
+	}
+
+	_, err = testRunner(t, map[string]string{}, "missing").Execute(context.Background(), "hello")
+	setupPhase(t, err, PhaseAuthenticate)
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("transcript write failed") }
+
+func TestSetupErrorReportsTranscriptWriteAsPromptPhase(t *testing.T) {
+	original := newHost
+	t.Cleanup(func() { newHost = original })
+	newHost = func(ctx context.Context, directory string, _ io.Writer, logger *slog.Logger) (*clienthost.Host, error) {
+		return original(ctx, directory, failingWriter{}, logger)
+	}
+	_, err := testRunner(t, map[string]string{}, "").Execute(context.Background(), "hello")
+	setupPhase(t, err, PhasePrompt)
+	if !strings.Contains(err.Error(), "transcript write failed") {
+		t.Fatalf("error = %v", err)
+	}
 }

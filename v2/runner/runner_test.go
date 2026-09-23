@@ -17,11 +17,17 @@ import (
 const (
 	testAgentEnv       = "ACP_GO_V2_RUNNER_TEST_AGENT"
 	testFailSessionEnv = "ACP_GO_V2_RUNNER_TEST_FAIL_SESSION"
+	testFailInitEnv    = "ACP_GO_V2_RUNNER_TEST_FAIL_INITIALIZE"
+	testFailPromptEnv  = "ACP_GO_V2_RUNNER_TEST_FAIL_PROMPT"
 )
 
 func TestMain(m *testing.M) {
 	if os.Getenv(testAgentEnv) == "1" {
-		implementation := &echoV2Agent{failSession: os.Getenv(testFailSessionEnv) == "1"}
+		implementation := &echoV2Agent{
+			failSession: os.Getenv(testFailSessionEnv) == "1",
+			failInit:    os.Getenv(testFailInitEnv) == "1",
+			failPrompt:  os.Getenv(testFailPromptEnv) == "1",
+		}
 		if implementation.failSession {
 			fmt.Fprintln(os.Stderr, "v2 runner test diagnostics")
 		}
@@ -36,9 +42,14 @@ func TestMain(m *testing.M) {
 type echoV2Agent struct {
 	closed      atomic.Bool
 	failSession bool
+	failInit    bool
+	failPrompt  bool
 }
 
 func (a *echoV2Agent) Initialize(context.Context, agentv2.Client, schema.InitializeRequest) (schema.InitializeResponse, error) {
+	if a.failInit {
+		return schema.InitializeResponse{}, errors.New("initialize refused by test agent")
+	}
 	return schema.InitializeResponse{
 		ProtocolVersion: schema.ProtocolVersion(2),
 		Info:            schema.Implementation{Name: "v2-runner-test-agent", Version: "test"},
@@ -63,6 +74,9 @@ func (a *echoV2Agent) NewSession(ctx context.Context, client agentv2.Client, req
 }
 
 func (a *echoV2Agent) Prompt(_ context.Context, client agentv2.Client, request schema.PromptRequest, updates agentv2.SessionUpdater) (schema.PromptResponse, error) {
+	if a.failPrompt {
+		return schema.PromptResponse{}, errors.New("prompt refused by test agent")
+	}
 	prompt := ""
 	if len(request.Prompt) == 1 && request.Prompt[0].Text != nil {
 		prompt = request.Prompt[0].Text.Text
@@ -179,5 +193,35 @@ func TestSetupErrorReportsPhase(t *testing.T) {
 	if !strings.HasPrefix(err.Error(), "agent setup failed before prompt: create ACP v2 session (check agent login): ") ||
 		!strings.HasSuffix(err.Error(), "\nAgent diagnostics: v2 runner test diagnostics\n") {
 		t.Fatalf("error text = %q", err.Error())
+	}
+}
+
+func TestSetupErrorReportsProtocolPhases(t *testing.T) {
+	tests := []struct {
+		environment map[string]string
+		authMethod  string
+		phase       Phase
+	}{
+		{map[string]string{testFailInitEnv: "1"}, "", PhaseInitialize},
+		{map[string]string{}, "missing", PhaseAuthenticate},
+		{map[string]string{testFailPromptEnv: "1"}, "", PhasePrompt},
+	}
+	for _, test := range tests {
+		test.environment[testAgentEnv] = "1"
+		_, err := Runner{
+			Config: Config{
+				Directory: t.TempDir(),
+				Agent: AgentConfig{
+					Command:     []string{os.Args[0]},
+					Environment: test.environment,
+					AuthMethod:  test.authMethod,
+				},
+			},
+			Log: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		}.Execute(context.Background(), "hello")
+		var setup *SetupError
+		if !errors.As(err, &setup) || setup.Phase != test.phase {
+			t.Fatalf("want phase %q: error %v, setup %+v", test.phase, err, setup)
+		}
 	}
 }

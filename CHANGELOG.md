@@ -8,8 +8,9 @@ series, minor releases may contain breaking API changes.
 
 ### Added
 
-- `runner.SetupError` and `v2/runner.SetupError` gain a `Phase` field naming
-  the setup step that failed, with exported constants (`PhaseLaunch`,
+- `runner.SetupError` and `v2/runner.SetupError` gain a `Phase` field of the
+  new `Phase` string type naming the setup step that failed, with exported
+  constants (`PhaseLaunch`,
   `PhaseInitialize`, `PhaseAuthenticate`, `PhaseSessionNew`, and
   `PhasePrompt`; the v1 runner adds `PhaseSelectMode`, `PhaseSelectModel`, and
   `PhaseSelectEffort`). The values match the phase recorded in the transcript's
@@ -23,8 +24,10 @@ series, minor releases may contain breaking API changes.
 
   Both selection errors keep the previous `Error()` text and pass through
   `SetupError` and the runner's diagnostics wrapping, so callers can use
-  `errors.As` to tell an unoffered value from a missing selector and from an
-  agent-side rejection (`*acp.RPCError`).
+  `errors.As` to tell an unoffered value from a missing selector and from a
+  JSON-RPC error returned by the agent (`*acp.RPCError`). Other selection
+  failures, such as an unconfirmed selection, malformed options, transport
+  errors, and the legacy `unknown session mode` error, remain untyped.
 
 ### Changed
 

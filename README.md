@@ -193,11 +193,14 @@ permission requests for unattended operation. It defaults to false. This is not
 an OS sandbox: agents and terminal commands inherit the caller's permissions.
 `SetupError` distinguishes failures before a prompt from failures during work,
 and its `Phase` field names the step that failed (`runner.PhaseSelectModel`,
-`runner.PhaseSelectEffort`, and so on). Use `errors.As` with
-`*acp.UnknownSelectionError` (the value is not offered; `Available` lists the
-advertised values), `*acp.UnsupportedSelectionError` (the agent advertises no
-such selector), or `*acp.RPCError` (the agent rejected the request) to classify
-selection failures.
+`runner.PhaseSelectEffort`, and so on). Some selection failures are typed for
+`errors.As`: `*acp.UnknownSelectionError` (the value is not offered;
+`Available` lists the advertised values), `*acp.UnsupportedSelectionError` (the
+agent advertises no such selector), and `*acp.RPCError` (the agent returned a
+JSON-RPC error). Other failures stay untyped, including an agent that does not
+confirm the selection, malformed selector options, transport and context
+errors, and the legacy `unknown session mode` error, so a failure that matches
+none of these is not necessarily an agent rejection.
 
 ## Contributing
 

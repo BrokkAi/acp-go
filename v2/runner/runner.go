@@ -54,24 +54,26 @@ type Runner struct {
 	Log    *slog.Logger
 }
 
-// Setup phases reported in SetupError.Phase. They match the phase recorded in
-// the session transcript's session_end event.
+// Phase names a setup step reported in SetupError.Phase. Values match the
+// phase recorded in the session transcript's session_end event.
+type Phase string
+
 const (
 	// PhaseLaunch covers configuration checks, the state directory,
 	// transcript, and starting the agent process.
-	PhaseLaunch       = "launch"
-	PhaseInitialize   = "initialize"
-	PhaseAuthenticate = "authenticate"
-	PhaseSessionNew   = "session/new"
+	PhaseLaunch       Phase = "launch"
+	PhaseInitialize   Phase = "initialize"
+	PhaseAuthenticate Phase = "authenticate"
+	PhaseSessionNew   Phase = "session/new"
 	// PhasePrompt covers session/prompt until the agent accepts the prompt.
-	PhasePrompt = "session/prompt"
+	PhasePrompt Phase = "session/prompt"
 )
 
 // SetupError marks failures before the agent accepts a prompt. Phase names the
-// step that failed (one of the Phase constants).
+// step that failed.
 type SetupError struct {
 	Err   error
-	Phase string
+	Phase Phase
 }
 
 func (e *SetupError) Error() string { return "agent setup failed before prompt: " + e.Err.Error() }
