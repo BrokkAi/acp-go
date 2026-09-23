@@ -4,6 +4,36 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Added
+
+- `runner.SetupError` and `v2/runner.SetupError` gain a `Phase` field of the
+  new `Phase` string type naming the setup step that failed, with exported
+  constants (`PhaseLaunch`,
+  `PhaseInitialize`, `PhaseAuthenticate`, `PhaseSessionNew`, and
+  `PhasePrompt`; the v1 runner adds `PhaseSelectMode`, `PhaseSelectModel`, and
+  `PhaseSelectEffort`). The values match the phase recorded in the transcript's
+  `session_end` event, plus `launch` for failures before the agent connection
+  exists. `Error()` text is unchanged.
+- `acp.UnknownSelectionError` is returned by `SetModel`, `SetEffort`, and
+  config-option `SetMode` when the requested value is not offered. It carries
+  the requested category, config ID, option name, value, and advertised values.
+- `acp.UnsupportedSelectionError` is returned when the agent advertises no
+  model, reasoning effort, or mode selector.
+
+  Both selection errors keep the previous `Error()` text and pass through
+  `SetupError` and the runner's diagnostics wrapping, so callers can use
+  `errors.As` to tell an unoffered value from a missing selector and from a
+  JSON-RPC error returned by the agent (`*acp.RPCError`). Other selection
+  failures, such as an unconfirmed selection, malformed options, transport
+  errors, and the legacy `unknown session mode` error, remain untyped.
+
+### Changed
+
+- The v1 runner now labels a failure to record the prompt in the transcript as
+  the `session/prompt` phase instead of the preceding selection phase.
+
 ## 0.9.0 - 2026-09-22
 
 ### Changed

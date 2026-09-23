@@ -9,6 +9,47 @@ import (
 	"github.com/BrokkAi/acp-go/schema"
 )
 
+// UnknownSelectionError reports that a requested session config option value
+// is not among the values the agent advertised for that selector. Category is
+// the selector the caller asked for (for example
+// schema.SessionConfigOptionCategoryModel from SetModel), which also covers
+// selectors matched by their conventional ID rather than an advertised
+// category. Available lists the advertised values in order and is nil when the
+// selector offers none. No request is sent to the agent when this error is
+// returned.
+type UnknownSelectionError struct {
+	Category  schema.SessionConfigOptionCategory
+	ConfigID  schema.SessionConfigId
+	Name      string
+	Value     string
+	Available []string
+}
+
+func (e *UnknownSelectionError) Error() string {
+	return fmt.Sprintf("unknown %s %q; available values: %s", e.Name, e.Value, strings.Join(e.Available, ", "))
+}
+
+// UnsupportedSelectionError reports that the agent advertises no selector for
+// the requested category, so the value could not be selected at all. Category
+// is schema.SessionConfigOptionCategoryMode, SessionConfigOptionCategoryModel,
+// or SessionConfigOptionCategoryThoughtLevel (reasoning effort). Value is the
+// requested value; the mode message does not include it.
+type UnsupportedSelectionError struct {
+	Category schema.SessionConfigOptionCategory
+	Value    string
+}
+
+func (e *UnsupportedSelectionError) Error() string {
+	switch e.Category {
+	case schema.SessionConfigOptionCategoryMode:
+		return "agent did not advertise session modes"
+	case schema.SessionConfigOptionCategoryModel:
+		return fmt.Sprintf("agent does not advertise ACP model selection; cannot select %q (update or choose an agent that supports session config options)", e.Value)
+	default:
+		return fmt.Sprintf("agent does not advertise ACP reasoning effort selection; cannot select %q (update or choose an agent that supports session config options)", e.Value)
+	}
+}
+
 func sessionSelector(session *Session, category schema.SessionConfigOptionCategory, conventionalID string) *schema.SessionConfigOption {
 	for i := range session.ConfigOptions {
 		option := &session.ConfigOptions[i]
@@ -44,6 +85,10 @@ func ConfigOptionsClientCapabilities(boolean bool) *schema.ClientSessionCapabili
 	return &capabilities
 }
 
+// SetMode selects an advertised session mode, using the legacy modes state
+// when present and otherwise a mode config option. It returns
+// *UnsupportedSelectionError when the agent advertises neither, and
+// *UnknownSelectionError when a mode config option does not offer mode.
 func (c *Connection) SetMode(ctx context.Context, session *Session, mode string) error {
 	if session.Modes != nil {
 		for _, available := range session.Modes.AvailableModes {
@@ -62,32 +107,36 @@ func (c *Connection) SetMode(ctx context.Context, session *Session, mode string)
 		return fmt.Errorf("unknown session mode %q", mode)
 	}
 	if option := sessionSelector(session, schema.SessionConfigOptionCategoryMode, "mode"); option != nil {
-		return c.setSelection(ctx, session, *option, mode)
+		return c.setSelection(ctx, session, schema.SessionConfigOptionCategoryMode, *option, mode)
 	}
-	return fmt.Errorf("agent did not advertise session modes")
+	return &UnsupportedSelectionError{Category: schema.SessionConfigOptionCategoryMode, Value: mode}
 }
 
 // SetModel selects an advertised model and verifies the agent acknowledged it.
 // A rejected or unavailable selection must not silently use the default model.
+// It returns *UnsupportedSelectionError when the agent advertises no model
+// selector and *UnknownSelectionError when model is not an advertised value;
+// agent-side rejections wrap the underlying RPC or transport error.
 func (c *Connection) SetModel(ctx context.Context, session *Session, model string) error {
 	option := sessionSelector(session, schema.SessionConfigOptionCategoryModel, "model")
 	if option == nil {
-		return fmt.Errorf("agent does not advertise ACP model selection; cannot select %q (update or choose an agent that supports session config options)", model)
+		return &UnsupportedSelectionError{Category: schema.SessionConfigOptionCategoryModel, Value: model}
 	}
-	return c.setSelection(ctx, session, *option, model)
+	return c.setSelection(ctx, session, schema.SessionConfigOptionCategoryModel, *option, model)
 }
 
 // SetEffort uses the current model's advertised reasoning levels. Call after
 // SetModel because model selection may replace the available effort options.
+// Errors follow SetModel, with Category SessionConfigOptionCategoryThoughtLevel.
 func (c *Connection) SetEffort(ctx context.Context, session *Session, effort string) error {
 	option := sessionSelector(session, schema.SessionConfigOptionCategoryThoughtLevel, "reasoning_effort")
 	if option == nil {
-		return fmt.Errorf("agent does not advertise ACP reasoning effort selection; cannot select %q (update or choose an agent that supports session config options)", effort)
+		return &UnsupportedSelectionError{Category: schema.SessionConfigOptionCategoryThoughtLevel, Value: effort}
 	}
-	return c.setSelection(ctx, session, *option, effort)
+	return c.setSelection(ctx, session, schema.SessionConfigOptionCategoryThoughtLevel, *option, effort)
 }
 
-func (c *Connection) setSelection(ctx context.Context, session *Session, option schema.SessionConfigOption, value string) error {
+func (c *Connection) setSelection(ctx context.Context, session *Session, category schema.SessionConfigOptionCategory, option schema.SessionConfigOption, value string) error {
 	choices, err := selectChoices(option.Select.Options)
 	if err != nil {
 		return err
@@ -99,7 +148,7 @@ func (c *Connection) setSelection(ctx context.Context, session *Session, option 
 		found = found || choice.Value == schema.SessionConfigValueId(value)
 	}
 	if !found {
-		return fmt.Errorf("unknown %s %q; available values: %s", option.Name, value, strings.Join(available, ", "))
+		return &UnknownSelectionError{Category: category, ConfigID: option.ID, Name: option.Name, Value: value, Available: available}
 	}
 	var response schema.SetSessionConfigOptionResponse
 	request := schema.SetSessionConfigOptionRequest{
