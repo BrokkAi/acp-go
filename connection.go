@@ -116,8 +116,21 @@ func (c *Connection) sendJSON(ctx context.Context, value any) error {
 	case err := <-w.sent:
 		return err
 	case <-ctx.Done():
-		c.stop(ctx.Err())
-		return ctx.Err() // Interrupt a blocked pipe write.
+		// A peer can receive a request and cancel its context before Write
+		// returns. Give an in-flight frame time to finish so Call can send
+		// $/cancel_request without disconnecting an otherwise healthy peer.
+		// A genuinely blocked writer still needs its pipe closed to unblock.
+		timer := time.NewTimer(250 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case err := <-w.sent:
+			return err
+		case <-timer.C:
+			c.stop(ctx.Err())
+			return ctx.Err()
+		case <-c.ctx.Done():
+			return c.Err()
+		}
 	case <-c.ctx.Done():
 		return c.Err()
 	}

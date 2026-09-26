@@ -135,6 +135,63 @@ func TestInvalidFrameAndBlockedWriter(t *testing.T) {
 		}
 	})
 }
+
+type cancellingWriter struct {
+	net.Conn
+	cancel context.CancelFunc
+}
+
+func (w *cancellingWriter) Write(p []byte) (int, error) {
+	n, err := w.Conn.Write(p)
+	if w.cancel != nil && err == nil {
+		w.cancel()
+		w.cancel = nil
+		// The peer has received the request but Write has not returned yet.
+		// Cancellation must allow this successful write to finish.
+		time.Sleep(20 * time.Millisecond)
+	}
+	return n, err
+}
+
+func TestCancellationAfterDeliveredRequestKeepsConnection(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	_ = peer.SetDeadline(time.Now().Add(3 * time.Second))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := Connect(local, &cancellingWriter{Conn: local, cancel: cancel}, nil, nil)
+	defer c.Close()
+	done := make(chan error, 1)
+	go func() { done <- c.Call(ctx, "first", nil, nil) }()
+	decoder := json.NewDecoder(peer)
+	var request packet
+	if err := decoder.Decode(&request); err != nil {
+		t.Fatal(err)
+	}
+	var cancellation packet
+	if err := decoder.Decode(&cancellation); err != nil {
+		t.Fatalf("connection closed instead of cancelling the delivered request: %v", err)
+	}
+	if cancellation.Method != "$/cancel_request" {
+		t.Fatalf("expected cancellation, got %+v", cancellation)
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first request: %v", err)
+	}
+	go func() { done <- c.Call(context.Background(), "second", nil, nil) }()
+	if err := decoder.Decode(&request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Method != "second" {
+		t.Fatalf("unexpected follow-up request: %+v", request)
+	}
+	if err := json.NewEncoder(peer).Encode(packet{Version: "2.0", ID: request.ID, Result: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
 func TestVersionNegotiation(t *testing.T) {
 	c, peer := pipeClient(t, nil, nil)
 	go func() {
