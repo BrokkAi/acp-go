@@ -67,6 +67,9 @@ The `schema` package is generated from the pinned ACP JSON Schema release
 (`schema/schema.json`, `schema/meta.json`, `schema/VERSION`) and must stay in
 sync with it. To track a new schema release:
 
+[docs/schema-pin-workflow.md](docs/schema-pin-workflow.md) is the review
+checklist around these commands, including the generated API diff review.
+
 ```sh
 go run ./cmd/acpgen -update <version>   # e.g. 1.23.0; downloads and pins
 go run ./cmd/acpgen                     # regenerates schema/*_gen*.go
