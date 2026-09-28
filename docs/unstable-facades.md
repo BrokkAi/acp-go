@@ -53,4 +53,8 @@ MCP-over-ACP for the v1 surface landed as `github.com/BrokkAi/acp-go/mcp`,
 mirroring `v2/mcp`: session create, resume, and fork helpers that
 accept the unstable server transports, including the native `acp` variant.
 
-That completes the typed-facade surface called out by #10 and #31.
+Still open from #10: the native MCP-over-ACP *methods* (`mcp/connect`,
+`mcp/message`, `mcp/disconnect`). Nothing in the SDK serves or drives them yet,
+and the shape decision comes first — a standard-library message mover versus an
+integration with a third-party MCP SDK, which the dependency policy forbids
+today. Tracked in #39.

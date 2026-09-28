@@ -63,9 +63,8 @@ series, minor releases may contain breaking API changes.
 - New opt-in `github.com/BrokkAi/acp-go/unstable` package starts the typed
   facades for optional methods: capability-gated `ListProviders`, `SetProvider`,
   `DisableProvider`, and `ForkSession` client helpers plus agent-side
-  `ProviderHandler`/`ForkHandler` dispatch through `Handle`. The remaining
-  surfaces called out by #10 (NES, MCP-over-ACP for v1, and the session-update
-  features) are tracked separately in `docs/unstable-facades.md`.
+  `ProviderHandler`/`ForkHandler` dispatch through `Handle`
+  (`docs/unstable-facades.md`).
 - NES typed facades: `unstable` (v1) and `v2/unstable` (draft v2) gain
   capability-gated `StartNes`, `SuggestNes`, `AcceptNes`, `RejectNes`, and
   `CloseNes`, plus agent-side `NesHandler` dispatch through `Handle` (requests)
