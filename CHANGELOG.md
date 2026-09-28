@@ -19,6 +19,12 @@ series, minor releases may contain breaking API changes.
   `ValidTraceparent` for the fixed `traceparent` grammar. The helpers work on
   the generated v1 `Meta` and draft-v2 `Nullable[Meta]` fields with no new
   dependencies.
+- `acp.TerminalAuthCapabilities` advertises terminal-type authentication
+  methods via `clientCapabilities.auth.terminal`. `runner.TerminalAuthMethod`,
+  `runner.TerminalAuthCommand`, and `runner.RunTerminalAuth` support the
+  out-of-band interactive login a terminal method requires: find the advertised
+  method, build the configured agent command with the method's args and env,
+  run it in the user's terminal, then reconnect and initialize.
 
 ## 0.10.0 - 2026-09-23
 

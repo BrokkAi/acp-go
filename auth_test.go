@@ -2,10 +2,22 @@ package acp
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/BrokkAi/acp-go/schema"
 )
+
+func TestTerminalAuthCapabilitiesAdvertiseTerminal(t *testing.T) {
+	encoded, err := json.Marshal(Capabilities{Auth: TerminalAuthCapabilities()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"auth":{"terminal":true}`) {
+		t.Fatalf("capabilities = %s", encoded)
+	}
+}
 
 func TestAuthenticateSendsOnlyAdvertisedAgentMethod(t *testing.T) {
 	c, requests := singleRequestFixture(t, `{}`)
