@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/acpvalidate"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -303,21 +304,63 @@ func validatePromptContent(initialization Initialization, prompt []Content) erro
 	}
 	for i, block := range prompt {
 		switch {
-		case block.Text != nil, block.ResourceLink != nil:
+		case block.Text != nil:
+		case block.ResourceLink != nil:
+			if err := acpvalidate.URI("resource link URI", block.ResourceLink.URI); err != nil {
+				return fmt.Errorf("prompt block %d: %w", i, err)
+			}
 		case block.Image != nil:
 			if capabilities == nil || capabilities.Image == nil {
 				return fmt.Errorf("agent did not advertise image prompt support (block %d)", i)
+			}
+			if err := acpvalidate.MediaType("image content media type", string(block.Image.MimeType)); err != nil {
+				return fmt.Errorf("prompt block %d: %w", i, err)
+			}
+			if block.Image.URI.Set && !block.Image.URI.Null {
+				if err := acpvalidate.URI("image content URI", block.Image.URI.Value); err != nil {
+					return fmt.Errorf("prompt block %d: %w", i, err)
+				}
 			}
 		case block.Audio != nil:
 			if capabilities == nil || capabilities.Audio == nil {
 				return fmt.Errorf("agent did not advertise audio prompt support (block %d)", i)
 			}
+			if err := acpvalidate.MediaType("audio content media type", string(block.Audio.MimeType)); err != nil {
+				return fmt.Errorf("prompt block %d: %w", i, err)
+			}
 		case block.Resource != nil:
 			if capabilities == nil || capabilities.EmbeddedContext == nil {
 				return fmt.Errorf("agent did not advertise embedded context prompt support (block %d)", i)
 			}
+			if err := validateEmbeddedResource(i, block.Resource); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("prompt block %d is not enabled by the negotiated capabilities", i)
+		}
+	}
+	return nil
+}
+
+// validateEmbeddedResource checks the URI, and any declared media type, of a
+// draft-v2 embedded text or blob resource.
+func validateEmbeddedResource(index int, resource *schema.EmbeddedResource) error {
+	var uri string
+	var mimeType *schema.MediaType
+	switch contents := resource.Resource; {
+	case contents.TextResourceContents != nil:
+		uri, mimeType = contents.TextResourceContents.URI, contents.TextResourceContents.MimeType
+	case contents.BlobResourceContents != nil:
+		uri, mimeType = contents.BlobResourceContents.URI, contents.BlobResourceContents.MimeType
+	default:
+		return fmt.Errorf("prompt block %d: embedded resource requires a text or blob resource", index)
+	}
+	if err := acpvalidate.URI("embedded resource URI", uri); err != nil {
+		return fmt.Errorf("prompt block %d: %w", index, err)
+	}
+	if mimeType != nil {
+		if err := acpvalidate.MediaType("embedded resource media type", string(*mimeType)); err != nil {
+			return fmt.Errorf("prompt block %d: %w", index, err)
 		}
 	}
 	return nil

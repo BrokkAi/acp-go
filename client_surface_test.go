@@ -400,6 +400,22 @@ func TestSessionValidationRejectsBeforeWire(t *testing.T) {
 			_, err := c.PromptContent(ctx, falsePrompt, session, []Content{NewTextResourceContent("file:///tmp/x", "hi")})
 			return err
 		}},
+		{"prompt resource link relative uri", `prompt block 0: resource link URI must be an absolute URI with a scheme: "relative/path"`, func() error {
+			_, err := c.PromptContent(ctx, full, session, []Content{NewResourceLinkContent("name", "relative/path")})
+			return err
+		}},
+		{"prompt image invalid media type", `prompt block 0: image content media type must be a media type of the form type/subtype: "png"`, func() error {
+			_, err := c.PromptContent(ctx, full, session, []Content{NewImageContent("png", "aGk=")})
+			return err
+		}},
+		{"prompt audio invalid media type", `prompt block 0: audio content media type must be a media type of the form type/subtype: "audio"`, func() error {
+			_, err := c.PromptContent(ctx, full, session, []Content{NewAudioContent("audio", "aGk=")})
+			return err
+		}},
+		{"prompt embedded resource relative uri", `prompt block 0: embedded resource URI must be an absolute URI with a scheme: "notes.txt"`, func() error {
+			_, err := c.PromptContent(ctx, full, session, []Content{NewTextResourceContent("notes.txt", "hi")})
+			return err
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

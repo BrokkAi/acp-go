@@ -180,6 +180,57 @@ func TestV2CapabilityGates(t *testing.T) {
 	}
 }
 
+// TestV2PromptContentValidation covers the draft-v2 facade's media-type and URI
+// checks, which mirror the Rust semantic newtypes and run before the wire.
+func TestV2PromptContentValidation(t *testing.T) {
+	initialization := sessionInitialization()
+	initialization.Capabilities.Session.Prompt = &schema.PromptCapabilities{
+		Image:           &schema.PromptImageCapabilities{},
+		Audio:           &schema.PromptAudioCapabilities{},
+		EmbeddedContext: &schema.PromptEmbeddedContextCapabilities{},
+	}
+	session := Session{SessionID: "s"}
+	tests := []struct {
+		name    string
+		content Content
+		want    string
+	}{
+		{
+			name:    "resource link relative uri",
+			content: Content{ResourceLink: &schema.ResourceLink{Name: "name", URI: "relative/path"}},
+			want:    "resource link URI must be an absolute URI",
+		},
+		{
+			name:    "image invalid media type",
+			content: Content{Image: &schema.ImageContent{Data: "aGk=", MimeType: "png"}},
+			want:    "image content media type must be a media type",
+		},
+		{
+			name:    "audio invalid media type",
+			content: Content{Audio: &schema.AudioContent{Data: "aGk=", MimeType: "audio"}},
+			want:    "audio content media type must be a media type",
+		},
+		{
+			name: "embedded resource relative uri",
+			content: Content{Resource: &schema.EmbeddedResource{Resource: schema.EmbeddedResourceResource{
+				TextResourceContents: &schema.TextResourceContents{URI: "notes.txt", Text: "hi"},
+			}}},
+			want: "embedded resource URI must be an absolute URI",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, _ := pipeClient(t, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+				t.Errorf("validation wrote %s to the wire", method)
+				return nil, &acp.RPCError{Code: -32601}
+			}, nil)
+			if _, err := client.PromptContent(context.Background(), initialization, session, []Content{test.content}); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestV2ClientAllowsOnlyOneSuccessfulInitialize(t *testing.T) {
 	client, server := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
 		if method != schema.InitializeMethodName {
