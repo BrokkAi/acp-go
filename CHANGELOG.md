@@ -81,6 +81,14 @@ series, minor releases may contain breaking API changes.
   re-reads the transcript on every poll for live updates and `Memory` serves
   events pushed by a host; `traceviewer.Open` launches the platform browser on
   request.
+- `unstable.Projection` folds the optional session updates into ordered
+  per-session state: plan/plan_update/plan_removed, compaction updates with
+  chunked or replaced summaries in first-seen order, live notices (`Notices`
+  peeks, `DrainNotices` consumes), and the latest end-turn token usage.
+  `Projection.Notifications` adapts `session/update` notifications. These
+  features travel inside session updates, so a projection helper is the right
+  shape rather than a request facade, as recorded in
+  `docs/unstable-facades.md`.
 
 ## 0.10.0 - 2026-09-23
 
