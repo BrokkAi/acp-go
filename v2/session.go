@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/BrokkAi/acp-go/internal/acpvalidate"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -115,6 +116,9 @@ func (s *SessionHandle) CancelActiveWorkAndWait(ctx context.Context) (WorkResult
 }
 
 func (s *SessionHandle) SetConfigOptionID(ctx context.Context, configID, valueID string) ([]schema.SessionConfigOption, error) {
+	if err := acpvalidate.Identifier("configuration value ID", valueID); err != nil {
+		return nil, err
+	}
 	return s.SetConfigOption(ctx, schema.SetSessionConfigOptionRequest{
 		SessionID: s.sessionID,
 		ConfigID:  schema.SessionConfigId(configID),
@@ -138,8 +142,8 @@ func (s *SessionHandle) SetConfigOptionBoolean(ctx context.Context, configID str
 // authoritative replacement option set. The handle caches no mutable state.
 func (s *SessionHandle) SetConfigOption(ctx context.Context, request schema.SetSessionConfigOptionRequest) ([]schema.SessionConfigOption, error) {
 	request.SessionID = s.sessionID
-	if request.ConfigID == "" {
-		return nil, errors.New("configuration ID is required")
+	if err := acpvalidate.Identifier("configuration ID", string(request.ConfigID)); err != nil {
+		return nil, err
 	}
 	set := 0
 	if request.ID != nil {

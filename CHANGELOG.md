@@ -40,6 +40,12 @@ series, minor releases may contain breaking API changes.
 - `docs/schema-pin-workflow.md` documents the reviewed process for moving a Rust
   schema pin: regenerate both artifacts, review the generated API diff, record
   it in this changelog, and validate before the pins move together.
+- Typed client facades now validate media types and URIs before writing, and the
+  draft-v2 session handle requires a non-blank configuration value ID. The checks
+  live in `internal/acpvalidate` as plain string work (no reflection, no
+  dependencies); the generated types stay permissive so unknown union tags,
+  open-world enum values, and raw `_meta` payloads keep decoding.
+  `docs/validation-boundaries.md` records the boundary decision.
 
 ## 0.10.0 - 2026-09-23
 

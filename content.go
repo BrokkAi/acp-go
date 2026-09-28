@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/BrokkAi/acp-go/internal/acpvalidate"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -106,22 +107,73 @@ func validatePromptCapabilities(init Initialization, prompt []Content) error {
 			return fmt.Errorf("prompt block %d has %d content variants, exactly one is required", i, variants)
 		}
 		switch {
-		case block.Text != nil || block.ResourceLink != nil:
-			// Text and resource links are protocol v1 baseline capabilities.
+		case block.Text != nil:
+			// Text is a protocol v1 baseline capability.
+		case block.ResourceLink != nil:
+			if err := acpvalidate.URI("resource link URI", block.ResourceLink.URI); err != nil {
+				return fmt.Errorf("prompt block %d: %w", i, err)
+			}
 		case block.Image != nil:
 			if !image {
 				return fmt.Errorf("agent did not advertise image prompt support (block %d)", i)
+			}
+			if err := validateMediaPayload(i, "image content", block.Image.MimeType, block.Image.URI); err != nil {
+				return err
 			}
 		case block.Audio != nil:
 			if !audio {
 				return fmt.Errorf("agent did not advertise audio prompt support (block %d)", i)
 			}
+			if err := acpvalidate.MediaType("audio content media type", block.Audio.MimeType); err != nil {
+				return fmt.Errorf("prompt block %d: %w", i, err)
+			}
 		case block.Resource != nil:
 			if !embedded {
 				return fmt.Errorf("agent did not advertise embedded resource prompt support (block %d)", i)
 			}
+			if err := validateEmbeddedResource(i, block.Resource); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("prompt block %d has no content variant", i)
+		}
+	}
+	return nil
+}
+
+// validateMediaPayload checks the media type a block declares and, when one is
+// present, that the optional URI is absolute.
+func validateMediaPayload(index int, kind, mimeType string, uri *string) error {
+	if err := acpvalidate.MediaType(kind+" media type", mimeType); err != nil {
+		return fmt.Errorf("prompt block %d: %w", index, err)
+	}
+	if uri != nil {
+		if err := acpvalidate.URI(kind+" URI", *uri); err != nil {
+			return fmt.Errorf("prompt block %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+// validateEmbeddedResource checks the URI, and any declared media type, of an
+// embedded text or blob resource.
+func validateEmbeddedResource(index int, resource *schema.EmbeddedResource) error {
+	var uri string
+	var mimeType *string
+	switch contents := resource.Resource; {
+	case contents.TextResourceContents != nil:
+		uri, mimeType = contents.TextResourceContents.URI, contents.TextResourceContents.MimeType
+	case contents.BlobResourceContents != nil:
+		uri, mimeType = contents.BlobResourceContents.URI, contents.BlobResourceContents.MimeType
+	default:
+		return fmt.Errorf("prompt block %d: embedded resource requires a text or blob resource", index)
+	}
+	if err := acpvalidate.URI("embedded resource URI", uri); err != nil {
+		return fmt.Errorf("prompt block %d: %w", index, err)
+	}
+	if mimeType != nil {
+		if err := acpvalidate.MediaType("embedded resource media type", *mimeType); err != nil {
+			return fmt.Errorf("prompt block %d: %w", index, err)
 		}
 	}
 	return nil

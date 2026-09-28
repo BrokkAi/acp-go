@@ -109,6 +109,10 @@ only remaining work.
   router tests.
 - Schema pin-change workflow (`docs/schema-pin-workflow.md`): regenerate both
   artifacts and review the generated API diff before either pin moves.
+- Semantic validation at the typed facade boundaries
+  (`docs/validation-boundaries.md`): absolute paths, required identifiers,
+  media types, and URIs are checked before a request reaches the wire, with the
+  generated types left permissive so unknown tags and raw `_meta` keep decoding.
 
 ## Remaining Rust-parity gaps
 
@@ -128,19 +132,7 @@ Work:
 - Keep every facade behind an explicit package import; do not expose unstable
   methods through the stable v1/v2 facades.
 
-### 2. Semantic validation parity
-
-Rust semantic newtypes enforce IDs, absolute paths, media types, and URI forms
-at the type boundary. Most Go generated types currently use string aliases.
-
-Work:
-
-- Determine Go-native validation boundaries that do not add reflection-heavy
-  runtime overhead.
-- Enforce absolute paths and required identifiers at typed facade boundaries.
-- Preserve unknown extension tags and raw `_meta` payloads.
-
-### 3. Rust ecosystem crate ports
+### 2. Rust ecosystem crate ports
 
 [docs/rust-ecosystem-parity.md](docs/rust-ecosystem-parity.md) evaluates the
 reference workspace crates that have no Go equivalent and records one decision
