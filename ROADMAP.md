@@ -118,19 +118,18 @@ only remaining work.
 
 ### 1. Optional typed facades for unstable methods
 
-The generated unstable schema packages expose every request, response, and
-notification type, and applications can already use the generic `Call`,
-`CallBatch`, and `Notify` transport APIs with those generated types. Rust also
-provides fluent builder/dispatch integration for each optional feature.
+The typed facade surface is delivered: client facades and agent dispatch for
+providers, session fork, and NES, the session-update projection helper, and the
+MCP session options all live in
+[docs/unstable-facades.md](docs/unstable-facades.md)'s packages
+(`unstable`, `v2/unstable`, `mcp`, `v2/mcp`).
 
-Work:
+What remains is the native MCP-over-ACP method dispatch:
 
-- Add narrow typed client facades where generated methods benefit from
-  capability checks or composite semantics.
-- Add optional agent dispatch interfaces for providers, fork, NES, and
-  MCP-over-ACP.
-- Keep every facade behind an explicit package import; do not expose unstable
-  methods through the stable v1/v2 facades.
+- Serve or drive `mcp/connect`, `mcp/message`, and `mcp/disconnect` behind an
+  explicit import, after deciding whether the Go side only moves MCP messages or
+  integrates a third-party MCP SDK (which the dependency policy forbids today):
+  #39.
 
 ### 2. Rust ecosystem crate ports
 
