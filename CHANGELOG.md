@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Added
+
+- `acp.Connection.CancelRequest(ctx, requestID)` sends a typed
+  `$/cancel_request` notification for one outstanding request, covering the v1
+  transport and the draft-v2 client that embeds it. Request IDs may be given as
+  a string, an integer, or a `json.RawMessage` for exact wire bytes; null,
+  empty, and non-scalar IDs are rejected.
+
 ## 0.10.0 - 2026-09-23
 
 ### Added

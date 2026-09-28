@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/BrokkAi/acp-go/schema"
 )
 
 // RPCError preserves the peer's JSON-RPC error, including extension data.
@@ -159,6 +161,50 @@ func (c *Connection) Notify(ctx context.Context, method string, params any) erro
 	}
 	return c.send(ctx, packet{Method: method, Params: b})
 }
+
+// CancelRequest asks the peer to cancel one outstanding request by sending a
+// $/cancel_request notification. Either side may cancel the other's in-flight
+// request; the peer answers the original request with a -32800 error or a valid
+// response, and both outcomes are normal completion.
+//
+// requestID identifies the request exactly as the peer saw it on the wire: a
+// JSON string or number, supplied as a Go string, an integer, or a
+// json.RawMessage for exact bytes. Call and CallBatch number their own outbound
+// requests from 1, so those IDs are integers. Null, empty, and non-scalar IDs
+// are rejected.
+func (c *Connection) CancelRequest(ctx context.Context, requestID any) error {
+	id, err := encodeRequestID(requestID)
+	if err != nil {
+		return err
+	}
+	return c.Notify(ctx, schema.CancelRequestMethodName, schema.CancelRequestNotification{RequestID: id})
+}
+
+// encodeRequestID validates a caller-supplied request ID and returns its exact
+// JSON encoding, so a json.RawMessage passes through without re-quoting.
+func encodeRequestID(requestID any) (json.RawMessage, error) {
+	if requestID == nil {
+		return nil, errors.New("cancel request requires a request ID")
+	}
+	raw, err := json.Marshal(requestID)
+	if err != nil {
+		return nil, fmt.Errorf("encode request ID: %w", err)
+	}
+	switch {
+	case len(raw) == 0 || string(raw) == "null":
+		return nil, errors.New("cancel request requires a request ID")
+	case raw[0] == '"':
+		if string(raw) == `""` {
+			return nil, errors.New("cancel request requires a request ID")
+		}
+		return raw, nil
+	case raw[0] == '-' || (raw[0] >= '0' && raw[0] <= '9'):
+		return raw, nil
+	default:
+		return nil, fmt.Errorf("request ID must be a JSON string or number, got %s", raw)
+	}
+}
+
 func (c *Connection) Call(ctx context.Context, method string, params, result any) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -189,7 +235,7 @@ func (c *Connection) Call(ctx context.Context, method string, params, result any
 		return decodeReply(p, result)
 	case <-ctx.Done():
 		cancelCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-		_ = c.Notify(cancelCtx, "$/cancel_request", map[string]any{"requestId": json.RawMessage(id)})
+		_ = c.CancelRequest(cancelCtx, json.RawMessage(id))
 		cancel()
 		return ctx.Err()
 	case <-c.ctx.Done():
