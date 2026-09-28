@@ -102,8 +102,8 @@ dependency policy changes.
 The Rust workspace also contains crates that #17 did not ask about, listed here
 so the decision trail is complete:
 
-- `agent-client-protocol-http` — HTTP/WebSocket transport, tracked separately by
-  the Streamable HTTP transport issue.
+- `agent-client-protocol-http` — HTTP/WebSocket transport, implemented as the
+  opt-in draft package `transport/http` (HTTP + SSE; WebSocket deferred).
 - `agent-client-protocol-derive` — a Rust `proc-macro` crate for trait derivation
   with no Go analogue.
 - `agent-client-protocol-polyfill` — backward-compatibility proxies (for example
