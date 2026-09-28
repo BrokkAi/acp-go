@@ -29,23 +29,8 @@ const agentCommandEnv = "ACP_INTEGRATION_AGENT"
 // out of every ordinary local and CI invocation; GitHub's opt-in integration
 // job supplies the matrix values.
 func TestRealAgentPrompt(t *testing.T) {
-	encoded := strings.TrimSpace(os.Getenv(agentCommandEnv))
-	if encoded == "" {
-		t.Skipf("%s is not set", agentCommandEnv)
-	}
-	var command []string
-	if err := json.Unmarshal([]byte(encoded), &command); err != nil {
-		t.Fatalf("%s must be a JSON argv array: %v", agentCommandEnv, err)
-	}
-	if len(command) == 0 || command[0] == "" {
-		t.Fatalf("%s must contain a non-empty argv array", agentCommandEnv)
-	}
-	for _, name := range strings.Split(os.Getenv("ACP_INTEGRATION_REQUIRED_ENV"), ",") {
-		name = strings.TrimSpace(name)
-		if name != "" && strings.TrimSpace(os.Getenv(name)) == "" {
-			t.Fatalf("required integration credential %s is empty", name)
-		}
-	}
+	command := integrationAgentCommand(t)
+	requireIntegrationCredentials(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -71,6 +56,36 @@ func TestRealAgentPrompt(t *testing.T) {
 		t.Fatal("real ACP agent returned an empty answer")
 	}
 	t.Logf("real agent answered: %s", strings.TrimSpace(answer))
+}
+
+// integrationAgentCommand decodes ACP_INTEGRATION_AGENT, the JSON argv array
+// naming the externally supplied agent under test.
+func integrationAgentCommand(t *testing.T) []string {
+	t.Helper()
+	encoded := strings.TrimSpace(os.Getenv(agentCommandEnv))
+	if encoded == "" {
+		t.Skipf("%s is not set", agentCommandEnv)
+	}
+	var command []string
+	if err := json.Unmarshal([]byte(encoded), &command); err != nil {
+		t.Fatalf("%s must be a JSON argv array: %v", agentCommandEnv, err)
+	}
+	if len(command) == 0 || command[0] == "" {
+		t.Fatalf("%s must contain a non-empty argv array", agentCommandEnv)
+	}
+	return command
+}
+
+// requireIntegrationCredentials fails the test when a required credential named
+// by ACP_INTEGRATION_REQUIRED_ENV is missing.
+func requireIntegrationCredentials(t *testing.T) {
+	t.Helper()
+	for _, name := range strings.Split(os.Getenv("ACP_INTEGRATION_REQUIRED_ENV"), ",") {
+		name = strings.TrimSpace(name)
+		if name != "" && strings.TrimSpace(os.Getenv(name)) == "" {
+			t.Fatalf("required integration credential %s is empty", name)
+		}
+	}
 }
 
 func mustAbsoluteTempWorkspace(t *testing.T) string {

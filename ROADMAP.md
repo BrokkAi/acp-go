@@ -101,6 +101,14 @@ only remaining work.
   - MCP-over-ACP,
   - end-turn token usage,
   - bidirectional `mcp/message` request/notification registry metadata.
+- Optional credential-backed v2 integration coverage: the draft-v2 runner is
+  exercised against a real adapter when it advertises v2, and the CI integration
+  job runs the v1 and v2 tests together.
+- Shared protocol-router fixtures (`internal/routertest`): one in-memory framing
+  harness plus v1 and draft-v2 fake agents used by the agent, proxy, and client
+  router tests.
+- Schema pin-change workflow (`docs/schema-pin-workflow.md`): regenerate both
+  artifacts and review the generated API diff before either pin moves.
 
 ## Remaining Rust-parity gaps
 
@@ -132,14 +140,7 @@ Work:
 - Enforce absolute paths and required identifiers at typed facade boundaries.
 - Preserve unknown extension tags and raw `_meta` payloads.
 
-### 3. Draft-v2 ecosystem validation
-
-- Extend optional credential-backed CI to exercise the v2 runner against real
-  adapters when they advertise v2.
-- Add protocol-router fixtures shared by v1 and v2 fake agents.
-- Track each Rust schema pin change as a reviewed regeneration and API diff.
-
-### 4. Rust ecosystem crate ports
+### 3. Rust ecosystem crate ports
 
 [docs/rust-ecosystem-parity.md](docs/rust-ecosystem-parity.md) evaluates the
 reference workspace crates that have no Go equivalent and records one decision

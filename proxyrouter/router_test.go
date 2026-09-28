@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"net"
 	"testing"
 	"time"
+
+	"github.com/BrokkAi/acp-go/internal/routertest"
 )
 
 type recordingProxy struct {
@@ -41,22 +42,7 @@ func (p recordingProxy) Serve(_ context.Context, in io.ReadCloser, out io.WriteC
 
 func start(t *testing.T, router *Router) *bufio.ReadWriter {
 	t.Helper()
-	local, peer := net.Pipe()
-	deadline := time.Now().Add(5 * time.Second)
-	_ = local.SetDeadline(deadline)
-	_ = peer.SetDeadline(deadline)
-	done := make(chan error, 1)
-	go func() { done <- router.Serve(context.Background(), local, local) }()
-	t.Cleanup(func() {
-		_ = peer.Close()
-		_ = local.Close()
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Error("proxy router did not stop")
-		}
-	})
-	return bufio.NewReadWriter(bufio.NewReader(peer), bufio.NewWriter(peer))
+	return routertest.Serve(t, router.Serve)
 }
 
 func TestProxyRouterRequiresExactVersion(t *testing.T) {
@@ -104,7 +90,7 @@ func TestProxyRouterRequiresExactVersion(t *testing.T) {
 func TestProxyRouterPreservesInitialBatchAndFutureFields(t *testing.T) {
 	started := make(chan string, 1)
 	seen := make(chan map[string]json.RawMessage, 1)
-	proxy := proxyFunc(func(ctx context.Context, in io.ReadCloser, out io.WriteCloser) error {
+	proxy := routertest.ProxyFunc(func(ctx context.Context, in io.ReadCloser, out io.WriteCloser) error {
 		defer in.Close()
 		var batch []map[string]json.RawMessage
 		if err := json.NewDecoder(in).Decode(&batch); err != nil {
@@ -173,7 +159,7 @@ func TestProxyRouterRejectsFutureVersion(t *testing.T) {
 }
 
 func TestProxyRouterValidatesExactV2Schema(t *testing.T) {
-	rw := start(t, New().WithV2(proxyFunc(func(context.Context, io.ReadCloser, io.WriteCloser) error {
+	rw := start(t, New().WithV2(routertest.ProxyFunc(func(context.Context, io.ReadCloser, io.WriteCloser) error {
 		t.Error("invalid v2 proxy initialize must not reach implementation")
 		return nil
 	})))
@@ -195,10 +181,4 @@ func TestProxyRouterValidatesExactV2Schema(t *testing.T) {
 	if response.Error == nil || response.Error.Code != -32600 {
 		t.Fatalf("response = %+v", response)
 	}
-}
-
-type proxyFunc func(context.Context, io.ReadCloser, io.WriteCloser) error
-
-func (f proxyFunc) Serve(ctx context.Context, in io.ReadCloser, out io.WriteCloser) error {
-	return f(ctx, in, out)
 }

@@ -75,4 +75,4 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: go test -tags integration -run TestRealAgentPrompt -v ./integration
+      - run: go test -tags integration -run 'TestRealAgentPrompt|TestRealAgentV2Prompt' -v ./integration

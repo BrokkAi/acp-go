@@ -30,6 +30,16 @@ series, minor releases may contain breaking API changes.
   for the test harness (#21), cookbook (#22), trace viewer (#23), and conductor
   (#24), and records the `agent-client-protocol-rmcp` bridge as won't port
   because it requires a third-party MCP SDK.
+- The optional credential-backed integration job now also runs the draft-v2
+  runner (`TestRealAgentV2Prompt`), which probes the agent and skips unless it
+  advertises ACP v2. `TestRealAgentPrompt` keeps covering the v1 runner against
+  the same command.
+- `internal/routertest` provides shared protocol-router fixtures: an in-memory
+  framing harness plus v1 and draft-v2 fake agents, used by the agent, proxy,
+  and client router tests.
+- `docs/schema-pin-workflow.md` documents the reviewed process for moving a Rust
+  schema pin: regenerate both artifacts, review the generated API diff, record
+  it in this changelog, and validate before the pins move together.
 
 ## 0.10.0 - 2026-09-23
 

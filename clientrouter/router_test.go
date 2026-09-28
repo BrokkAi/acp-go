@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/BrokkAi/acp-go"
-	schema1 "github.com/BrokkAi/acp-go/schema"
+	"github.com/BrokkAi/acp-go/internal/routertest"
 	schema2 "github.com/BrokkAi/acp-go/schema/v2"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
 )
@@ -79,37 +79,7 @@ func agentFactory(protocol uint16, opens *atomic.Int32) AgentConnection {
 		deadline := time.Now().Add(5 * time.Second)
 		_ = local.SetDeadline(deadline)
 		_ = peer.SetDeadline(deadline)
-		handler := func(ctx context.Context, method string, raw json.RawMessage) (any, error) {
-			switch method {
-			case schema2.InitializeMethodName:
-				var params struct{ ProtocolVersion uint16 }
-				if err := json.Unmarshal(raw, &params); err != nil {
-					return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
-				}
-				if params.ProtocolVersion != protocol && !(protocol == 1 && params.ProtocolVersion >= 2) {
-					return nil, &acp.RPCError{Code: -32600, Message: fmt.Sprintf("unexpected protocol %d", params.ProtocolVersion)}
-				}
-				if protocol == 1 {
-					return schema1.InitializeResponse{
-						ProtocolVersion: acp.Version,
-						AgentInfo:       &schema1.Implementation{Name: "fixture-agent", Version: "1"},
-					}, nil
-				}
-				return schema2.InitializeResponse{
-					ProtocolVersion: acpv2.Version,
-					Info:            schema2.Implementation{Name: "fixture-agent", Version: "1"},
-					Capabilities:    &schema2.AgentCapabilities{Session: &schema2.SessionCapabilities{}},
-				}, nil
-			case schema1.SessionNewMethodName:
-				if protocol == 1 {
-					return schema1.NewSessionResponse{SessionID: "v1-session"}, nil
-				}
-				return schema2.NewSessionResponse{SessionID: "v2-session"}, nil
-			default:
-				return nil, &acp.RPCError{Code: -32601}
-			}
-		}
-		_ = acp.Connect(local, local, handler, nil)
+		_ = acp.Connect(local, local, routertest.AgentHandler(protocol), nil)
 		return peer, nil
 	}
 }
