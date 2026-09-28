@@ -46,6 +46,14 @@ series, minor releases may contain breaking API changes.
   dependencies); the generated types stay permissive so unknown union tags,
   open-world enum values, and raw `_meta` payloads keep decoding.
   `docs/validation-boundaries.md` records the boundary decision.
+- New opt-in `github.com/BrokkAi/acp-go/transport/http` package (`acphttp`)
+  implements the draft Streamable HTTP binding: `POST` + `application/json`
+  frames, `Acp-Connection-Id`/`Acp-Session-Id` headers, and a
+  `text/event-stream` `GET` for server-to-client messages. `acphttp.Dial`
+  returns a normal `acp.Connection` and `acphttp.Server` serves any
+  `agent.Runtime` entry, so stdio stays the default and no transport falls back
+  to another. Draft limits (no WebSocket, CORS, per-session streams, or batch
+  bodies) are documented in `docs/http-transport.md`.
 
 ## 0.10.0 - 2026-09-23
 

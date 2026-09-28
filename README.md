@@ -224,6 +224,18 @@ its `env` overrides the configured environment), then reconnect and initialize
 again before `Runner.Execute`. Never pass a terminal method ID to
 `Connection.Authenticate`.
 
+## Draft HTTP transport
+
+`github.com/BrokkAi/acp-go/transport/http` is an explicit, opt-in binding for the
+draft Streamable HTTP transport: `POST` with `application/json` for frames,
+`Acp-Connection-Id` and `Acp-Session-Id` headers, and a `text/event-stream`
+`GET` for server-to-client messages. `Dial` returns a normal `acp.Connection`, so
+callers drive it with the usual methods, and any `agent.Runtime` can be served
+with `acphttp.Server`. Stdio stays the default and the transport never falls
+back between bindings; see [docs/http-transport.md](docs/http-transport.md) for
+the binding and its draft limits (no WebSocket, CORS, per-session streams, or
+batch bodies yet).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and our
