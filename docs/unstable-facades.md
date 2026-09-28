@@ -30,16 +30,27 @@ providers, err := unstable.ListProviders(ctx, connection, initialization)
 | `StartNes`, `SuggestNes`, `AcceptNes`, `RejectNes`, `CloseNes` | `agentCapabilities.nes` | Requests: start/suggest/close; notifications: accept/reject. Requires non-blank session and suggestion IDs, and an absolute document URI. Implemented for v1 and draft v2. |
 | `Handle` | — | Agent-side dispatch: routes providers/* and session/fork to optional `ProviderHandler`/`ForkHandler` implementations, answers method-not-found when a handler is missing, and delegates every other method to the next handler. |
 | `HandleNesNotifications` | — | Composes the agent side of `nes/accept`/`nes/reject` (notifications) with another `acp.Notifications` handler. |
+| `Projection` | — | Client-side: folds optional session updates into ordered per-session state (see below). `Projection.Notifications` adapts `session/update` notifications. |
 
-## Remaining #10 surfaces
+## Session updates: projection, not request facades
 
-The evaluation of #10 called out more features than one focused change can
-  carry. These are tracked separately so each keeps its own review:
+Plan operations, compaction, notices, and end-turn token usage do not have
+methods of their own; they arrive as `session/update` payloads the client has to
+interpret. A request facade would be the wrong shape, so they are served by
+`unstable.Projection`, which folds updates in wire order and keeps the reference
+rules:
 
-- Plan operations, compaction and notices, and end-turn token usage, which are
-  carried inside session updates and may need projection helpers rather than
-  request facades: #31.
+- `plan` replaces the session's plan entries, `plan_update` replaces the plan
+  payload, and `plan_removed` clears it.
+- `compaction_update` upserts by compaction id and its summary is a complete
+  replacement; `compaction_summary_chunk` appends to that compaction. Compactions
+  keep first-seen order.
+- `notice` is a live event rather than history: `Notices` peeks and
+  `DrainNotices` consumes.
+- `usage_update` keeps the latest end-turn token usage (used, size, cost).
 
 MCP-over-ACP for the v1 surface landed as `github.com/BrokkAi/acp-go/mcp`,
 mirroring `v2/mcp`: session create, resume, and fork helpers that
 accept the unstable server transports, including the native `acp` variant.
+
+That completes the typed-facade surface called out by #10 and #31.
