@@ -62,6 +62,14 @@ The fuzz seed corpus runs as part of that command; see
 [CONTRIBUTING.md](CONTRIBUTING.md) for longer campaigns and opt-in tests
 against real ACP agents.
 
+`github.com/BrokkAi/acp-go/acptest` is the standard-library-only test harness.
+`acptest.NewPair` returns an in-memory duplex transport that either a v1
+`acp.Connection` or a draft-v2 `v2.Connection` can drive; `acptest.TestAgent`
+executes deterministic typed prompt commands (`acptest.Command`), and the
+package also ships v1/draft-v2 fake agents plus framing helpers (`Serve`,
+`WriteRequest`, `ReadResponse`) for protocol-router tests. The router tests
+themselves consume it, so the harness cannot drift.
+
 ## Agent runtime
 
 `github.com/BrokkAi/acp-go/agent` serves an agent over stdio. Implement the

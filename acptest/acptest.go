@@ -1,8 +1,17 @@
-// Package routertest provides shared v1/v2 fake agents and in-memory framing
-// helpers for the protocol-router tests. It deliberately does not import the
-// router packages, so router tests can use these fixtures without creating an
-// import cycle.
-package routertest
+// Package acptest is the standard-library-only test harness for ACP clients,
+// agents, and the protocol routers. It deliberately does not import the router
+// packages, so router tests can use these fixtures without creating an import
+// cycle.
+//
+// The harness covers three layers:
+//
+//   - Pipe/Endpoint: one in-memory duplex transport that any v1 or draft-v2
+//     connection can use, with the release's newline-delimited framing.
+//   - Serve/WriteRequest/WriteInitialize/ReadResponse: framing helpers for
+//     tests that drive a router or agent over that transport.
+//   - V1Agent/V2Agent/AgentHandler/ProxyFunc and Command/TestAgent: fake
+//     implementations, including deterministic typed prompt commands.
+package acptest
 
 import (
 	"bufio"
@@ -73,6 +82,14 @@ func WriteRequest(t testing.TB, rw *bufio.ReadWriter, id int, method string, par
 func WriteInitialize(t testing.TB, rw *bufio.ReadWriter, params any) {
 	t.Helper()
 	WriteRequest(t, rw, 1, schema1.InitializeMethodName, params)
+}
+
+// ReadResponse decodes one JSON-RPC frame from the router's peer stream.
+func ReadResponse(t testing.TB, rw *bufio.ReadWriter, value any) {
+	t.Helper()
+	if err := json.NewDecoder(rw).Decode(value); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // V1Agent is a minimal v1 agent.Agent for router fixtures. Requests, when

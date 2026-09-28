@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/BrokkAi/acp-go/internal/routertest"
+	"github.com/BrokkAi/acp-go/acptest"
 	schema1 "github.com/BrokkAi/acp-go/schema"
 	schema2 "github.com/BrokkAi/acp-go/schema/v2"
 )
@@ -13,15 +13,15 @@ import (
 // startRouter serves router over the shared in-memory pipe harness.
 func startRouter(t *testing.T, router *Agent) *bufio.ReadWriter {
 	t.Helper()
-	return routertest.Serve(t, router.Serve)
+	return acptest.Serve(t, router.Serve)
 }
 
 func TestRouterRoutesFutureVersionToV2(t *testing.T) {
 	requests := make(chan schema2.InitializeRequest, 1)
 	rw := startRouter(t, New().
-		WithV1(&routertest.V1Agent{Requests: nil}).
-		WithV2(&routertest.V2Agent{Requests: requests}))
-	routertest.WriteInitialize(t, rw, map[string]any{
+		WithV1(&acptest.V1Agent{Requests: nil}).
+		WithV2(&acptest.V2Agent{Requests: requests}))
+	acptest.WriteInitialize(t, rw, map[string]any{
 		"protocolVersion":        3,
 		"info":                   map[string]any{"name": "future-client", "version": "3.0"},
 		"_futureInitializeField": map[string]any{"future": true},
@@ -55,8 +55,8 @@ func TestRouterRoutesFutureVersionToV2(t *testing.T) {
 
 func TestRouterCanonicalizesV2ToConfiguredV1(t *testing.T) {
 	requests := make(chan schema1.InitializeRequest, 1)
-	rw := startRouter(t, New().WithV1(&routertest.V1Agent{Requests: requests}))
-	routertest.WriteInitialize(t, rw, map[string]any{
+	rw := startRouter(t, New().WithV1(&acptest.V1Agent{Requests: requests}))
+	acptest.WriteInitialize(t, rw, map[string]any{
 		"protocolVersion": 2,
 		"capabilities": map[string]any{
 			"auth":        map[string]any{"terminal": map[string]any{}},
@@ -99,7 +99,7 @@ func TestRouterCanonicalizesV2ToConfiguredV1(t *testing.T) {
 
 func TestRouterPreservesFramesBufferedAfterInitialize(t *testing.T) {
 	requests := make(chan schema2.InitializeRequest, 1)
-	rw := startRouter(t, New().WithV2(&routertest.V2Agent{Requests: requests}))
+	rw := startRouter(t, New().WithV2(&acptest.V2Agent{Requests: requests}))
 	initialize, err := json.Marshal(map[string]any{
 		"protocolVersion": 2,
 		"info":            map[string]any{"name": "client", "version": "1"},
@@ -141,8 +141,8 @@ func TestRouterPreservesFramesBufferedAfterInitialize(t *testing.T) {
 }
 
 func TestRouterRejectsMalformedProtocolVersion(t *testing.T) {
-	rw := startRouter(t, New().WithV2(&routertest.V2Agent{Requests: make(chan schema2.InitializeRequest, 1)}))
-	routertest.WriteInitialize(t, rw, map[string]any{
+	rw := startRouter(t, New().WithV2(&acptest.V2Agent{Requests: make(chan schema2.InitializeRequest, 1)}))
+	acptest.WriteInitialize(t, rw, map[string]any{
 		"protocolVersion": 100000,
 		"info":            map[string]any{"name": "client", "version": "1"},
 	})
@@ -162,7 +162,7 @@ func TestRouterRejectsMalformedProtocolVersion(t *testing.T) {
 
 func TestRouterValidatesInitializeBeforeBatchDispatch(t *testing.T) {
 	requests := make(chan schema2.InitializeRequest, 1)
-	rw := startRouter(t, New().WithV2(&routertest.V2Agent{Requests: requests}))
+	rw := startRouter(t, New().WithV2(&acptest.V2Agent{Requests: requests}))
 	batch, err := json.Marshal([]map[string]any{
 		{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": 2}},
 		{"jsonrpc": "2.0", "id": 2, "method": "session/list", "params": map[string]any{}},
@@ -199,7 +199,7 @@ func TestRouterValidatesInitializeBeforeBatchDispatch(t *testing.T) {
 
 func TestRouterAcceptsInitialBatchAndPreservesFutureNotification(t *testing.T) {
 	requests := make(chan schema2.InitializeRequest, 1)
-	rw := startRouter(t, New().WithV2(&routertest.V2Agent{Requests: requests}))
+	rw := startRouter(t, New().WithV2(&acptest.V2Agent{Requests: requests}))
 	batch, err := json.Marshal([]map[string]any{
 		{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
 			"protocolVersion": 2,

@@ -34,9 +34,12 @@ series, minor releases may contain breaking API changes.
   runner (`TestRealAgentV2Prompt`), which probes the agent and skips unless it
   advertises ACP v2. `TestRealAgentPrompt` keeps covering the v1 runner against
   the same command.
-- `internal/routertest` provides shared protocol-router fixtures: an in-memory
-  framing harness plus v1 and draft-v2 fake agents, used by the agent, proxy,
-  and client router tests.
+- `github.com/BrokkAi/acp-go/acptest` is the standard-library-only test harness:
+  an in-memory duplex `Pair` transport any v1 or draft-v2 connection can use,
+  deterministic typed prompt commands through `TestAgent`, raw framing helpers
+  (`Serve`, `WriteRequest`, `WriteInitialize`, `ReadResponse`), and v1/draft-v2
+  fake agents. The agent, proxy, and client router tests consume it instead of
+  hand-rolled framing.
 - `docs/schema-pin-workflow.md` documents the reviewed process for moving a Rust
   schema pin: regenerate both artifacts, review the generated API diff, record
   it in this changelog, and validate before the pins move together.

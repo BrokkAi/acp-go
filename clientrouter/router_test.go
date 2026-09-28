@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/BrokkAi/acp-go"
-	"github.com/BrokkAi/acp-go/internal/routertest"
+	"github.com/BrokkAi/acp-go/acptest"
 	schema2 "github.com/BrokkAi/acp-go/schema/v2"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
 )
@@ -79,7 +79,7 @@ func agentFactory(protocol uint16, opens *atomic.Int32) AgentConnection {
 		deadline := time.Now().Add(5 * time.Second)
 		_ = local.SetDeadline(deadline)
 		_ = peer.SetDeadline(deadline)
-		_ = acp.Connect(local, local, routertest.AgentHandler(protocol), nil)
+		_ = acp.Connect(local, local, acptest.AgentHandler(protocol), nil)
 		return peer, nil
 	}
 }

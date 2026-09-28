@@ -104,9 +104,9 @@ only remaining work.
 - Optional credential-backed v2 integration coverage: the draft-v2 runner is
   exercised against a real adapter when it advertises v2, and the CI integration
   job runs the v1 and v2 tests together.
-- Shared protocol-router fixtures (`internal/routertest`): one in-memory framing
-  harness plus v1 and draft-v2 fake agents used by the agent, proxy, and client
-  router tests.
+- Test harness (`acptest`): an in-memory duplex transport, deterministic typed
+  prompt commands, framing helpers, and v1/draft-v2 fake agents shared by the
+  agent, proxy, and client router tests.
 - Schema pin-change workflow (`docs/schema-pin-workflow.md`): regenerate both
   artifacts and review the generated API diff before either pin moves.
 - Semantic validation at the typed facade boundaries

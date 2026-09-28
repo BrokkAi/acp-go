@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BrokkAi/acp-go/internal/routertest"
+	"github.com/BrokkAi/acp-go/acptest"
 )
 
 type recordingProxy struct {
@@ -42,7 +42,7 @@ func (p recordingProxy) Serve(_ context.Context, in io.ReadCloser, out io.WriteC
 
 func start(t *testing.T, router *Router) *bufio.ReadWriter {
 	t.Helper()
-	return routertest.Serve(t, router.Serve)
+	return acptest.Serve(t, router.Serve)
 }
 
 func TestProxyRouterRequiresExactVersion(t *testing.T) {
@@ -90,7 +90,7 @@ func TestProxyRouterRequiresExactVersion(t *testing.T) {
 func TestProxyRouterPreservesInitialBatchAndFutureFields(t *testing.T) {
 	started := make(chan string, 1)
 	seen := make(chan map[string]json.RawMessage, 1)
-	proxy := routertest.ProxyFunc(func(ctx context.Context, in io.ReadCloser, out io.WriteCloser) error {
+	proxy := acptest.ProxyFunc(func(ctx context.Context, in io.ReadCloser, out io.WriteCloser) error {
 		defer in.Close()
 		var batch []map[string]json.RawMessage
 		if err := json.NewDecoder(in).Decode(&batch); err != nil {
@@ -159,7 +159,7 @@ func TestProxyRouterRejectsFutureVersion(t *testing.T) {
 }
 
 func TestProxyRouterValidatesExactV2Schema(t *testing.T) {
-	rw := start(t, New().WithV2(routertest.ProxyFunc(func(context.Context, io.ReadCloser, io.WriteCloser) error {
+	rw := start(t, New().WithV2(acptest.ProxyFunc(func(context.Context, io.ReadCloser, io.WriteCloser) error {
 		t.Error("invalid v2 proxy initialize must not reach implementation")
 		return nil
 	})))

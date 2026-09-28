@@ -42,7 +42,8 @@ hand-roll framing.
 Decision: port the parts that stay standard-library-only — an importable
 in-memory duplex transport, `testy`-style deterministic prompt commands, and
 v1/v2 fake-agent fixtures shared by the router packages. The MCP echo server and
-the `rmcp`-based pieces are out of scope. Follow-up: #21.
+the `rmcp`-based pieces are out of scope. Delivered as
+`github.com/BrokkAi/acp-go/acptest` (#21).
 
 ## `agent-client-protocol-cookbook` — port as documentation
 
