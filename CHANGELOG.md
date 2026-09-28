@@ -64,6 +64,11 @@ series, minor releases may contain breaking API changes.
   capability-gated `StartNes`, `SuggestNes`, `AcceptNes`, `RejectNes`, and
   `CloseNes`, plus agent-side `NesHandler` dispatch through `Handle` (requests)
   and `HandleNesNotifications` (notifications).
+- New opt-in `github.com/BrokkAi/acp-go/mcp` package is the v1 counterpart to
+  `v2/mcp`: `NewSession`, `ResumeSession`, and `ForkSession` accept the unstable
+  MCP server transports, including the native `acp` variant the stable v1 schema
+  does not model, with capability gating, absolute-path checks, and server
+  validation. `unstable.ForkSession` points callers at it for MCP servers.
 
 ## 0.10.0 - 2026-09-23
 

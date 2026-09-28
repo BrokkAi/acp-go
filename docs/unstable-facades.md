@@ -36,7 +36,10 @@ providers, err := unstable.ListProviders(ctx, connection, initialization)
 The evaluation of #10 called out more features than one focused change can
   carry. These are tracked separately so each keeps its own review:
 
-- MCP-over-ACP for the v1 surface, mirroring the existing `v2/mcp` opt-in: #30.
 - Plan operations, compaction and notices, and end-turn token usage, which are
   carried inside session updates and may need projection helpers rather than
   request facades: #31.
+
+MCP-over-ACP for the v1 surface landed as `github.com/BrokkAi/acp-go/mcp`,
+mirroring `v2/mcp`: session create, resume, and fork helpers that
+accept the unstable server transports, including the native `acp` variant.
