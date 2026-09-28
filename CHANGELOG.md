@@ -72,6 +72,12 @@ series, minor releases may contain breaking API changes.
   MCP server transports, including the native `acp` variant the stable v1 schema
   does not model, with capability gating, absolute-path checks, and server
   validation. `unstable.ForkSession` points callers at it for MCP servers.
+- New `github.com/BrokkAi/acp-go/traceviewer` package and `cmd/acp-trace-viewer`
+  command render a JSONL transcript as an ordered sequence diagram over
+  `net/http`, with an embedded page and no external assets. `FileSource`
+  re-reads the transcript on every poll for live updates and `Memory` serves
+  events pushed by a host; `traceviewer.Open` launches the platform browser on
+  request.
 
 ## 0.10.0 - 2026-09-23
 

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ACP trace</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.hint { margin: 0 0 20px; opacity: 0.7; }
+  ol { list-style: none; margin: 0; padding: 0; border-left: 2px solid #8884; }
+  li { position: relative; padding: 8px 0 8px 20px; }
+  li::before { content: ""; position: absolute; left: -7px; top: 16px; width: 12px; height: 12px; border-radius: 50%; background: #2b7; }
+  code { font-weight: 600; }
+  .direction { opacity: 0.7; font-weight: 400; margin-left: 6px; }
+  pre { margin: 4px 0 0; padding: 8px; background: #8881; border-radius: 6px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>ACP trace</h1>
+<p class="hint">Events in wire order. The page refreshes from <code>/events</code> every second, so a live session updates in place.</p>
+<ol id="steps"></ol>
+<script>
+async function refresh() {
+  let payload;
+  try {
+    const response = await fetch("events", { cache: "no-store" });
+    if (!response.ok) return;
+    payload = await response.json();
+  } catch (error) {
+    return;
+  }
+  const steps = document.getElementById("steps");
+  steps.replaceChildren(...payload.events.map((event) => {
+    const item = document.createElement("li");
+    const label = document.createElement("code");
+    label.textContent = event.label;
+    if (event.direction) {
+      const direction = document.createElement("span");
+      direction.className = "direction";
+      direction.textContent = event.direction;
+      label.append(direction);
+    }
+    const raw = document.createElement("pre");
+    raw.textContent = JSON.stringify(event.raw);
+    item.append(label, raw);
+    return item;
+  }));
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

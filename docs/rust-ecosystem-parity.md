@@ -70,7 +70,7 @@ them; debugging means reading raw JSON lines.
 Decision: port as an explicit opt-in tool — `net/http` for the server, an
 embedded asset for the page, and a JSONL/in-memory event source. This is a
 debugging tool, not a transport, and must not change the standard-library stdio
-default. Follow-up: #23.
+default. Delivered as `github.com/BrokkAi/acp-go/traceviewer` (#23).
 
 ## `agent-client-protocol-conductor` — port as a CLI
 

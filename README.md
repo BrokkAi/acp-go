@@ -235,6 +235,20 @@ its `env` overrides the configured environment), then reconnect and initialize
 again before `Runner.Execute`. Never pass a terminal method ID to
 `Connection.Authenticate`.
 
+## Trace viewer
+
+`github.com/BrokkAi/acp-go/traceviewer` and `cmd/acp-trace-viewer` render a JSONL
+transcript (the files `clienthost` writes) as an ordered sequence diagram over
+`net/http`, with an embedded page and no external assets:
+
+```sh
+go run ./cmd/acp-trace-viewer -addr 127.0.0.1:8787 session.jsonl
+```
+
+`FileSource` re-reads the transcript on every poll, so a live session updates in
+place, and `Memory` serves events pushed by a host. This is a developer tool, not
+a transport: the SDK still speaks stdio by default.
+
 ## Draft HTTP transport
 
 `github.com/BrokkAi/acp-go/transport/http` is an explicit, opt-in binding for the
