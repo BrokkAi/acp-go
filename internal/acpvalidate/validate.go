@@ -11,6 +11,7 @@ package acpvalidate
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -19,6 +20,15 @@ import (
 func Identifier(kind, value string) error {
 	if strings.TrimSpace(value) == "" {
 		return fmt.Errorf("%s is required", kind)
+	}
+	return nil
+}
+
+// AbsolutePath requires the ACP absolute-path newtype: a path that is absolute
+// for the host running the client.
+func AbsolutePath(kind, value string) error {
+	if !filepath.IsAbs(value) {
+		return fmt.Errorf("%s must be absolute: %q", kind, value)
 	}
 	return nil
 }
