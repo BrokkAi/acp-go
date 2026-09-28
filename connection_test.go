@@ -113,6 +113,60 @@ func TestOutgoingCancellationAndUnknownMethod(t *testing.T) {
 		t.Fatalf("missing method-not-found: %+v", p)
 	}
 }
+
+func TestCancelRequestSendsTypedNotification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		id   any
+		want string
+	}{
+		{name: "string", id: "wait", want: `"wait"`},
+		{name: "integer", id: 7, want: `7`},
+		{name: "raw", id: json.RawMessage(`"agent-3"`), want: `"agent-3"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, peer := pipeClient(t, nil, nil)
+			seen := make(chan packet, 1)
+			go func() {
+				var p packet
+				if err := json.NewDecoder(peer).Decode(&p); err == nil {
+					seen <- p
+				}
+			}()
+			if err := c.CancelRequest(context.Background(), tc.id); err != nil {
+				t.Fatalf("CancelRequest: %v", err)
+			}
+			var p packet
+			select {
+			case p = <-seen:
+			case <-time.After(time.Second):
+				t.Fatal("missing $/cancel_request frame")
+			}
+			if p.Method != "$/cancel_request" || len(p.ID) != 0 {
+				t.Fatalf("unexpected frame: %+v", p)
+			}
+			var params struct {
+				RequestID json.RawMessage `json:"requestId"`
+			}
+			if err := json.Unmarshal(p.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			if string(params.RequestID) != tc.want {
+				t.Fatalf("requestId = %s, want %s", params.RequestID, tc.want)
+			}
+		})
+	}
+}
+
+func TestCancelRequestRejectsInvalidIDs(t *testing.T) {
+	c, _ := pipeClient(t, nil, nil)
+	for _, id := range []any{nil, "", json.RawMessage(``), json.RawMessage(`null`), struct{}{}} {
+		if err := c.CancelRequest(context.Background(), id); err == nil {
+			t.Fatalf("expected error for %#v", id)
+		}
+	}
+}
+
 func TestInvalidFrameAndBlockedWriter(t *testing.T) {
 	t.Run("malformed", func(t *testing.T) {
 		c, peer := pipeClient(t, nil, nil)

@@ -288,3 +288,55 @@ func TestV2PromptRejectsMissingUserMessageID(t *testing.T) {
 		t.Fatalf("prompt error = %v", err)
 	}
 }
+
+// TestV2CancelRequestReusesTransportHelper covers the acceptance criterion that
+// the typed cancellation helper is available on both the v1 and draft-v2
+// transports: the v2 client embeds the shared root Connection, so its promoted
+// CancelRequest must emit the same $/cancel_request notification.
+func TestV2CancelRequestReusesTransportHelper(t *testing.T) {
+	local, peer := net.Pipe()
+	deadline := time.Now().Add(5 * time.Second)
+	_ = local.SetDeadline(deadline)
+	_ = peer.SetDeadline(deadline)
+	client := Connect(local, local, nil, nil)
+	t.Cleanup(func() { _ = client.Close(); _ = peer.Close() })
+
+	seen := make(chan struct {
+		method string
+		id     json.RawMessage
+	}, 1)
+	go func() {
+		var frame struct {
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(peer).Decode(&frame); err != nil {
+			return
+		}
+		var params struct {
+			RequestID json.RawMessage `json:"requestId"`
+		}
+		if err := json.Unmarshal(frame.Params, &params); err != nil {
+			return
+		}
+		seen <- struct {
+			method string
+			id     json.RawMessage
+		}{method: frame.Method, id: params.RequestID}
+	}()
+
+	if err := client.CancelRequest(context.Background(), "v2-wait"); err != nil {
+		t.Fatalf("CancelRequest: %v", err)
+	}
+	select {
+	case frame := <-seen:
+		if frame.method != schema.CancelRequestMethodName {
+			t.Fatalf("method = %q", frame.method)
+		}
+		if string(frame.id) != `"v2-wait"` {
+			t.Fatalf("requestId = %s", frame.id)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing $/cancel_request frame")
+	}
+}
