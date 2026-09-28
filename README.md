@@ -113,6 +113,18 @@ plan operations, session fork/compaction/notices, and end-turn token usage. The
 stable `schema` and `schema/v2` packages do not import or expose those generated
 types.
 
+## Trace context
+
+`github.com/BrokkAi/acp-go/tracecontext` sets and extracts the root-level
+`_meta` keys `traceparent`, `tracestate`, and `baggage` that the ACP
+extensibility conventions reserve for W3C Trace Context, so MCP and
+OpenTelemetry integrations can correlate ACP requests, responses, and
+notifications with the surrounding trace. `IntoMeta` and `FromMeta` operate on
+the generated `schema.Meta` and `v2.Meta` maps (and the draft-v2
+`Nullable[Meta]` field that wraps them), while `ValidTraceparent` checks the
+fixed W3C grammar without parsing the opaque `tracestate` or `baggage` values.
+The package is standard-library only.
+
 ## Draft ACP v2
 
 `github.com/BrokkAi/acp-go/v2` is a separate draft client for ACP v2, pinned
