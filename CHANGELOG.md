@@ -25,6 +25,11 @@ series, minor releases may contain breaking API changes.
   out-of-band interactive login a terminal method requires: find the advertised
   method, build the configured agent command with the method's args and env,
   run it in the user's terminal, then reconnect and initialize.
+- `docs/rust-ecosystem-parity.md` records whether each reference Rust workspace
+  crate without a Go equivalent should be ported. It breaks out follow-up issues
+  for the test harness (#21), cookbook (#22), trace viewer (#23), and conductor
+  (#24), and records the `agent-client-protocol-rmcp` bridge as won't port
+  because it requires a third-party MCP SDK.
 
 ## 0.10.0 - 2026-09-23
 
