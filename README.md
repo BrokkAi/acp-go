@@ -170,10 +170,13 @@ go run ./examples/v2-one-shot-client \
 ```
 
 MCP-over-ACP remains an explicit draft opt-in through
-`github.com/BrokkAi/acp-go/v2/mcp`, matching the Rust SDK's separately gated
-`unstable_mcp_over_acp` feature. Generated protocol versions and error codes use
-the schema's exact integer widths; in particular, `ProtocolVersion` is a
-`uint16`, so strings and values above 65535 fail to decode.
+`github.com/BrokkAi/acp-go/v2/mcp` (draft v2) and
+`github.com/BrokkAi/acp-go/mcp` (v1), matching the Rust SDK's separately gated
+`unstable_mcp_over_acp` feature; the v1 package is what carries the native
+`acp` server transport that the stable v1 schema does not model. Generated
+protocol versions and error codes use the schema's exact integer widths; in
+particular, `ProtocolVersion` is a `uint16`, so strings and values above 65535
+fail to decode.
 
 `github.com/BrokkAi/acp-go/agentrouter` serves one endpoint with explicit v1 and
 v2 implementations. It selects the highest configured implementation compatible

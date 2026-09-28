@@ -86,7 +86,7 @@ func ForkSession(ctx context.Context, connection *acp.Connection, initialization
 		}
 	}
 	if len(request.MCPServers) > 0 {
-		return result, fmt.Errorf("MCP servers require an explicit MCP package import")
+		return result, fmt.Errorf("MCP servers require the explicit github.com/BrokkAi/acp-go/mcp package")
 	}
 	if err := connection.Call(ctx, schema.SessionForkMethodName, request, &result); err != nil {
 		return result, err
