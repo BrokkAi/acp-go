@@ -13,6 +13,12 @@ series, minor releases may contain breaking API changes.
   transport and the draft-v2 client that embeds it. Request IDs may be given as
   a string, an integer, or a `json.RawMessage` for exact wire bytes; null,
   empty, and non-scalar IDs are rejected.
+- `github.com/BrokkAi/acp-go/tracecontext` gains `IntoMeta` and `FromMeta` for
+  the root-level `_meta` keys `traceparent`, `tracestate`, and `baggage` that
+  the ACP extensibility conventions reserve for W3C Trace Context, plus
+  `ValidTraceparent` for the fixed `traceparent` grammar. The helpers work on
+  the generated v1 `Meta` and draft-v2 `Nullable[Meta]` fields with no new
+  dependencies.
 
 ## 0.10.0 - 2026-09-23
 
