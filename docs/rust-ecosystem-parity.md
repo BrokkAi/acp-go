@@ -24,7 +24,7 @@ is recorded as *won't port* even when the Rust crate itself is valuable.
 | `agent-client-protocol-test` | Port the standard-library-compatible core | [#21](https://github.com/BrokkAi/acp-go/issues/21) |
 | `agent-client-protocol-cookbook` | Port the guides as a Go cookbook | [#22](https://github.com/BrokkAi/acp-go/issues/22) |
 | `agent-client-protocol-trace-viewer` | Port as an opt-in standard-library tool | [#23](https://github.com/BrokkAi/acp-go/issues/23) |
-| `agent-client-protocol-conductor` | Port as an opt-in standard-library CLI | [#24](https://github.com/BrokkAi/acp-go/issues/24) |
+| `agent-client-protocol-conductor` | Won't port (revisit if a Go consumer appears) | [#24](https://github.com/BrokkAi/acp-go/issues/24) |
 | `agent-client-protocol-rmcp` | Won't port | none |
 
 ## `agent-client-protocol-test` — port the core
@@ -72,19 +72,26 @@ embedded asset for the page, and a JSONL/in-memory event source. This is a
 debugging tool, not a transport, and must not change the standard-library stdio
 default. Delivered as `github.com/BrokkAi/acp-go/traceviewer` (#23).
 
-## `agent-client-protocol-conductor` — port as a CLI
+## `agent-client-protocol-conductor` — won't port
 
 A binary that spawns a chain of proxy components plus the base agent, routes
 `_proxy/successor` envelopes between them, and presents the chain to the editor
-as a single ACP agent, tearing the whole chain down on any component exit.
-It depends on the trace viewer, `tokio`, `clap`, and `chrono`.
+as a single ACP agent.
 
-`acp-go` has `proxyrouter`, `agentrouter`, and `clientrouter` to *select* a
-protocol implementation, but nothing that *runs* a proxy chain.
+It is an application, not a library. Its only consumer is an editor pointed at a
+binary, and no Go proxy components or Go proxy-chain users exist to consume one.
+The wire shape is also untrackable here: `_proxy/*` appears nowhere in the
+pinned schema (`schema/unstable`, `schema/v2/unstable`, or their method
+registries), the Rust `SuccessorMessage` lives in that crate's own
+`schema/proxy_protocol.rs`, and the reference design document is explicitly
+historical. A Go conductor would hand-model a shape the pin-and-regenerate
+discipline cannot keep in sync.
 
-Decision: port the orchestration as an opt-in standard-library command that
-spawns components without a shell, routes the `_proxy/successor` envelope, and
-owns child-process teardown. Follow-up: #24.
+`acp-go` already ships the producer side: `proxyrouter` lets an application write
+a Go proxy that the reference conductor can orchestrate. If a concrete Go
+consumer for proxy chains appears, revisit with a library helper in
+`proxyrouter` for `_proxy/successor` routing, driven by that consumer, rather
+than a speculative CLI. Recorded as not planned in #24.
 
 ## `agent-client-protocol-rmcp` — won't port
 

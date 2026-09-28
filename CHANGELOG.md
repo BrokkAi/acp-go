@@ -27,9 +27,12 @@ series, minor releases may contain breaking API changes.
   run it in the user's terminal, then reconnect and initialize.
 - `docs/rust-ecosystem-parity.md` records whether each reference Rust workspace
   crate without a Go equivalent should be ported. It breaks out follow-up issues
-  for the test harness (#21), cookbook (#22), trace viewer (#23), and conductor
-  (#24), and records the `agent-client-protocol-rmcp` bridge as won't port
-  because it requires a third-party MCP SDK.
+  for the test harness (#21, delivered as `acptest`), cookbook (#22), trace
+  viewer (#23, delivered as `traceviewer`), and conductor (#24), and records two
+  won't ports with their rationale: the `agent-client-protocol-rmcp` bridge,
+  which requires a third-party MCP SDK, and the proxy-chain conductor, which is
+  an application with no Go consumer on a wire shape the pinned schema does not
+  cover.
 - The optional credential-backed integration job now also runs the draft-v2
   runner (`TestRealAgentV2Prompt`), which probes the agent and skips unless it
   advertises ACP v2. `TestRealAgentPrompt` keeps covering the v1 runner against

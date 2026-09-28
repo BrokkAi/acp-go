@@ -136,15 +136,16 @@ Work:
 
 [docs/rust-ecosystem-parity.md](docs/rust-ecosystem-parity.md) evaluates the
 reference workspace crates that have no Go equivalent and records one decision
-per crate:
+per crate. The test harness (`acptest`) and the trace viewer (`traceviewer`)
+are done; the remaining port is:
 
-- reusable test harness (in-memory transport, shared v1/v2 fake agents): #21.
 - cookbook of client, proxy, and agent patterns: #22.
-- JSONL transcript trace viewer: #23.
-- proxy-chain conductor CLI: #24.
-- `agent-client-protocol-rmcp`: won't port; it needs a third-party MCP SDK.
 
-Every port stays standard-library-only and behind its own package or command.
+Two crates are recorded as won't port: the `agent-client-protocol-rmcp` bridge,
+which needs a third-party MCP SDK, and the proxy-chain conductor, which is an
+application with no Go consumer and whose `_proxy/*` wire shape the pinned
+schema does not cover. Every port stays standard-library-only and behind its own
+package or command.
 
 ## Guardrails
 
