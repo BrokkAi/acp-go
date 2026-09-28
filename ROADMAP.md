@@ -139,6 +139,20 @@ Work:
 - Add protocol-router fixtures shared by v1 and v2 fake agents.
 - Track each Rust schema pin change as a reviewed regeneration and API diff.
 
+### 4. Rust ecosystem crate ports
+
+[docs/rust-ecosystem-parity.md](docs/rust-ecosystem-parity.md) evaluates the
+reference workspace crates that have no Go equivalent and records one decision
+per crate:
+
+- reusable test harness (in-memory transport, shared v1/v2 fake agents): #21.
+- cookbook of client, proxy, and agent patterns: #22.
+- JSONL transcript trace viewer: #23.
+- proxy-chain conductor CLI: #24.
+- `agent-client-protocol-rmcp`: won't port; it needs a third-party MCP SDK.
+
+Every port stays standard-library-only and behind its own package or command.
+
 ## Guardrails
 
 - Standard library only; the dependency policy in
