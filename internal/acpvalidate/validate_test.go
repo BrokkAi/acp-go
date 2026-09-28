@@ -2,6 +2,22 @@ package acpvalidate
 
 import "testing"
 
+func TestAbsolutePath(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "/tmp/workspace", want: true},
+		{value: "relative/path", want: false},
+		{value: "", want: false},
+		{value: "./here", want: false},
+	} {
+		if err := AbsolutePath("path", tc.value); (err == nil) != tc.want {
+			t.Fatalf("AbsolutePath(%q) error = %v, want ok=%v", tc.value, err, tc.want)
+		}
+	}
+}
+
 func TestIdentifier(t *testing.T) {
 	for _, tc := range []struct {
 		value string

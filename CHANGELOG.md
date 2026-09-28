@@ -54,6 +54,12 @@ series, minor releases may contain breaking API changes.
   `agent.Runtime` entry, so stdio stays the default and no transport falls back
   to another. Draft limits (no WebSocket, CORS, per-session streams, or batch
   bodies) are documented in `docs/http-transport.md`.
+- New opt-in `github.com/BrokkAi/acp-go/unstable` package starts the typed
+  facades for optional methods: capability-gated `ListProviders`, `SetProvider`,
+  `DisableProvider`, and `ForkSession` client helpers plus agent-side
+  `ProviderHandler`/`ForkHandler` dispatch through `Handle`. The remaining
+  surfaces called out by #10 (NES, MCP-over-ACP for v1, and the session-update
+  features) are tracked separately in `docs/unstable-facades.md`.
 
 ## 0.10.0 - 2026-09-23
 
