@@ -206,3 +206,132 @@ func TestHandleDispatchesUnstableMethods(t *testing.T) {
 		t.Fatal("malformed params were accepted")
 	}
 }
+
+func nesInitialization() schema.InitializeResponse {
+	return schema.InitializeResponse{AgentCapabilities: &schema.AgentCapabilities{
+		Nes: &schema.NesCapabilities{},
+	}}
+}
+
+func TestNesFacadesGateAndEncode(t *testing.T) {
+	ctx := context.Background()
+	t.Run("capability gate", func(t *testing.T) {
+		connection, requests := fixture(t, func(string) any { return map[string]any{} })
+		if _, err := acpunstable.StartNes(ctx, connection, schema.InitializeResponse{}, schema.StartNesRequest{}); err == nil {
+			t.Fatal("nes/start without the capability was allowed")
+		}
+		if err := acpunstable.AcceptNes(ctx, connection, schema.InitializeResponse{}, schema.AcceptNesNotification{SessionID: "s", ID: "i"}); err == nil {
+			t.Fatal("nes/accept without the capability was allowed")
+		}
+		select {
+		case request := <-requests:
+			t.Fatalf("capability gate wrote %s to the wire", request.method)
+		default:
+		}
+	})
+
+	t.Run("requests and notifications", func(t *testing.T) {
+		connection, requests := fixture(t, func(method string) any {
+			if method == schema.NesStartMethodName {
+				return schema.StartNesResponse{SessionID: "nes-1"}
+			}
+			return map[string]any{}
+		})
+		initialization := nesInitialization()
+		started, err := acpunstable.StartNes(ctx, connection, initialization, schema.StartNesRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if started.SessionID != "nes-1" {
+			t.Fatalf("NES session = %q", started.SessionID)
+		}
+		if request := <-requests; request.method != schema.NesStartMethodName {
+			t.Fatalf("method = %s", request.method)
+		}
+		if _, err := acpunstable.SuggestNes(ctx, connection, initialization, schema.SuggestNesRequest{SessionID: "nes-1", URI: "file:///tmp/x"}); err != nil {
+			t.Fatal(err)
+		}
+		if request := <-requests; request.method != schema.NesSuggestMethodName {
+			t.Fatalf("method = %s", request.method)
+		}
+		if _, err := acpunstable.SuggestNes(ctx, connection, initialization, schema.SuggestNesRequest{SessionID: "nes-1", URI: "relative"}); err == nil {
+			t.Fatal("relative document URI was allowed")
+		}
+		if err := acpunstable.AcceptNes(ctx, connection, initialization, schema.AcceptNesNotification{SessionID: "nes-1", ID: "sug"}); err != nil {
+			t.Fatal(err)
+		}
+		if request := <-requests; request.method != schema.NesAcceptMethodName {
+			t.Fatalf("method = %s", request.method)
+		}
+		if err := acpunstable.RejectNes(ctx, connection, initialization, schema.RejectNesNotification{SessionID: "nes-1", ID: "sug"}); err != nil {
+			t.Fatal(err)
+		}
+		if request := <-requests; request.method != schema.NesRejectMethodName {
+			t.Fatalf("method = %s", request.method)
+		}
+		if _, err := acpunstable.CloseNes(ctx, connection, initialization, schema.CloseNesRequest{SessionID: "nes-1"}); err != nil {
+			t.Fatal(err)
+		}
+		if request := <-requests; request.method != schema.NesCloseMethodName {
+			t.Fatalf("method = %s", request.method)
+		}
+	})
+}
+
+type nesTestHandler struct {
+	accepted bool
+}
+
+func (h *nesTestHandler) StartNes(context.Context, schema.StartNesRequest) (schema.StartNesResponse, error) {
+	return schema.StartNesResponse{SessionID: "dispatched"}, nil
+}
+
+func (h *nesTestHandler) SuggestNes(context.Context, schema.SuggestNesRequest) (schema.SuggestNesResponse, error) {
+	return schema.SuggestNesResponse{}, nil
+}
+
+func (h *nesTestHandler) AcceptNes(context.Context, schema.AcceptNesNotification) error {
+	h.accepted = true
+	return nil
+}
+
+func (h *nesTestHandler) RejectNes(context.Context, schema.RejectNesNotification) error { return nil }
+
+func (h *nesTestHandler) CloseNes(context.Context, schema.CloseNesRequest) (schema.CloseNesResponse, error) {
+	return schema.CloseNesResponse{}, nil
+}
+
+func TestHandleDispatchesNes(t *testing.T) {
+	ctx := context.Background()
+	handler := &nesTestHandler{}
+	dispatch := acpunstable.Handle(func(context.Context, string, json.RawMessage) (any, error) {
+		return "next", nil
+	}, handler)
+	result, err := dispatch(ctx, schema.NesStartMethodName, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started, ok := result.(schema.StartNesResponse); !ok || started.SessionID != "dispatched" {
+		t.Fatalf("nes/start dispatch = %#v", result)
+	}
+	if result, err := dispatch(ctx, "session/new", json.RawMessage(`{}`)); err != nil || result != "next" {
+		t.Fatalf("fallthrough = %#v, %v", result, err)
+	}
+
+	notifications := acpunstable.HandleNesNotifications(nil, handler)
+	if err := notifications(schema.NesAcceptMethodName, json.RawMessage(`{"sessionId":"s","id":"i"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if !handler.accepted {
+		t.Fatal("nes/accept was not dispatched")
+	}
+	if err := notifications(schema.NesRejectMethodName, json.RawMessage(`{`)); err == nil {
+		t.Fatal("malformed nes/reject notification was accepted")
+	}
+	if err := notifications("session/update", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("unrelated notification = %v", err)
+	}
+	if _, err := acpunstable.Handle(nil, struct{}{})(ctx, schema.NesStartMethodName, json.RawMessage(`{}`)); err == nil {
+		t.Fatal("missing NES handler answered nes/start")
+	}
+}

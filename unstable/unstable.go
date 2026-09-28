@@ -128,6 +128,7 @@ type ForkHandler interface {
 func Handle(next acp.Handler, handler any) acp.Handler {
 	providers, _ := handler.(ProviderHandler)
 	fork, _ := handler.(ForkHandler)
+	nes, _ := handler.(NesHandler)
 	return func(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 		switch method {
 		case schema.ProvidersListMethodName:
@@ -166,6 +167,33 @@ func Handle(next acp.Handler, handler any) acp.Handler {
 				return nil, err
 			}
 			return fork.ForkSession(ctx, request)
+		case schema.NesStartMethodName:
+			if nes == nil {
+				return nil, methodNotFound(method)
+			}
+			request, err := decode[schema.StartNesRequest](raw)
+			if err != nil {
+				return nil, err
+			}
+			return nes.StartNes(ctx, request)
+		case schema.NesSuggestMethodName:
+			if nes == nil {
+				return nil, methodNotFound(method)
+			}
+			request, err := decode[schema.SuggestNesRequest](raw)
+			if err != nil {
+				return nil, err
+			}
+			return nes.SuggestNes(ctx, request)
+		case schema.NesCloseMethodName:
+			if nes == nil {
+				return nil, methodNotFound(method)
+			}
+			request, err := decode[schema.CloseNesRequest](raw)
+			if err != nil {
+				return nil, err
+			}
+			return nes.CloseNes(ctx, request)
 		default:
 			if next == nil {
 				return nil, methodNotFound(method)

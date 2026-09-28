@@ -60,6 +60,10 @@ series, minor releases may contain breaking API changes.
   `ProviderHandler`/`ForkHandler` dispatch through `Handle`. The remaining
   surfaces called out by #10 (NES, MCP-over-ACP for v1, and the session-update
   features) are tracked separately in `docs/unstable-facades.md`.
+- NES typed facades: `unstable` (v1) and `v2/unstable` (draft v2) gain
+  capability-gated `StartNes`, `SuggestNes`, `AcceptNes`, `RejectNes`, and
+  `CloseNes`, plus agent-side `NesHandler` dispatch through `Handle` (requests)
+  and `HandleNesNotifications` (notifications).
 
 ## 0.10.0 - 2026-09-23
 
