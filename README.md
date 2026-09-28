@@ -216,6 +216,14 @@ confirm the selection, malformed selector options, transport and context
 errors, and the legacy `unknown session mode` error, so a failure that matches
 none of these is not necessarily an agent rejection.
 
+Terminal-type authentication methods run outside the protocol connection:
+advertise them with `acp.TerminalAuthCapabilities()`, resolve the advertised
+method with `runner.TerminalAuthMethod`, run the configured agent program
+interactively with `runner.RunTerminalAuth` (the method's `args` are appended and
+its `env` overrides the configured environment), then reconnect and initialize
+again before `Runner.Execute`. Never pass a terminal method ID to
+`Connection.Authenticate`.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and our
