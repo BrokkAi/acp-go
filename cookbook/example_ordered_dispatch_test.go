@@ -117,11 +117,13 @@ func Example_orderedApplicationDispatch() {
 		case event.Resumed != nil:
 			if event.Resumed.Err != nil {
 				fmt.Println("resume failed:", event.Resumed.Err)
-				return
+			} else {
+				// The response is exposed only now, after its replay was applied.
+				fmt.Printf("resumed after %d replayed updates: %q\n", replayed, projection.Text())
 			}
-			// The response is exposed only now, after its replay was applied.
-			fmt.Printf("resumed after %d replayed updates: %q\n", replayed, projection.Text())
-			stopAgent() // The agent process exits; the client reads EOF next.
+			// Either way this observer is done: the agent process exits, and
+			// the client reads EOF next.
+			stopAgent()
 		case event.Closed:
 			fmt.Println("connection closed")
 		}

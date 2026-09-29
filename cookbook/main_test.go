@@ -33,5 +33,11 @@ func TestMain(m *testing.M) {
 // test binary as a v1 or draft-v2 fixture agent. Applications pass their real
 // agent command instead.
 func fixtureAgentProcess(version string) ([]string, map[string]string) {
-	return []string{os.Args[0]}, map[string]string{processAgentEnv: version}
+	// The runners start the agent in its workspace, so a relative os.Args[0]
+	// would resolve against the wrong directory.
+	executable, err := os.Executable()
+	if err != nil {
+		executable = os.Args[0]
+	}
+	return []string{executable}, map[string]string{processAgentEnv: version}
 }

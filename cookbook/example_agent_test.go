@@ -65,6 +65,14 @@ func (a *releaseAgent) Prompt(ctx context.Context, client agent.Client, request 
 		},
 	})
 	if ctx.Err() != nil {
+		// session/cancel: send the pending update that closes out the tool
+		// call, then end the turn. Updates still work after ctx ends.
+		failed := schema.ToolCallStatusFailed
+		if err := updates.Update(schema.SessionUpdate{ToolCallUpdate: &schema.ToolCallUpdate{
+			ToolCallID: "tag-release", Status: &failed,
+		}}); err != nil {
+			return schema.PromptResponse{}, err
+		}
 		return schema.PromptResponse{StopReason: schema.StopReasonCancelled}, nil
 	}
 	if err != nil {
@@ -91,7 +99,12 @@ func (a *releaseAgent) Prompt(ctx context.Context, client agent.Client, request 
 type approveOnce struct{}
 
 func (approveOnce) RequestPermission(_ context.Context, request schema.RequestPermissionRequest) (schema.RequestPermissionResponse, error) {
-	fmt.Println("permission requested:", *request.ToolCall.Title)
+	// Tool call update fields are optional; fall back to the required ID.
+	name := string(request.ToolCall.ToolCallID)
+	if request.ToolCall.Title != nil {
+		name = *request.ToolCall.Title
+	}
+	fmt.Println("permission requested:", name)
 	for _, option := range request.Options {
 		if option.Kind == schema.PermissionOptionKindAllowOnce {
 			return schema.RequestPermissionResponse{Outcome: schema.RequestPermissionOutcome{
@@ -116,8 +129,13 @@ func Example_buildingAnAgent() {
 		acp.SessionUpdates(func(update acp.Update) error {
 			switch {
 			case update.Update.ToolCall != nil:
-				fmt.Println("tool call:", update.Update.ToolCall.Title, *update.Update.ToolCall.Status)
-			case update.Update.ToolCallUpdate != nil:
+				status := "no status"
+				if update.Update.ToolCall.Status != nil {
+					status = string(*update.Update.ToolCall.Status)
+				}
+				fmt.Println("tool call:", update.Update.ToolCall.Title, status)
+			case update.Update.ToolCallUpdate != nil && update.Update.ToolCallUpdate.Status != nil:
+				// A nil field in a tool call update means unchanged.
 				fmt.Println("tool call update:", *update.Update.ToolCallUpdate.Status)
 			case update.Update.AgentMessageChunk != nil && update.Update.AgentMessageChunk.Content.Text != nil:
 				text.WriteString(update.Update.AgentMessageChunk.Content.Text.Text)

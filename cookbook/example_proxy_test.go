@@ -3,6 +3,7 @@ package cookbook_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,7 +25,9 @@ const (
 
 // successorMessage is the conductor's envelope for traffic between a proxy and
 // its successor. The pinned schema has no _proxy/* methods, so acp-go does not
-// generate it; this mirrors SuccessorMessage in the Rust SDK 2.2.0.
+// generate it; this mirrors SuccessorMessage in the Rust SDK 2.2.0. Like the
+// reference conductor, the proxy sets no envelope _meta and does not forward
+// it; the inner params, including their own _meta, pass through unchanged.
 type successorMessage struct {
 	Method string          `json:"method"`
 	Params json.RawMessage `json:"params"`
@@ -57,6 +60,10 @@ func (p toolsProxy) Serve(ctx context.Context, in io.ReadCloser, out io.WriteClo
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-link.connection.Done():
+		// End of input is a normal shutdown; anything else is reported.
+		if err := link.connection.Err(); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
+			return err
+		}
 		return nil
 	}
 }
@@ -94,7 +101,12 @@ func (l *proxyLink) request(ctx context.Context, method string, params json.RawM
 		}
 		l.toClient.flush(ctx)
 		var result json.RawMessage
-		if err := l.connection.Call(ctx, message.Method, message.Params, &result); err != nil {
+		err := l.connection.Call(ctx, message.Method, message.Params, &result)
+		// Client notifications sent before the client's answer, such as a
+		// session/cancel before a cancelled permission outcome, stay ahead of
+		// it on the way back to the successor.
+		l.toSuccessor.flush(ctx)
+		if err != nil {
 			return nil, err
 		}
 		return result, nil
@@ -150,6 +162,9 @@ func addMCPServer(params json.RawMessage, server schema.McpServer) (json.RawMess
 	var request map[string]json.RawMessage
 	if err := json.Unmarshal(params, &request); err != nil {
 		return nil, err
+	}
+	if request == nil {
+		return nil, errors.New("session setup params must be a JSON object")
 	}
 	var servers []json.RawMessage
 	if raw, ok := request["mcpServers"]; ok {

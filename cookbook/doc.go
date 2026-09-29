@@ -182,7 +182,9 @@
 // initializes each proxy with _proxy/initialize, whose parameters and result
 // are the v1 initialize request and response, and delivers client traffic
 // unwrapped. Traffic to and from a proxy's successor travels inside
-// _proxy/successor envelopes carrying the inner method, params, and _meta.
+// _proxy/successor envelopes carrying the inner method and params. Like the
+// reference conductor, the recipe neither sets nor forwards the envelope's own
+// _meta; the params, including their _meta, pass through unchanged.
 // The pinned schema has no _proxy/* methods, so the recipe hand-models the
 // envelope from the Rust SDK 2.2.0 and acp-go ships no helper for it; the
 // conductor itself is recorded as won't port (#24). Run a Go proxy under the
@@ -197,9 +199,10 @@
 //
 // Notification callbacks must not write to their own connection, so the proxy
 // queues notifications and sends them from a goroutine. Before it forwards a
-// response or a request, it flushes the queue for that direction, so a v1
-// client still receives every session/update of a turn before the turn's
-// response. A cancelled client request cancels the forwarded call, which
+// response or a request in either direction, it flushes the queue for that
+// direction. A v1 client therefore receives every session/update of a turn
+// before the turn's response, and a successor sees a client's session/cancel
+// before the client's cancelled permission outcome. A cancelled client request cancels the forwarded call, which
 // sends its own $/cancel_request for that hop. acp-go runs inbound requests
 // concurrently, so a notification that follows a request, such as
 // session/cancel right after session/prompt, can overtake it on its way to the
@@ -221,7 +224,8 @@
 // including native MCP-over-ACP. Its gates read the unstable initialize
 // response, and the stable facade does not decode those flags, so the recipe
 // captures the raw initialize result and decodes it into both shapes. That
-// bypasses InitializeWithInfo, so it checks the negotiated version itself. A
+// replaces InitializeWithInfo on the connection, so the recipe checks the
+// negotiated version itself and closes the connection on a mismatch. A
 // native acp server makes the agent reach the MCP server over the same ACP
 // connection with mcp/connect, mcp/message, and mcp/disconnect. acp-go does
 // not serve those methods yet (#39), so an application that declares one
