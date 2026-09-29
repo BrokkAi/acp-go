@@ -124,12 +124,14 @@ MCP session options all live in
 [docs/unstable-facades.md](docs/unstable-facades.md)'s packages
 (`unstable`, `v2/unstable`, `mcp`, `v2/mcp`).
 
-What remains is the native MCP-over-ACP method dispatch:
-
-- Serve or drive `mcp/connect`, `mcp/message`, and `mcp/disconnect` behind an
-  explicit import, after deciding whether the Go side only moves MCP messages or
-  integrates a third-party MCP SDK (which the dependency policy forbids today):
-  #39.
+What remains is the native MCP-over-ACP binding (#39). The shape is decided:
+a standard-library message mover with no third-party MCP SDK. Implementation is
+blocked upstream, because
+[agentclientprotocol/agent-client-protocol#2223](https://github.com/agentclientprotocol/agent-client-protocol/pull/2223)
+replaced the pinned `mcp/connect`/`mcp/message`/`mcp/disconnect` draft with
+request-scoped `mcp/message` for MCP 2026-07-28, and no schema release includes
+it yet. Work resumes once the Rust SDK pins a schema that does; see
+[docs/unstable-facades.md](docs/unstable-facades.md).
 
 ### 2. Rust ecosystem crate ports
 

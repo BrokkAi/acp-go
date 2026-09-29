@@ -97,6 +97,11 @@ series, minor releases may contain breaking API changes.
   through the stable v1 facade, `mcp`, and `v2/mcp`. The package documentation
   records the Go ordering contract each recipe relies on and the Rust recipes
   that do not port.
+- `docs/unstable-facades.md` records the MCP-over-ACP method decision (#39):
+  a standard-library message mover, with no third-party MCP SDK. The work is
+  blocked until a schema release includes upstream's request-scoped
+  `mcp/message` binding (agentclientprotocol/agent-client-protocol#2223), which
+  removes the pinned `mcp/connect` and `mcp/disconnect`.
 
 ## 0.10.0 - 2026-09-23
 
