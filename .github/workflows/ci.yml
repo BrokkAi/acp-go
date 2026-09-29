@@ -19,8 +19,9 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -29,10 +30,12 @@ jobs:
           go-version-file: go.mod
           cache: false
       - name: Check dependency licenses and notices
+        if: runner.os != 'Windows'
         run: python3 scripts/licenses.py
       - run: go test -race ./...
       - run: go vet ./...
-      - run: python3 -m unittest discover -s scripts -p '*_test.py'
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s scripts -p '*_test.py'
 
   fuzz:
     if: github.event_name == 'schedule' || inputs.run-fuzz

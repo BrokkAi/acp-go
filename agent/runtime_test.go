@@ -76,7 +76,7 @@ func TestRuntimeServesMandatoryLifecycleAndStreamsUpdates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	initialization := initializeClient(t, connection, acp.Capabilities{})
-	session, err := connection.NewSession(ctx, "/tmp")
+	session, err := connection.NewSession(ctx, hostRoot+"/tmp")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestRuntimeDispatchesOptionalMethodsAndReportsUnsupportedMethods(t *testing
 
 	var loadedResult schema.LoadSessionResponse
 	if err := connection.Call(ctx, schema.SessionLoadMethodName, schema.LoadSessionRequest{
-		SessionID: "old", Cwd: "/tmp",
+		SessionID: "old", Cwd: hostRoot + "/tmp",
 	}, &loadedResult); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestRuntimeDispatchesOptionalMethodsAndReportsUnsupportedMethods(t *testing
 	}
 
 	err := connection.Call(ctx, schema.SessionResumeMethodName, schema.ResumeSessionRequest{
-		SessionID: "old", Cwd: "/tmp",
+		SessionID: "old", Cwd: hostRoot + "/tmp",
 	}, nil)
 	var rpcErr *acp.RPCError
 	if !errors.As(err, &rpcErr) || rpcErr.Code != -32601 {
@@ -154,7 +154,7 @@ func TestRuntimeRequiresAndAllowsInitializeOnlyOnce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	err := connection.Call(ctx, schema.SessionNewMethodName, schema.NewSessionRequest{
-		Cwd: "/tmp", MCPServers: []schema.McpServer{},
+		Cwd: hostRoot + "/tmp", MCPServers: []schema.McpServer{},
 	}, nil)
 	var rpcErr *acp.RPCError
 	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "agent is not initialized" {
@@ -186,7 +186,7 @@ func TestRuntimeGatesOptionalMethodsOnAgentCapabilities(t *testing.T) {
 	defer cancel()
 	initializeClient(t, connection, acp.Capabilities{})
 	err := connection.Call(ctx, schema.SessionResumeMethodName, schema.ResumeSessionRequest{
-		SessionID: "old", Cwd: "/tmp",
+		SessionID: "old", Cwd: hostRoot + "/tmp",
 	}, nil)
 	var rpcErr *acp.RPCError
 	if !errors.As(err, &rpcErr) || rpcErr.Code != -32601 || rpcErr.Message != "agent does not implement method: session/resume" {
@@ -218,7 +218,7 @@ func TestSessionCancelNotificationCancelsActivePrompt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	initializeClient(t, connection, acp.Capabilities{})
-	session, err := connection.NewSession(ctx, "/tmp")
+	session, err := connection.NewSession(ctx, hostRoot+"/tmp")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,7 @@ func TestSessionCancelNotificationCancelsActivePrompt(t *testing.T) {
 func TestAgentClientMethodsAreGatedByAdvertisedCapabilities(t *testing.T) {
 	prompt := func(ctx context.Context, client Client, request schema.PromptRequest, updates SessionUpdater) (schema.PromptResponse, error) {
 		file, err := client.ReadTextFile(ctx, schema.ReadTextFileRequest{
-			SessionID: request.SessionID, Path: "/tmp/source.txt",
+			SessionID: request.SessionID, Path: hostRoot + "/tmp/source.txt",
 		})
 		if err != nil {
 			return schema.PromptResponse{}, err
@@ -276,7 +276,7 @@ func TestAgentClientMethodsAreGatedByAdvertisedCapabilities(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		initialization := initializeClient(t, connection, acp.WorkspaceCapabilities(true, false, false))
-		session, err := connection.NewSession(ctx, "/tmp")
+		session, err := connection.NewSession(ctx, hostRoot+"/tmp")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -298,7 +298,7 @@ func TestAgentClientMethodsAreGatedByAdvertisedCapabilities(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		initialization := initializeClient(t, connection, acp.Capabilities{})
-		session, err := connection.NewSession(ctx, "/tmp")
+		session, err := connection.NewSession(ctx, hostRoot+"/tmp")
 		if err != nil {
 			t.Fatal(err)
 		}

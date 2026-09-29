@@ -84,10 +84,10 @@ func TestClientLifecycleMethodsHaveIndependentWireFixtures(t *testing.T) {
 
 	t.Run("new session", func(t *testing.T) {
 		c, requests := singleRequestFixture(t, `{"sessionId":"new-session"}`)
-		created, err := c.NewSessionWithOptions(ctx, init, "/tmp", NewSessionOptions{
-			AdditionalDirectories: []string{"/tmp/extra"},
+		created, err := c.NewSessionWithOptions(ctx, init, hostRoot+"/tmp", NewSessionOptions{
+			AdditionalDirectories: []string{hostRoot + "/tmp/extra"},
 			MCPServers: []schema.McpServer{
-				NewStdioMCPServer("local", "/usr/bin/mcp", []string{"--stdio"}, map[string]string{"MCP_ENV": "1"}),
+				NewStdioMCPServer("local", hostRoot+"/usr/bin/mcp", []string{"--stdio"}, map[string]string{"MCP_ENV": "1"}),
 				NewHTTPMCPServer("remote", "https://example.test/mcp"),
 				NewSSEMCPServer("events", "https://example.test/sse"),
 			},
@@ -99,10 +99,10 @@ func TestClientLifecycleMethodsHaveIndependentWireFixtures(t *testing.T) {
 		if request.Method != schema.SessionNewMethodName {
 			t.Fatalf("method = %s", request.Method)
 		}
-		assertJSONKey(t, request.Params, "cwd", `"/tmp"`)
-		assertJSONKey(t, request.Params, "additionalDirectories", `["/tmp/extra"]`)
+		assertJSONKey(t, request.Params, "cwd", `"`+hostRoot+`/tmp"`)
+		assertJSONKey(t, request.Params, "additionalDirectories", `["`+hostRoot+`/tmp/extra"]`)
 		assertJSONEqual(t, request.Params, "mcpServers", `[
-			{"name":"local","command":"/usr/bin/mcp","args":["--stdio"],"env":[{"name":"MCP_ENV","value":"1"}]},
+			{"name":"local","command":"`+hostRoot+`/usr/bin/mcp","args":["--stdio"],"env":[{"name":"MCP_ENV","value":"1"}]},
 			{"type":"http","name":"remote","url":"https://example.test/mcp","headers":null},
 			{"type":"sse","name":"events","url":"https://example.test/sse","headers":null}
 		]`)
@@ -139,7 +139,7 @@ func TestClientLifecycleMethodsHaveIndependentWireFixtures(t *testing.T) {
 	t.Run("load session", func(t *testing.T) {
 		c, requests := singleRequestFixture(t, `{"configOptions":[]}`)
 		loaded, err := c.LoadSession(ctx, init, schema.LoadSessionRequest{
-			SessionID: "old", Cwd: "/tmp", AdditionalDirectories: []string{"/tmp/extra"},
+			SessionID: "old", Cwd: hostRoot + "/tmp", AdditionalDirectories: []string{hostRoot + "/tmp/extra"},
 		})
 		if err != nil || loaded.ConfigOptions == nil {
 			t.Fatalf("load session: %v, %+v", err, loaded)
@@ -149,14 +149,14 @@ func TestClientLifecycleMethodsHaveIndependentWireFixtures(t *testing.T) {
 			t.Fatalf("method = %s", request.Method)
 		}
 		assertJSONKey(t, request.Params, "sessionId", `"old"`)
-		assertJSONKey(t, request.Params, "cwd", `"/tmp"`)
-		assertJSONKey(t, request.Params, "additionalDirectories", `["/tmp/extra"]`)
+		assertJSONKey(t, request.Params, "cwd", `"`+hostRoot+`/tmp"`)
+		assertJSONKey(t, request.Params, "additionalDirectories", `["`+hostRoot+`/tmp/extra"]`)
 		assertJSONKey(t, request.Params, "mcpServers", `[]`)
 	})
 
 	t.Run("resume session", func(t *testing.T) {
 		c, requests := singleRequestFixture(t, `{"configOptions":[]}`)
-		resumed, err := c.ResumeSession(ctx, init, schema.ResumeSessionRequest{SessionID: "old", Cwd: "/tmp"})
+		resumed, err := c.ResumeSession(ctx, init, schema.ResumeSessionRequest{SessionID: "old", Cwd: hostRoot + "/tmp"})
 		if err != nil || resumed.ConfigOptions == nil {
 			t.Fatalf("resume session: %v, %+v", err, resumed)
 		}
@@ -165,13 +165,13 @@ func TestClientLifecycleMethodsHaveIndependentWireFixtures(t *testing.T) {
 			t.Fatalf("method = %s", request.Method)
 		}
 		assertJSONKey(t, request.Params, "sessionId", `"old"`)
-		assertJSONKey(t, request.Params, "cwd", `"/tmp"`)
+		assertJSONKey(t, request.Params, "cwd", `"`+hostRoot+`/tmp"`)
 	})
 
 	t.Run("list sessions", func(t *testing.T) {
-		c, requests := singleRequestFixture(t, `{"sessions":[{"sessionId":"listed","cwd":"/tmp"}],"nextCursor":"more"}`)
+		c, requests := singleRequestFixture(t, `{"sessions":[{"sessionId":"listed","cwd":"`+hostRoot+`/tmp"}],"nextCursor":"more"}`)
 		cursor := "next"
-		listed, err := c.ListSessions(ctx, init, schema.ListSessionsRequest{Cursor: &cursor, Cwd: strPtr("/tmp")})
+		listed, err := c.ListSessions(ctx, init, schema.ListSessionsRequest{Cursor: &cursor, Cwd: strPtr(hostRoot + "/tmp")})
 		if err != nil || len(listed.Sessions) != 1 || listed.NextCursor == nil || *listed.NextCursor != "more" {
 			t.Fatalf("list sessions: %v, %+v", err, listed)
 		}
@@ -180,7 +180,7 @@ func TestClientLifecycleMethodsHaveIndependentWireFixtures(t *testing.T) {
 			t.Fatalf("method = %s", request.Method)
 		}
 		assertJSONKey(t, request.Params, "cursor", `"next"`)
-		assertJSONKey(t, request.Params, "cwd", `"/tmp"`)
+		assertJSONKey(t, request.Params, "cwd", `"`+hostRoot+`/tmp"`)
 	})
 
 	t.Run("close session", func(t *testing.T) {
@@ -268,63 +268,63 @@ func TestSessionValidationRejectsBeforeWire(t *testing.T) {
 			return err
 		}},
 		{"additional directories unsupported", "agent did not advertise additionalDirectories support", func() error {
-			_, err := c.NewSessionWithOptions(ctx, noCapabilities, "/tmp", NewSessionOptions{AdditionalDirectories: []string{"/extra"}})
+			_, err := c.NewSessionWithOptions(ctx, noCapabilities, hostRoot+"/tmp", NewSessionOptions{AdditionalDirectories: []string{hostRoot + "/extra"}})
 			return err
 		}},
 		{"additional directory relative", `ACP path must be absolute: "extra"`, func() error {
-			_, err := c.NewSessionWithOptions(ctx, full, "/tmp", NewSessionOptions{AdditionalDirectories: []string{"extra"}})
+			_, err := c.NewSessionWithOptions(ctx, full, hostRoot+"/tmp", NewSessionOptions{AdditionalDirectories: []string{"extra"}})
 			return err
 		}},
 		{"mcp empty variant", "MCP server 0 has no transport variant", func() error {
-			_, err := c.NewSessionWithOptions(ctx, full, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{{}}})
+			_, err := c.NewSessionWithOptions(ctx, full, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{{}}})
 			return err
 		}},
 		{"stdio missing name", "MCP server 0 requires a name and command", func() error {
-			_, err := c.NewSessionWithOptions(ctx, full, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewStdioMCPServer("", "/bin/mcp", nil, nil)}})
+			_, err := c.NewSessionWithOptions(ctx, full, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewStdioMCPServer("", hostRoot+"/bin/mcp", nil, nil)}})
 			return err
 		}},
 		{"stdio missing command", "MCP server 0 requires a name and command", func() error {
-			_, err := c.NewSessionWithOptions(ctx, full, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewStdioMCPServer("local", "", nil, nil)}})
+			_, err := c.NewSessionWithOptions(ctx, full, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewStdioMCPServer("local", "", nil, nil)}})
 			return err
 		}},
 		{"http unsupported", "agent did not advertise HTTP MCP server support", func() error {
-			_, err := c.NewSessionWithOptions(ctx, noCapabilities, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewHTTPMCPServer("remote", "https://example.test")}})
+			_, err := c.NewSessionWithOptions(ctx, noCapabilities, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewHTTPMCPServer("remote", "https://example.test")}})
 			return err
 		}},
 		{"http false", "agent did not advertise HTTP MCP server support", func() error {
-			_, err := c.NewSessionWithOptions(ctx, falseMCP, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewHTTPMCPServer("remote", "https://example.test")}})
+			_, err := c.NewSessionWithOptions(ctx, falseMCP, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewHTTPMCPServer("remote", "https://example.test")}})
 			return err
 		}},
 		{"http missing name", "HTTP MCP server 0 requires a name and URL", func() error {
-			_, err := c.NewSessionWithOptions(ctx, full, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewHTTPMCPServer("", "https://example.test")}})
+			_, err := c.NewSessionWithOptions(ctx, full, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewHTTPMCPServer("", "https://example.test")}})
 			return err
 		}},
 		{"http missing url", "HTTP MCP server 0 requires a name and URL", func() error {
-			_, err := c.NewSessionWithOptions(ctx, full, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewHTTPMCPServer("remote", "")}})
+			_, err := c.NewSessionWithOptions(ctx, full, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewHTTPMCPServer("remote", "")}})
 			return err
 		}},
 		{"sse unsupported", "agent did not advertise SSE MCP server support", func() error {
-			_, err := c.NewSessionWithOptions(ctx, noCapabilities, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewSSEMCPServer("events", "https://example.test")}})
+			_, err := c.NewSessionWithOptions(ctx, noCapabilities, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewSSEMCPServer("events", "https://example.test")}})
 			return err
 		}},
 		{"sse false", "agent did not advertise SSE MCP server support", func() error {
-			_, err := c.NewSessionWithOptions(ctx, falseMCP, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewSSEMCPServer("events", "https://example.test")}})
+			_, err := c.NewSessionWithOptions(ctx, falseMCP, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewSSEMCPServer("events", "https://example.test")}})
 			return err
 		}},
 		{"sse missing name", "SSE MCP server 0 requires a name and URL", func() error {
-			_, err := c.NewSessionWithOptions(ctx, full, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewSSEMCPServer("", "https://example.test")}})
+			_, err := c.NewSessionWithOptions(ctx, full, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewSSEMCPServer("", "https://example.test")}})
 			return err
 		}},
 		{"sse missing url", "SSE MCP server 0 requires a name and URL", func() error {
-			_, err := c.NewSessionWithOptions(ctx, full, "/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewSSEMCPServer("events", "")}})
+			_, err := c.NewSessionWithOptions(ctx, full, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewSSEMCPServer("events", "")}})
 			return err
 		}},
 		{"load unsupported", "agent did not advertise session/load support", func() error {
-			_, err := c.LoadSession(ctx, noCapabilities, schema.LoadSessionRequest{SessionID: "old", Cwd: "/tmp"})
+			_, err := c.LoadSession(ctx, noCapabilities, schema.LoadSessionRequest{SessionID: "old", Cwd: hostRoot + "/tmp"})
 			return err
 		}},
 		{"load false", "agent did not advertise session/load support", func() error {
-			_, err := c.LoadSession(ctx, falseLoad, schema.LoadSessionRequest{SessionID: "old", Cwd: "/tmp"})
+			_, err := c.LoadSession(ctx, falseLoad, schema.LoadSessionRequest{SessionID: "old", Cwd: hostRoot + "/tmp"})
 			return err
 		}},
 		{"load relative cwd", `ACP path must be absolute: "relative"`, func() error {
@@ -332,11 +332,11 @@ func TestSessionValidationRejectsBeforeWire(t *testing.T) {
 			return err
 		}},
 		{"load empty session", "session ID is required", func() error {
-			_, err := c.LoadSession(ctx, full, schema.LoadSessionRequest{Cwd: "/tmp"})
+			_, err := c.LoadSession(ctx, full, schema.LoadSessionRequest{Cwd: hostRoot + "/tmp"})
 			return err
 		}},
 		{"resume unsupported", "agent did not advertise session/resume support", func() error {
-			_, err := c.ResumeSession(ctx, noCapabilities, schema.ResumeSessionRequest{SessionID: "old", Cwd: "/tmp"})
+			_, err := c.ResumeSession(ctx, noCapabilities, schema.ResumeSessionRequest{SessionID: "old", Cwd: hostRoot + "/tmp"})
 			return err
 		}},
 		{"resume relative cwd", `ACP path must be absolute: "relative"`, func() error {
@@ -344,7 +344,7 @@ func TestSessionValidationRejectsBeforeWire(t *testing.T) {
 			return err
 		}},
 		{"resume empty session", "session ID is required", func() error {
-			_, err := c.ResumeSession(ctx, full, schema.ResumeSessionRequest{Cwd: "/tmp"})
+			_, err := c.ResumeSession(ctx, full, schema.ResumeSessionRequest{Cwd: hostRoot + "/tmp"})
 			return err
 		}},
 		{"close unsupported", "agent did not advertise session/close support", func() error {

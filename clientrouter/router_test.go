@@ -33,7 +33,7 @@ func (c testV1Client) Serve(ctx context.Context, connection *acp.Connection) err
 	if initialization.ProtocolVersion != acp.Version {
 		return fmt.Errorf("v1 client negotiated %d", initialization.ProtocolVersion)
 	}
-	_, err = connection.NewSession(ctx, "/repo")
+	_, err = connection.NewSession(ctx, hostRoot+"/repo")
 	return err
 }
 
@@ -65,7 +65,7 @@ func (c testV2Client) Serve(ctx context.Context, connection *acpv2.Connection) e
 	if initialization.ProtocolVersion != acpv2.Version {
 		return fmt.Errorf("v2 client negotiated %d", initialization.ProtocolVersion)
 	}
-	_, err = connection.NewSessionWithOptions(ctx, initialization, "/repo", acpv2.NewSessionOptions{})
+	_, err = connection.NewSessionWithOptions(ctx, initialization, hostRoot+"/repo", acpv2.NewSessionOptions{})
 	return err
 }
 

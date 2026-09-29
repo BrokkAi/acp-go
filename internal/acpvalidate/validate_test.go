@@ -7,7 +7,7 @@ func TestAbsolutePath(t *testing.T) {
 		value string
 		want  bool
 	}{
-		{value: "/tmp/workspace", want: true},
+		{value: hostRoot + "/tmp/workspace", want: true},
 		{value: "relative/path", want: false},
 		{value: "", want: false},
 		{value: "./here", want: false},

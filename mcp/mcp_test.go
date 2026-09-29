@@ -134,10 +134,10 @@ func TestNewSessionValidatesTransports(t *testing.T) {
 func TestResumeAndForkGateOnCapabilities(t *testing.T) {
 	ctx := context.Background()
 	connection, requests := fixture(t, func(string) any { return map[string]any{"sessionId": "s"} })
-	if _, err := mcp.ResumeSession(ctx, connection, schema.InitializeResponse{}, schema.ResumeSessionRequest{Cwd: "/tmp", SessionID: "old"}); err == nil {
+	if _, err := mcp.ResumeSession(ctx, connection, schema.InitializeResponse{}, schema.ResumeSessionRequest{Cwd: hostRoot + "/tmp", SessionID: "old"}); err == nil {
 		t.Fatal("session/resume without the capability was allowed")
 	}
-	if _, err := mcp.ForkSession(ctx, connection, schema.InitializeResponse{}, schema.ForkSessionRequest{Cwd: "/tmp", SessionID: "old"}); err == nil {
+	if _, err := mcp.ForkSession(ctx, connection, schema.InitializeResponse{}, schema.ForkSessionRequest{Cwd: hostRoot + "/tmp", SessionID: "old"}); err == nil {
 		t.Fatal("session/fork without the capability was allowed")
 	}
 	select {
@@ -152,13 +152,13 @@ func TestResumeAndForkGateOnCapabilities(t *testing.T) {
 			Fork:   &schema.SessionForkCapabilities{},
 		},
 	}}
-	if _, err := mcp.ResumeSession(ctx, connection, initialization, schema.ResumeSessionRequest{Cwd: "/tmp", SessionID: "old"}); err != nil {
+	if _, err := mcp.ResumeSession(ctx, connection, initialization, schema.ResumeSessionRequest{Cwd: hostRoot + "/tmp", SessionID: "old"}); err != nil {
 		t.Fatal(err)
 	}
 	if method := <-requests; method != schema.SessionResumeMethodName {
 		t.Fatalf("method = %s", method)
 	}
-	if _, err := mcp.ForkSession(ctx, connection, initialization, schema.ForkSessionRequest{Cwd: "/tmp", SessionID: "old"}); err != nil {
+	if _, err := mcp.ForkSession(ctx, connection, initialization, schema.ForkSessionRequest{Cwd: hostRoot + "/tmp", SessionID: "old"}); err != nil {
 		t.Fatal(err)
 	}
 	if method := <-requests; method != schema.SessionForkMethodName {

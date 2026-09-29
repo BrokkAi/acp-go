@@ -1,3 +1,8 @@
+//go:build !windows
+
+// The documented output names a Unix stdio command path, which the facade
+// rejects as relative on Windows.
+
 package cookbook_test
 
 import (

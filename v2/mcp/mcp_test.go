@@ -39,7 +39,7 @@ func TestValidateServersRequiresAdvertisedTransports(t *testing.T) {
 
 func TestValidateServersRejectsIncompleteStdioConfiguration(t *testing.T) {
 	if err := validateServers(initialization(true), []schema.McpServer{
-		NewStdioServer("", "/opt/mcp", nil, nil),
+		NewStdioServer("", hostRoot+"/opt/mcp", nil, nil),
 	}); err == nil {
 		t.Fatal("empty name accepted")
 	}
@@ -51,13 +51,13 @@ func TestValidateServersRejectsIncompleteStdioConfiguration(t *testing.T) {
 }
 
 func TestValidatePathsGatesAdditionalDirectories(t *testing.T) {
-	err := validatePaths(initialization(true), "/repo", []string{"/additional"})
+	err := validatePaths(initialization(true), hostRoot+"/repo", []string{hostRoot + "/additional"})
 	if err == nil || err.Error() != "agent did not advertise additionalDirectories support" {
 		t.Fatalf("additional directories error = %v", err)
 	}
 	withAdditional := initialization(true)
 	withAdditional.Capabilities.Session.AdditionalDirectories = &schema.SessionAdditionalDirectoriesCapabilities{}
-	if err := validatePaths(withAdditional, "/repo", []string{"/additional"}); err != nil {
+	if err := validatePaths(withAdditional, hostRoot+"/repo", []string{hostRoot + "/additional"}); err != nil {
 		t.Fatal(err)
 	}
 }

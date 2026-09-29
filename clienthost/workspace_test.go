@@ -3,14 +3,27 @@ package clienthost
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
+// symlink skips on Windows accounts without the create-symbolic-link privilege
+// (ERROR_PRIVILEGE_NOT_HELD); elsewhere its error still fails the test.
+func symlink(t *testing.T, target, link string) error {
+	t.Helper()
+	err := os.Symlink(target, link)
+	if runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(1314)) {
+		t.Skip("symlinks need Developer Mode or the SeCreateSymbolicLinkPrivilege on Windows")
+	}
+	return err
+}
 func writeTestFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
@@ -22,7 +35,7 @@ func TestWorkspaceCannotEscapeAndCancelledPermission(t *testing.T) {
 	outside := t.TempDir()
 	path := filepath.Join(outside, "private")
 	writeTestFile(t, path, "secret")
-	if err := os.Symlink(outside, filepath.Join(dir, "link")); err != nil {
+	if err := symlink(t, outside, filepath.Join(dir, "link")); err != nil {
 		t.Fatal(err)
 	}
 	h, err := newHost(context.Background(), dir, io.Discard, slog.New(slog.NewTextHandler(io.Discard, nil)))

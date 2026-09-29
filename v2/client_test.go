@@ -61,7 +61,7 @@ func TestV2LifecycleAndSessionUpdates(t *testing.T) {
 			return sessionInitialization(), nil
 		case schema.SessionNewMethodName:
 			request := decode[schema.NewSessionRequest](t, raw)
-			if request.Cwd != "/fixture/workspace" {
+			if request.Cwd != hostRoot+"/fixture/workspace" {
 				t.Errorf("cwd = %q", request.Cwd)
 			}
 			return schema.NewSessionResponse{SessionID: "v2-session"}, nil
@@ -83,7 +83,7 @@ func TestV2LifecycleAndSessionUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := client.NewSessionWithOptions(ctx, initialization, "/fixture/workspace", NewSessionOptions{})
+	session, err := client.NewSessionWithOptions(ctx, initialization, hostRoot+"/fixture/workspace", NewSessionOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestV2CapabilityGates(t *testing.T) {
 		{
 			name: "session surface",
 			run: func(client *Connection) error {
-				_, err := client.NewSession(context.Background(), "/repo")
+				_, err := client.NewSession(context.Background(), hostRoot+"/repo")
 				return err
 			},
 		},
@@ -154,8 +154,8 @@ func TestV2CapabilityGates(t *testing.T) {
 		{
 			name: "additional directories",
 			run: func(client *Connection) error {
-				_, err := client.NewSessionWithOptions(context.Background(), sessionInitialization(), "/repo", NewSessionOptions{
-					AdditionalDirectories: []string{"/additional"},
+				_, err := client.NewSessionWithOptions(context.Background(), sessionInitialization(), hostRoot+"/repo", NewSessionOptions{
+					AdditionalDirectories: []string{hostRoot + "/additional"},
 				})
 				return err
 			},
@@ -327,7 +327,7 @@ func TestV2PromptRejectsMissingUserMessageID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := client.NewSessionWithOptions(ctx, initialization, "/fixture/workspace", NewSessionOptions{})
+	session, err := client.NewSessionWithOptions(ctx, initialization, hostRoot+"/fixture/workspace", NewSessionOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

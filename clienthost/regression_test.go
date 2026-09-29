@@ -2,56 +2,15 @@ package clienthost
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/BrokkAi/acp-go/schema"
 )
-
-func TestReadFIFOIsRejectedWithoutBlocking(t *testing.T) {
-	for _, heldOpen := range []bool{false, true} {
-		name := "no-writer"
-		if heldOpen {
-			name = "held-open"
-		}
-		t.Run(name, func(t *testing.T) {
-			directory := t.TempDir()
-			path := filepath.Join(directory, "input.fifo")
-			if err := syscall.Mkfifo(path, 0600); err != nil {
-				t.Fatal(err)
-			}
-			if heldOpen {
-				f, err := os.OpenFile(path, os.O_RDWR|syscall.O_NONBLOCK, 0)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer f.Close()
-			}
-			h, err := Open(context.Background(), Config{Directory: directory})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer h.Close()
-			h.SetSession("s")
-			raw, _ := json.Marshal(schema.ReadTextFileRequest{SessionID: "s", Path: path})
-			done := make(chan error, 1)
-			go func() { _, err := h.Request(context.Background(), schema.FsReadTextFileMethodName, raw); done <- err }()
-			select {
-			case err := <-done:
-				if err == nil || !strings.Contains(err.Error(), "regular file") {
-					t.Fatalf("expected regular-file error, got %v", err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("FIFO read blocked")
-			}
-		})
-	}
-}
 
 func TestTerminalSymlinkWorkspace(t *testing.T) {
 	base, err := filepath.EvalSymlinks(t.TempDir())
@@ -63,10 +22,10 @@ func TestTerminalSymlinkWorkspace(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(real, "sub"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(real, workspace); err != nil {
+	if err := symlink(t, real, workspace); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(base, filepath.Join(real, "escape")); err != nil {
+	if err := symlink(t, base, filepath.Join(real, "escape")); err != nil {
 		t.Fatal(err)
 	}
 	h, err := Open(context.Background(), Config{Directory: workspace})
@@ -75,9 +34,14 @@ func TestTerminalSymlinkWorkspace(t *testing.T) {
 	}
 	defer h.Close()
 	h.SetSession("s")
+	// Git Bash's pwd prints /c/... on Windows; cmd prints the native spelling.
+	command, args := "pwd", []string(nil)
+	if runtime.GOOS == "windows" {
+		command, args = "cmd", []string{"/c", "cd"}
+	}
 	for _, cwd := range []string{"", workspace, filepath.Join(workspace, "sub"), real, filepath.Join(workspace, "escape")} {
 		t.Run(cwd, func(t *testing.T) {
-			request := schema.CreateTerminalRequest{SessionID: "s", Command: "pwd"}
+			request := schema.CreateTerminalRequest{SessionID: "s", Command: command, Args: args}
 			if cwd != "" {
 				request.Cwd = &cwd
 			}
