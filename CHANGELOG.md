@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
-## Unreleased
+## 0.11.0 - 2026-09-29
 
 ### Added
 
@@ -102,6 +102,16 @@ series, minor releases may contain breaking API changes.
   blocked until a schema release includes upstream's request-scoped
   `mcp/message` binding (agentclientprotocol/agent-client-protocol#2223), which
   removes the pinned `mcp/connect` and `mcp/disconnect`.
+
+### Fixed
+
+- The module builds and tests on Windows. `internal/osrun` used `Setpgid` and
+  `syscall.Kill` without a build constraint, so `runner`, `v2/runner`, and
+  `clienthost` (and `go install` of anything importing them) failed to compile
+  there. Windows now starts commands in a new process group and kills the
+  command tree with `taskkill /T`, and never signals a PID after `Wait` has
+  released it. Descendants orphaned by an exited command are reaped only on
+  Unix. CI adds a `windows-latest` job.
 
 ## 0.10.0 - 2026-09-23
 
