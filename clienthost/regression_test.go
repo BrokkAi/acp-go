@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -33,9 +34,14 @@ func TestTerminalSymlinkWorkspace(t *testing.T) {
 	}
 	defer h.Close()
 	h.SetSession("s")
+	// Git Bash's pwd prints /c/... on Windows; cmd prints the native spelling.
+	command, args := "pwd", []string(nil)
+	if runtime.GOOS == "windows" {
+		command, args = "cmd", []string{"/c", "cd"}
+	}
 	for _, cwd := range []string{"", workspace, filepath.Join(workspace, "sub"), real, filepath.Join(workspace, "escape")} {
 		t.Run(cwd, func(t *testing.T) {
-			request := schema.CreateTerminalRequest{SessionID: "s", Command: "pwd"}
+			request := schema.CreateTerminalRequest{SessionID: "s", Command: command, Args: args}
 			if cwd != "" {
 				request.Cwd = &cwd
 			}
