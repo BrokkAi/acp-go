@@ -56,7 +56,11 @@ components, and running proxies with the conductor.
 patterns to `acp`, `v2`, `runner`, `clienthost`, and `proxyrouter`.
 
 Decision: port the guides that map onto the Go packages, with every snippet
-compiling as a tested example and no new dependencies. Follow-up: #22.
+compiling as a tested example and no new dependencies. Delivered as
+`github.com/BrokkAi/acp-go/cookbook` (#22). The recipes that need an MCP server
+SDK (`global_mcp_server`, `per_session_mcp_server`, `filtering_tools`) or the
+conductor (`running_proxies_with_conductor`) do not port; the package
+documentation records why.
 
 ## `agent-client-protocol-trace-viewer` — port as a tool
 

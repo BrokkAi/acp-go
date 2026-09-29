@@ -101,6 +101,13 @@ go run ./examples/drive-cli -command 'go run ./examples/minimal-agent' -prompt h
 `drive-cli` accepts the same mode/model/effort/auth options commonly needed by
 external CLI adapters; substitute the real agent command for the minimal agent.
 
+`github.com/BrokkAi/acp-go/cookbook` is a guide to common client, proxy, and
+agent patterns, ported from the reference Rust cookbook. Each recipe is a
+runnable example that `go test ./...` executes: one-shot v1 and draft-v2
+prompts, building an agent, ordered application dispatch, draft-v2 session
+coordination, a `proxyrouter` proxy component, and attaching MCP servers. Read
+it with `go doc github.com/BrokkAi/acp-go/cookbook`.
+
 ## Wire schema
 
 `github.com/BrokkAi/acp-go/schema` provides typed constants, request and

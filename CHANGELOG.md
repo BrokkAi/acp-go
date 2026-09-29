@@ -27,12 +27,12 @@ series, minor releases may contain breaking API changes.
   run it in the user's terminal, then reconnect and initialize.
 - `docs/rust-ecosystem-parity.md` records whether each reference Rust workspace
   crate without a Go equivalent should be ported. It breaks out follow-up issues
-  for the test harness (#21, delivered as `acptest`), cookbook (#22), trace
-  viewer (#23, delivered as `traceviewer`), and conductor (#24), and records two
-  won't ports with their rationale: the `agent-client-protocol-rmcp` bridge,
-  which requires a third-party MCP SDK, and the proxy-chain conductor, which is
-  an application with no Go consumer on a wire shape the pinned schema does not
-  cover.
+  for the test harness (#21, delivered as `acptest`), cookbook (#22, delivered
+  as `cookbook`), trace viewer (#23, delivered as `traceviewer`), and conductor
+  (#24), and records two won't ports with their rationale: the
+  `agent-client-protocol-rmcp` bridge, which requires a third-party MCP SDK,
+  and the proxy-chain conductor, which is an application with no Go consumer on
+  a wire shape the pinned schema does not cover.
 - The optional credential-backed integration job now also runs the draft-v2
   runner (`TestRealAgentV2Prompt`), which probes the agent and skips unless it
   advertises ACP v2. `TestRealAgentPrompt` keeps covering the v1 runner against
@@ -88,6 +88,15 @@ series, minor releases may contain breaking API changes.
   features travel inside session updates, so a projection helper is the right
   shape rather than a request facade, as recorded in
   `docs/unstable-facades.md`.
+- New documentation-only `github.com/BrokkAi/acp-go/cookbook` package ports the
+  Rust cookbook recipes that map onto acp-go as runnable examples that
+  `go test ./...` executes: one-shot v1 and draft-v2 prompts (in-process and
+  through both runners), building a v1 agent with tool calls and permission
+  requests, ordered application dispatch, draft-v2 session resume/replay/close
+  coordination, a `proxyrouter` proxy component, and attaching MCP servers
+  through the stable v1 facade, `mcp`, and `v2/mcp`. The package documentation
+  records the Go ordering contract each recipe relies on and the Rust recipes
+  that do not port.
 
 ## 0.10.0 - 2026-09-23
 

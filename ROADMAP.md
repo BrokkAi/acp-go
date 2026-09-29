@@ -135,10 +135,9 @@ What remains is the native MCP-over-ACP method dispatch:
 
 [docs/rust-ecosystem-parity.md](docs/rust-ecosystem-parity.md) evaluates the
 reference workspace crates that have no Go equivalent and records one decision
-per crate. The test harness (`acptest`) and the trace viewer (`traceviewer`)
-are done; the remaining port is:
-
-- cookbook of client, proxy, and agent patterns: #22.
+per crate. Every port is done: the test harness (`acptest`), the trace viewer
+(`traceviewer`), and the cookbook of client, proxy, and agent patterns
+(`cookbook`, #22).
 
 Two crates are recorded as won't port: the `agent-client-protocol-rmcp` bridge,
 which needs a third-party MCP SDK, and the proxy-chain conductor, which is an
