@@ -53,7 +53,7 @@ func TestResumeSessionFromStartAppliesReplayBeforeResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.ResumeSessionFromStart(ctx, initialization, "replay-session", "/repo", nil); err != nil {
+	if _, err := client.ResumeSessionFromStart(ctx, initialization, "replay-session", hostRoot+"/repo", nil); err != nil {
 		t.Fatal(err)
 	}
 	work := tracker.Work("replay-session")

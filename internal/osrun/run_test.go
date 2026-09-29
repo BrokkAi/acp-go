@@ -2,6 +2,7 @@ package osrun
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -25,7 +26,11 @@ func TestProcessTreeCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := Run(ctx, "", nil, "sh", "-c", "sleep 30 & wait"); err == nil {
+	args := []string{"sh", "-c", "sleep 30 & wait"}
+	if runtime.GOOS == "windows" {
+		args = []string{"cmd", "/c", "ping -n 30 127.0.0.1 | findstr x"}
+	}
+	if _, err := Run(ctx, "", nil, args...); err == nil {
 		t.Fatal("cancelled shell succeeded")
 	}
 	if time.Since(start) > 2*time.Second {

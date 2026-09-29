@@ -140,7 +140,7 @@ func TestSessionHandleCommandsAndCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := client.NewSessionWithOptions(ctx, initialization, "/repo", NewSessionOptions{})
+	session, err := client.NewSessionWithOptions(ctx, initialization, hostRoot+"/repo", NewSessionOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

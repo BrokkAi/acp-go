@@ -52,7 +52,7 @@ func (a *echoAgent) Prompt(_ context.Context, _ Client, request schema.PromptReq
 }
 
 func (a *echoAgent) ListSessions(context.Context, Client, schema.ListSessionsRequest) (schema.ListSessionsResponse, error) {
-	return schema.ListSessionsResponse{Sessions: []schema.SessionInfo{{SessionID: "v2-session", Cwd: "/repo"}}}, nil
+	return schema.ListSessionsResponse{Sessions: []schema.SessionInfo{{SessionID: "v2-session", Cwd: hostRoot + "/repo"}}}, nil
 }
 
 func (a *echoAgent) ResumeSession(context.Context, Client, schema.ResumeSessionRequest) (schema.ResumeSessionResponse, error) {
@@ -103,7 +103,7 @@ func TestRuntimeServesBaselineV2Lifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := client.NewSessionWithOptions(ctx, initialization, "/repo", acpv2.NewSessionOptions{})
+	session, err := client.NewSessionWithOptions(ctx, initialization, hostRoot+"/repo", acpv2.NewSessionOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestRuntimeServesBaselineV2Lifecycle(t *testing.T) {
 		t.Fatalf("sessions = %+v", list.Sessions)
 	}
 	if _, err := client.ResumeSession(ctx, initialization, schema.ResumeSessionRequest{
-		SessionID: session.SessionID, Cwd: "/repo",
+		SessionID: session.SessionID, Cwd: hostRoot + "/repo",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestRuntimeGatesClientElicitationByCapability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := client.NewSessionWithOptions(ctx, initialization, "/repo", acpv2.NewSessionOptions{})
+	session, err := client.NewSessionWithOptions(ctx, initialization, hostRoot+"/repo", acpv2.NewSessionOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestRuntimeRejectsPromptResponseWithoutUserMessageID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := client.NewSessionWithOptions(ctx, initialization, "/repo", acpv2.NewSessionOptions{})
+	session, err := client.NewSessionWithOptions(ctx, initialization, hostRoot+"/repo", acpv2.NewSessionOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

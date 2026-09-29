@@ -121,12 +121,12 @@ func TestForkSessionGatesAndEncodes(t *testing.T) {
 	connection, requests := fixture(t, func(string) any {
 		return schema.ForkSessionResponse{SessionID: "forked"}
 	})
-	if _, err := acpunstable.ForkSession(ctx, connection, schema.InitializeResponse{}, schema.ForkSessionRequest{Cwd: "/tmp", SessionID: "old"}); err == nil {
+	if _, err := acpunstable.ForkSession(ctx, connection, schema.InitializeResponse{}, schema.ForkSessionRequest{Cwd: hostRoot + "/tmp", SessionID: "old"}); err == nil {
 		t.Fatal("session/fork without the capability was allowed")
 	}
 	initialization := forkInitialization()
 	for name, request := range map[string]schema.ForkSessionRequest{
-		"missing session": {Cwd: "/tmp"},
+		"missing session": {Cwd: hostRoot + "/tmp"},
 		"relative cwd":    {Cwd: "relative", SessionID: "old"},
 	} {
 		if _, err := acpunstable.ForkSession(ctx, connection, initialization, request); err == nil {
@@ -138,7 +138,7 @@ func TestForkSessionGatesAndEncodes(t *testing.T) {
 		t.Fatalf("validation wrote %s to the wire", request.method)
 	default:
 	}
-	result, err := acpunstable.ForkSession(ctx, connection, initialization, schema.ForkSessionRequest{Cwd: "/tmp", SessionID: "old"})
+	result, err := acpunstable.ForkSession(ctx, connection, initialization, schema.ForkSessionRequest{Cwd: hostRoot + "/tmp", SessionID: "old"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestHandleDispatchesUnstableMethods(t *testing.T) {
 	if providers, ok := result.(schema.ListProvidersResponse); !ok || len(providers.Providers) != 1 {
 		t.Fatalf("providers/list dispatch = %#v", result)
 	}
-	result, err = handler(ctx, schema.SessionForkMethodName, json.RawMessage(`{"sessionId":"s","cwd":"/tmp"}`))
+	result, err = handler(ctx, schema.SessionForkMethodName, json.RawMessage(`{"sessionId":"s","cwd":"`+hostRoot+`/tmp"}`))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,4 @@
-// Package osrun supplies bounded command output for the Unix daemon.
+// Package osrun supplies bounded command output for unattended processes.
 package osrun
 
 import (
@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode/utf8"
 )
@@ -52,20 +51,10 @@ func StartCommand(ctx context.Context, dir string, args []string, env map[string
 	for key, value := range env {
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = processGroup()
 	cmd.WaitDelay = time.Second
 	cmd.Cancel = func() error { return Kill(cmd) }
 	return cmd
-}
-func Kill(cmd *exec.Cmd) error {
-	if cmd.Process == nil {
-		return nil
-	}
-	err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	if errors.Is(err, syscall.ESRCH) {
-		return os.ErrProcessDone
-	}
-	return err
 }
 
 // Run separates stdout from diagnostic stderr. JSON callers fail if truncated.
