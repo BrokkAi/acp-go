@@ -61,3 +61,14 @@ func TestValidatePathsGatesAdditionalDirectories(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestValidatePathsAcceptsAbsolutePathsFromEitherPlatform(t *testing.T) {
+	if err := validatePaths(initialization(true), "/", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateServers(initialization(true), []schema.McpServer{
+		NewStdioServer("local", "/opt/mcp", nil, nil),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
