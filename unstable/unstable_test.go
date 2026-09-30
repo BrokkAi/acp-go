@@ -148,6 +148,14 @@ func TestForkSessionGatesAndEncodes(t *testing.T) {
 	if request := <-requests; request.method != schema.SessionForkMethodName {
 		t.Fatalf("method = %s", request.method)
 	}
+	// Issue #47: a Windows client must be able to fork into a POSIX agent
+	// working directory even though filepath.IsAbs rejects "/" there.
+	if _, err := acpunstable.ForkSession(ctx, connection, initialization, schema.ForkSessionRequest{Cwd: "/", SessionID: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if request := <-requests; request.method != schema.SessionForkMethodName {
+		t.Fatalf("method = %s", request.method)
+	}
 }
 
 type testHandler struct{}

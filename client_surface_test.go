@@ -497,3 +497,74 @@ func TestNewSessionAcceptsPOSIXAbsoluteAgentPath(t *testing.T) {
 	}
 	assertJSONKey(t, request.Params, "cwd", `"/"`)
 }
+
+// TestNewSessionAcceptsWindowsAbsoluteAgentPath covers the other direction of
+// issue #47: a POSIX client must be able to address a Windows agent with a
+// drive-absolute or UNC path.
+func TestNewSessionAcceptsWindowsAbsoluteAgentPath(t *testing.T) {
+	ctx := context.Background()
+	for _, cwd := range []string{`C:\agent\workspace`, `C:/agent/workspace`, `\\server\share`} {
+		c, requests := singleRequestFixture(t, `{"sessionId":"windows-agent"}`)
+		created, err := c.NewSessionWithOptions(ctx, allCapabilities(), cwd, NewSessionOptions{})
+		if err != nil {
+			t.Fatalf("cwd %q: %v", cwd, err)
+		}
+		if created.SessionID != "windows-agent" {
+			t.Fatalf("cwd %q: session ID = %q", cwd, created.SessionID)
+		}
+		request := receiveRequest(t, requests)
+		if request.Method != schema.SessionNewMethodName {
+			t.Fatalf("cwd %q: method = %s", cwd, request.Method)
+		}
+		want, err := json.Marshal(cwd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertJSONKey(t, request.Params, "cwd", string(want))
+	}
+}
+
+// TestSessionPathsAcceptPOSIXAbsoluteAgentPaths covers issue #47: every
+// agent-side session entry point must accept a path that is absolute on the
+// agent's platform. On Windows, filepath.IsAbs rejects "/", so these fail if a
+// call site stops delegating to acpvalidate.AbsolutePath.
+func TestSessionPathsAcceptPOSIXAbsoluteAgentPaths(t *testing.T) {
+	ctx := context.Background()
+	init := allCapabilities()
+
+	t.Run("load", func(t *testing.T) {
+		c, requests := singleRequestFixture(t, `{}`)
+		if _, err := c.LoadSession(ctx, init, schema.LoadSessionRequest{SessionID: "old", Cwd: "/"}); err != nil {
+			t.Fatal(err)
+		}
+		request := receiveRequest(t, requests)
+		if request.Method != schema.SessionLoadMethodName {
+			t.Fatalf("method = %s", request.Method)
+		}
+		assertJSONKey(t, request.Params, "cwd", `"/"`)
+	})
+
+	t.Run("resume", func(t *testing.T) {
+		c, requests := singleRequestFixture(t, `{}`)
+		if _, err := c.ResumeSession(ctx, init, schema.ResumeSessionRequest{SessionID: "old", Cwd: "/"}); err != nil {
+			t.Fatal(err)
+		}
+		request := receiveRequest(t, requests)
+		if request.Method != schema.SessionResumeMethodName {
+			t.Fatalf("method = %s", request.Method)
+		}
+		assertJSONKey(t, request.Params, "cwd", `"/"`)
+	})
+
+	t.Run("list", func(t *testing.T) {
+		c, requests := singleRequestFixture(t, `{"sessions":[]}`)
+		if _, err := c.ListSessions(ctx, init, schema.ListSessionsRequest{Cwd: strPtr("/")}); err != nil {
+			t.Fatal(err)
+		}
+		request := receiveRequest(t, requests)
+		if request.Method != schema.SessionListMethodName {
+			t.Fatalf("method = %s", request.Method)
+		}
+		assertJSONKey(t, request.Params, "cwd", `"/"`)
+	})
+}

@@ -68,6 +68,7 @@ func TestValidatePathsAcceptsAbsolutePathsFromEitherPlatform(t *testing.T) {
 	}
 	if err := validateServers(initialization(true), []schema.McpServer{
 		NewStdioServer("local", "/opt/mcp", nil, nil),
+		NewStdioServer("windows", `C:\tools\mcp.exe`, nil, nil),
 	}); err != nil {
 		t.Fatal(err)
 	}

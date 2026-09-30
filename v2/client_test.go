@@ -426,3 +426,36 @@ func TestV2NewSessionUsesStoredInitialization(t *testing.T) {
 		t.Fatalf("session ID = %q", session.SessionID)
 	}
 }
+
+// TestV2SessionPathsAcceptPOSIXAbsoluteAgentPaths covers issue #47 for the
+// draft-v2 session entry points besides NewSession.
+func TestV2SessionPathsAcceptPOSIXAbsoluteAgentPaths(t *testing.T) {
+	ctx := context.Background()
+	client, _ := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
+		switch method {
+		case schema.SessionResumeMethodName:
+			request := decode[schema.ResumeSessionRequest](t, raw)
+			if request.Cwd != "/" {
+				t.Errorf("resume cwd = %q", request.Cwd)
+			}
+			return schema.ResumeSessionResponse{}, nil
+		case schema.SessionListMethodName:
+			request := decode[schema.ListSessionsRequest](t, raw)
+			if request.Cwd == nil || *request.Cwd != "/" {
+				t.Errorf("list cwd = %v", request.Cwd)
+			}
+			return schema.ListSessionsResponse{}, nil
+		default:
+			return nil, &acp.RPCError{Code: -32601}
+		}
+	}, nil)
+
+	initialization := sessionInitialization()
+	if _, err := client.ResumeSession(ctx, initialization, schema.ResumeSessionRequest{SessionID: "old", Cwd: "/"}); err != nil {
+		t.Fatal(err)
+	}
+	cwd := schema.AbsolutePath("/")
+	if _, err := client.ListSessions(ctx, initialization, schema.ListSessionsRequest{Cwd: &cwd}); err != nil {
+		t.Fatal(err)
+	}
+}

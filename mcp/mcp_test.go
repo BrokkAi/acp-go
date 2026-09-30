@@ -165,3 +165,46 @@ func TestResumeAndForkGateOnCapabilities(t *testing.T) {
 		t.Fatalf("method = %s", method)
 	}
 }
+
+// TestSessionPathsAcceptPOSIXAbsoluteAgentPaths covers issue #47 for the
+// unstable v1 MCP session helpers: each one must accept "/" even when the
+// client host treats it as relative.
+func TestSessionPathsAcceptPOSIXAbsoluteAgentPaths(t *testing.T) {
+	ctx := context.Background()
+	initialization := schema.InitializeResponse{AgentCapabilities: &schema.AgentCapabilities{
+		SessionCapabilities: &schema.SessionCapabilities{
+			Resume: &schema.SessionResumeCapabilities{},
+			Fork:   &schema.SessionForkCapabilities{},
+		},
+	}}
+
+	t.Run("new", func(t *testing.T) {
+		connection, requests := fixture(t, func(string) any { return map[string]any{"sessionId": "s"} })
+		if _, err := mcp.NewSession(ctx, connection, initialization, "/", mcp.NewSessionOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if method := <-requests; method != schema.SessionNewMethodName {
+			t.Fatalf("method = %s", method)
+		}
+	})
+
+	t.Run("resume", func(t *testing.T) {
+		connection, requests := fixture(t, func(string) any { return map[string]any{} })
+		if _, err := mcp.ResumeSession(ctx, connection, initialization, schema.ResumeSessionRequest{Cwd: "/", SessionID: "old"}); err != nil {
+			t.Fatal(err)
+		}
+		if method := <-requests; method != schema.SessionResumeMethodName {
+			t.Fatalf("method = %s", method)
+		}
+	})
+
+	t.Run("fork", func(t *testing.T) {
+		connection, requests := fixture(t, func(string) any { return map[string]any{"sessionId": "forked"} })
+		if _, err := mcp.ForkSession(ctx, connection, initialization, schema.ForkSessionRequest{Cwd: "/", SessionID: "old"}); err != nil {
+			t.Fatal(err)
+		}
+		if method := <-requests; method != schema.SessionForkMethodName {
+			t.Fatalf("method = %s", method)
+		}
+	})
+}
