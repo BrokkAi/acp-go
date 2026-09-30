@@ -33,6 +33,14 @@ never uses reflection over struct fields.
 | Absolute URIs on resource links and embedded resources | v1 and draft-v2 prompt facades |
 | Capability gates before writing | v1 and draft-v2 facades |
 
+`acpvalidate.AbsolutePath` accepts a path that is absolute on either platform -
+POSIX (`/dir`), Windows drive-absolute (`C:\dir` or `C:/dir`), or a Windows UNC
+path - because the agent that resolves session paths may run on a different
+platform than the client. Drive-relative (`C:dir`) and root-relative (`\dir`)
+paths are still rejected. Host-local paths keep host-native `filepath.IsAbs`
+checks: `clienthost` resolves them against the client filesystem, and the v2
+runner uses one as the local agent's working directory.
+
 `acpvalidate.MediaType` accepts RFC 6838 `type/subtype` with optional
 `name=value` parameters. `acpvalidate.URI` requires an RFC 3986 scheme, and
 `acpvalidate.Identifier` requires a non-blank value. All three report an error

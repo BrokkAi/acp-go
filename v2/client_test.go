@@ -391,3 +391,38 @@ func TestV2CancelRequestReusesTransportHelper(t *testing.T) {
 		t.Fatal("missing $/cancel_request frame")
 	}
 }
+
+// TestV2NewSessionUsesStoredInitialization covers issue #46: the convenience
+// wrapper must use the initialization from Initialize, and a POSIX-absolute
+// cwd must reach the wire from a Windows client.
+func TestV2NewSessionUsesStoredInitialization(t *testing.T) {
+	client, _ := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
+		switch method {
+		case schema.InitializeMethodName:
+			return sessionInitialization(), nil
+		case schema.SessionNewMethodName:
+			request := decode[schema.NewSessionRequest](t, raw)
+			if request.Cwd != "/" {
+				t.Errorf("cwd = %q", request.Cwd)
+			}
+			return schema.NewSessionResponse{SessionID: "v2-session"}, nil
+		default:
+			return nil, &acp.RPCError{Code: -32601}
+		}
+	}, nil)
+
+	ctx := context.Background()
+	if _, err := client.NewSession(ctx, "/"); err == nil {
+		t.Fatal("NewSession before Initialize was accepted")
+	}
+	if _, err := client.InitializeWithInfo(ctx, Capabilities{}, ClientInfo{Name: "fixture-client", Version: "2.0"}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.NewSession(ctx, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.SessionID != "v2-session" {
+		t.Fatalf("session ID = %q", session.SessionID)
+	}
+}

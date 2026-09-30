@@ -11,6 +11,7 @@ package acpvalidate
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -24,13 +25,42 @@ func Identifier(kind, value string) error {
 	return nil
 }
 
-// AbsolutePath requires the ACP absolute-path newtype: a path that is absolute
-// for the host running the client.
+// AbsolutePath requires the ACP absolute-path newtype. The session paths that
+// the facades validate are resolved by the agent, which may run on a different
+// platform than the client, so the check accepts a path that is absolute on
+// either platform: POSIX-absolute (a leading "/"), Windows drive-absolute
+// ("C:\dir" or "C:/dir"), or a Windows UNC path. Relative paths,
+// drive-relative paths such as "C:dir", and root-relative paths such as
+// "\dir" are rejected. The check is deliberately permissive: the agent stays
+// the authority on its own filesystem.
 func AbsolutePath(kind, value string) error {
-	if !filepath.IsAbs(value) {
+	if !isAbsolutePath(value) {
 		return fmt.Errorf("%s must be absolute: %q", kind, value)
 	}
 	return nil
+}
+
+// isAbsolutePath reports whether value is absolute on at least one supported
+// platform. filepath.IsAbs answers for the client host and path.IsAbs answers
+// for POSIX regardless of host; the Windows forms that filepath recognizes
+// only when built for Windows need an explicit check so a POSIX client can
+// address a Windows agent.
+func isAbsolutePath(value string) bool {
+	if filepath.IsAbs(value) || path.IsAbs(value) {
+		return true
+	}
+	if len(value) >= 3 && isASCIILetter(value[0]) && value[1] == ':' && isPathSeparator(value[2]) {
+		return true
+	}
+	return len(value) >= 2 && value[0] == '\\' && value[1] == '\\'
+}
+
+func isASCIILetter(c byte) bool {
+	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
+}
+
+func isPathSeparator(c byte) bool {
+	return c == '/' || c == '\\'
 }
 
 // MediaType requires an RFC 6838 "type/subtype" media type. Optional

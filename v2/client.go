@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"path/filepath"
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
@@ -35,6 +34,9 @@ type Connection struct {
 	mu           sync.Mutex
 	initialized  bool
 	initializing bool
+	// initialization is the response from the most recent successful
+	// Initialize call. It is guarded by mu.
+	initialization Initialization
 }
 
 func Connect(in io.ReadCloser, out io.WriteCloser, onRequest acp.Handler, onNotification acp.Notifications) *Connection {
@@ -55,11 +57,14 @@ func (c *Connection) beginInitialize() error {
 	}
 }
 
-func (c *Connection) completeInitialize(success bool) {
+func (c *Connection) completeInitialize(initialization Initialization, success bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.initializing = false
 	c.initialized = success
+	if success {
+		c.initialization = initialization
+	}
 }
 
 func (c *Connection) Initialize(ctx context.Context, capabilities Capabilities) (Initialization, error) {
@@ -85,14 +90,14 @@ func (c *Connection) InitializeWithInfo(ctx context.Context, capabilities Capabi
 	if result.ProtocolVersion != Version {
 		_ = c.Close()
 		err := fmt.Errorf("agent selected unsupported ACP version %d", result.ProtocolVersion)
-		c.completeInitialize(false)
+		c.completeInitialize(Initialization{}, false)
 		return result, err
 	}
 	if result.Info.Name == "" || result.Info.Version == "" {
-		c.completeInitialize(false)
+		c.completeInitialize(Initialization{}, false)
 		return result, fmt.Errorf("agent initialize response info requires name and version")
 	}
-	c.completeInitialize(true)
+	c.completeInitialize(result, true)
 	return result, nil
 }
 
@@ -138,8 +143,23 @@ type NewSessionOptions struct {
 	AdditionalDirectories []string
 }
 
+// NewSession starts a session using the initialization response from the most
+// recent successful Initialize call. Use NewSessionWithOptions when the
+// initialization is held elsewhere.
 func (c *Connection) NewSession(ctx context.Context, directory string) (Session, error) {
-	return c.NewSessionWithOptions(ctx, Initialization{}, directory, NewSessionOptions{})
+	initialization, ok := c.initializationSnapshot()
+	if !ok {
+		return Session{}, fmt.Errorf("connection must be initialized before starting a session")
+	}
+	return c.NewSessionWithOptions(ctx, initialization, directory, NewSessionOptions{})
+}
+
+// initializationSnapshot returns the most recent successful initialization.
+// ok is false until Initialize has completed successfully.
+func (c *Connection) initializationSnapshot() (Initialization, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.initialization, c.initialized
 }
 
 func (c *Connection) NewSessionWithOptions(ctx context.Context, initialization Initialization, directory string, options NewSessionOptions) (Session, error) {
@@ -272,10 +292,7 @@ func requireSessionCapabilities(initialization Initialization) error {
 }
 
 func validateAbsolutePath(path string) error {
-	if !filepath.IsAbs(path) {
-		return fmt.Errorf("ACP path must be absolute: %q", path)
-	}
-	return nil
+	return acpvalidate.AbsolutePath("ACP path", path)
 }
 
 func validateAdditionalDirectories(initialization Initialization, directories []string) error {

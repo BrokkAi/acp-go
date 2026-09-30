@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"time"
 
+	"github.com/BrokkAi/acp-go/internal/acpvalidate"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -17,10 +17,7 @@ type NewSessionOptions struct {
 }
 
 func requireAbsolutePath(path string) error {
-	if !filepath.IsAbs(path) {
-		return fmt.Errorf("ACP path must be absolute: %q", path)
-	}
-	return nil
+	return acpvalidate.AbsolutePath("ACP path", path)
 }
 
 func requireCapability(supported bool, method string) error {

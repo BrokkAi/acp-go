@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Fixed
+
+- Client-side path validation now accepts paths that are absolute on either
+  platform: POSIX roots (`/`), Windows drive-absolute paths (`C:\dir` or
+  `C:/dir`), and UNC paths. A Windows client can address a remote POSIX agent
+  with `cwd` `/`, and a POSIX client can address a Windows agent; drive-relative
+  (`C:dir`) and root-relative (`\dir`) paths stay rejected. Host-local paths in
+  `clienthost` and the draft-v2 runner keep host-native checks.
+- `v2.Connection.NewSession(ctx, directory)` uses the initialization from the
+  most recent successful `Initialize` call instead of passing an empty
+  initialization, which made the convenience method fail before sending
+  `session/new` (#46).
+
 ## 0.11.0 - 2026-09-29
 
 ### Added

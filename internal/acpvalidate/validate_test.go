@@ -8,9 +8,16 @@ func TestAbsolutePath(t *testing.T) {
 		want  bool
 	}{
 		{value: hostRoot + "/tmp/workspace", want: true},
+		{value: "/", want: true},
+		{value: "/tmp/workspace", want: true},
+		{value: "C:/workspace", want: true},
+		{value: `C:\workspace`, want: true},
+		{value: `\\server\share`, want: true},
 		{value: "relative/path", want: false},
 		{value: "", want: false},
 		{value: "./here", want: false},
+		{value: "C:relative", want: false},
+		{value: `\rooted`, want: false},
 	} {
 		if err := AbsolutePath("path", tc.value); (err == nil) != tc.want {
 			t.Fatalf("AbsolutePath(%q) error = %v, want ok=%v", tc.value, err, tc.want)

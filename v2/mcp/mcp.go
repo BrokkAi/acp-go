@@ -6,8 +6,8 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
+	"github.com/BrokkAi/acp-go/internal/acpvalidate"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
 )
@@ -82,8 +82,8 @@ func validateSessionCapabilities(initialization acpv2.Initialization) error {
 }
 
 func validatePaths(initialization acpv2.Initialization, directory string, additional []string) error {
-	if !filepath.IsAbs(directory) {
-		return fmt.Errorf("ACP path must be absolute: %q", directory)
+	if err := acpvalidate.AbsolutePath("ACP path", directory); err != nil {
+		return err
 	}
 	if len(additional) > 0 {
 		session := initialization.Capabilities.Session
@@ -92,8 +92,8 @@ func validatePaths(initialization acpv2.Initialization, directory string, additi
 		}
 	}
 	for _, path := range additional {
-		if !filepath.IsAbs(path) {
-			return fmt.Errorf("ACP path must be absolute: %q", path)
+		if err := acpvalidate.AbsolutePath("ACP path", path); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -113,8 +113,8 @@ func validateServers(initialization acpv2.Initialization, servers []schema.McpSe
 			if server.Stdio.Name == "" || server.Stdio.Command == "" {
 				return fmt.Errorf("stdio MCP server %d requires a name and command", i)
 			}
-			if !filepath.IsAbs(string(server.Stdio.Command)) {
-				return fmt.Errorf("stdio MCP server %d command path must be absolute", i)
+			if err := acpvalidate.AbsolutePath(fmt.Sprintf("stdio MCP server %d command path", i), string(server.Stdio.Command)); err != nil {
+				return err
 			}
 		case server.HTTP != nil:
 			if capabilities == nil || capabilities.HTTP == nil {

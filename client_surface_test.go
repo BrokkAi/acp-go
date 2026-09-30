@@ -478,3 +478,22 @@ func assertJSONEqual(t *testing.T, params map[string]json.RawMessage, key, want 
 }
 
 func strPtr(value string) *string { return &value }
+
+// TestNewSessionAcceptsPOSIXAbsoluteAgentPath covers issue #45: a Windows
+// client must be able to address a POSIX agent with cwd "/".
+func TestNewSessionAcceptsPOSIXAbsoluteAgentPath(t *testing.T) {
+	ctx := context.Background()
+	c, requests := singleRequestFixture(t, `{"sessionId":"posix-root"}`)
+	created, err := c.NewSessionWithOptions(ctx, allCapabilities(), "/", NewSessionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.SessionID != "posix-root" {
+		t.Fatalf("session ID = %q", created.SessionID)
+	}
+	request := receiveRequest(t, requests)
+	if request.Method != schema.SessionNewMethodName {
+		t.Fatalf("method = %s", request.Method)
+	}
+	assertJSONKey(t, request.Params, "cwd", `"/"`)
+}
