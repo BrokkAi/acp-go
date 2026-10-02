@@ -227,9 +227,9 @@
 // replaces InitializeWithInfo on the connection, so the recipe checks the
 // negotiated version itself and closes the connection on a mismatch. A
 // native acp server makes the agent reach the MCP server over the same ACP
-// connection with the request-scoped mcp/message binding. acp-go does not
-// serve that binding yet (#39), so an application that declares one answers
-// it in its own handler.
+// connection with the request-scoped mcp/message binding. The recipe does not
+// wire the mover up; an application that declares a server serves it with
+// mcp.MessageRouter and the consuming side calls through mcp.MessageClient.
 //
 // Draft v2 attaches servers only through [github.com/BrokkAi/acp-go/v2/mcp];
 // the core v2 facade refuses them. Every transport, stdio included, needs the
@@ -241,9 +241,9 @@
 // The Rust global_mcp_server, per_session_mcp_server, and filtering_tools
 // recipes build MCP servers inside a proxy with the rmcp SDK and serve them
 // over MCP-over-ACP. acp-go is standard-library-only, so it has no MCP server
-// builder, and the request-scoped MCP-over-ACP binding is open in #39. The
-// proxy recipe shows the ACP half: adding a server declaration to session
-// setup.
+// builder; the request-scoped binding is only a message mover that leaves the
+// MCP protocol to the caller. The proxy recipe shows the ACP half: adding a
+// server declaration to session setup.
 //
 // running_proxies_with_conductor has no Go counterpart, because the conductor
 // is won't port (#24). connecting_as_client describes Rust's session builder;

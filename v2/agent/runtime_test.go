@@ -220,7 +220,7 @@ func (a *unidentifiedPromptAgent) Prompt(context.Context, Client, schema.PromptR
 }
 
 // TestRuntimeRejectsPromptResponseWithoutUserMessageID keeps an invalid
-// acceptance off the wire. schema-v2.0.0-alpha.5 requires
+// acceptance off the wire. schema-v2.0.0-alpha.7 requires
 // PromptResponse.messageId, so an implementation that leaves it empty must
 // fail loudly instead of sending "messageId": "".
 func TestRuntimeRejectsPromptResponseWithoutUserMessageID(t *testing.T) {

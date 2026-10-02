@@ -1,6 +1,7 @@
-// Package mcp provides the draft MCP-over-ACP session options. It mirrors the
-// Rust SDK's separately enabled unstable_mcp_over_acp feature: importing this
-// package is the explicit Go opt-in.
+// Package mcp provides the draft MCP-over-ACP session options and the
+// request-scoped mcp/message mover (MessageClient and MessageRouter). It
+// mirrors the Rust SDK's separately enabled unstable_mcp_over_acp feature:
+// importing this package is the explicit Go opt-in.
 package mcp
 
 import (

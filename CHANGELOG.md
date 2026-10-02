@@ -15,6 +15,12 @@ series, minor releases may contain breaking API changes.
   `subagent_update` types (#1992), plus the session message and state-update
   types (`idle`, `running`, `requires_action`, `unknown`) that ride in
   `session/update`.
+- `mcp` and `v2/mcp` gain the request-scoped MCP-over-ACP message mover
+  (#39): `MessageClient` drives an agent-to-provider `mcp/message` request and
+  routes its request-scoped notifications, while `MessageRouter` serves
+  registered server IDs and answers binding failures with the protocol's outer
+  error codes (`-32602`, `-32800`, `-33001`, `-33002`). Inner MCP errors stay
+  in the response carrier and never surface as ACP errors.
 
 ### Changed
 

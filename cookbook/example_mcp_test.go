@@ -126,9 +126,9 @@ func Example_mcpServers() {
 
 	// Importing mcp opts in to the unstable transports. A native acp server
 	// asks the agent to reach the MCP server over this ACP connection with
-	// the request-scoped mcp/message binding. acp-go does not serve that
-	// binding yet (#39), so an application that declares one answers it in
-	// its own acp.Handler.
+	// the request-scoped mcp/message binding. An application that declares
+	// one serves it with mcp.MessageRouter; this recipe only shows the
+	// session declaration.
 	if _, err := mcp.NewSession(ctx, connection, optional, directory, mcp.NewSessionOptions{
 		Servers: []unstable.McpServer{{ACP: &unstable.McpServerAcp{Name: "workspace-tools", ServerID: "tools-1"}}},
 	}); err != nil {

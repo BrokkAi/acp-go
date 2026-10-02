@@ -5,8 +5,9 @@ the reference Rust SDK workspace have no Go equivalent, which are worth porting,
 and which are not. This document records that evaluation.
 
 It was checked against the same baseline as [ROADMAP.md](../ROADMAP.md): Rust
-`agent-client-protocol` 2.2.0 with `agent-client-protocol-schema = "=1.9.1"`.
-For each crate we read the workspace `Cargo.toml` and its public documentation,
+`agent-client-protocol` 2.2.0. The schema baseline has since moved to
+`agent-client-protocol-schema` 1.10.2, which the SDK has not adopted yet. For
+each crate we read the workspace `Cargo.toml` and its public documentation,
 then compared the surface with what `acp-go` already ships.
 
 ## Decision rule

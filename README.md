@@ -188,7 +188,11 @@ MCP-over-ACP remains an explicit draft opt-in through
 `github.com/BrokkAi/acp-go/v2/mcp` (draft v2) and
 `github.com/BrokkAi/acp-go/mcp` (v1), matching the Rust SDK's separately gated
 `unstable_mcp_over_acp` feature; the v1 package is what carries the native
-`acp` server transport that the stable v1 schema does not model. Generated
+`acp` server transport that the stable v1 schema does not model. Both packages
+carry the request-scoped `mcp/message` mover: `MessageClient` drives an
+agent-to-provider request and routes its request-scoped notifications, and
+`MessageRouter` serves registered server IDs on the provider side, keeping
+inner MCP errors in the response carrier. Generated
 protocol versions and error codes use the schema's exact integer widths; in
 particular, `ProtocolVersion` is a `uint16`, so strings and values above 65535
 fail to decode.
