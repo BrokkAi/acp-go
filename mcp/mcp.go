@@ -3,6 +3,10 @@
 // unstable MCP server transports, including the native MCP-over-ACP variant
 // that the stable v1 schema does not model.
 //
+// The package also carries the request-scoped MCP-over-ACP mover: MessageClient
+// drives agent-to-provider mcp/message requests, and MessageRouter serves them
+// for registered server IDs.
+//
 // Importing this package is the explicit opt-in, mirroring the Rust SDK's
 // separately enabled unstable_mcp_over_acp feature. Capability gating reads the
 // unstable initialize response, whose McpCapabilities carry the acp/http/sse

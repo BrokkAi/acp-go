@@ -28,6 +28,8 @@ providers, err := unstable.ListProviders(ctx, connection, initialization)
 | `ListProviders`, `SetProvider`, `DisableProvider` | `agentCapabilities.providers` | Requires a non-blank provider ID before writing. |
 | `ForkSession` | `sessionCapabilities.fork` | Requires a session ID, an absolute `cwd`, and absolute additional directories; rejects inline MCP servers so MCP stays behind its own import; requires a non-blank forked session ID in the response. |
 | `StartNes`, `SuggestNes`, `AcceptNes`, `RejectNes`, `CloseNes` | `agentCapabilities.nes` | Requests: start/suggest/close; notifications: accept/reject. Requires non-blank session and suggestion IDs, and an absolute document URI. Implemented for v1 and draft v2. |
+| `MessageClient` | — | Consumer side of the request-scoped `mcp/message` binding: requires a server ID, request ID, and inner MCP method, rejects duplicate active IDs, routes request-scoped notifications to the owning call, and cancels through the outer ACP request. Implemented for v1 and draft v2. |
+| `MessageRouter` | — | Provider side of the request-scoped binding: server-ID registry and dispatch, request-scoped notifications through `MessageRequest.Notify`, `Unregister` cancellation, and the binding's outer error codes (`-32602`, `-32800`, `-33001`, `-33002`). Implemented for v1 and draft v2. |
 | `Handle` | — | Agent-side dispatch: routes providers/* and session/fork to optional `ProviderHandler`/`ForkHandler` implementations, answers method-not-found when a handler is missing, and delegates every other method to the next handler. |
 | `HandleNesNotifications` | — | Composes the agent side of `nes/accept`/`nes/reject` (notifications) with another `acp.Notifications` handler. |
 | `Projection` | — | Client-side: folds optional session updates into ordered per-session state (see below). `Projection.Notifications` adapts `session/update` notifications. |
@@ -61,12 +63,13 @@ binding that upstream shipped in
 [agentclientprotocol/agent-client-protocol#2223](https://github.com/agentclientprotocol/agent-client-protocol/pull/2223):
 `mcp/connect` and `mcp/disconnect` are gone, and each `mcp/message` request
 carries a `serverId`, a caller-generated `requestId`, and the inner MCP method
-and params. Nothing in the SDK serves or drives it yet.
+and params. The `mcp` and `v2/mcp` packages serve and drive it as
+`MessageClient` and `MessageRouter`, behind those explicit opt-ins.
 
-**Decision:** the binding will be a standard-library message mover that carries
-MCP requests, results, and notifications and leaves the MCP protocol to the
-caller. It will not integrate a third-party Go MCP SDK, for the same
-dependency-policy reason that `agent-client-protocol-rmcp` is won't port.
+**Decision:** the binding is a standard-library message mover that carries MCP
+requests, results, and notifications and leaves the MCP protocol to the caller.
+It does not integrate a third-party Go MCP SDK, for the same dependency-policy
+reason that `agent-client-protocol-rmcp` is won't port.
 
 In that revision:
 
@@ -79,8 +82,8 @@ In that revision:
   notifications tied to an active request, never requests of its own.
 - It targets MCP 2026-07-28 only.
 
-The released schema crate carries the change, so implementation is unblocked
-and tracked in #39. It is expected to live in `mcp` and `v2/mcp` as an
-agent-side caller plus a provider-side server-ID registry and dispatcher, with
-tests for the result/error split, request IDs, notification ordering, and
+The released schema crate carried the change, and #39 delivered the mover in
+`mcp` and `v2/mcp`: an agent-side caller plus a provider-side server-ID
+registry and dispatcher, with tests for the result/error split, request IDs,
+duplicate active IDs, notification ordering, late-notification rejection, and
 cancellation.

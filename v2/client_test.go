@@ -304,7 +304,7 @@ func TestV2AuthLoginUsesAdvertisedAgentMethod(t *testing.T) {
 	}
 }
 
-// TestV2PromptRejectsMissingUserMessageID covers schema-v2.0.0-alpha.5, which
+// TestV2PromptRejectsMissingUserMessageID covers schema-v2.0.0-alpha.7, which
 // makes PromptResponse.messageId required. An agent that omits it has not
 // identified the inserted user message, so acceptance cannot be reported as a
 // success.

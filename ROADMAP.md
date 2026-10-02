@@ -37,8 +37,10 @@ only remaining work.
 - One-shot v2 runner with the reference update projection:
   ignore until `running`, apply message chunks and patch snapshots, complete at
   the next `idle`.
-- Explicit MCP-over-ACP opt-in through `github.com/BrokkAi/acp-go/v2/mcp`,
-  mirroring Rust's separate `unstable_mcp_over_acp` feature boundary.
+- Explicit MCP-over-ACP opt-in through `github.com/BrokkAi/acp-go/mcp` and
+  `github.com/BrokkAi/acp-go/v2/mcp`, mirroring Rust's separate
+  `unstable_mcp_over_acp` feature boundary, including the request-scoped
+  `mcp/message` mover.
 - Exact JSON Schema integer formats, notably Rust-compatible `uint16`
   `ProtocolVersion` and `int32` error codes.
 - Stable programmatic tool-call names in v1 and draft v2, surfaced by the
@@ -88,13 +90,13 @@ only remaining work.
   - validate the selected initialize schema,
   - preserve the complete initial single or batch frame without canonicalization,
   - reject future versions rather than downgrading.
-- Unstable schema surfaces from the exact Rust 1.9.1 unstable artifacts:
+- Unstable schema surfaces from the exact Rust 1.10.2 unstable artifacts:
   - v1 and v2 generated bindings in explicit import-only packages,
   - LLM providers,
   - plan operations,
   - session fork, compaction, and notices,
   - NES,
-  - MCP-over-ACP,
+  - MCP-over-ACP (session options and the request-scoped `mcp/message` mover),
   - end-turn token usage,
   - bidirectional `mcp/message` request/notification registry metadata.
 - Optional credential-backed v2 integration coverage: the draft-v2 runner is
@@ -120,14 +122,11 @@ MCP session options all live in
 [docs/unstable-facades.md](docs/unstable-facades.md)'s packages
 (`unstable`, `v2/unstable`, `mcp`, `v2/mcp`).
 
-What remains is the native MCP-over-ACP binding (#39). The shape is decided:
-a standard-library message mover with no third-party MCP SDK. The upstream
-block cleared when the schema crate published the request-scoped
-`mcp/message` binding
-([agentclientprotocol/agent-client-protocol#2223](https://github.com/agentclientprotocol/agent-client-protocol/pull/2223))
-in `schema-v1.24.1` and `schema-v2.0.0-alpha.7`. Implementation is tracked in
-#39 and lives in `mcp` and `v2/mcp` as an agent-side caller plus a
-provider-side server-ID registry and dispatcher; see
+The native MCP-over-ACP binding is delivered (#39): `mcp` and `v2/mcp` expose
+the standard-library message mover decided above, with `MessageClient` on the
+consumer side and `MessageRouter` on the provider side. Inner MCP errors stay
+in the response carrier; binding failures use the protocol's outer error codes
+(`-32602`, `-32800`, `-33001`, `-33002`). See
 [docs/unstable-facades.md](docs/unstable-facades.md).
 
 ### 2. Rust ecosystem crate ports
