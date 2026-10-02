@@ -568,3 +568,78 @@ func TestSessionPathsAcceptPOSIXAbsoluteAgentPaths(t *testing.T) {
 		assertJSONKey(t, request.Params, "cwd", `"/"`)
 	})
 }
+
+// TestSessionPathsAcceptWindowsAbsoluteAgentPaths covers the other direction of
+// issue #47 for the v1 load, resume, and list validators: a POSIX client must
+// be able to address a Windows agent with a drive-absolute cwd.
+func TestSessionPathsAcceptWindowsAbsoluteAgentPaths(t *testing.T) {
+	ctx := context.Background()
+	init := allCapabilities()
+	cwd := `C:\agent\workspace`
+	want, err := json.Marshal(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("load", func(t *testing.T) {
+		c, requests := singleRequestFixture(t, `{}`)
+		if _, err := c.LoadSession(ctx, init, schema.LoadSessionRequest{SessionID: "old", Cwd: cwd}); err != nil {
+			t.Fatal(err)
+		}
+		request := receiveRequest(t, requests)
+		if request.Method != schema.SessionLoadMethodName {
+			t.Fatalf("method = %s", request.Method)
+		}
+		assertJSONKey(t, request.Params, "cwd", string(want))
+	})
+
+	t.Run("resume", func(t *testing.T) {
+		c, requests := singleRequestFixture(t, `{}`)
+		if _, err := c.ResumeSession(ctx, init, schema.ResumeSessionRequest{SessionID: "old", Cwd: cwd}); err != nil {
+			t.Fatal(err)
+		}
+		request := receiveRequest(t, requests)
+		if request.Method != schema.SessionResumeMethodName {
+			t.Fatalf("method = %s", request.Method)
+		}
+		assertJSONKey(t, request.Params, "cwd", string(want))
+	})
+
+	t.Run("list", func(t *testing.T) {
+		c, requests := singleRequestFixture(t, `{"sessions":[]}`)
+		if _, err := c.ListSessions(ctx, init, schema.ListSessionsRequest{Cwd: strPtr(cwd)}); err != nil {
+			t.Fatal(err)
+		}
+		request := receiveRequest(t, requests)
+		if request.Method != schema.SessionListMethodName {
+			t.Fatalf("method = %s", request.Method)
+		}
+		assertJSONKey(t, request.Params, "cwd", string(want))
+	})
+}
+
+// TestNewSessionAcceptsEitherPlatformAdditionalDirectories covers the
+// additionalDirectories validator shared by session/new, session/load, and
+// session/resume: a mixed list must survive the path check even though the
+// first entry is absolute only on POSIX and the others only on Windows.
+func TestNewSessionAcceptsEitherPlatformAdditionalDirectories(t *testing.T) {
+	ctx := context.Background()
+	directories := []string{"/", `C:\agent\extra`, `\\server\share\extra`}
+	c, requests := singleRequestFixture(t, `{"sessionId":"either-platform"}`)
+	created, err := c.NewSessionWithOptions(ctx, allCapabilities(), `C:\agent\workspace`, NewSessionOptions{AdditionalDirectories: directories})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.SessionID != "either-platform" {
+		t.Fatalf("session ID = %q", created.SessionID)
+	}
+	request := receiveRequest(t, requests)
+	if request.Method != schema.SessionNewMethodName {
+		t.Fatalf("method = %s", request.Method)
+	}
+	want, err := json.Marshal(directories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONKey(t, request.Params, "additionalDirectories", string(want))
+}
