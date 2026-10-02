@@ -6,6 +6,32 @@ series, minor releases may contain breaking API changes.
 
 ## Unreleased
 
+### Added
+
+- Draft v2 `NewSessionResponse` and `ResumeSessionResponse` carry
+  `availableCommands`, the initial commands the agent can execute; later
+  `available_commands_update` notifications replace the list (#2259).
+- The pinned unstable schemas add the subagent capability, session, and
+  `subagent_update` types (#1992), plus the session message and state-update
+  types (`idle`, `running`, `requires_action`, `unknown`) that ride in
+  `session/update`.
+
+### Changed
+
+- Schema pins move from ACP v1 `schema-v1.23.0` / draft v2
+  `schema-v2.0.0-alpha.5` to `schema-v1.24.1` / `schema-v2.0.0-alpha.7`,
+  matching Rust schema crate `agent-client-protocol-schema` 1.10.2. The
+  unstable MCP-over-ACP surface follows upstream's request-scoped binding
+  (#2223): `mcp/connect` and `mcp/disconnect` are removed, `mcp/message` now
+  carries `serverId`, `requestId`, `method`, and optional `params`, and its
+  response is a shape-disambiguated union carrying exactly one inner MCP
+  `result` or `McpError`. The Rust SDK's latest release (2.2.0) still pins
+  schema 1.9.1; the pin moved on the schema crate's own release, which the
+  pin workflow allows.
+- `cmd/acpgen` models untagged unions with inline object variants
+  distinguished by required carrier keys, the shape of the new
+  `MessageMcpResponse`, with a regression test.
+
 ### Fixed
 
 - Client-side path validation now accepts paths that are absolute on either

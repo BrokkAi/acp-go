@@ -6,17 +6,13 @@ Protocol, with v1 and draft-v2 behavior aligned to the
 
 ## Reference baseline
 
-The behavioral reference is:
-
-- Rust `agent-client-protocol` **2.2.0**
-- Rust `agent-client-protocol-schema` **exactly 1.9.1**
-- schema crate 1.9.1 contains:
-  - ACP v1 **`schema-v1.23.0`**
-  - draft ACP v2 **`schema-v2.0.0-alpha.5`**
-
-Our pinned artifacts are byte-for-byte identical to that Rust release. Do not
-track ACP repository `main` or a newer schema release until the Rust SDK moves
-its exact `=1.9.1` schema dependency.
+The behavioral reference is Rust `agent-client-protocol` **2.2.0**. The schema
+baseline moved ahead of it: Rust `agent-client-protocol-schema` **1.10.2**
+published ACP v1 **`schema-v1.24.1`** and draft ACP v2
+**`schema-v2.0.0-alpha.7`**, and our pinned artifacts are byte-for-byte
+identical to that schema-crate release. The SDK's latest release still pins
+`=1.9.1`; the pin workflow allows the schema-crate release trigger, and the
+newer pin carries the released request-scoped MCP-over-ACP binding.
 
 ## Status
 
@@ -125,12 +121,13 @@ MCP session options all live in
 (`unstable`, `v2/unstable`, `mcp`, `v2/mcp`).
 
 What remains is the native MCP-over-ACP binding (#39). The shape is decided:
-a standard-library message mover with no third-party MCP SDK. Implementation is
-blocked upstream, because
-[agentclientprotocol/agent-client-protocol#2223](https://github.com/agentclientprotocol/agent-client-protocol/pull/2223)
-replaced the pinned `mcp/connect`/`mcp/message`/`mcp/disconnect` draft with
-request-scoped `mcp/message` for MCP 2026-07-28, and no schema release includes
-it yet. Work resumes once the Rust SDK pins a schema that does; see
+a standard-library message mover with no third-party MCP SDK. The upstream
+block cleared when the schema crate published the request-scoped
+`mcp/message` binding
+([agentclientprotocol/agent-client-protocol#2223](https://github.com/agentclientprotocol/agent-client-protocol/pull/2223))
+in `schema-v1.24.1` and `schema-v2.0.0-alpha.7`. Implementation is tracked in
+#39 and lives in `mcp` and `v2/mcp` as an agent-side caller plus a
+provider-side server-ID registry and dispatcher; see
 [docs/unstable-facades.md](docs/unstable-facades.md).
 
 ### 2. Rust ecosystem crate ports

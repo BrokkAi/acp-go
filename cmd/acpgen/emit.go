@@ -334,9 +334,22 @@ func emitUntaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 		fmt.Fprintf(b, "\t%s\n", f.goDecl())
 	}
 	for _, v := range td.Variants {
-		fmt.Fprintf(b, "\t%s *%s `json:\"-\"`\n", v.GoName, v.Payload)
+		fmt.Fprintf(b, "\t%s *%s `json:\"-\"`\n", v.GoName, payloadType(r, td, v))
 	}
 	b.WriteString("}\n\n")
+
+	// Inline variant payload structs.
+	for _, v := range td.Variants {
+		if v.Open || v.Payload != "" {
+			continue
+		}
+		fmt.Fprintf(b, "type %s%s struct {\n", td.Name, v.GoName)
+		for _, f := range v.Inline {
+			writeDoc(b, "\t", f.Doc)
+			fmt.Fprintf(b, "\t%s\n", f.goDecl())
+		}
+		b.WriteString("}\n\n")
+	}
 
 	if len(td.Fields) > 0 {
 		fmt.Fprintf(b, "// %s mirrors %s without its union methods, for encoding common fields.\ntype %s %s\n\n", shadow, td.Name, shadow, td.Name)
@@ -372,7 +385,7 @@ func emitUntaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 		if i > 0 {
 			keyword = "} else if"
 		}
-		fmt.Fprintf(b, "\t%s %s {\n\t\tv.%s = new(%s)\n\t\treturn json.Unmarshal(data, v.%s)\n\t", keyword, probeCall(r, v.Payload), v.GoName, v.Payload, v.GoName)
+		fmt.Fprintf(b, "\t%s %s {\n\t\tv.%s = new(%s)\n\t\treturn json.Unmarshal(data, v.%s)\n\t", keyword, untaggedProbe(r, v), v.GoName, payloadType(r, td, v), v.GoName)
 	}
 	fmt.Fprintf(b, "}\n\treturn fmt.Errorf(\"%s: payload matches no variant\")\n}\n\n", td.Name)
 
@@ -409,6 +422,25 @@ func arrayHasKeys(data []byte, keys ...string) bool {
 }
 
 var probeHelpersEmitted bool
+
+// untaggedProbe renders the shape test guarding one untagged variant. Ref and
+// array variants probe the payload def's required keys; inline variants probe
+// their own required carrier keys.
+func untaggedProbe(r *ir, v variant) string {
+	if v.Payload != "" {
+		return probeCall(r, v.Payload)
+	}
+	var keys []string
+	for _, f := range v.Inline {
+		if f.Required {
+			keys = append(keys, f.JSONName)
+		}
+	}
+	if len(keys) == 0 {
+		return "true"
+	}
+	return fmt.Sprintf("hasKeys(data, %s)", quoteList(keys))
+}
 
 // requiredKeysExpr lists the payload def's required wire keys for probing.
 func requiredKeysExpr(r *ir, defName string) []string {

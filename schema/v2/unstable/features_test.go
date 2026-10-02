@@ -6,8 +6,7 @@ func TestUnstableFeatureMethodsAreImportOptIn(t *testing.T) {
 	required := []string{
 		"providers/list", "providers/set", "providers/disable",
 		"session/fork", "nes/start", "nes/suggest", "nes/accept",
-		"nes/reject", "nes/close", "mcp/connect", "mcp/message",
-		"mcp/disconnect", "document/didOpen",
+		"nes/reject", "nes/close", "mcp/message", "document/didOpen",
 	}
 	for _, method := range required {
 		if _, ok := Methods[method]; !ok {
