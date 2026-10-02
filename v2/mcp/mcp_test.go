@@ -66,8 +66,14 @@ func TestValidatePathsAcceptsAbsolutePathsFromEitherPlatform(t *testing.T) {
 	if err := validatePaths(initialization(true), "/", nil); err != nil {
 		t.Fatal(err)
 	}
+	withAdditional := initialization(true)
+	withAdditional.Capabilities.Session.AdditionalDirectories = &schema.SessionAdditionalDirectoriesCapabilities{}
+	if err := validatePaths(withAdditional, `C:\agent\workspace`, []string{"/", `C:\agent\extra`}); err != nil {
+		t.Fatal(err)
+	}
 	if err := validateServers(initialization(true), []schema.McpServer{
 		NewStdioServer("local", "/opt/mcp", nil, nil),
+		NewStdioServer("windows", `C:\tools\mcp.exe`, nil, nil),
 	}); err != nil {
 		t.Fatal(err)
 	}

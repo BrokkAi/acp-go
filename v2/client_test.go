@@ -426,3 +426,69 @@ func TestV2NewSessionUsesStoredInitialization(t *testing.T) {
 		t.Fatalf("session ID = %q", session.SessionID)
 	}
 }
+
+// TestV2SessionPathsAcceptEitherPlatformAbsolutePaths covers issue #47 for the
+// draft-v2 session entry points: every client-side validator must accept a path
+// that is absolute on the agent's platform, whichever platform the client runs
+// on, including the additional directories resume carries.
+func TestV2SessionPathsAcceptEitherPlatformAbsolutePaths(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		cwd  string
+	}{
+		{name: "posix root", cwd: "/"},
+		{name: "windows drive", cwd: `C:\agent\workspace`},
+		{name: "windows unc", cwd: `\\server\share`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, _ := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
+				switch method {
+				case schema.SessionNewMethodName:
+					request := decode[schema.NewSessionRequest](t, raw)
+					if string(request.Cwd) != tc.cwd {
+						t.Errorf("new cwd = %q", request.Cwd)
+					}
+					return schema.NewSessionResponse{SessionID: "v2-session"}, nil
+				case schema.SessionResumeMethodName:
+					request := decode[schema.ResumeSessionRequest](t, raw)
+					if string(request.Cwd) != tc.cwd {
+						t.Errorf("resume cwd = %q", request.Cwd)
+					}
+					if len(request.AdditionalDirectories) != 2 ||
+						string(request.AdditionalDirectories[0]) != "/" ||
+						string(request.AdditionalDirectories[1]) != `C:\agent\extra` {
+						t.Errorf("additional directories = %v", request.AdditionalDirectories)
+					}
+					return schema.ResumeSessionResponse{}, nil
+				case schema.SessionListMethodName:
+					request := decode[schema.ListSessionsRequest](t, raw)
+					if request.Cwd == nil || string(*request.Cwd) != tc.cwd {
+						t.Errorf("list cwd = %v", request.Cwd)
+					}
+					return schema.ListSessionsResponse{}, nil
+				default:
+					return nil, &acp.RPCError{Code: -32601}
+				}
+			}, nil)
+
+			initialization := sessionInitialization()
+			initialization.Capabilities.Session.AdditionalDirectories = &schema.SessionAdditionalDirectoriesCapabilities{}
+			if _, err := client.NewSessionWithOptions(ctx, initialization, tc.cwd, NewSessionOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.ResumeSession(ctx, initialization, schema.ResumeSessionRequest{
+				SessionID:             "old",
+				Cwd:                   schema.AbsolutePath(tc.cwd),
+				AdditionalDirectories: []schema.AbsolutePath{"/", `C:\agent\extra`},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			cwd := schema.AbsolutePath(tc.cwd)
+			if _, err := client.ListSessions(ctx, initialization, schema.ListSessionsRequest{Cwd: &cwd}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
