@@ -53,22 +53,22 @@ MCP-over-ACP for the v1 surface landed as `github.com/BrokkAi/acp-go/mcp`,
 mirroring `v2/mcp`: session create, resume, and fork helpers that
 accept the unstable server transports, including the native `acp` variant.
 
-## MCP-over-ACP methods: a message mover, blocked upstream
+## MCP-over-ACP methods: a request-scoped message mover
 
 The native MCP-over-ACP *methods* are still open from #10. The pinned schemas
-(`schema-v1.23.0` and `schema-v2.0.0-alpha.5`) model a connection-based binding
-with `mcp/connect`, `mcp/message`, and `mcp/disconnect`. Nothing in the SDK
-serves or drives them, and nothing will be added for that shape.
+(`schema-v1.24.1` and `schema-v2.0.0-alpha.7`) model the request-scoped
+binding that upstream shipped in
+[agentclientprotocol/agent-client-protocol#2223](https://github.com/agentclientprotocol/agent-client-protocol/pull/2223):
+`mcp/connect` and `mcp/disconnect` are gone, and each `mcp/message` request
+carries a `serverId`, a caller-generated `requestId`, and the inner MCP method
+and params. Nothing in the SDK serves or drives it yet.
 
 **Decision:** the binding will be a standard-library message mover that carries
 MCP requests, results, and notifications and leaves the MCP protocol to the
 caller. It will not integrate a third-party Go MCP SDK, for the same
 dependency-policy reason that `agent-client-protocol-rmcp` is won't port.
 
-**Blocked upstream:**
-[agentclientprotocol/agent-client-protocol#2223](https://github.com/agentclientprotocol/agent-client-protocol/pull/2223)
-replaced the connection-based draft with a request-scoped one, and the RFD says
-the earlier drafts are not compatibility commitments. In that revision:
+In that revision:
 
 - `mcp/connect` and `mcp/disconnect` are gone. Each agent-to-provider
   `mcp/message` request carries a `serverId`, a caller-generated `requestId`,
@@ -79,10 +79,8 @@ the earlier drafts are not compatibility commitments. In that revision:
   notifications tied to an active request, never requests of its own.
 - It targets MCP 2026-07-28 only.
 
-No schema release includes that change yet, and the
-[pin workflow](schema-pin-workflow.md) moves the pins only when the Rust SDK
-moves its exact schema dependency. Implementation waits for that release. It is
-expected to live in `mcp` and `v2/mcp` as an agent-side caller plus a
-provider-side server-ID registry and dispatcher, with tests for the
-result/error split, request IDs, notification ordering, and cancellation.
-Tracked in #39.
+The released schema crate carries the change, so implementation is unblocked
+and tracked in #39. It is expected to live in `mcp` and `v2/mcp` as an
+agent-side caller plus a provider-side server-ID registry and dispatcher, with
+tests for the result/error split, request IDs, notification ordering, and
+cancellation.

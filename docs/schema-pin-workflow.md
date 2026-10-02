@@ -9,11 +9,12 @@ generator commands; this page is the review checklist that runs around them.
 The reference Rust SDK releases `agent-client-protocol` with a different
 `agent-client-protocol-schema = "=X.Y.Z"` pin, or that schema crate publishes a
 new version. [ROADMAP.md](../ROADMAP.md) records the current baseline (schema
-crate 1.9.1 → ACP v1 `schema-v1.23.0`, draft v2
-`schema-v2.0.0-alpha.5`).
+crate 1.10.2 → ACP v1 `schema-v1.24.1`, draft v2
+`schema-v2.0.0-alpha.7`). The 1.10.2 pin moved on the schema-crate release
+trigger while the Rust SDK core 2.2.0 still pinned `=1.9.1`.
 
-Do not follow the ACP schema repository on its own; move only when the Rust SDK
-moves its exact pin.
+Do not follow the ACP schema repository `main` on its own; move on a released
+schema crate or when the Rust SDK moves its exact pin.
 
 ## Steps
 
@@ -28,8 +29,14 @@ moves its exact pin.
      -out schema/v2 -package v2
    go run ./cmd/acpgen -schema schema/v2/schema.json \
      -meta schema/v2/meta.json -out schema/v2 -package v2
+   go run ./cmd/acpgen -update <version> -unstable \
+     -schema schema/unstable/schema.json -meta schema/unstable/meta.json \
+     -out schema/unstable -package unstable
    go run ./cmd/acpgen -schema schema/unstable/schema.json \
      -meta schema/unstable/meta.json -out schema/unstable -package unstable
+   go run ./cmd/acpgen -update <v2-version> -unstable \
+     -schema schema/v2/unstable/schema.json -meta schema/v2/unstable/meta.json \
+     -out schema/v2/unstable -package unstable
    go run ./cmd/acpgen -schema schema/v2/unstable/schema.json \
      -meta schema/v2/unstable/meta.json -out schema/v2/unstable -package unstable
    ```

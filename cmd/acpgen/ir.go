@@ -257,8 +257,10 @@ func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *roo
 		return td, nil
 	}
 
-	// Untagged composite union: probe-decoded sum struct. Variants are either
-	// direct $refs or arrays of a $ref (e.g. flat vs grouped select options).
+	// Untagged composite union: probe-decoded sum struct. Variants are direct
+	// $refs, arrays of a $ref (e.g. flat vs grouped select options), or inline
+	// object variants distinguished by their required carrier keys (e.g. a
+	// result branch versus an error branch).
 	td.Kind = kindUntaggedUnion
 	for _, v := range variants {
 		payload := v.Ref
@@ -270,10 +272,28 @@ func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *roo
 				payload = "[]" + target
 			}
 		}
+		nv := variant{GoName: goNameOf(v.Title), Payload: payload, Doc: v.Description}
 		if payload == "" {
-			return nil, fmt.Errorf("%s: untagged variant without $ref is unsupported", name)
+			if v.Properties == nil && v.soleType() != "object" {
+				return nil, fmt.Errorf("%s: untagged variant without $ref or object payload is unsupported", name)
+			}
+			if nv.GoName == "" {
+				return nil, fmt.Errorf("%s: untagged inline variant is missing a title", name)
+			}
+			required := map[string]bool{}
+			for _, k := range v.Required {
+				required[k] = true
+			}
+			for _, p := range sortedProps(v.Properties) {
+				f, err := fieldFrom(p.key, p.value, root, preserveNull)
+				if err != nil {
+					return nil, fmt.Errorf("%s %s variant: %w", name, nv.GoName, err)
+				}
+				f.Required = required[p.key]
+				nv.Inline = append(nv.Inline, f)
+			}
 		}
-		td.Variants = append(td.Variants, variant{GoName: goNameOf(v.Title), Payload: payload, Doc: v.Description})
+		td.Variants = append(td.Variants, nv)
 	}
 	return td, nil
 }
@@ -673,11 +693,13 @@ func (r *ir) checkCollisions() error {
 	for _, td := range r.Defs {
 		if td.Kind == kindTaggedUnion {
 			generated[td.Name+"Kind"] = true
+		}
+		if td.Kind == kindTaggedUnion || td.Kind == kindUntaggedUnion {
 			for _, v := range td.Variants {
-				if len(v.Inline) > 0 {
+				if !v.Open && v.Payload == "" {
 					generated[td.Name+v.GoName] = true
 				}
-				if v.Open {
+				if td.Kind == kindTaggedUnion && v.Open {
 					generated[td.Name+"Other"] = true
 				}
 			}
@@ -727,8 +749,9 @@ func countKey(m map[string]bool, key string) int {
 
 func (r *ir) buildMethods(meta *metaFile) error {
 	type entry struct {
-		side, params, notificationParams, result string
-		notification                             bool
+		sides                            map[string]bool
+		params, notificationParams, result string
+		notification                     bool
 	}
 	entries := map[string]*entry{}
 	for _, td := range r.Defs {
@@ -737,11 +760,11 @@ func (r *ir) buildMethods(meta *metaFile) error {
 		}
 		e := entries[td.Method]
 		if e == nil {
-			e = &entry{}
+			e = &entry{sides: map[string]bool{}}
 			entries[td.Method] = e
 		}
 		if td.Side != "" {
-			e.side = td.Side
+			e.sides[td.Side] = true
 		}
 		switch {
 		case strings.HasSuffix(td.Name, "Response"):
@@ -809,8 +832,19 @@ func (r *ir) buildMethods(meta *metaFile) error {
 		} else if e.notification && e.notificationParams == "" {
 			e.notificationParams = e.params
 		}
-		if e.side != "" && e.side != side {
-			return fmt.Errorf("method %s: x-side %q contradicts meta.json side %q", m, e.side, side)
+		defSides := make([]string, 0, len(e.sides))
+		for defSide := range e.sides {
+			defSides = append(defSides, defSide)
+		}
+		sort.Strings(defSides)
+		for _, defSide := range defSides {
+			// A method both peers may call carries per-message x-side
+			// annotations (the sender or owner of each payload), so agent and
+			// client sides are both consistent with meta.json's "both".
+			if defSide == side || (side == "both" && (defSide == "agent" || defSide == "client")) {
+				continue
+			}
+			return fmt.Errorf("method %s: x-side %q contradicts meta.json side %q", m, defSide, side)
 		}
 		r.Methods = append(r.Methods, methodDesc{
 			Name: m, GoName: methodGoName(m), Side: side,
