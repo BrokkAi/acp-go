@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"strings"
@@ -308,4 +309,65 @@ func TestAgentClientMethodsAreGatedByAdvertisedCapabilities(t *testing.T) {
 			t.Fatalf("capability gate error = %v", err)
 		}
 	})
+}
+
+// TestCreateElicitationSendsModeFields guards the mode-specific fields an
+// elicitation/create request must carry: requestedSchema for form mode, and
+// url plus elicitationId for URL mode.
+func TestCreateElicitationSendsModeFields(t *testing.T) {
+	wantURL := "https://example.test/login"
+	prompt := func(ctx context.Context, client Client, request schema.PromptRequest, _ SessionUpdater) (schema.PromptResponse, error) {
+		session := &schema.ElicitationSessionScope{SessionID: request.SessionID}
+		if _, err := client.CreateElicitation(ctx, schema.CreateElicitationRequest{
+			Message: "Which ticket?",
+			Form: &schema.ElicitationFormMode{
+				RequestedSchema: schema.ElicitationSchema{Required: []string{"ticket"}},
+				Session:         session,
+			},
+		}); err != nil {
+			return schema.PromptResponse{}, err
+		}
+		if _, err := client.CreateElicitation(ctx, schema.CreateElicitationRequest{
+			Message: "Log in to continue",
+			URL:     &schema.ElicitationUrlMode{ElicitationID: "el_1", URL: wantURL, Session: session},
+		}); err != nil {
+			return schema.PromptResponse{}, err
+		}
+		return schema.PromptResponse{StopReason: schema.StopReasonEndTurn}, nil
+	}
+	var sent []json.RawMessage
+	elicitation := acp.HandleElicitation(nil, func(context.Context, schema.CreateElicitationRequest) (schema.CreateElicitationResponse, error) {
+		return acp.CancelElicitation(), nil
+	})
+	host := func(ctx context.Context, method string, raw json.RawMessage) (any, error) {
+		sent = append(sent, append(json.RawMessage(nil), raw...))
+		return elicitation(ctx, method, raw)
+	}
+	connection := startRuntime(t, testAgent{prompt: prompt}, host, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	initialization := initializeClient(t, connection, acp.Capabilities{Elicitation: acp.ElicitationClientCapabilities(true, true)})
+	session, err := connection.NewSession(ctx, hostRoot+"/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.PromptContent(ctx, initialization, session, []acp.Content{acp.NewTextContent("ask")}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("elicitation requests = %d, want 2", len(sent))
+	}
+	var form, url map[string]any
+	if err := json.Unmarshal(sent[0], &form); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(sent[1], &url); err != nil {
+		t.Fatal(err)
+	}
+	if requested, ok := form["requestedSchema"].(map[string]any); form["mode"] != "form" || !ok || requested["required"] == nil {
+		t.Fatalf("form request = %s", sent[0])
+	}
+	if url["mode"] != "url" || url["url"] != wantURL || url["elicitationId"] != "el_1" {
+		t.Fatalf("url request = %s", sent[1])
+	}
 }

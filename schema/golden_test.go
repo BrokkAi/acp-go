@@ -2,6 +2,7 @@ package schema
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -38,8 +39,8 @@ var goldens = []struct {
 			},
 			"agentInfo": {"name": "example-agent", "version": "1.2.3"},
 			"authMethods": [
-				{"id": "agent-login", "type": "agent"},
-				{"id": "terminal-login", "type": "terminal"}
+				{"id": "agent-login", "name": "Agent login"},
+				{"id": "terminal-login", "name": "Terminal login", "type": "terminal"}
 			]
 		}`,
 	},
@@ -49,7 +50,7 @@ var goldens = []struct {
 		`{
 			"cwd": "/repo",
 			"mcpServers": [
-				{"name": "docs", "command": "npx", "args": ["-y", "@docs/server"]}
+				{"name": "docs", "command": "npx", "args": ["-y", "@docs/server"], "env": []}
 			]
 		}`,
 	},
@@ -126,8 +127,9 @@ var goldens = []struct {
 			"sessionId": "sess_123",
 			"update": {
 				"sessionUpdate": "usage_update",
-				"contextWindow": {"used": 12000, "size": 200000},
-				"cumulativeCost": {"usd": 0.42}
+				"used": 12000,
+				"size": 200000,
+				"cost": {"amount": 0.42, "currency": "USD"}
 			}
 		}`,
 	},
@@ -151,12 +153,12 @@ var goldens = []struct {
 	{
 		"terminal create and output",
 		CreateTerminalRequest{},
-		`{"command": "go", "args": ["test", "./..."], "cwd": "/repo", "outputByteLimit": 1048576}`,
+		`{"sessionId": "sess_123", "command": "go", "args": ["test", "./..."], "cwd": "/repo", "outputByteLimit": 1048576}`,
 	},
 	{
 		"terminal output with exit status",
 		TerminalOutputResponse{},
-		`{"output": "ok\n", "truncated": false, "exitStatus": {"exitCode": 0, "signal": null}}`,
+		`{"output": "ok\n", "truncated": false, "exitStatus": {"exitCode": 0}}`,
 	},
 	{
 		"fs read with line range",
@@ -169,6 +171,7 @@ var goldens = []struct {
 		`{
 			"sessionId": "sess_123",
 			"mode": "form",
+			"message": "Which ticket?",
 			"requestedSchema": {
 				"type": "object",
 				"properties": {
@@ -210,10 +213,13 @@ func TestGoldenFlows(t *testing.T) {
 	for _, g := range goldens {
 		t.Run(g.name, func(t *testing.T) {
 			want := canonical(t, g.wire)
-			if err := json.Unmarshal([]byte(g.wire), &g.typ); err != nil {
+			// Decode into a pointer to the concrete type; decoding into the
+			// any field itself would replace it with a generic map.
+			value := reflect.New(reflect.TypeOf(g.typ))
+			if err := json.Unmarshal([]byte(g.wire), value.Interface()); err != nil {
 				t.Fatalf("decode: %v\n%s", err, g.wire)
 			}
-			got, err := json.Marshal(g.typ)
+			got, err := json.Marshal(value.Elem().Interface())
 			if err != nil {
 				t.Fatalf("encode: %v", err)
 			}
