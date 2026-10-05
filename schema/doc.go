@@ -23,4 +23,9 @@
 //   - The JSON-RPC routing envelopes (AgentRequest, AgentNotification, and
 //     friends) are not emitted; dispatch by method string and decode params
 //     with the type named by the Methods registry.
+//
+// This package is the stable surface only. ACP's optional ("unstable")
+// features, including LLM providers, session fork, MCP-over-ACP, NES, and
+// document events, live in the opt-in schema/unstable package and are not
+// re-exported here.
 package schema

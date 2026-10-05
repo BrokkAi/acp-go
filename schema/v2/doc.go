@@ -21,4 +21,8 @@
 // three wire states: omitted, explicit null, and a concrete value.
 // Integer formats retain their JSON Schema wire width; ProtocolVersion is a
 // uint16 and ErrorCode is an int32.
+//
+// This package is the stable draft surface only. ACP v2's optional
+// ("unstable") features live in the opt-in schema/v2/unstable package and are
+// not re-exported here.
 package v2

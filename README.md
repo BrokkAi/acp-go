@@ -121,12 +121,14 @@ tests, so tracking a new schema release is a reviewed regeneration rather
 than hand transcription. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
 update workflow.
 
-`schema/unstable` and `schema/v2/unstable` are separate opt-in packages
-generated from Rust schema crate 1.10.2's unstable artifacts. They expose the
-combined optional feature surface, including LLM providers, MCP-over-ACP, NES,
+acp-go exposes ACP's optional ("unstable") features through opt-in packages,
+not through the stable surface. `schema/unstable` and `schema/v2/unstable` are
+generated from Rust schema crate 1.10.2's unstable artifacts and carry the
+combined optional feature types, including LLM providers, MCP-over-ACP, NES,
 plan operations, session fork/compaction/notices, and end-turn token usage. The
-stable `schema` and `schema/v2` packages do not import or expose those generated
-types.
+`unstable`, `v2/unstable`, `mcp`, and `v2/mcp` packages add typed facades on top.
+The stable `acp`, `v2`, `schema`, and `schema/v2` packages do not import or
+expose any of it. See [docs/unstable-facades.md](docs/unstable-facades.md).
 
 ## Trace context
 
