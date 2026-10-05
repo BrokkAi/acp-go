@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
-## Unreleased
+## 0.12.1 - 2026-10-05
 
 ### Fixed
 
