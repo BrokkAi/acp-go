@@ -2,6 +2,7 @@ package v2
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -97,17 +98,46 @@ var goldens = []struct {
 			"nextCursor": "next"
 		}`,
 	},
+	{
+		"elicitation form request",
+		CreateElicitationRequest{},
+		`{
+			"sessionId": "sess_123",
+			"mode": "form",
+			"message": "Which ticket?",
+			"requestedSchema": {
+				"type": "object",
+				"properties": {
+					"ticket": {"type": "string", "format": "uri"}
+				},
+				"required": ["ticket"]
+			}
+		}`,
+	},
+	{
+		"elicitation url request",
+		CreateElicitationRequest{},
+		`{
+			"requestId": 7,
+			"mode": "url",
+			"elicitationId": "el_1",
+			"url": "https://example.test/login",
+			"message": "Log in to continue"
+		}`,
+	},
 }
 
 func TestGoldenFlows(t *testing.T) {
 	for _, golden := range goldens {
 		t.Run(golden.name, func(t *testing.T) {
 			want := canonical(t, golden.wire)
-			value := golden.typ
-			if err := json.Unmarshal([]byte(golden.wire), &value); err != nil {
+			// Decode into a pointer to the concrete type; decoding into an
+			// any variable would replace it with a generic map.
+			value := reflect.New(reflect.TypeOf(golden.typ))
+			if err := json.Unmarshal([]byte(golden.wire), value.Interface()); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
-			got, err := json.Marshal(value)
+			got, err := json.Marshal(value.Elem().Interface())
 			if err != nil {
 				t.Fatalf("encode: %v", err)
 			}

@@ -177,6 +177,58 @@ func classify(name string, def *rawSchema, root *rootSchema, preserveNull bool) 
 }
 
 func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *rootSchema, preserveNull bool) (*typeDef, error) {
+	td, err := classifyUnionShape(name, def, variants, root, preserveNull)
+	if err != nil {
+		return nil, err
+	}
+	// Properties declared beside the oneOf/anyOf are part of the wire shape.
+	// Fail instead of generating a type that silently drops them.
+	for _, p := range sortedProps(def.Properties) {
+		if !td.carries(p.key) {
+			return nil, fmt.Errorf("%s: property %q declared beside the union is not modeled", name, p.key)
+		}
+	}
+	return td, nil
+}
+
+// carries reports whether the generated type encodes the given wire key as a
+// field or as its discriminator.
+func (td *typeDef) carries(key string) bool {
+	if td.Kind == kindTaggedUnion && key == td.TagJSON {
+		return true
+	}
+	for _, f := range td.Fields {
+		if f.JSONName == key {
+			return true
+		}
+	}
+	return false
+}
+
+// sharedFields lifts properties declared beside a oneOf/anyOf (schemars puts
+// common fields there) into union struct fields. skip names the tag key,
+// which the union derives from the chosen variant instead.
+func sharedFields(name string, def *rawSchema, skip string, root *rootSchema, preserveNull bool) ([]field, error) {
+	required := map[string]bool{}
+	for _, k := range def.Required {
+		required[k] = true
+	}
+	var fields []field
+	for _, p := range sortedProps(def.Properties) {
+		if p.key == skip {
+			continue
+		}
+		f, err := fieldFrom(p.key, p.value, root, preserveNull)
+		if err != nil {
+			return nil, fmt.Errorf("%s.%s: %w", name, p.key, err)
+		}
+		f.Required = required[p.key]
+		fields = append(fields, f)
+	}
+	return fields, nil
+}
+
+func classifyUnionShape(name string, def *rawSchema, variants []*rawSchema, root *rootSchema, preserveNull bool) (*typeDef, error) {
 	td := &typeDef{Name: name, Doc: def.Description}
 
 	// Enum: every variant is a bare string or integer; known members carry
@@ -236,23 +288,8 @@ func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *roo
 		td.Kind = kindTaggedUnion
 		td.TagJSON = tagged.tag
 		td.Variants = tagged.list
-		// Shared properties lifted beside the oneOf/anyOf by schemars.
-		if len(def.Properties) > 0 {
-			required := map[string]bool{}
-			for _, k := range def.Required {
-				required[k] = true
-			}
-			for _, p := range sortedProps(def.Properties) {
-				if p.key == tagged.tag {
-					continue
-				}
-				f, err := fieldFrom(p.key, p.value, root, preserveNull)
-				if err != nil {
-					return nil, fmt.Errorf("%s.%s: %w", name, p.key, err)
-				}
-				f.Required = required[p.key]
-				td.Fields = append(td.Fields, f)
-			}
+		if td.Fields, err = sharedFields(name, def, tagged.tag, root, preserveNull); err != nil {
+			return nil, err
 		}
 		return td, nil
 	}
@@ -260,8 +297,13 @@ func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *roo
 	// Untagged composite union: probe-decoded sum struct. Variants are direct
 	// $refs, arrays of a $ref (e.g. flat vs grouped select options), or inline
 	// object variants distinguished by their required carrier keys (e.g. a
-	// result branch versus an error branch).
+	// result branch versus an error branch). Shared properties (e.g. the
+	// elicitation form schema beside its session/request scope) become
+	// common fields.
 	td.Kind = kindUntaggedUnion
+	if td.Fields, err = sharedFields(name, def, "", root, preserveNull); err != nil {
+		return nil, err
+	}
 	for _, v := range variants {
 		payload := v.Ref
 		if payload == "" && len(v.AllOf) == 1 {
@@ -749,9 +791,9 @@ func countKey(m map[string]bool, key string) int {
 
 func (r *ir) buildMethods(meta *metaFile) error {
 	type entry struct {
-		sides                            map[string]bool
+		sides                              map[string]bool
 		params, notificationParams, result string
-		notification                     bool
+		notification                       bool
 	}
 	entries := map[string]*entry{}
 	for _, td := range r.Defs {

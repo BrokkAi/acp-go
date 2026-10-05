@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Fixed
+
+- Generated `ElicitationFormMode` now carries `RequestedSchema`, and
+  `ElicitationUrlMode` carries `ElicitationID` and `URL`, in the v1, draft v2,
+  and both unstable schema packages. These required fields were dropped, so
+  `CreateElicitation` sent invalid `elicitation/create` requests and decoding
+  lost them (#53). `cmd/acpgen` now lifts properties declared beside an
+  untagged union into common fields, and fails generation when a union's
+  properties would not be modeled.
+- The schema golden tests decoded into a generic map instead of the generated
+  type, so they never exercised the generated codecs. They now decode into the
+  concrete type, and the v1 fixtures that had drifted from the pinned schema
+  are corrected.
+
 ## 0.12.0 - 2026-10-02
 
 ### Added

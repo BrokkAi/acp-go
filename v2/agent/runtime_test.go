@@ -205,7 +205,12 @@ type gatingAgent struct{ *echoAgent }
 
 func (a *gatingAgent) Prompt(ctx context.Context, client Client, request schema.PromptRequest, _ SessionUpdater) (schema.PromptResponse, error) {
 	_, err := client.CreateElicitation(ctx, schema.CreateElicitationRequest{
-		URL: &schema.ElicitationUrlMode{Session: &schema.ElicitationSessionScope{SessionID: request.SessionID}},
+		Message: "Log in to continue",
+		URL: &schema.ElicitationUrlMode{
+			ElicitationID: "el_1",
+			URL:           "https://example.test/login",
+			Session:       &schema.ElicitationSessionScope{SessionID: request.SessionID},
+		},
 	})
 	if err != nil {
 		return schema.PromptResponse{}, err

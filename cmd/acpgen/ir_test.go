@@ -78,3 +78,83 @@ func TestUntaggedUnionSupportsInlineObjectVariants(t *testing.T) {
 		}
 	}
 }
+
+// TestUntaggedUnionLiftsSharedProperties covers the elicitation mode shape:
+// mode-specific properties declared beside an untagged anyOf of scope refs
+// must become common fields, not be dropped.
+func TestUntaggedUnionLiftsSharedProperties(t *testing.T) {
+	object := json.RawMessage(`"object"`)
+	scope := func(key string) *rawSchema {
+		return &rawSchema{
+			Type:       object,
+			Required:   []string{key},
+			Properties: map[string]*rawSchema{key: {Type: json.RawMessage(`"string"`)}},
+		}
+	}
+	root := &rootSchema{Defs: map[string]*rawSchema{
+		"SessionScope": scope("sessionId"),
+		"RequestScope": scope("requestId"),
+	}}
+	def := &rawSchema{
+		Type:     object,
+		Required: []string{"url"},
+		Properties: map[string]*rawSchema{
+			"url":  {Type: json.RawMessage(`"string"`)},
+			"note": {Type: json.RawMessage(`"string"`)},
+		},
+		AnyOf: []*rawSchema{
+			{Title: "Session", AllOf: []*rawSchema{{Ref: "#/$defs/SessionScope"}}},
+			{Title: "Request", AllOf: []*rawSchema{{Ref: "#/$defs/RequestScope"}}},
+		},
+	}
+
+	td, err := classify("UrlMode", def, root, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if td.Kind != kindUntaggedUnion || len(td.Variants) != 2 {
+		t.Fatalf("classified as %+v", td)
+	}
+	if len(td.Fields) != 2 || td.Fields[0].JSONName != "note" || td.Fields[0].Required ||
+		td.Fields[1].JSONName != "url" || !td.Fields[1].Required {
+		t.Fatalf("shared fields = %+v", td.Fields)
+	}
+
+	defs := []*typeDef{td}
+	byName := map[string]*typeDef{"UrlMode": td}
+	for _, name := range []string{"SessionScope", "RequestScope"} {
+		scopeDef, err := classify(name, root.Defs[name], root, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defs = append(defs, scopeDef)
+		byName[name] = scopeDef
+	}
+	src := string(emitTypes(&ir{ByName: byName, Defs: defs}, "test", "testpkg"))
+	for _, want := range []string{
+		"`json:\"url\"`",
+		"`json:\"note,omitempty\"`",
+		"type urlModeShadow UrlMode",
+		"json.Unmarshal(data, (*urlModeShadow)(v))",
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("generated source missing %q:\n%s", want, src)
+		}
+	}
+}
+
+// TestUnionRejectsUnmodeledSharedProperties keeps the generator from silently
+// dropping properties declared beside a union shape that cannot carry them.
+func TestUnionRejectsUnmodeledSharedProperties(t *testing.T) {
+	def := &rawSchema{
+		Properties: map[string]*rawSchema{"extra": {Type: json.RawMessage(`"string"`)}},
+		OneOf: []*rawSchema{
+			{Type: json.RawMessage(`"string"`), Const: json.RawMessage(`"a"`)},
+			{Type: json.RawMessage(`"string"`), Const: json.RawMessage(`"b"`)},
+		},
+	}
+	_, err := classify("Letter", def, &rootSchema{}, false)
+	if err == nil || !strings.Contains(err.Error(), `"extra"`) {
+		t.Fatalf("classify error = %v, want unmodeled property error", err)
+	}
+}

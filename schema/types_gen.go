@@ -1096,12 +1096,24 @@ type ElicitationFormCapabilities struct {
 // ElicitationFormMode is a shape-disambiguated union. Exactly one variant pointer must be
 // set; decoding probes each variant's required wire keys in order.
 type ElicitationFormMode struct {
-	Session *ElicitationSessionScope `json:"-"`
-	Request *ElicitationRequestScope `json:"-"`
+	// A JSON Schema describing the form fields to present to the user.
+	RequestedSchema ElicitationSchema        `json:"requestedSchema"`
+	Session         *ElicitationSessionScope `json:"-"`
+	Request         *ElicitationRequestScope `json:"-"`
 }
+
+// elicitationFormModeShadow mirrors ElicitationFormMode without its union methods, for encoding common fields.
+type elicitationFormModeShadow ElicitationFormMode
 
 func (v ElicitationFormMode) MarshalJSON() ([]byte, error) {
 	obj := map[string]json.RawMessage{}
+	if common, err := json.Marshal(elicitationFormModeShadow(v)); err != nil {
+		return nil, err
+	} else if len(common) > 2 {
+		if err := json.Unmarshal(common, &obj); err != nil {
+			return nil, err
+		}
+	}
 	set := 0
 	if v.Session != nil {
 		set++
@@ -1143,6 +1155,9 @@ func (v ElicitationFormMode) MarshalJSON() ([]byte, error) {
 
 func (v *ElicitationFormMode) UnmarshalJSON(data []byte) error {
 	*v = ElicitationFormMode{}
+	if err := json.Unmarshal(data, (*elicitationFormModeShadow)(v)); err != nil {
+		return err
+	}
 	if hasKeys(data, "sessionId") {
 		v.Session = new(ElicitationSessionScope)
 		return json.Unmarshal(data, v.Session)
@@ -1440,12 +1455,26 @@ type ElicitationUrlCapabilities struct {
 // ElicitationUrlMode is a shape-disambiguated union. Exactly one variant pointer must be
 // set; decoding probes each variant's required wire keys in order.
 type ElicitationUrlMode struct {
+	// The unique identifier for this elicitation.
+	ElicitationID ElicitationId `json:"elicitationId"`
+	// The URL to direct the user to.
+	URL     string                   `json:"url"`
 	Session *ElicitationSessionScope `json:"-"`
 	Request *ElicitationRequestScope `json:"-"`
 }
 
+// elicitationUrlModeShadow mirrors ElicitationUrlMode without its union methods, for encoding common fields.
+type elicitationUrlModeShadow ElicitationUrlMode
+
 func (v ElicitationUrlMode) MarshalJSON() ([]byte, error) {
 	obj := map[string]json.RawMessage{}
+	if common, err := json.Marshal(elicitationUrlModeShadow(v)); err != nil {
+		return nil, err
+	} else if len(common) > 2 {
+		if err := json.Unmarshal(common, &obj); err != nil {
+			return nil, err
+		}
+	}
 	set := 0
 	if v.Session != nil {
 		set++
@@ -1487,6 +1516,9 @@ func (v ElicitationUrlMode) MarshalJSON() ([]byte, error) {
 
 func (v *ElicitationUrlMode) UnmarshalJSON(data []byte) error {
 	*v = ElicitationUrlMode{}
+	if err := json.Unmarshal(data, (*elicitationUrlModeShadow)(v)); err != nil {
+		return err
+	}
 	if hasKeys(data, "sessionId") {
 		v.Session = new(ElicitationSessionScope)
 		return json.Unmarshal(data, v.Session)
