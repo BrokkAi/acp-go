@@ -81,6 +81,11 @@ func withAdditionalDirectories(response *schema.InitializeResponse) error {
 	return nil
 }
 
+func withAppendSystemPrompt(response *schema.InitializeResponse) error {
+	response.Capabilities.Session.SystemPrompt = &schema.SessionSystemPromptCapabilities{}
+	return nil
+}
+
 // serve runs the v2 agent runtime with the unstable dispatch installed, as
 // the package documentation describes, and returns a client connection to
 // it plus each request that reached the dispatch, in order.
@@ -94,7 +99,7 @@ func serve(t *testing.T, implementation agent.Agent, next acp.Handler) (*acpv2.C
 		dispatched <- method
 		return handle(ctx, method, raw)
 	}
-	runtime.InitializeResult = acpunstable.Advertise(implementation, withAdditionalDirectories)
+	runtime.InitializeResult = acpunstable.Advertise(implementation, withAdditionalDirectories, withAppendSystemPrompt)
 	done := make(chan error, 1)
 	go func() { done <- runtime.Serve(context.Background(), pair.B, pair.B) }()
 	client := acpv2.Connect(pair.A, pair.A, nil, nil)

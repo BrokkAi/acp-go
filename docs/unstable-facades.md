@@ -14,8 +14,7 @@ removed from the upstream unstable schema in crate 1.15, so acp-go no longer
 generates or wraps them.
 
 Several unstable surfaces in the 1.15.1 pin are generated but have no facade
-yet: client-provided system prompts (#58), subagents (#60), auth status
-(#72), and proxy chains
+yet: subagents (#60), auth status (#72), and proxy chains
 (`proxy/initialize`, `proxy/successor`, registered with `SideProxy`; #69).
 
 ## Why a separate import
@@ -56,21 +55,24 @@ initialization refuse to run.
 | Facade | Gate | Notes |
 |---|---|---|
 | `ListProviders`, `SetProvider`, `DisableProvider` | `agentCapabilities.providers` | Requires a non-blank provider ID before writing. |
-| `ForkSession` | `sessionCapabilities.fork` | Requires a session ID and an absolute `cwd`; additional directories need `sessionCapabilities.additionalDirectories`, which the protocol requires before a client sends them, and must be absolute; rejects inline MCP servers so MCP stays behind its own import; requires a non-blank forked session ID in the response. |
+| `ForkSession` | `sessionCapabilities.fork` | Requires a session ID and an absolute `cwd`; additional directories need `sessionCapabilities.additionalDirectories`, which the protocol requires before a client sends them, and must be absolute; rejects inline MCP servers so MCP stays behind its own import; checks `systemPrompt` (see [Client-provided system prompts](#client-provided-system-prompts)); requires a non-blank forked session ID in the response. |
+| `NewSession`, `LoadSession`, `ResumeSession` | — / `loadSession` / `sessionCapabilities.resume` | The unstable lifecycle requests, which can carry a `systemPrompt` (the reference SDK's `_from` helpers). Same path, MCP, and `systemPrompt` checks as `ForkSession`; load and resume need a session ID; `mcpServers` goes out as `[]` where v1 requires it; session/new needs a non-blank session ID in the response. |
 | `MessageClient` | — | Consumer side of the request-scoped `mcp/message` binding: requires a server ID, request ID, and inner MCP method, rejects duplicate active IDs, routes request-scoped notifications to the owning call, and cancels through the outer ACP request. Implemented for v1 and draft v2. |
 | `MessageRouter` | — | Provider side of the request-scoped binding: server-ID registry and dispatch, request-scoped notifications through `MessageRequest.Notify`, `Unregister`/`UnregisterAndWait` cancellation, an optional `SetMaxActive` limit, and the binding's outer error codes (`-32602`, `-32800`, `-33000`, `-33001`, `-33002`). Implemented for v1 and draft v2. |
 | `Server`, `Service`, `ToolRegistry`, `NewToolServer`, `NewTool` | — | Standard-library MCP server framework and typed tool registry, shared by `mcp` and `v2/mcp` (see below). |
 | `MessageRouter.Attach`, `NewAttachedSession`, `ResumeAttachedSession`, `ForkAttachedSession` (+ v1 `LoadAttachedSession`) | `mcpCapabilities.acp` (v1), `session.mcp.acp` (v2) | Generates a unique `serverId`, registers before writing, appends the `acp` declaration, and releases the registration when validation or the request fails. v2 rejects a name the request already declares with `-32602` before writing. |
 | `Attachment.HandleSessionSetup`, `Attachment.AppendDeclarations` | — | Connection-scoped (global) attachment for proxies: appends the declaration to the raw params of every session setup request, so unknown fields keep their values (the encoding is semantically equal; members may be re-ordered). v2 rejects name collisions with `-32602` and does not forward the request. |
-| `LoadSession` (v1 `mcp`) | `agentCapabilities.loadSession` | session/load with the unstable MCP server transports. |
 | `ArchiveSession`, `UnarchiveSession` | `sessionCapabilities.archive` | Require a non-blank session ID. An unknown session answers `-32002` (`acp.IsResourceNotFound`). |
 | `ListSessions` | `sessionCapabilities.list`; the `archived` filter also needs `sessionCapabilities.archive` | The unstable `session/list` request, whose `archived` filter (`exclude`, `include`, `only`, or any other value, sent unchanged) the stable `ListSessions` cannot carry. `cwd` must be absolute. `SessionInfo.Archived` reports the archive state. |
 | `SessionStatus` | `sessionCapabilities.status` | Requires a non-blank session ID. Unknown status values are preserved; treat anything other than `open` as `saved`. A response without `status` (omitted or `null`) is an error. An unknown session answers `-32002` with the session ID as data. |
 | `SetSessionTitle` | `sessionCapabilities.title` | Requires a non-blank session ID and title. The response carries the title the agent stored, which may be normalized; a response without `title` (omitted or `null`) is an error. |
-| `Install`, `Handle`, `Advertise` | — | Agent-side dispatch: `Handle` routes providers/*, session/fork, session/archive, session/unarchive, session/status, and session/set_title to optional `ProviderHandler`/`ForkHandler`/`ArchiveHandler`/`StatusHandler`/`TitleHandler` implementations and delegates everything else to the next handler; `Advertise` announces the implemented capabilities except `archive`; `Install` sets both on a runtime together with the runtime overrides, such as `session/list` with the archive filter, and is the only way to announce `archive`. See [Agent-side dispatch](#agent-side-dispatch). |
+| `Install`, `Handle`, `Advertise` | — | Agent-side dispatch: `Handle` routes providers/*, session/fork, session/archive, session/unarchive, session/status, and session/set_title to optional `ProviderHandler`/`ForkHandler`/`ArchiveHandler`/`StatusHandler`/`TitleHandler` implementations and delegates everything else to the next handler; `Advertise` announces the implemented capabilities except `archive` and `systemPrompt`; `Install` sets both on a runtime together with the runtime overrides, such as `session/list` with the archive filter and `session/new`, `session/load`, and `session/resume` with the system prompt, and is the only way to announce `archive` and `systemPrompt`. See [Agent-side dispatch](#agent-side-dispatch). |
+| `ValidateSessionSystemPrompt`, `SystemPromptHandler` (+ v1 `SystemPromptLoader`, `SystemPromptResumer`) | `sessionCapabilities.systemPrompt` (v1), `session.systemPrompt` (v2) | Client and agent sides of client-provided system prompts, v1 and draft v2. See [Client-provided system prompts](#client-provided-system-prompts). |
 | `v2/unstable.ListProviders`, `SetProvider`, `DisableProvider` | `capabilities.providers` | Draft-v2 counterparts of the v1 provider facades, with the same non-blank provider ID check. |
-| `v2/unstable.ForkSession` | `capabilities.session.fork` | Counterpart of the reference SDK's `v2::ForkSessionBuilder`. Requires a session ID and an absolute `cwd`; additional directories need `capabilities.session.additionalDirectories`, as on the stable v2 `session/new`, and must be absolute. Rejects inline MCP servers (use `v2/mcp.ForkSession`) and requires a non-blank forked session ID in the response. `systemPrompt` is forwarded unchanged; its capability checks are #58. |
-| `v2/mcp.ForkSession` | `capabilities.session.fork` | The same fork checks, plus the `v2/mcp` transport checks for each server: stdio, HTTP, and the native `acp` transport each need their `capabilities.session.mcp` entry. |
+| `v2/unstable.ForkSession` | `capabilities.session.fork` | Counterpart of the reference SDK's `v2::ForkSessionBuilder`. Requires a session ID and an absolute `cwd`; additional directories need `capabilities.session.additionalDirectories`, as on the stable v2 `session/new`, and must be absolute. Rejects inline MCP servers (use `v2/mcp.ForkSession`), checks `systemPrompt`, and requires a non-blank forked session ID in the response. |
+| `v2/unstable.NewSession`, `ResumeSession` | `capabilities.session` | The draft-v2 lifecycle requests that can carry a `systemPrompt`, with the same path, MCP, and `systemPrompt` checks; resume needs a session ID, and session/new needs a non-blank session ID in the response. |
+| `v2/mcp.NewSession`, `ResumeSession`, `ForkSession` | `capabilities.session` (fork: `.fork`) | The same lifecycle checks, plus the `v2/mcp` transport checks for each server: stdio, HTTP, and the native `acp` transport each need their `capabilities.session.mcp` entry. All three read the unstable initialize response and send the unstable requests, so `NewSessionOptions.SystemPrompt` and the requests' `SystemPrompt` combine with MCP servers, including attached ones. |
+| `mcp.NewSession`, `LoadSession`, `ResumeSession`, `ForkSession` | as their `unstable` counterparts | v1 MCP session helpers with the unstable MCP server transports; `NewSessionOptions.SystemPrompt` and the requests' `SystemPrompt` get the same checks. The attached-session helpers send through them. |
 | `v2/unstable.ArchiveSession`, `UnarchiveSession`, `ListSessions`, `SetSessionTitle` | `capabilities.session.archive` / `.title`; `ListSessions` needs `capabilities.session`, plus `archive` for the filter | Draft-v2 counterparts of the v1 archive, list, and title facades, with the same checks. An unknown session answers `-32002` with `SessionNotFoundErrorData`, which `acpv2.SessionNotFoundData` decodes. |
 | `v2/unstable.SessionStatus` | `capabilities.session.status` | As in v1, plus the optional foreground `State` snapshot. `State` is nil when the agent omits it, sends `null`, or sends a malformed value; nil is not idle, and an idle snapshot is not a new completion. |
 | `v2/unstable.Install`, `Handle`, `Advertise` | — | The draft-v2 counterparts of `Install`, `Handle`, and `Advertise`. |
@@ -131,14 +133,23 @@ if err := unstable.Install(runtime, implementation); err != nil { // or v2/unsta
   v2, the baseline `capabilities.session`) does not gain `archive`, and one
   that removes `archive` leaves the `session/list` override installed.
 - `Runtime.Overrides` gains the stable methods whose unstable form the
-  handler serves. Today that is `session/list` for an `ArchiveHandler`.
+  handler serves: `session/list` for an `ArchiveHandler`, and the lifecycle
+  requests that carry a client-provided system prompt for a
+  `SystemPromptHandler` (see
+  [Client-provided system prompts](#client-provided-system-prompts)).
+- `systemPrompt` is announced (as `{}`, append only) only for a
+  `SystemPromptHandler` that receives the prompt on every lifecycle request
+  the agent advertises. It is decided from the `Agent`'s own response, like
+  `archive`, but checked again after the customize functions: a customize
+  function may add `mode.override`, while a `systemPrompt` some advertised
+  lifecycle request would drop fails `initialize` instead of being sent.
 
 `Install` fails, changing nothing, for a nil runtime, a runtime whose
 `InitializeResult` is already set (including by an earlier `Install`), or one
 whose `Overrides` already serves a method it would override. `Handle` and
 `Advertise` remain for wiring by hand, but `Advertise` never announces
-`archive`: an agent that does must also serve the `archived` filter, which
-only `Install` wires up. Neither runtime imports the unstable schema.
+`archive` or `systemPrompt`: an agent that does must also serve the
+`archived` filter or the prompt, which only `Install` wires up. Neither runtime imports the unstable schema.
 
 ### Runtime overrides
 
@@ -163,11 +174,10 @@ connection's client through `agent.ClientFromContext(ctx)` (or
 handler its connection. It is the same client the stable dispatch passes to
 `NewSession`, `LoadSession`, and `ResumeSession`, so a `session/load` override
 can stream the replay as `session/update` notifications before it answers,
-and the client receives them in order ahead of the response. Serving the
-unstable form of another stable request, such as `session/new`,
-`session/load`, or `session/resume` with the client-provided system prompt,
-takes one `Install` route: the override decodes the raw params into the
-unstable request and reads the client from the context.
+and the client receives them in order ahead of the response. Each `Install`
+route decodes the raw params into the unstable request and passes the
+context, so the handler method reads the client from it; serving the unstable
+form of another stable request takes one more route.
 
 `session/list` is a baseline method the runtime serves through the stable
 schema, which drops the `archived` filter and `SessionInfo.archived`. The
@@ -183,6 +193,128 @@ the reference SDK's `DefaultOnError` does, rather than failing the page.
 
 Further unstable methods (auth status in #72) join the same dispatch as
 additional handler interfaces.
+
+## Client-provided system prompts
+
+Client-provided system prompts follow the
+[RFD](https://agentclientprotocol.com/rfds/client-system-prompt) and the
+reference SDK's `unstable_session_system_prompt` feature. They are unstable
+(Preview) and live only in the unstable schemas.
+
+The agent advertises support at
+`agentCapabilities.sessionCapabilities.systemPrompt` (v1) or
+`capabilities.session.systemPrompt` (draft v2). `{}` means text content in
+`append` mode, and `mode.override` is the nested opt-in for `override`.
+Clients send the prompt as the `systemPrompt` member of the lifecycle
+requests: v1 `session/new`, `session/load`, `session/resume`, and
+`session/fork`; v2 `session/new`, `session/resume`, and `session/fork`.
+
+```go
+prompt := unstable.NewTextSystemPrompt("Review changes without modifying files.")
+session, err := unstable.NewSession(ctx, connection, initialization, unstableschema.NewSessionRequest{
+	Cwd:          directory,
+	SystemPrompt: &prompt,
+})
+```
+
+`NewSystemPrompt` and `NewTextSystemPrompt` default to `Append`, as Rust's
+`SystemPrompt::new` does; set `Mode` to `Override` to replace the agent's
+default instructions. The type always encodes both members, a nil `Content`
+as `null`; the facades below refuse empty content, so a prompt they send
+carries at least one text block.
+
+Before any lifecycle request reaches the wire, every facade (`unstable`,
+`v2/unstable`, `mcp`, and `v2/mcp`) rejects:
+
+- a `systemPrompt` when the agent did not advertise the capability;
+- `override` without `mode.override`;
+- a missing mode, or any mode other than `append` and `override`, including
+  `_`-prefixed extension modes. The type still decodes and forwards unknown
+  modes;
+- empty content, or any content block that is not text.
+
+The reference SDK does not check these in its builders. It leaves the
+capability negotiation to the caller. acp-go checks them because its facades
+gate every capability before writing.
+
+Clients should send the same prompt on load, resume, and fork that they used
+when the session was created. Omitting it leaves the result to the agent: it
+may keep a stored prompt or fall back to its default. Only send content you
+trust at system-instruction precedence. `override` replaces the agent's own
+default instructions, not its tools, permissions, MCP servers, or workspace
+instructions.
+
+On the agent side, an agent that advertises the capability must apply a
+supplied prompt or reject the lifecycle request. It must not create, load,
+resume, or fork the session without it. The runtimes decode session/new,
+session/load, and session/resume into the stable types, which do not model
+`systemPrompt`, so `Install` serves those methods from the unstable requests
+through [runtime overrides](#runtime-overrides), in place of the `Agent`'s
+own methods:
+
+| Handler | v1 methods | Draft-v2 methods |
+| --- | --- | --- |
+| `SystemPromptHandler` | `NewSessionWithSystemPrompt` (session/new) | `NewSessionWithSystemPrompt` and `ResumeSessionWithSystemPrompt` (session/new and session/resume, both required in v2) |
+| `SystemPromptLoader` (v1) | `LoadSessionWithSystemPrompt` (session/load) | — |
+| `SystemPromptResumer` (v1) | `ResumeSessionWithSystemPrompt` (session/resume) | — |
+| `ForkHandler` | `ForkSession` (session/fork, through `Handle`) | `ForkSession` |
+
+`Install` announces the capability only when the handler receives the prompt
+on every lifecycle request the agent advertises: in v1, `loadSession` needs a
+`SystemPromptLoader`, `sessionCapabilities.resume` a `SystemPromptResumer`,
+and `fork` a `ForkHandler`; in v2, `fork` needs a `ForkHandler`. Otherwise
+some lifecycle request would drop the prompt, so nothing is announced, and a
+customize function that announces it anyway fails `initialize`. It announces
+`{}` (append only); add `mode.override` with a customize function:
+
+```go
+err := unstable.Install(runtime, implementation, func(response *unstableschema.InitializeResponse) error {
+	// v2: response.Capabilities and Capabilities.Session
+	if capabilities := response.AgentCapabilities; capabilities != nil && capabilities.SessionCapabilities != nil && capabilities.SessionCapabilities.SystemPrompt != nil {
+		capabilities.SessionCapabilities.SystemPrompt.Mode = &unstableschema.SessionSystemPromptModeCapabilities{
+			Override: &unstableschema.SessionSystemPromptOverrideCapabilities{},
+		}
+	}
+	return nil
+})
+
+func (a *myAgent) NewSessionWithSystemPrompt(ctx context.Context, request unstableschema.NewSessionRequest) (unstableschema.NewSessionResponse, error) {
+	client, _ := agent.ClientFromContext(ctx)
+	// Create the session with request.SystemPrompt (nil when the client sent
+	// none), which the route already checked.
+}
+```
+
+The customize function adds `mode.override` only when `Install` announced the
+capability; setting `systemPrompt` where `Install` did not fails `initialize`.
+
+The handlers do not check the prompt themselves. Before one runs, its route
+answers `-32602` without reaching it in two cases:
+
+- a `systemPrompt` the reference SDK does not deserialize: a missing or
+  `null` `mode` or `content`, a text block whose `text` is missing or `null`,
+  or any other value that does not decode. These answer in the reference
+  SDK's deserialization shape (`{error, json, phase: "deserialization"}`),
+  as `Handle` answers malformed params, with the reference SDK's error text
+  (``missing field `mode` ``, for example) for the values `encoding/json` alone
+  would accept. As in the reference SDK, the first fault in document order
+  within `systemPrompt` is reported, and missing members only after the whole
+  object. This check runs before the params are decoded, so a prompt fault
+  wins over a bad sibling member of the params even when that member comes
+  first, where the reference SDK would report the sibling;
+- a prompt the capability the runtime sent in this connection's initialize
+  response does not cover: an unadvertised prompt, `override` without
+  `mode.override`, an unknown mode, empty content, or non-text content. These
+  answer in the reference SDK's `Error::invalid_params().data(reason)` shape:
+  message `Invalid params`, with the reason as string data.
+
+The capability checked is the one actually sent, so a handler cannot accept a
+prompt that was never advertised, for example on a session/new whose
+`Install` declined to announce `systemPrompt` because no `SystemPromptLoader`
+serves the advertised `loadSession`. The handlers reach the connection's
+client through `agent.ClientFromContext` (`v2/agent.ClientFromContext`), so
+`LoadSessionWithSystemPrompt` can replay the conversation with
+`session/update` before it answers.
 
 ## Session updates: projection, not request facades
 

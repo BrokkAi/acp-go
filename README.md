@@ -188,12 +188,17 @@ combined optional feature types, including LLM providers, MCP-over-ACP, plan
 operations, session fork/archive/status/title, auth status, client-provided
 system prompts, subagents, proxy chains, and end-turn token usage. The
 `unstable` (v1) and `v2/unstable` (draft v2) packages add typed facades on
-top: capability-gated provider configuration, session fork, and session
-archive/unarchive, status, title, and archived-filter listing for clients, and
+top: capability-gated provider configuration, session fork, session
+archive/unarchive, status, title, archived-filter listing, and the session
+lifecycle requests that carry a client-provided system prompt for clients, and
 `Install` for agents, which sets `Handle` dispatch, the `Advertise`
 initialize hook, and the runtime `Overrides` (such as `session/list` with the
-archive filter) on the agent runtimes together. The `mcp` and `v2/mcp`
-packages carry the session helpers that accept MCP servers, including fork.
+archive filter, and `session/new`, `session/load`, and `session/resume` with
+the system prompt) on the agent runtimes together, and rejects a supplied
+system prompt the connection was not told it may send before the handler
+runs. The `mcp` and `v2/mcp` packages
+carry the session helpers that accept MCP servers, including fork, alongside an
+optional system prompt.
 The stable `acp`, `v2`, `schema`, and `schema/v2` packages do not import or
 expose any of it. See [docs/unstable-facades.md](docs/unstable-facades.md).
 

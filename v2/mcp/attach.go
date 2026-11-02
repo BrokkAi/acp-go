@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
-	"github.com/BrokkAi/acp-go/internal/acpvalidate"
 	"github.com/BrokkAi/acp-go/internal/mcpserver"
 	unstable "github.com/BrokkAi/acp-go/schema/v2/unstable"
 )
@@ -234,7 +233,7 @@ func NewAttachedSession(ctx context.Context, router *MessageRouter, initializati
 	return attachTo(ctx, router, servers, request.MCPServers, func(declared []unstable.McpServer) (unstable.NewSessionResponse, error) {
 		var response unstable.NewSessionResponse
 		request.MCPServers = declared
-		if err := validateUnstableSetup(initialization, string(request.Cwd), request.AdditionalDirectories, request.MCPServers); err != nil {
+		if err := validateNewSession(initialization, request); err != nil {
 			return response, err
 		}
 		if err := router.connection.Call(ctx, unstable.SessionNewMethodName, request, &response); err != nil {
@@ -250,15 +249,8 @@ func NewAttachedSession(ctx context.Context, router *MessageRouter, initializati
 // ResumeAttachedSession is NewAttachedSession for session/resume.
 func ResumeAttachedSession(ctx context.Context, router *MessageRouter, initialization unstable.InitializeResponse, request unstable.ResumeSessionRequest, servers ...*Server) (unstable.ResumeSessionResponse, *Attachment, error) {
 	return attachTo(ctx, router, servers, request.MCPServers, func(declared []unstable.McpServer) (unstable.ResumeSessionResponse, error) {
-		var response unstable.ResumeSessionResponse
 		request.MCPServers = declared
-		if request.SessionID == "" {
-			return response, fmt.Errorf("session ID is required")
-		}
-		if err := validateUnstableSetup(initialization, string(request.Cwd), request.AdditionalDirectories, request.MCPServers); err != nil {
-			return response, err
-		}
-		return response, router.connection.Call(ctx, unstable.SessionResumeMethodName, request, &response)
+		return ResumeSession(ctx, router.connection, initialization, request)
 	})
 }
 
@@ -271,62 +263,4 @@ func ForkAttachedSession(ctx context.Context, router *MessageRouter, initializat
 		request.MCPServers = declared
 		return ForkSession(ctx, router.connection, initialization, request)
 	})
-}
-
-// validateUnstableSetup applies the session setup checks to the unstable v2
-// request types, whose McpServer models the native acp transport.
-func validateUnstableSetup(initialization unstable.InitializeResponse, directory string, additional []unstable.AbsolutePath, servers []unstable.McpServer) error {
-	var session *unstable.SessionCapabilities
-	if initialization.Capabilities != nil {
-		session = initialization.Capabilities.Session
-	}
-	if session == nil {
-		return fmt.Errorf("agent did not advertise the ACP v2 session method surface")
-	}
-	if err := acpvalidate.AbsolutePath("ACP path", directory); err != nil {
-		return err
-	}
-	if len(additional) > 0 && session.AdditionalDirectories == nil {
-		return fmt.Errorf("agent did not advertise additionalDirectories support")
-	}
-	for _, path := range additional {
-		if err := acpvalidate.AbsolutePath("ACP path", string(path)); err != nil {
-			return err
-		}
-	}
-	capabilities := session.MCP
-	for i, server := range servers {
-		switch {
-		case server.Stdio != nil:
-			if capabilities == nil || capabilities.Stdio == nil {
-				return fmt.Errorf("agent did not advertise stdio MCP server support (server %d)", i)
-			}
-			if server.Stdio.Name == "" || server.Stdio.Command == "" {
-				return fmt.Errorf("stdio MCP server %d requires a name and command", i)
-			}
-			if err := acpvalidate.AbsolutePath(fmt.Sprintf("stdio MCP server %d command path", i), string(server.Stdio.Command)); err != nil {
-				return err
-			}
-		case server.HTTP != nil:
-			if capabilities == nil || capabilities.HTTP == nil {
-				return fmt.Errorf("agent did not advertise HTTP MCP server support (server %d)", i)
-			}
-			if server.HTTP.Name == "" || server.HTTP.URL == "" {
-				return fmt.Errorf("HTTP MCP server %d requires a name and URL", i)
-			}
-		case server.ACP != nil:
-			if capabilities == nil || capabilities.ACP == nil {
-				return fmt.Errorf("agent did not advertise native MCP-over-ACP server support (server %d)", i)
-			}
-			if server.ACP.Name == "" {
-				return fmt.Errorf("MCP-over-ACP server %d requires a name", i)
-			}
-			if err := acpvalidate.Identifier("MCP-over-ACP server ID", string(server.ACP.ServerID)); err != nil {
-				return fmt.Errorf("server %d: %w", i, err)
-			}
-		default:
-			return fmt.Errorf("MCP server %d has no supported transport variant", i)
-		}
-	}
-	return nil
 }

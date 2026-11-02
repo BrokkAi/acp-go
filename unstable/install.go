@@ -25,13 +25,24 @@ import (
 // it. For an ArchiveHandler, Install serves session/list from
 // ListSessionsWithArchive, so that the archived filter and
 // SessionInfo.archived survive, and announces sessionCapabilities.archive,
-// which Advertise alone never does.
+// which Advertise alone never does. For a SystemPromptHandler, Install serves
+// session/new from NewSessionWithSystemPrompt (and session/load and
+// session/resume from SystemPromptLoader and SystemPromptResumer), so that the
+// client-provided systemPrompt survives, and announces
+// sessionCapabilities.systemPrompt only when every lifecycle request the agent
+// advertises receives it (fork through ForkHandler).
 //
 // Whether archive is announced is decided before the customize functions run,
 // from the response the Agent's Initialize returned: a customize function
 // that adds sessionCapabilities.list does not gain archive, and one that
 // removes archive leaves the session/list override installed, so the agent
-// still serves the archived filter it no longer announces.
+// still serves the archived filter it no longer announces. systemPrompt is
+// announced from that response too, but checked again after customize: a
+// customize function may add mode.override, while a systemPrompt capability
+// that some advertised lifecycle request would drop (a customize function
+// that adds it without a SystemPromptHandler, or adds loadSession without a
+// SystemPromptLoader, for example) fails the initialize request instead of
+// being sent.
 //
 // Install fails without changing runtime when runtime is nil, when
 // runtime.InitializeResult is already set (including by an earlier Install),
@@ -55,16 +66,24 @@ func Install(runtime *agent.Runtime, handler any, customize ...func(*schema.Init
 
 // overrideRoutes maps each stable runtime method Install replaces to the
 // binding that serves its unstable form from a handler. The runtime runs its
-// initialization gate and the method's capability check first. Serving the
-// unstable form of another stable request, such as session/new,
-// session/load, or session/resume with fields the stable schema drops (the
-// client-provided system prompt, for example), takes one entry here: the
-// binding decodes the raw params into the unstable request type, and the
-// handler method reaches the connection's client through
-// agent.ClientFromContext, the same client the stable dispatch passes to
-// NewSession and LoadSession, to call it or stream session/update (a
-// session/load replay) before it answers. Such a handler then serves the
-// whole method in place of the Agent's.
+// initialization gate and the method's capability check first (session/load
+// still needs loadSession, and session/resume sessionCapabilities.resume).
+// session/new, session/load, and session/resume carry the client-provided
+// system prompt, which the stable schema drops: each binding checks the raw
+// systemPrompt as the reference SDK deserializes it, decodes the params into
+// the unstable request type, checks the prompt against the capability this
+// connection's initialize response announced, and the handler method reaches the
+// connection's client through agent.ClientFromContext, the same client the
+// stable dispatch passes to NewSession and LoadSession, to call it or stream
+// session/update (a session/load replay) before it answers. Such a handler
+// then serves the whole method in place of the Agent's. Serving the unstable
+// form of another stable request takes one entry here.
 var overrideRoutes = map[string]unstabledispatch.Binding{
 	schema.SessionListMethodName: unstabledispatch.Route(ArchiveHandler.ListSessionsWithArchive, checkArchiveListResponse),
+	schema.SessionNewMethodName: systemPromptRoute(SystemPromptHandler.NewSessionWithSystemPrompt,
+		func(request schema.NewSessionRequest) *SystemPrompt { return request.SystemPrompt }, nil),
+	schema.SessionLoadMethodName: systemPromptRoute(SystemPromptLoader.LoadSessionWithSystemPrompt,
+		func(request schema.LoadSessionRequest) *SystemPrompt { return request.SystemPrompt }, nil),
+	schema.SessionResumeMethodName: systemPromptRoute(SystemPromptResumer.ResumeSessionWithSystemPrompt,
+		func(request schema.ResumeSessionRequest) *SystemPrompt { return request.SystemPrompt }, nil),
 }

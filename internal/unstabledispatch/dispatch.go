@@ -59,15 +59,34 @@ type Binding func(handler any) acp.Handler
 // the method, and runs check, when non-nil, on a successful response before it
 // is sent.
 func Route[H, Request, Response any](method func(H, context.Context, Request) (Response, error), check func(Response) error) Binding {
+	return RouteChecked(method, nil, nil, check)
+}
+
+// RouteChecked is Route with two more checks, each run when non-nil: strict
+// on the raw params before they are decoded, whose error answers as
+// InvalidParams, for values the reference SDK refuses to deserialize but
+// encoding/json accepts; and accept on the decoded request before the
+// handler, whose error is answered as it is.
+func RouteChecked[H, Request, Response any](method func(H, context.Context, Request) (Response, error), strict func(json.RawMessage) error, accept func(context.Context, Request) error, check func(Response) error) Binding {
 	return func(handler any) acp.Handler {
 		implementation, ok := handler.(H)
 		if !ok {
 			return nil
 		}
 		return func(ctx context.Context, _ string, raw json.RawMessage) (any, error) {
+			if strict != nil {
+				if err := strict(raw); err != nil {
+					return nil, InvalidParams(err, raw)
+				}
+			}
 			var request Request
 			if err := json.Unmarshal(raw, &request); err != nil {
 				return nil, InvalidParams(err, raw)
+			}
+			if accept != nil {
+				if err := accept(ctx, request); err != nil {
+					return nil, err
+				}
 			}
 			response, err := method(implementation, ctx, request)
 			if err != nil {

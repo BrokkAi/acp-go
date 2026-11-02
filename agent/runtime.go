@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/initresult"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -94,6 +95,9 @@ type server struct {
 	initializing      bool
 	agentCapabilities *schema.AgentCapabilities
 	promptCancels     map[schema.SessionId]*promptCancel
+	// sent is the encoded initialize response, which handlers read through
+	// initresult.From.
+	sent json.RawMessage
 }
 
 type promptCancel struct {
@@ -110,7 +114,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 	if !s.advertisesMethod(method) {
 		return nil, methodNotFound(method)
 	}
-	ctx = withClient(ctx, s.client)
+	ctx = initresult.With(withClient(ctx, s.client), s.sentInitialize())
 	if override, ok := s.overrides[method]; ok {
 		return override(ctx, method, raw)
 	}
@@ -263,10 +267,15 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 	if response.ProtocolVersion != acp.Version {
 		return nil, fmt.Errorf("agent selected unsupported ACP version %d", response.ProtocolVersion)
 	}
+	sent, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("encode initialize response: %w", err)
+	}
 	s.client.initialize(request.ClientCapabilities)
 	s.mu.Lock()
 	s.initialized = true
 	s.agentCapabilities = response.AgentCapabilities
+	s.sent = sent
 	s.mu.Unlock()
 	return result, nil
 }
@@ -330,6 +339,13 @@ func (s *server) notification(method string, raw json.RawMessage) error {
 		return implementation.CancelSession(context.Background(), notification)
 	}
 	return nil
+}
+
+// sentInitialize is the encoded initialize response sent on the connection.
+func (s *server) sentInitialize() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sent
 }
 
 func (s *server) isInitialized() bool {

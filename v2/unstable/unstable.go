@@ -59,10 +59,9 @@ func DisableProvider(ctx context.Context, connection *acpv2.Connection, initiali
 // directories need capabilities.session.additionalDirectories and must each be
 // absolute. Inline MCP servers are rejected so MCP stays behind the explicit
 // github.com/BrokkAi/acp-go/v2/mcp import, whose ForkSession accepts them. The
-// response must carry a non-blank forked session ID.
-//
-// request.SystemPrompt is forwarded unchanged; this package does not yet check
-// it against capabilities.session.systemPrompt.
+// response must carry a non-blank forked session ID. A systemPrompt must pass
+// ValidateSessionSystemPrompt; clients should re-send the one the source
+// session was created with.
 func ForkSession(ctx context.Context, connection *acpv2.Connection, initialization schema.InitializeResponse, request schema.ForkSessionRequest) (schema.ForkSessionResponse, error) {
 	var result schema.ForkSessionResponse
 	if err := v2session.ValidateForkRequest(initialization, request); err != nil {

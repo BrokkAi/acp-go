@@ -12,6 +12,7 @@ import (
 
 	"github.com/BrokkAi/acp-go/acptest"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
+	unstable "github.com/BrokkAi/acp-go/schema/v2/unstable"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
 	agentv2 "github.com/BrokkAi/acp-go/v2/agent"
 	mcpv2 "github.com/BrokkAi/acp-go/v2/mcp"
@@ -43,9 +44,12 @@ func Example_v2McpServers() {
 
 	connection := acpv2.Connect(link.A, link.A, acpv2.HandlePermissions(nil, cancelPermissionsV2{}), nil)
 	defer connection.Close()
-	initialization, err := connection.InitializeWithInfo(ctx, acpv2.Capabilities{}, acpv2.ClientInfo{
+	// The v2/mcp session helpers gate on the unstable initialize response,
+	// which InitializeExtended decodes alongside the stable one.
+	var initialization unstable.InitializeResponse
+	_, err := connection.InitializeExtended(ctx, acpv2.Capabilities{}, acpv2.ClientInfo{
 		Name: "cookbook-tools", Version: "0.1.0",
-	})
+	}, &initialization)
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -60,7 +64,7 @@ func Example_v2McpServers() {
 	// opt-in. Every transport, stdio included, needs the agent's advertised
 	// session.mcp capability, and a stdio command must be an absolute path.
 	session, err := mcpv2.NewSession(ctx, connection, initialization, directory, mcpv2.NewSessionOptions{
-		Servers: []schema.McpServer{mcpv2.NewStdioServer("docs", "/usr/local/bin/docs-mcp", []string{"--stdio"}, nil)},
+		Servers: []unstable.McpServer{mcpv2.NewStdioServer("docs", "/usr/local/bin/docs-mcp", []string{"--stdio"}, nil)},
 	})
 	if err != nil {
 		fmt.Println("error:", err)
@@ -71,7 +75,7 @@ func Example_v2McpServers() {
 	}
 
 	_, err = mcpv2.NewSession(ctx, connection, initialization, directory, mcpv2.NewSessionOptions{
-		Servers: []schema.McpServer{mcpv2.NewHTTPServer("tickets", "https://mcp.example.com/tickets", nil)},
+		Servers: []unstable.McpServer{mcpv2.NewHTTPServer("tickets", "https://mcp.example.com/tickets", nil)},
 	})
 	fmt.Println("refused:", err)
 	// Output:

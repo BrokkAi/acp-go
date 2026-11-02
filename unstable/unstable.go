@@ -1,7 +1,9 @@
 /*
 Package unstable exposes narrow, opt-in typed facades for ACP's optional
-("unstable") methods: agent provider configuration, session fork, and
-session archive, status, and title.
+("unstable") methods: agent provider configuration, session fork, session
+archive, status, and title, and the session lifecycle requests that carry a
+client-provided system prompt (NewSession, LoadSession, ResumeSession, and
+ForkSession).
 
 Every method here lives behind its own package import because the ACP release
 marks the surface unstable and may change or remove it. Nothing in this package
@@ -78,7 +80,9 @@ func DisableProvider(ctx context.Context, connection *acp.Connection, initializa
 
 // ForkSession forks an existing session, gated on sessionCapabilities.fork.
 // Additional directories need sessionCapabilities.additionalDirectories, which
-// the protocol requires before a client sends them, and must be absolute.
+// the protocol requires before a client sends them, and must be absolute. A
+// systemPrompt must pass ValidateSessionSystemPrompt; clients should re-send
+// the one the source session was created with.
 func ForkSession(ctx context.Context, connection *acp.Connection, initialization schema.InitializeResponse, request schema.ForkSessionRequest) (schema.ForkSessionResponse, error) {
 	var result schema.ForkSessionResponse
 	if err := requireFork(initialization); err != nil {
@@ -100,6 +104,9 @@ func ForkSession(ctx context.Context, connection *acp.Connection, initialization
 	}
 	if len(request.MCPServers) > 0 {
 		return result, fmt.Errorf("MCP servers require the explicit github.com/BrokkAi/acp-go/mcp package")
+	}
+	if err := ValidateSessionSystemPrompt(initialization, request.SystemPrompt); err != nil {
+		return result, err
 	}
 	if err := connection.Call(ctx, schema.SessionForkMethodName, request, &result); err != nil {
 		return result, err
