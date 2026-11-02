@@ -17,7 +17,9 @@ type Declaration struct {
 
 // AppendDeclarations appends declarations to the mcpServers array of a raw
 // session setup params object. Every other member, including fields the
-// generated types do not model, is kept byte-for-byte.
+// generated types do not model, keeps its value; the encoding is semantically
+// equal, not byte-identical (members are re-ordered and whitespace dropped),
+// and HTML characters are not escaped.
 //
 // With uniqueNames set (ACP v2), it fails with -32602 and leaves params
 // untouched when mcpServers already declares one of the names: names must be
@@ -38,8 +40,11 @@ func AppendDeclarations(params json.RawMessage, declarations []Declaration, uniq
 		}
 	}
 	if uniqueNames {
-		if err := checkUniqueNames(servers, declarations); err != nil {
-			return nil, err
+		taken := declaredNames(servers)
+		for _, declaration := range declarations {
+			if taken[declaration.Name] {
+				return nil, invalidSetup(fmt.Sprintf("MCP server `%s` is configured by the proxy, so mcpServers cannot declare another server with that name; names must be unique within mcpServers", declaration.Name))
+			}
 		}
 	}
 	if servers == nil {
@@ -48,17 +53,15 @@ func AppendDeclarations(params json.RawMessage, declarations []Declaration, uniq
 	for _, declaration := range declarations {
 		servers = append(servers, declaration.JSON)
 	}
-	encoded, err := json.Marshal(servers)
+	encoded, err := encodeJSON(servers)
 	if err != nil {
 		return nil, err
 	}
 	fields["mcpServers"] = encoded
-	return json.Marshal(fields)
+	return encodeJSON(fields)
 }
 
-// CheckUniqueNames fails with -32602 when an attached server's name is
-// already declared in servers or by another attached server.
-func checkUniqueNames(servers []json.RawMessage, declarations []Declaration) error {
+func declaredNames(servers []json.RawMessage) map[string]bool {
 	taken := map[string]bool{}
 	for _, server := range servers {
 		var declared struct {
@@ -68,27 +71,25 @@ func checkUniqueNames(servers []json.RawMessage, declarations []Declaration) err
 			taken[*declared.Name] = true
 		}
 	}
+	return taken
+}
+
+// CheckDeclaredNames applies the v2 name-uniqueness rule to a typed request,
+// like the reference per-session attachment: names lists the names already in
+// mcpServers, and each declaration is checked in turn against them and the
+// declarations before it.
+func CheckDeclaredNames(names []string, declarations []Declaration) error {
+	taken := map[string]bool{}
+	for _, name := range names {
+		taken[name] = true
+	}
 	for _, declaration := range declarations {
 		if taken[declaration.Name] {
-			return invalidSetup(fmt.Sprintf("MCP server `%s` is attached here, so mcpServers cannot declare another server with that name; names must be unique within mcpServers", declaration.Name))
+			return invalidSetup(fmt.Sprintf("MCP server name `%s` is already declared; names must be unique within mcpServers", declaration.Name))
 		}
 		taken[declaration.Name] = true
 	}
 	return nil
-}
-
-// CheckDeclaredNames applies the v2 name-uniqueness rule to typed requests:
-// names lists the names already in mcpServers.
-func CheckDeclaredNames(names []string, declarations []Declaration) error {
-	servers := make([]json.RawMessage, 0, len(names))
-	for _, name := range names {
-		encoded, err := json.Marshal(map[string]string{"name": name})
-		if err != nil {
-			return err
-		}
-		servers = append(servers, encoded)
-	}
-	return checkUniqueNames(servers, declarations)
 }
 
 func invalidSetup(detail string) *acp.RPCError {

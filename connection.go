@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/BrokkAi/acp-go/internal/jsonline"
+	"github.com/BrokkAi/acp-go/internal/rpcctl"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -384,11 +385,13 @@ func (c *Connection) startRequest(p packet) {
 	go func() {
 		defer c.tasks.Done()
 		defer cancel()
-		response := c.executeRequest(ctx, p)
+		response, answer := c.executeRequest(rpcctl.WithRequestID(ctx, p.ID), p)
 		c.unregisterInbound(string(p.ID), generation)
 		// Free handler capacity before the peer can observe the response.
 		c.releaseWorker()
-		_ = c.send(c.ctx, response)
+		if answer {
+			_ = c.send(c.ctx, response)
+		}
 	}()
 }
 
@@ -447,13 +450,18 @@ func (c *Connection) cancelInbound(id string) {
 	}
 }
 
-func (c *Connection) executeRequest(ctx context.Context, p packet) packet {
+// executeRequest runs the handler. answer is false when an internal binding
+// asked for the request to go unanswered (rpcctl.ErrNoResponse).
+func (c *Connection) executeRequest(ctx context.Context, p packet) (response packet, answer bool) {
 	var value any
 	var err error = &RPCError{Code: -32601, Message: "unsupported method: " + p.Method}
 	if c.onRequest != nil {
 		value, err = c.onRequest(ctx, p.Method, p.Params)
 	}
-	response := packet{Version: "2.0", ID: p.ID}
+	if errors.Is(err, rpcctl.ErrNoResponse) {
+		return packet{}, false
+	}
+	response = packet{Version: "2.0", ID: p.ID}
 	if err != nil {
 		if !errors.As(err, &response.Error) {
 			response.Error = &RPCError{Code: -32603, Message: err.Error()}
@@ -473,5 +481,5 @@ func (c *Connection) executeRequest(ctx context.Context, p packet) packet {
 			response.Result = nil
 		}
 	}
-	return response
+	return response, true
 }

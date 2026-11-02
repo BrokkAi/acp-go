@@ -152,8 +152,7 @@ The MCP server framework is delivered (#63): a standard-library counterpart of
 Rust's `mcp_server` module and the `rmcp_3` builder's tool semantics, with
 `Server`/`Service`, a typed `ToolRegistry`, standalone serving, and automatic
 per-session and proxy-wide attachment for v1 (`session/new`, `load`, `resume`,
-`fork`) and draft v2 (`session/new`, `resume`). A draft v2 per-session
-`session/fork` helper waits for the v2 fork facade (#61).
+`fork`) and draft v2 (`session/new`, `resume`, `fork`).
 
 ### 2. Rust ecosystem crate ports
 

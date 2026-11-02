@@ -114,7 +114,19 @@ func TestV2AttachedSessionsDeclareAndServe(t *testing.T) {
 	if lastDeclaration(t, <-h.setups)["serverId"] != resumed.ServerIDs()[0] || resumed.ServerIDs()[0] == serverID {
 		t.Fatal("resume must declare a fresh server ID")
 	}
-	for _, closing := range []*mcp.Attachment{attachment, resumed} {
+	forkInitialization := acpInitialization()
+	forkInitialization.Capabilities.Session.Fork = &schema.SessionForkCapabilities{}
+	if _, _, err := mcp.ForkAttachedSession(ctx, h.router, acpInitialization(), schema.ForkSessionRequest{SessionID: "v2-session", Cwd: schema.AbsolutePath(directory)}, toolServer(t, "tools")); err == nil {
+		t.Fatal("fork without the fork capability was sent")
+	}
+	forked, forkAttachment, err := mcp.ForkAttachedSession(ctx, h.router, forkInitialization, schema.ForkSessionRequest{SessionID: "v2-session", Cwd: schema.AbsolutePath(directory)}, toolServer(t, "tools"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forked.SessionID != "v2-session" || lastDeclaration(t, <-h.setups)["serverId"] != forkAttachment.ServerIDs()[0] {
+		t.Fatalf("fork = %+v", forked)
+	}
+	for _, closing := range []*mcp.Attachment{attachment, resumed, forkAttachment} {
 		if err := closing.Close(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -133,7 +145,8 @@ func TestV2AttachedSessionRejectsNameCollisionBeforeWriting(t *testing.T) {
 	}}}
 	_, attachment, err := mcp.NewAttachedSession(context.Background(), h.router, acpInitialization(), request, toolServer(t, "tools"))
 	var rpcErr *acp.RPCError
-	if attachment != nil || !asRPC(err, &rpcErr) || rpcErr.Code != -32602 {
+	if attachment != nil || !asRPC(err, &rpcErr) || rpcErr.Code != -32602 || rpcErr.Message != "Invalid params" ||
+		string(rpcErr.Data) != "\"MCP server name `tools` is already declared; names must be unique within mcpServers\"" {
 		t.Fatalf("collision = %v, %v", attachment, err)
 	}
 	select {
@@ -178,7 +191,8 @@ func TestV2HandleSessionSetupIsGlobalAttachment(t *testing.T) {
 	collision := json.RawMessage(`{"cwd":"/w","mcpServers":[{"type":"http","name":"global","url":"https://example.com"}]}`)
 	_, err = handler(context.Background(), "session/new", collision)
 	var rpcErr *acp.RPCError
-	if !asRPC(err, &rpcErr) || rpcErr.Code != -32602 || calls != 0 {
+	if !asRPC(err, &rpcErr) || rpcErr.Code != -32602 || calls != 0 ||
+		string(rpcErr.Data) != "\"MCP server `global` is configured by the proxy, so mcpServers cannot declare another server with that name; names must be unique within mcpServers\"" {
 		t.Fatalf("collision = %v, forwarded %d", err, calls)
 	}
 }

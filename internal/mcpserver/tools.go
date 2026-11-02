@@ -302,34 +302,51 @@ type requestMeta struct {
 	capabilities json.RawMessage
 }
 
-func readMeta(params json.RawMessage) (requestMeta, *Error) {
+// readMeta reads the per-request metadata the way the reference SDK does: a
+// protocol version that is not a JSON string counts as absent.
+func readMeta(params json.RawMessage) requestMeta {
 	var meta requestMeta
 	raw := metaOf(params)
 	if raw == nil {
-		return meta, nil
+		return meta
 	}
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(raw, &fields) != nil {
-		return meta, nil
+		return meta
 	}
-	if value, ok := fields[MetaProtocolVersion]; ok {
-		meta.hasVersion = true
-		if json.Unmarshal(value, &meta.version) != nil {
-			return meta, invalidParams("request _meta has a malformed " + MetaProtocolVersion)
-		}
-	}
+	meta.version, meta.hasVersion = metaString(fields, MetaProtocolVersion)
 	meta.capabilities = fields[MetaClientCapabilities]
-	return meta, nil
+	return meta
+}
+
+// Inner errors of the tool server, shaped like the rmcp ones the reference
+// builder returns: the detail is the message and there is no data.
+func toolInvalidParams(message string) *Error {
+	return &Error{Code: codeInvalidParams, Message: message}
+}
+func toolMethodNotFound(method string) *Error {
+	return &Error{Code: codeMethodNotFound, Message: method}
+}
+
+// invalidMCPRequest is the reference binding's answer to params that do not
+// parse as the MCP request (native.rs): message "Invalid MCP request" with
+// the parse failure as data.
+func invalidMCPRequest(detail string) *Error {
+	return newError(codeInvalidParams, "Invalid MCP request", detail)
 }
 
 func (s *toolService) Execute(ctx context.Context, request Request, rc *RequestContext) (Outcome, error) {
 	if len(request.Params) > 0 && request.Params[0] != '{' {
-		return Outcome{Error: invalidParams("params must be an object")}, nil
+		return Outcome{Error: invalidMCPRequest("invalid type: expected a map for params")}, nil
 	}
-	meta, invalid := readMeta(request.Params)
-	if invalid != nil {
-		return Outcome{Error: invalid}, nil
+	var call toolCall
+	if request.Method == "tools/call" {
+		var invalid *Error
+		if call, invalid = parseToolCall(request.Params); invalid != nil {
+			return Outcome{Error: invalid}, nil
+		}
 	}
+	meta := readMeta(request.Params)
 	inline := request.Method != "initialize"
 	if inline && meta.hasVersion && !slices.Contains(knownProtocolVersions, meta.version) {
 		return Outcome{Error: unsupportedVersion(meta.version, knownProtocolVersions)}, nil
@@ -344,15 +361,19 @@ func (s *toolService) Execute(ctx context.Context, request Request, rc *RequestC
 			missing = append(missing, MetaClientCapabilities)
 		}
 		if len(missing) > 0 {
-			return Outcome{Error: invalidParams("request _meta is missing or has malformed required fields: " + strings.Join(missing, ", "))}, nil
+			return Outcome{Error: toolInvalidParams("request _meta is missing or has malformed required fields: " + strings.Join(missing, ", "))}, nil
 		}
+	}
+	resultType := ""
+	if modern {
+		resultType = "complete"
 	}
 	switch request.Method {
 	case "initialize":
 		return s.initialize(request.Params)
 	case "ping":
 		if modern {
-			return Outcome{Error: methodNotFound("ping")}, nil
+			return Outcome{Error: toolMethodNotFound("ping")}, nil
 		}
 		return ResultOutcome(struct{}{})
 	case "server/discover":
@@ -360,10 +381,31 @@ func (s *toolService) Execute(ctx context.Context, request Request, rc *RequestC
 	case "tools/list":
 		return s.listTools(modern)
 	case "tools/call":
-		return s.callTool(ctx, request.Params, rc, modern)
+		return s.callTool(ctx, call, rc, resultType)
+	// The reference handler's defaults for features a tool server lacks.
+	case "prompts/list":
+		return emptyList("prompts", resultType)
+	case "resources/list":
+		return emptyList("resources", resultType)
+	case "resources/templates/list":
+		return emptyList("resourceTemplates", resultType)
+	case "completion/complete":
+		result := map[string]any{"completion": map[string]any{"values": []string{}}}
+		if resultType != "" {
+			result["resultType"] = resultType
+		}
+		return ResultOutcome(result)
 	default:
-		return Outcome{Error: methodNotFound(request.Method)}, nil
+		return Outcome{Error: toolMethodNotFound(request.Method)}, nil
 	}
+}
+
+func emptyList(key, resultType string) (Outcome, error) {
+	result := map[string]any{key: []any{}}
+	if resultType != "" {
+		result["resultType"] = resultType
+	}
+	return ResultOutcome(result)
 }
 
 func (s *toolService) serverInfo() map[string]string {
@@ -449,70 +491,96 @@ type callResult struct {
 	IsError           bool            `json:"isError"`
 }
 
-func (s *toolService) callTool(ctx context.Context, params json.RawMessage, rc *RequestContext, modern bool) (Outcome, error) {
-	var call struct {
-		Name      *string         `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
+type toolCall struct {
+	name      string
+	arguments json.RawMessage
+}
+
+// parseToolCall reads tools/call params the way the reference SDK's request
+// type parses them; a failure is an "Invalid MCP request" error.
+func parseToolCall(params json.RawMessage) (toolCall, *Error) {
+	var fields map[string]json.RawMessage
+	if len(params) == 0 || json.Unmarshal(params, &fields) != nil {
+		return toolCall{}, invalidMCPRequest("missing field `name`")
 	}
-	if len(params) == 0 || json.Unmarshal(params, &call) != nil || call.Name == nil {
-		return Outcome{Error: invalidParams("tools/call requires a tool name")}, nil
-	}
-	arguments := bytes.TrimSpace(call.Arguments)
-	if len(arguments) == 0 || string(arguments) == "null" {
-		arguments = json.RawMessage(`{}`)
-	} else if arguments[0] != '{' {
-		return Outcome{Error: invalidParams("tools/call arguments must be an object")}, nil
-	}
-	tool, ok := s.registry.EnabledTool(*call.Name)
+	rawName, ok := fields["name"]
 	if !ok {
-		return Outcome{Error: invalidParams(fmt.Sprintf("tool `%s` not found", *call.Name))}, nil
+		return toolCall{}, invalidMCPRequest("missing field `name`")
 	}
-	resultType := ""
-	if modern {
-		resultType = "complete"
+	var call toolCall
+	if len(rawName) == 0 || rawName[0] != '"' || json.Unmarshal(rawName, &call.name) != nil {
+		return toolCall{}, invalidMCPRequest("invalid type: expected a string for `name`")
+	}
+	arguments := bytes.TrimSpace(fields["arguments"])
+	switch {
+	case len(arguments) == 0 || string(arguments) == "null":
+		call.arguments = json.RawMessage(`{}`)
+	case arguments[0] == '{':
+		call.arguments = arguments
+	default:
+		return toolCall{}, invalidMCPRequest("invalid type: expected a map for `arguments`")
+	}
+	return call, nil
+}
+
+func (s *toolService) callTool(ctx context.Context, call toolCall, rc *RequestContext, resultType string) (Outcome, error) {
+	tool, ok := s.registry.EnabledTool(call.name)
+	if !ok {
+		return Outcome{Error: toolInvalidParams(fmt.Sprintf("tool `%s` not found", call.name))}, nil
 	}
 	toolError := func(text string) (Outcome, error) {
 		return ResultOutcome(callResult{ResultType: resultType, Content: []any{TextContent(text)}, IsError: true})
 	}
-	if err := validateSchema(tool.InputSchema, arguments); err != nil {
+	if err := validateSchema(tool.InputSchema, call.arguments); err != nil {
 		return toolError(err.Error())
 	}
-	value, err := tool.Handler(ctx, arguments, rc)
+	value, err := tool.Handler(ctx, call.arguments, rc)
 	if ctx.Err() != nil {
-		return Outcome{Error: newError(codeInternalError, "operation cancelled", nil)}, nil
+		return Outcome{Error: &Error{Code: codeInternalError, Message: "operation cancelled"}}, nil
 	}
 	if err != nil {
 		return toolError(err.Error())
 	}
-	result, err := s.toolResult(tool, value, resultType)
+	result, err := toolResult(tool, value, resultType)
 	if err != nil {
 		return toolError(err.Error())
 	}
 	return ResultOutcome(result)
 }
 
-func (s *toolService) toolResult(tool Tool, value any, resultType string) (callResult, error) {
+// toolResult converts a handler's value like the reference builder: with an
+// output schema it is structured content (and its JSON as text); without one
+// it is a single text block holding its JSON encoding, so a string result is
+// sent quoted.
+func toolResult(tool Tool, value any, resultType string) (callResult, error) {
 	switch explicit := value.(type) {
 	case *ToolResult:
-		if explicit == nil {
-			break
+		if explicit != nil {
+			return explicitResult(*explicit, resultType)
 		}
-		return explicitResult(*explicit, resultType)
 	case ToolResult:
 		return explicitResult(explicit, resultType)
 	}
-	encoded, err := json.Marshal(value)
+	encoded, err := encodeJSON(value)
 	if err != nil {
 		return callResult{}, fmt.Errorf("encode tool output: %w", err)
 	}
+	result := callResult{ResultType: resultType, Content: []any{TextContent(string(encoded))}}
 	if tool.HasStructuredOutput() {
-		return callResult{ResultType: resultType, Content: []any{TextContent(string(encoded))}, StructuredContent: encoded}, nil
+		result.StructuredContent = encoded
 	}
-	text := string(encoded)
-	if s, ok := value.(string); ok {
-		text = s
+	return result, nil
+}
+
+// encodeJSON encodes like serde_json: no HTML escaping, no trailing newline.
+func encodeJSON(value any) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
 	}
-	return callResult{ResultType: resultType, Content: []any{TextContent(text)}}, nil
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
 }
 
 func explicitResult(result ToolResult, resultType string) (callResult, error) {

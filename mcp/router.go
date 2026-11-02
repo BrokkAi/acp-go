@@ -67,16 +67,13 @@ type MessageRouter struct {
 // connection carries request-scoped notifications emitted by services and
 // the session setup requests of the attached-session helpers.
 func NewMessageRouter(connection *acp.Connection) *MessageRouter {
-	var notifier mcpserver.Connection
-	if connection != nil {
-		notifier = connection
-	}
-	return &MessageRouter{connection: connection, binding: mcpserver.NewBinding(notifier, codec)}
+	return &MessageRouter{connection: connection, binding: mcpserver.NewBinding(connection, codec)}
 }
 
-// Register binds one server ID to a low-level service. A server ID is never
-// rebound on the router: not while it is registered, and not after it was
-// unregistered.
+// Register binds one server ID to a low-level service. An ID cannot be bound
+// while it is registered or its operations are still finishing. The router,
+// like the reference SDK, keeps no record of released IDs; the RFD forbids
+// rebinding a server ID on a connection, so callers must not reuse one.
 func (r *MessageRouter) Register(serverID string, service MessageService) error {
 	if service == nil {
 		return errors.New("mcp message service is required")

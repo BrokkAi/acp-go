@@ -78,17 +78,68 @@ func validateObjectSchema(schema map[string]any, value any, path string) error {
 		}
 	}
 	if one, ok := schema["oneOf"].([]any); ok {
-		matches := 0
-		for _, sub := range one {
-			if validateValue(sub, value, path) == nil {
-				matches++
+		if !slices.ContainsFunc(one, func(sub any) bool { return !decidable(sub) }) {
+			matches := 0
+			for _, sub := range one {
+				if validateValue(sub, value, path) == nil {
+					matches++
+				}
 			}
-		}
-		if matches != 1 {
-			return fmt.Errorf("%s must match exactly one allowed schema, matched %d", path, matches)
+			if matches != 1 {
+				return fmt.Errorf("%s must match exactly one allowed schema, matched %d", path, matches)
+			}
+		} else if !slices.ContainsFunc(one, func(sub any) bool { return validateValue(sub, value, path) == nil }) {
+			// A branch with keywords this validator does not enforce may match
+			// more values than it can tell, so exactly-one cannot be decided:
+			// require only that some branch matches, as anyOf does.
+			return fmt.Errorf("%s does not match any allowed schema", path)
 		}
 	}
 	return nil
+}
+
+// enforcedKeywords are the keywords validateValue checks, and annotations,
+// which never constrain a value.
+var enforcedKeywords = map[string]bool{
+	"type": true, "enum": true, "const": true, "properties": true, "required": true,
+	"additionalProperties": true, "items": true, "allOf": true, "anyOf": true, "oneOf": true,
+	"title": true, "description": true, "default": true, "examples": true, "$schema": true,
+	"$id": true, "$comment": true, "deprecated": true, "readOnly": true, "writeOnly": true,
+}
+
+// decidable reports whether a schema uses only enforced keywords, so that a
+// value it accepts is exactly a value the schema allows.
+func decidable(schema any) bool {
+	object, ok := schema.(map[string]any)
+	if !ok {
+		return true
+	}
+	for key, value := range object {
+		if !enforcedKeywords[key] {
+			return false
+		}
+		switch key {
+		case "properties":
+			properties, _ := value.(map[string]any)
+			for _, sub := range properties {
+				if !decidable(sub) {
+					return false
+				}
+			}
+		case "additionalProperties", "items":
+			if !decidable(value) {
+				return false
+			}
+		case "allOf", "anyOf", "oneOf":
+			subs, _ := value.([]any)
+			for _, sub := range subs {
+				if !decidable(sub) {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 func validateProperties(schema map[string]any, object map[string]any, path string) error {

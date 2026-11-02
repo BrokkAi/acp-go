@@ -154,7 +154,7 @@ func TestNewAttachedSessionDeclaresAndServesBeforeAndAfterSetup(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := result["content"].([]any)[0].(map[string]any)
-	if result["resultType"] != "complete" || result["isError"] != false || content["text"] != "hello" {
+	if result["resultType"] != "complete" || result["isError"] != false || content["text"] != `"hello"` {
 		t.Fatalf("result = %s", outcome.Result)
 	}
 
@@ -414,26 +414,38 @@ func TestAttachedRequestsValidateModernMetadata(t *testing.T) {
 	cases := []struct {
 		name, method string
 		params       map[string]any
-		code         int32
+		want         string
 	}{
-		{"no metadata", "tools/list", map[string]any{}, -32602},
+		{"no metadata", "tools/list", map[string]any{},
+			`{"code":-32602,"data":"inner params._meta must be an object","message":"Invalid params"}`},
 		{"old version", "tools/list", map[string]any{"_meta": map[string]any{
 			"io.modelcontextprotocol/protocolVersion":    "2025-11-25",
 			"io.modelcontextprotocol/clientCapabilities": map[string]any{},
-		}}, -32022},
+		}}, `{"code":-32022,"data":{"requested":"2025-11-25","supported":["2026-07-28"]},"message":"Unsupported protocol version"}`},
+		{"null version", "tools/list", map[string]any{"_meta": map[string]any{
+			"io.modelcontextprotocol/protocolVersion":    nil,
+			"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+		}}, `{"code":-32602,"data":"inner params._meta requires io.modelcontextprotocol/protocolVersion","message":"Invalid params"}`},
 		{"capabilities not an object", "tools/list", map[string]any{"_meta": map[string]any{
 			"io.modelcontextprotocol/protocolVersion": "2026-07-28",
-		}}, -32602},
-		{"initialize", "initialize", modernParams(nil), -32601},
-		{"unknown tool", "tools/call", modernParams(map[string]any{"name": "missing"}), -32602},
+		}}, `{"code":-32602,"data":"inner params._meta requires io.modelcontextprotocol/clientCapabilities object","message":"Invalid params"}`},
+		{"initialize", "initialize", modernParams(nil),
+			`{"code":-32601,"data":"native MCP requests do not use initialize","message":"Method not found"}`},
+		{"unknown tool", "tools/call", modernParams(map[string]any{"name": "missing"}),
+			"{\"code\":-32602,\"message\":\"tool `missing` not found\"}"},
+		{"unparsable call", "tools/call", modernParams(nil),
+			"{\"code\":-32602,\"data\":\"missing field `name`\",\"message\":\"Invalid MCP request\"}"},
 	}
 	for i, tc := range cases {
 		outcome, err := h.caller.Call(ctx, serverID, string(rune('a'+i)), tc.method, tc.params, nil)
 		if err != nil {
 			t.Fatalf("%s: outer error %v", tc.name, err)
 		}
-		if outcome.Error == nil || outcome.Error.Code != tc.code {
-			t.Fatalf("%s: outcome = %+v", tc.name, outcome)
+		if outcome.Error == nil {
+			t.Fatalf("%s: outcome = %s", tc.name, outcome.Result)
+		}
+		if got, _ := json.Marshal(outcome.Error); string(got) != tc.want {
+			t.Fatalf("%s:\n got %s\nwant %s", tc.name, got, tc.want)
 		}
 	}
 
@@ -474,7 +486,7 @@ func TestMessageRouterResourceLimit(t *testing.T) {
 	probe.finish()
 }
 
-func TestMessageRouterNeverRebindsServerIDs(t *testing.T) {
+func TestMessageRouterRegistrationLifetime(t *testing.T) {
 	router := mcp.NewMessageRouter(nil)
 	service := mcp.MessageServiceFunc(func(context.Context, mcp.MessageRequest) (mcp.MessageOutcome, error) {
 		return mcp.MessageOutcome{}, nil
@@ -482,11 +494,15 @@ func TestMessageRouterNeverRebindsServerIDs(t *testing.T) {
 	if err := router.Register("tools", service); err != nil {
 		t.Fatal(err)
 	}
+	if err := router.Register("tools", service); err == nil {
+		t.Fatal("a registered server ID was bound twice")
+	}
 	if err := router.UnregisterAndWait(context.Background(), "tools"); err != nil {
 		t.Fatal(err)
 	}
-	if err := router.Register("tools", service); err == nil {
-		t.Fatal("a released server ID was rebound")
+	// Like the reference SDK, the router keeps no record of released IDs.
+	if err := router.Register("tools", service); err != nil {
+		t.Fatal(err)
 	}
 }
 

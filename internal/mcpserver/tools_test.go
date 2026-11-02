@@ -161,12 +161,13 @@ func TestToolServerListsAndDiscovers(t *testing.T) {
 	if info["name"] != "named" || info["version"] != "1.2.3" || discovery["instructions"] != "be nice" || discovery["capabilities"].(map[string]any)["tools"] == nil {
 		t.Fatalf("discovery = %v", discovery)
 	}
-	if _, invalid := execute(t, server, "server/discover", json.RawMessage(`{}`)); invalid == nil || invalid.Code != codeInvalidParams {
-		t.Fatalf("discovery without metadata = %v", invalid)
-	}
-	if _, invalid := execute(t, server, "tools/list", json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01"}}`)); invalid == nil || invalid.Code != CodeUnsupportedProtocolVersion {
-		t.Fatalf("unsupported version = %v", invalid)
-	}
+	_, invalid := execute(t, server, "server/discover", json.RawMessage(`{}`))
+	wantError(t, invalid, `{"code":-32602,"message":"request _meta is missing or has malformed required fields: io.modelcontextprotocol/protocolVersion, io.modelcontextprotocol/clientCapabilities"}`)
+	// A protocol version that is not a string counts as missing.
+	_, invalid = execute(t, server, "server/discover", json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":null,"io.modelcontextprotocol/clientCapabilities":{}}}`))
+	wantError(t, invalid, `{"code":-32602,"message":"request _meta is missing or has malformed required fields: io.modelcontextprotocol/protocolVersion"}`)
+	_, invalid = execute(t, server, "tools/list", json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01"}}`))
+	wantError(t, invalid, `{"code":-32022,"message":"Unsupported protocol version","data":{"requested":"1900-01-01","supported":["2024-11-05","2025-03-26","2025-06-18","2025-11-25","2026-07-28"]}}`)
 
 	initialized, _ := execute(t, NewToolServer("plain", "", NewToolRegistry()), "initialize", json.RawMessage(`{"protocolVersion":"2025-06-18"}`))
 	if initialized["protocolVersion"] != "2025-06-18" || initialized["serverInfo"].(map[string]any)["version"] != DefaultServerVersion {
@@ -175,11 +176,15 @@ func TestToolServerListsAndDiscovers(t *testing.T) {
 	if result, invalid := execute(t, server, "ping", nil); invalid != nil || result == nil {
 		t.Fatalf("legacy ping = %v, %v", result, invalid)
 	}
-	if _, invalid := execute(t, server, "ping", modern(nil)); invalid == nil || invalid.Code != codeMethodNotFound {
-		t.Fatalf("modern ping = %v", invalid)
-	}
-	if _, invalid := execute(t, server, "resources/list", modern(nil)); invalid == nil || invalid.Code != codeMethodNotFound {
-		t.Fatalf("unknown method = %v", invalid)
+	_, invalid = execute(t, server, "ping", modern(nil))
+	wantError(t, invalid, `{"code":-32601,"message":"ping"}`)
+	_, invalid = execute(t, server, "resources/read", modern(nil))
+	wantError(t, invalid, `{"code":-32601,"message":"resources/read"}`)
+	_, invalid = execute(t, server, "vendor/custom", modern(nil))
+	wantError(t, invalid, `{"code":-32601,"message":"vendor/custom"}`)
+	prompts, _ := execute(t, server, "prompts/list", modern(nil))
+	if encoded, _ := json.Marshal(prompts); string(encoded) != `{"prompts":[],"resultType":"complete"}` {
+		t.Fatalf("prompts/list = %s", encoded)
 	}
 }
 
@@ -211,7 +216,8 @@ func TestToolServerCallSemantics(t *testing.T) {
 	}
 
 	result, _ := call("greet", map[string]any{"name": "Bob"})
-	if text(result) != "Hello, Bob!" || result["isError"] != false || result["resultType"] != "complete" {
+	// Like the reference builder, the text is the output's JSON encoding.
+	if text(result) != `"Hello, Bob!"` || result["isError"] != false || result["resultType"] != "complete" {
 		t.Fatalf("greet = %v", result)
 	}
 	result, _ = call("structured", map[string]any{"name": "Al"})
@@ -229,23 +235,21 @@ func TestToolServerCallSemantics(t *testing.T) {
 		}
 	}
 	for _, name := range []string{"missing", "explicit"} {
-		if _, invalid := call(name, nil); invalid == nil || invalid.Code != codeInvalidParams {
-			t.Fatalf("%s = %v", name, invalid)
-		}
+		_, invalid := call(name, nil)
+		wantError(t, invalid, "{\"code\":-32602,\"message\":\"tool `"+name+"` not found\"}")
 	}
-	if _, invalid := call("greet", "not-an-object"); invalid == nil || invalid.Code != codeInvalidParams {
-		t.Fatalf("non-object arguments = %v", invalid)
-	}
-	if _, invalid := execute(t, server, "tools/call", modern(nil)); invalid == nil || invalid.Code != codeInvalidParams {
-		t.Fatalf("missing name = %v", invalid)
-	}
+	_, invalid := call("greet", "not-an-object")
+	wantError(t, invalid, `{"code":-32602,"message":"Invalid MCP request","data":"invalid type: expected a map for `+"`arguments`"+`"}`)
+	_, invalid = execute(t, server, "tools/call", modern(nil))
+	wantError(t, invalid, `{"code":-32602,"message":"Invalid MCP request","data":"missing field `+"`name`"+`"}`)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	outcome, err := server.Service().Execute(ctx, Request{Method: "tools/call", Params: modern(map[string]any{"name": "cancelled"})}, &RequestContext{})
-	if err != nil || outcome.Error == nil || outcome.Error.Code != codeInternalError {
-		t.Fatalf("cancelled call = %+v, %v", outcome, err)
+	if err != nil {
+		t.Fatal(err)
 	}
+	wantError(t, outcome.Error, `{"code":-32603,"message":"operation cancelled"}`)
 
 	_ = registry.EnableTool("explicit")
 	result, _ = call("explicit", nil)
@@ -284,5 +288,41 @@ func TestValidateSchemaKeywords(t *testing.T) {
 		if (err == nil) != valid {
 			t.Errorf("%s: err = %v, want valid=%v", arguments, err, valid)
 		}
+	}
+}
+
+func wantError(t *testing.T, got *Error, want string) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("error = nil, want %s", want)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != want {
+		t.Fatalf("error = %s\nwant    %s", encoded, want)
+	}
+}
+
+func TestValidateSchemaNeverRejectsOnUnenforcedKeywords(t *testing.T) {
+	for schema, arguments := range map[string]string{
+		`{"oneOf":[{"$ref":"#/$defs/a"},{"$ref":"#/$defs/b"}]}`:                              `{"x":1}`,
+		`{"oneOf":[{"type":"string","minLength":3},{"type":"string","format":"uuid"}]}`:      `"ab"`,
+		`{"oneOf":[{"type":"object"},{"type":"object","properties":{"a":{"pattern":"x"}}}]}`: `{"a":"y"}`,
+		`{"type":"object","properties":{"n":{"$ref":"#/$defs/n"}}}`:                          `{"n":"anything"}`,
+		`{"not":{"type":"object"}}`:                                                          `{}`,
+	} {
+		if err := validateSchema(json.RawMessage(schema), json.RawMessage(arguments)); err != nil {
+			t.Errorf("%s rejected %s: %v", schema, arguments, err)
+		}
+	}
+	// A decidable oneOf still requires exactly one match.
+	if err := validateSchema(json.RawMessage(`{"oneOf":[{"type":"number"},{"type":"integer"}]}`), json.RawMessage(`2`)); err == nil {
+		t.Fatal("two matching oneOf branches were accepted")
+	}
+	// An undecidable oneOf still requires some branch to match.
+	if err := validateSchema(json.RawMessage(`{"oneOf":[{"type":"string","minLength":1},{"type":"boolean"}]}`), json.RawMessage(`3`)); err == nil {
+		t.Fatal("a value matching no oneOf branch was accepted")
 	}
 }

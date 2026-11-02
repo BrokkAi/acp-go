@@ -10,15 +10,8 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/rpcctl"
 )
-
-// Connection is the part of an ACP connection the binding uses. Both
-// *acp.Connection and the draft v2 connection satisfy it.
-type Connection interface {
-	Notify(ctx context.Context, method string, params any) error
-	Done() <-chan struct{}
-	InputClosed() <-chan struct{}
-}
 
 // Envelope is a decoded agent-to-provider mcp/message request.
 type Envelope struct {
@@ -45,26 +38,25 @@ type Codec struct {
 // one ACP connection: a registry of server IDs and the dispatcher for their
 // mcp/message requests.
 type Binding struct {
-	connection Connection
+	connection *acp.Connection
 	codec      Codec
 
 	mu            sync.Mutex
 	registrations map[string]*Registration
 	closing       map[string]*Registration
-	retired       map[string]struct{}
 	active        int
 	maxActive     int
 }
 
 // NewBinding returns a binding that sends notifications over connection, which
-// may be nil when no notifications are needed.
-func NewBinding(connection Connection, codec Codec) *Binding {
+// may be nil when no notifications are needed. A draft v2 connection passes
+// its embedded *acp.Connection.
+func NewBinding(connection *acp.Connection, codec Codec) *Binding {
 	return &Binding{
 		connection:    connection,
 		codec:         codec,
 		registrations: map[string]*Registration{},
 		closing:       map[string]*Registration{},
-		retired:       map[string]struct{}{},
 	}
 }
 
@@ -95,8 +87,10 @@ func (r *Registration) ServerID() string { return r.serverID }
 
 // Register binds serverID to service. A native registration validates the
 // MCP 2026-07-28 request metadata and restricts discovery to that revision;
-// a raw one leaves the MCP protocol to the service. A server ID is never
-// rebound, even after its registration was removed.
+// a raw one leaves the MCP protocol to the service. Like the reference SDK,
+// the binding keeps no record of released IDs: the RFD's rule that a server
+// ID is never rebound on a connection is the provider's to keep, and
+// RegisterNew keeps it with random IDs.
 func (b *Binding) Register(serverID string, service Service, native bool) (*Registration, error) {
 	if strings.TrimSpace(serverID) == "" {
 		return nil, errors.New("mcp server ID is required")
@@ -106,16 +100,13 @@ func (b *Binding) Register(serverID string, service Service, native bool) (*Regi
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if _, exists := b.registrations[serverID]; exists {
+	if b.registrations[serverID] != nil || b.closing[serverID] != nil {
 		return nil, fmt.Errorf("mcp server %q is already registered", serverID)
-	}
-	if _, retired := b.retired[serverID]; retired {
-		return nil, fmt.Errorf("mcp server ID %q was already used on this connection", serverID)
 	}
 	return b.registerLocked(serverID, service, native), nil
 }
 
-// RegisterNew binds a freshly generated, connection-unique server ID.
+// RegisterNew binds a freshly generated server ID.
 func (b *Binding) RegisterNew(service Service) (*Registration, error) {
 	if service == nil {
 		return nil, errors.New("mcp service is required")
@@ -126,9 +117,7 @@ func (b *Binding) RegisterNew(service Service) (*Registration, error) {
 			return nil, err
 		}
 		b.mu.Lock()
-		_, exists := b.registrations[serverID]
-		_, retired := b.retired[serverID]
-		if !exists && !retired {
+		if b.registrations[serverID] == nil && b.closing[serverID] == nil {
 			registration := b.registerLocked(serverID, service, true)
 			b.mu.Unlock()
 			return registration, nil
@@ -197,8 +186,9 @@ func (b *Binding) Lookup(serverID string) *Registration {
 }
 
 // Close revokes admission for the registration and cancels its active
-// operations with ErrServerUnavailable. It returns once no notification of
-// those operations is being written; it does not wait for them to return.
+// operations with ErrServerUnavailable, revoking their notification rights.
+// It does not wait for the operations to return and never blocks on the
+// transport.
 func (r *Registration) Close() {
 	b := r.binding
 	b.mu.Lock()
@@ -213,7 +203,6 @@ func (r *Registration) Close() {
 	if len(r.operations) > 0 {
 		b.closing[r.serverID] = r
 	}
-	b.retired[r.serverID] = struct{}{}
 	operations := make([]*operation, 0, len(r.operations))
 	for _, op := range r.operations {
 		operations = append(operations, op)
@@ -256,8 +245,9 @@ type operation struct {
 	gate         operationGate
 }
 
-// stop cancels the operation, then waits for an in-flight notification to
-// finish so none is written afterwards.
+// stop cancels the operation, then waits for a notification that is being
+// queued to finish queueing, so none is queued afterwards. Queueing observes
+// the cancellation, so stop never waits on the transport.
 func (o *operation) stop(cause error) {
 	o.cancel(cause)
 	o.gate.close()
@@ -273,29 +263,46 @@ func rpcError(code int, message string, data any) *acp.RPCError {
 	return err
 }
 
+// The outer errors use the reference SDK's codes, messages, and data.
+func invalidEnvelope(detail string) *acp.RPCError { return rpcError(-32602, "Invalid params", detail) }
 func backendFailure(detail string) *acp.RPCError {
 	return rpcError(ErrorCodeBackendFailure, "MCP backend failure", detail)
 }
-
 func providerRemoved() *acp.RPCError {
 	return rpcError(ErrorCodeServerUnavailable, "MCP provider removed", nil)
 }
+func registrationUnavailable() *acp.RPCError {
+	return rpcError(ErrorCodeServerUnavailable, "MCP server registration unavailable", nil)
+}
+func cancelled() *acp.RPCError { return rpcError(-32800, "Request cancelled", nil) }
 
-func cancelled() *acp.RPCError { return &acp.RPCError{Code: -32800, Message: "request cancelled"} }
+func closedChannel(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// inputClosed reports whether the connection stopped reading or closed.
+func (b *Binding) inputClosed() bool {
+	return b.connection != nil && (closedChannel(b.connection.InputClosed()) || closedChannel(b.connection.Done()))
+}
 
 // Handle serves one mcp/message request. The returned value is the version's
 // response carrier; binding failures are returned as *acp.RPCError.
 func (b *Binding) Handle(ctx context.Context, raw json.RawMessage) (any, error) {
 	envelope, err := b.codec.Decode(raw)
 	if err != nil {
-		return nil, rpcError(-32602, "malformed mcp/message envelope: "+err.Error(), nil)
+		return nil, invalidEnvelope(err.Error())
 	}
 	if strings.TrimSpace(envelope.ServerID) == "" || strings.TrimSpace(envelope.RequestID) == "" || strings.TrimSpace(envelope.Method) == "" {
-		return nil, rpcError(-32602, "mcp/message requires serverId, requestId, and method", nil)
+		return nil, invalidEnvelope("mcp/message requires non-blank serverId, requestId, and method")
 	}
 	registration := b.Lookup(envelope.ServerID)
 	if registration == nil {
-		return nil, rpcError(ErrorCodeServerUnavailable, fmt.Sprintf("mcp server %q is not registered", envelope.ServerID), nil)
+		return nil, registrationUnavailable()
 	}
 	var meta json.RawMessage
 	if registration.native {
@@ -316,24 +323,38 @@ func (b *Binding) Handle(ctx context.Context, raw json.RawMessage) (any, error) 
 	}
 	defer b.release(op)
 
+	// Work reported cancelled before execution never starts.
+	switch {
+	case b.inputClosed():
+		op.stop(ErrConnectionClosed)
+	case ctx.Err() != nil:
+		op.stop(ErrRequestCancelled)
+	}
 	go b.watch(ctx, opCtx, op)
 
-	rc := &RequestContext{
-		serverID:      envelope.ServerID,
-		requestID:     envelope.RequestID,
-		meta:          meta,
-		requestDone:   ctx.Done(),
-		operationDone: opCtx.Done(),
-		notify: func(notifyCtx context.Context, method string, params json.RawMessage) error {
-			return b.notify(notifyCtx, opCtx, op, method, params)
-		},
+	var outcome Outcome
+	if opCtx.Err() == nil {
+		rc := &RequestContext{
+			serverID:      envelope.ServerID,
+			requestID:     envelope.RequestID,
+			meta:          meta,
+			requestDone:   ctx.Done(),
+			operationDone: opCtx.Done(),
+			notify: func(notifyCtx context.Context, method string, params json.RawMessage) error {
+				return b.notify(notifyCtx, opCtx, op, method, params)
+			},
+		}
+		outcome, err = registration.service.Execute(opCtx, Request{Method: envelope.Method, Params: envelope.Params}, rc)
 	}
-	outcome, err := registration.service.Execute(opCtx, Request{Method: envelope.Method, Params: envelope.Params}, rc)
 	// Revoke notification rights before the response can be written.
 	op.gate.close()
-	if opCtx.Err() != nil {
+	if opCtx.Err() != nil || b.inputClosed() {
 		// Cancellation wins a race with completion: the result is discarded.
-		switch cause := context.Cause(opCtx); {
+		// After EOF or shutdown the request gets cleanup, not a response.
+		cause := context.Cause(opCtx)
+		switch {
+		case b.inputClosed() || errors.Is(cause, ErrConnectionClosed):
+			return nil, rpcctl.ErrNoResponse
 		case errors.Is(cause, ErrServerUnavailable):
 			return nil, providerRemoved()
 		default:
@@ -341,9 +362,6 @@ func (b *Binding) Handle(ctx context.Context, raw json.RawMessage) (any, error) 
 		}
 	}
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return nil, cancelled()
-		}
 		return nil, backendFailure(err.Error())
 	}
 	if registration.native && envelope.Method == "server/discover" {
@@ -370,7 +388,7 @@ func (b *Binding) admit(registration *Registration, op *operation) *acp.RPCError
 		return providerRemoved()
 	}
 	if _, duplicate := registration.operations[op.requestID]; duplicate {
-		return rpcError(-32602, fmt.Sprintf("mcp/message request %q for server %q is already active", op.requestID, registration.serverID), nil)
+		return invalidEnvelope("duplicate active MCP requestId")
 	}
 	if b.maxActive > 0 && b.active >= b.maxActive {
 		return rpcError(ErrorCodeResourceLimitExceeded, "MCP binding resource limit exceeded", fmt.Sprintf("at most %d MCP operations may be active", b.maxActive))
@@ -405,25 +423,19 @@ func (b *Binding) watch(requestCtx, opCtx context.Context, op *operation) {
 	case <-inputClosed:
 		op.stop(ErrConnectionClosed)
 	case <-requestCtx.Done():
-		select {
-		case <-connectionDone:
+		if closedChannel(connectionDone) {
 			op.stop(ErrConnectionClosed)
-		default:
+		} else {
 			op.stop(ErrRequestCancelled)
 		}
 	}
 }
 
+// notify queues one request-scoped notification. The gate is held only while
+// queueing, and queueing stops when the operation is cancelled, so stopping an
+// operation never waits for a stalled transport. The write itself is awaited
+// outside the gate, until it finishes, ctx ends, or the operation stops.
 func (b *Binding) notify(ctx, opCtx context.Context, op *operation, method string, params json.RawMessage) error {
-	op.gate.mu.Lock()
-	defer op.gate.mu.Unlock()
-	if op.gate.done || opCtx.Err() != nil {
-		err := fmt.Errorf("mcp/message request %q for server %q is no longer active", op.requestID, op.registration.serverID)
-		if cause := context.Cause(opCtx); cause != nil {
-			err = fmt.Errorf("%w: %w", err, cause)
-		}
-		return err
-	}
 	if b.connection == nil {
 		return errors.New("mcp binding has no connection for notifications")
 	}
@@ -431,7 +443,35 @@ func (b *Binding) notify(ctx, opCtx context.Context, op *operation, method strin
 	if err != nil {
 		return err
 	}
-	return b.connection.Notify(ctx, b.codec.Method, notification)
+	queueCtx, cancelQueue := context.WithCancel(ctx)
+	defer cancelQueue()
+	stopQueue := context.AfterFunc(opCtx, cancelQueue)
+	defer stopQueue()
+
+	op.gate.mu.Lock()
+	if op.gate.done || opCtx.Err() != nil {
+		op.gate.mu.Unlock()
+		return inactive(op, opCtx)
+	}
+	wait, err := rpcctl.QueueNotification(b.connection, queueCtx, b.codec.Method, notification)
+	op.gate.mu.Unlock()
+	if err == nil {
+		// A queued notification is written in order even if the operation
+		// stops meanwhile; only the wait for it ends early.
+		err = wait(queueCtx)
+	}
+	if err != nil && opCtx.Err() != nil {
+		return inactive(op, opCtx)
+	}
+	return err
+}
+
+func inactive(op *operation, opCtx context.Context) error {
+	err := fmt.Errorf("mcp/message request %q for server %q is no longer active", op.requestID, op.registration.serverID)
+	if cause := context.Cause(opCtx); cause != nil {
+		err = fmt.Errorf("%w: %w", err, cause)
+	}
+	return err
 }
 
 func metaOf(params json.RawMessage) json.RawMessage {
@@ -449,29 +489,40 @@ func metaOf(params json.RawMessage) json.RawMessage {
 	return meta
 }
 
+// metaString returns a metadata member that is a JSON string.
+func metaString(fields map[string]json.RawMessage, key string) (string, bool) {
+	raw := fields[key]
+	if len(raw) == 0 || raw[0] != '"' {
+		return "", false
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return "", false
+	}
+	return value, true
+}
+
 // validateNativeRequest applies the binding's per-request MCP checks and
-// returns the validated metadata. Failures are inner MCP errors.
+// returns the validated metadata. Failures are inner MCP errors, shaped like
+// the reference SDK's: message "Invalid params" with the detail in data.
 func validateNativeRequest(method string, params json.RawMessage) (json.RawMessage, *Error) {
 	if method == "initialize" {
-		return nil, methodNotFound("native MCP requests do not use initialize")
+		return nil, newError(codeMethodNotFound, "Method not found", "native MCP requests do not use initialize")
 	}
 	meta := metaOf(params)
-	if meta == nil {
-		return nil, invalidParams("inner params._meta must be an object")
-	}
 	var fields map[string]json.RawMessage
-	if json.Unmarshal(meta, &fields) != nil {
-		return nil, invalidParams("inner params._meta must be an object")
+	if meta == nil || json.Unmarshal(meta, &fields) != nil {
+		return nil, newError(codeInvalidParams, "Invalid params", "inner params._meta must be an object")
 	}
-	var version string
-	if raw, ok := fields[MetaProtocolVersion]; !ok || json.Unmarshal(raw, &version) != nil {
-		return nil, invalidParams("inner params._meta requires " + MetaProtocolVersion)
+	version, ok := metaString(fields, MetaProtocolVersion)
+	if !ok {
+		return nil, newError(codeInvalidParams, "Invalid params", "inner params._meta requires "+MetaProtocolVersion)
 	}
 	if version != ProtocolVersion {
 		return nil, unsupportedVersion(version, []string{ProtocolVersion})
 	}
 	if raw := fields[MetaClientCapabilities]; len(raw) == 0 || raw[0] != '{' {
-		return nil, invalidParams("inner params._meta requires " + MetaClientCapabilities + " object")
+		return nil, newError(codeInvalidParams, "Invalid params", "inner params._meta requires "+MetaClientCapabilities+" object")
 	}
 	return meta, nil
 }
@@ -486,19 +537,22 @@ func projectDiscovery(outcome Outcome) (Outcome, error) {
 	if err := json.Unmarshal(outcome.Result, &result); err != nil || result == nil {
 		return Outcome{}, errors.New("invalid MCP discovery supportedVersions")
 	}
-	var versions []string
-	if err := json.Unmarshal(result["supportedVersions"], &versions); err != nil || versions == nil {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(result["supportedVersions"], &entries); err != nil || entries == nil {
 		return Outcome{}, errors.New("invalid MCP discovery supportedVersions")
+	}
+	versions := make([]string, len(entries))
+	for i, entry := range entries {
+		if len(entry) == 0 || entry[0] != '"' || json.Unmarshal(entry, &versions[i]) != nil {
+			return Outcome{}, errors.New("invalid MCP discovery supportedVersions")
+		}
 	}
 	supported := false
 	for _, version := range versions {
 		supported = supported || version == ProtocolVersion
 	}
 	if !supported {
-		return Outcome{Error: newError(CodeUnsupportedProtocolVersion, "Unsupported protocol version", map[string]any{
-			"requested": ProtocolVersion,
-			"supported": versions,
-		})}, nil
+		return Outcome{Error: unsupportedVersion(ProtocolVersion, versions)}, nil
 	}
 	result["supportedVersions"] = json.RawMessage(`["` + ProtocolVersion + `"]`)
 	encoded, err := json.Marshal(result)

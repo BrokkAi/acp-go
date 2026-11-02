@@ -105,13 +105,6 @@ func newError(code int, message string, data any) *Error {
 	return err
 }
 
-func invalidParams(detail string) *Error {
-	return newError(codeInvalidParams, "Invalid params", detail)
-}
-func methodNotFound(detail string) *Error {
-	return newError(codeMethodNotFound, "Method not found", detail)
-}
-
 func unsupportedVersion(requested any, supported []string) *Error {
 	return newError(CodeUnsupportedProtocolVersion, "Unsupported protocol version", map[string]any{
 		"requested": requested,

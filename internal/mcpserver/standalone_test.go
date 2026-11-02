@@ -95,7 +95,7 @@ func TestServeStandaloneAnswersADirectMCPClient(t *testing.T) {
 	if err := client.Call(ctx, "tools/call", map[string]any{"name": "greet", "arguments": map[string]any{"name": "Ann"}}, &called); err != nil {
 		t.Fatal(err)
 	}
-	if _, modern := called["resultType"]; modern || called["content"].([]any)[0].(map[string]any)["text"] != "Hello, Ann!" {
+	if _, modern := called["resultType"]; modern || called["content"].([]any)[0].(map[string]any)["text"] != `"Hello, Ann!"` {
 		t.Fatalf("legacy call = %v", called)
 	}
 	if err := client.Call(ctx, "tools/call", json.RawMessage(modern(map[string]any{"name": "progress"})), &called); err != nil {
@@ -106,7 +106,7 @@ func TestServeStandaloneAnswersADirectMCPClient(t *testing.T) {
 	}
 	err := client.Call(ctx, "tools/call", map[string]any{"name": "missing"}, nil)
 	var rpcErr *acp.RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32602 {
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32602 || rpcErr.Message != "tool `missing` not found" || rpcErr.Data != nil {
 		t.Fatalf("unknown tool = %v", err)
 	}
 
@@ -121,5 +121,48 @@ func TestServeStandaloneAnswersADirectMCPClient(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return after EOF")
+	}
+}
+
+func TestServeStandaloneHonorsNotificationsCancelled(t *testing.T) {
+	pair := acptest.NewPairWithDeadline(time.Now().Add(10 * time.Second))
+	defer pair.Close()
+	causes := make(chan error, 1)
+	started := make(chan struct{})
+	registry := NewToolRegistry()
+	_ = registry.Register(Tool{Name: "hang", Handler: func(ctx context.Context, _ json.RawMessage, _ *RequestContext) (any, error) {
+		close(started)
+		<-ctx.Done()
+		causes <- context.Cause(ctx)
+		return nil, ctx.Err()
+	}})
+	server := NewToolServer("direct", "", registry)
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(context.Background(), pair.A, pair.A) }()
+
+	send := func(frame string) {
+		if _, err := pair.B.Write([]byte(frame + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send(`{"jsonrpc":"2.0","id":"call-7","method":"tools/call","params":{"name":"hang"}}`)
+	<-started
+	send(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId": "call-7","reason":"user"}}`)
+	if cause := <-causes; !errors.Is(cause, ErrRequestCancelled) {
+		t.Fatalf("cause = %v", cause)
+	}
+	send(`{"jsonrpc":"2.0","id":8,"method":"ping"}`)
+	var response struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := pair.B.Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if string(response.ID) != "8" {
+		t.Fatalf("first response is for %s; the cancelled request must get none", response.ID)
+	}
+	_ = pair.B.Close()
+	if err := <-served; err != nil {
+		t.Fatal(err)
 	}
 }

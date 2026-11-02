@@ -28,13 +28,14 @@ series, minor releases may contain breaking API changes.
   - `Server.Serve` for a direct MCP client without an ACP session.
   - `MessageRouter.Attach`, `Attachment`, and the attached-session helpers
     `NewAttachedSession`, `LoadAttachedSession`, `ResumeAttachedSession`, and
-    `ForkAttachedSession` (v1) and `NewAttachedSession` and
-    `ResumeAttachedSession` (v2): unique `mcp-server:<uuid>` IDs, registration
-    before the request, release on failure or `Attachment.Close`, and, for
-    v2, `-32602` before writing when the request already declares the name.
+    `ForkAttachedSession` (v1) and `NewAttachedSession`,
+    `ResumeAttachedSession`, and `ForkAttachedSession` (v2): unique
+    `mcp-server:<uuid>` IDs, registration before the request, release on
+    failure or `Attachment.Close`, and, for v2, `-32602` before writing when
+    the request already declares the name.
   - `Attachment.HandleSessionSetup` and `Attachment.AppendDeclarations` for
     connection-scoped proxy attachment, appending to the raw params so unknown
-    fields survive.
+    fields keep their values.
   - `ErrorCodeResourceLimitExceeded` (`-33000`), `ErrorCodeServerUnavailable`
     (`-33001`), and `ErrorCodeBackendFailure` (`-33002`), and
     `MessageRouter.SetMaxActive`, which answers `-33000` past its limit.
@@ -160,14 +161,23 @@ series, minor releases may contain breaking API changes.
 
 ### Changed
 
-- `mcp.MessageRouter` and the v2 `MessageRouter` now cancel an active request
-  when the connection's input reaches EOF, answer a request cancelled by
-  `Unregister` with `-33001` instead of `-32800`, report a service error as
-  `-33002` with the message `MCP backend failure` and the error text in
-  `data`.
-- **Breaking:** a `MessageRouter` no longer rebinds a server ID after
-  `Unregister`; the MCP-over-ACP RFD forbids reusing a server ID on a
-  connection.
+- `mcp.MessageRouter` and the v2 `MessageRouter` follow the reference
+  binding for low-level `Register` services too:
+  - an active request is cancelled when the connection's input reaches EOF,
+    and then gets no response;
+  - a request whose outer cancellation arrives before the service starts is
+    not executed;
+  - a result that loses a race with cancellation is discarded, and the
+    cancellation error is sent instead;
+  - a request cancelled by `Unregister` is answered with `-33001`
+    `MCP provider removed` instead of `-32800`;
+  - an unknown server is `-33001` `MCP server registration unavailable`, a
+    duplicate active request ID is `-32602` `Invalid params` with data
+    `duplicate active MCP requestId`, and a malformed envelope is `-32602`
+    `Invalid params` with the decode error as data;
+  - a service error is `-33002` `MCP backend failure` with the error text in
+    `data`, including a `context.Canceled` returned when the request was not
+    cancelled (previously `-32800`).
 - v1 `mcp.NewSession` sends `"mcpServers": []` instead of `null` when no
   servers are given; the v1 schema requires the array.
 - v1 `unstable.Handle` follows the reference SDK's handler chain and error

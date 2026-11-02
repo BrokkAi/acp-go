@@ -122,8 +122,9 @@ func isSessionSetup(method string) bool {
 
 // AppendDeclarations appends the attachment's declarations to the mcpServers
 // of a raw session/new, session/resume, or session/fork params object and
-// returns the new params. Every other member is kept unchanged, so fields the
-// generated types do not model survive. Names must be unique within
+// returns the new params. Every other member keeps its value, so fields the
+// generated types do not model survive; the result is semantically equal, not
+// byte-identical (members may be re-ordered). Names must be unique within
 // mcpServers: when the params already declare a server with an attached
 // server's name, it fails with -32602 and the request must not be forwarded.
 // Other methods, and every method after Close, return params unchanged.
@@ -173,7 +174,7 @@ func (a *Attachment) HandleSessionSetup(next acp.Handler) acp.Handler {
 // with -32602 before writing, lets call send the session setup request with
 // the declarations appended, and releases the registrations when validation
 // or the request fails. Every attached-session helper is built on it, so a
-// new setup method (session/fork, #61) only supplies call.
+// new setup method only supplies call.
 func attachTo[T any](ctx context.Context, router *MessageRouter, servers []*Server, existing []unstable.McpServer, call func(declared []unstable.McpServer) (T, error)) (T, *Attachment, error) {
 	var zero T
 	if router == nil || router.connection == nil {
@@ -259,6 +260,39 @@ func ResumeAttachedSession(ctx context.Context, router *MessageRouter, initializ
 		}
 		return response, router.connection.Call(ctx, unstable.SessionResumeMethodName, request, &response)
 	})
+}
+
+// ForkAttachedSession is NewAttachedSession for the unstable session/fork,
+// the counterpart of the reference ForkSessionBuilder::with_mcp_server. The
+// agent must advertise capabilities.session.fork, and the response must carry
+// a forked session ID.
+func ForkAttachedSession(ctx context.Context, router *MessageRouter, initialization unstable.InitializeResponse, request unstable.ForkSessionRequest, servers ...*Server) (unstable.ForkSessionResponse, *Attachment, error) {
+	return attachTo(ctx, router, servers, request.MCPServers, func(declared []unstable.McpServer) (unstable.ForkSessionResponse, error) {
+		request.MCPServers = declared
+		return forkSession(ctx, router, initialization, request)
+	})
+}
+
+// forkSession validates and sends one session/fork. It stays private so the
+// public v2 fork facade (#61) can own that name.
+func forkSession(ctx context.Context, router *MessageRouter, initialization unstable.InitializeResponse, request unstable.ForkSessionRequest) (unstable.ForkSessionResponse, error) {
+	var response unstable.ForkSessionResponse
+	if initialization.Capabilities == nil || initialization.Capabilities.Session == nil || initialization.Capabilities.Session.Fork == nil {
+		return response, fmt.Errorf("agent did not advertise session/fork support")
+	}
+	if request.SessionID == "" {
+		return response, fmt.Errorf("session ID is required")
+	}
+	if err := validateUnstableSetup(initialization, string(request.Cwd), request.AdditionalDirectories, request.MCPServers); err != nil {
+		return response, err
+	}
+	if err := router.connection.Call(ctx, unstable.SessionForkMethodName, request, &response); err != nil {
+		return response, err
+	}
+	if response.SessionID == "" {
+		return response, fmt.Errorf("agent returned an empty forked session ID")
+	}
+	return response, nil
 }
 
 // validateUnstableSetup applies the session setup checks to the unstable v2

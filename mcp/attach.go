@@ -120,8 +120,9 @@ func isSessionSetup(method string) bool {
 
 // AppendDeclarations appends the attachment's declarations to the mcpServers
 // of a raw session/new, session/load, session/resume, or session/fork params
-// object and returns the new params. Every other member is kept unchanged, so
-// fields the generated types do not model survive. Other methods, and every
+// object and returns the new params. Every other member keeps its value, so
+// fields the generated types do not model survive; the result is semantically
+// equal, not byte-identical (members may be re-ordered). Other methods, and every
 // method after Close, return params unchanged.
 func (a *Attachment) AppendDeclarations(method string, params json.RawMessage) (json.RawMessage, error) {
 	if !isSessionSetup(method) || a.isClosed() {
