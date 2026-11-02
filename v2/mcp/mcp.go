@@ -2,6 +2,17 @@
 // request-scoped mcp/message mover (MessageClient and MessageRouter). It
 // mirrors the Rust SDK's separately enabled unstable_mcp_over_acp feature:
 // importing this package is the explicit Go opt-in.
+//
+// The package shares a standard-library MCP server framework with
+// github.com/BrokkAi/acp-go/mcp: Server, Service, RequestContext, ToolRegistry,
+// and NewToolServer are the same types in both, so a server defined once
+// attaches to v1 and v2 sessions. NewAttachedSession, ResumeAttachedSession,
+// and ForkAttachedSession attach servers with generated server IDs to draft
+// v2 sessions, reading the acp capability from the unstable initialize
+// response, and reject a server whose name the request already declares with
+// -32602 before writing.
+// Attachment.HandleSessionSetup attaches servers to every session/new,
+// session/resume, and session/fork a proxy forwards.
 package mcp
 
 import (

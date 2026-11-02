@@ -145,8 +145,14 @@ The native MCP-over-ACP binding is delivered (#39): `mcp` and `v2/mcp` expose
 the standard-library message mover decided above, with `MessageClient` on the
 consumer side and `MessageRouter` on the provider side. Inner MCP errors stay
 in the response carrier; binding failures use the protocol's outer error codes
-(`-32602`, `-32800`, `-33001`, `-33002`). See
+(`-32602`, `-32800`, `-33000`, `-33001`, `-33002`). See
 [docs/unstable-facades.md](docs/unstable-facades.md).
+
+The MCP server framework is delivered (#63): a standard-library counterpart of
+Rust's `mcp_server` module and the `rmcp_3` builder's tool semantics, with
+`Server`/`Service`, a typed `ToolRegistry`, standalone serving, and automatic
+per-session and proxy-wide attachment for v1 (`session/new`, `load`, `resume`,
+`fork`) and draft v2 (`session/new`, `resume`, `fork`).
 
 ### 2. Rust ecosystem crate ports
 

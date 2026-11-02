@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/BrokkAi/acp-go/internal/jsonline"
+	"github.com/BrokkAi/acp-go/internal/rpcctl"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -55,6 +56,7 @@ type Connection struct {
 	failure     error
 	initOnce    bool
 	initPending bool
+	inputDone   chan struct{}
 	once        sync.Once
 	loops       sync.WaitGroup
 	tasks       sync.WaitGroup
@@ -75,7 +77,7 @@ func Connect(in io.ReadCloser, out io.WriteCloser, h Handler, n Notifications) *
 // ConnectObserving is Connect with an optional RequestObserver.
 func ConnectObserving(in io.ReadCloser, out io.WriteCloser, h Handler, n Notifications, observe RequestObserver) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Connection{in: in, out: out, ctx: ctx, cancel: cancel, onRequest: h, onNotify: n, onObserve: observe, writes: make(chan outgoing, 32), workers: make(chan struct{}, 32), pending: make(map[string]chan packet), inbound: make(map[string][]inboundCancellation)}
+	c := &Connection{in: in, out: out, ctx: ctx, cancel: cancel, onRequest: h, onNotify: n, onObserve: observe, writes: make(chan outgoing, 32), inputDone: make(chan struct{}), workers: make(chan struct{}, 32), pending: make(map[string]chan packet), inbound: make(map[string][]inboundCancellation)}
 	c.loops.Add(2)
 	go c.readLoop()
 	go c.writeLoop()
@@ -98,7 +100,14 @@ func (c *Connection) Close() error {
 	return nil
 }
 func (c *Connection) Done() <-chan struct{} { return c.ctx.Done() }
-func (c *Connection) Err() error            { c.mu.Lock(); defer c.mu.Unlock(); return c.failure }
+
+// InputClosed is closed once the connection stops reading frames: the peer
+// closed its output (EOF), a frame was invalid, or the connection was closed.
+// On a clean EOF, Done stays open until in-flight handlers return so their
+// responses can still be written; long-running handlers that wait on the peer
+// can select on InputClosed to stop instead of waiting forever.
+func (c *Connection) InputClosed() <-chan struct{} { return c.inputDone }
+func (c *Connection) Err() error                   { c.mu.Lock(); defer c.mu.Unlock(); return c.failure }
 
 func (c *Connection) send(ctx context.Context, p packet) error {
 	p.Version = "2.0"
@@ -265,6 +274,8 @@ func decodeReply(p packet, result any) error {
 
 func (c *Connection) readLoop() {
 	defer c.loops.Done()
+	inputDone := sync.OnceFunc(func() { close(c.inputDone) })
+	defer inputDone()
 	s := bufio.NewScanner(c.in)
 	s.Buffer(make([]byte, 4096), 8<<20)
 	for s.Scan() {
@@ -333,6 +344,7 @@ func (c *Connection) readLoop() {
 		c.startRequest(p)
 	}
 	err := s.Err()
+	inputDone()
 	if err == nil {
 		c.tasks.Wait()
 		err = io.EOF
@@ -373,11 +385,13 @@ func (c *Connection) startRequest(p packet) {
 	go func() {
 		defer c.tasks.Done()
 		defer cancel()
-		response := c.executeRequest(ctx, p)
+		response, answer := c.executeRequest(rpcctl.WithRequestID(ctx, p.ID), p)
 		c.unregisterInbound(string(p.ID), generation)
 		// Free handler capacity before the peer can observe the response.
 		c.releaseWorker()
-		_ = c.send(c.ctx, response)
+		if answer {
+			_ = c.send(c.ctx, response)
+		}
 	}()
 }
 
@@ -436,13 +450,18 @@ func (c *Connection) cancelInbound(id string) {
 	}
 }
 
-func (c *Connection) executeRequest(ctx context.Context, p packet) packet {
+// executeRequest runs the handler. answer is false when an internal binding
+// asked for the request to go unanswered (rpcctl.ErrNoResponse).
+func (c *Connection) executeRequest(ctx context.Context, p packet) (response packet, answer bool) {
 	var value any
 	var err error = &RPCError{Code: -32601, Message: "unsupported method: " + p.Method}
 	if c.onRequest != nil {
 		value, err = c.onRequest(ctx, p.Method, p.Params)
 	}
-	response := packet{Version: "2.0", ID: p.ID}
+	if errors.Is(err, rpcctl.ErrNoResponse) {
+		return packet{}, false
+	}
+	response = packet{Version: "2.0", ID: p.ID}
 	if err != nil {
 		if !errors.As(err, &response.Error) {
 			response.Error = &RPCError{Code: -32603, Message: err.Error()}
@@ -462,5 +481,5 @@ func (c *Connection) executeRequest(ctx context.Context, p packet) packet {
 			response.Result = nil
 		}
 	}
-	return response
+	return response, true
 }

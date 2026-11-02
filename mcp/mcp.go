@@ -7,6 +7,21 @@
 // drives agent-to-provider mcp/message requests, and MessageRouter serves them
 // for registered server IDs.
 //
+// On top of the mover sits a standard-library MCP server framework, shared
+// with github.com/BrokkAi/acp-go/v2/mcp: a Server wraps a Service that runs
+// one operation per call with a RequestContext, NewToolServer serves a typed
+// ToolRegistry, Server.Serve serves a direct MCP client, and
+// NewAttachedSession (with LoadAttachedSession, ResumeAttachedSession, and
+// ForkAttachedSession) attaches servers to a session with generated server
+// IDs and releases them on failure or Attachment.Close:
+//
+//	router := mcp.NewMessageRouter(connection) // serve router.Handle(next)
+//	server := mcp.NewToolServer("project-tools", "1.0.0", registry)
+//	session, attachment, err := mcp.NewAttachedSession(ctx, router, initialization, directory, mcp.NewSessionOptions{}, server)
+//	defer attachment.Close(ctx)
+//
+// Attachment.HandleSessionSetup attaches servers to every session setup
+// request a proxy forwards.
 // Importing this package is the explicit opt-in, mirroring the Rust SDK's
 // separately enabled unstable_mcp_over_acp feature. Capability gating reads the
 // unstable initialize response, whose McpCapabilities carry the acp/http/sse
@@ -44,10 +59,15 @@ func NewSession(ctx context.Context, connection *acp.Connection, initialization 
 	if err := validateServers(initialization, options.Servers); err != nil {
 		return session, err
 	}
+	servers := options.Servers
+	if servers == nil {
+		// mcpServers is required in v1, so send an empty array, not null.
+		servers = []schema.McpServer{}
+	}
 	request := schema.NewSessionRequest{
 		Cwd:                   directory,
 		AdditionalDirectories: options.AdditionalDirectories,
-		MCPServers:            options.Servers,
+		MCPServers:            servers,
 	}
 	if err := connection.Call(ctx, schema.SessionNewMethodName, request, &session); err != nil {
 		return session, err
@@ -56,6 +76,29 @@ func NewSession(ctx context.Context, connection *acp.Connection, initialization 
 		return session, err
 	}
 	return session, nil
+}
+
+// LoadSession loads a session with the unstable MCP server transports. The
+// agent must advertise loadSession.
+func LoadSession(ctx context.Context, connection *acp.Connection, initialization schema.InitializeResponse, request schema.LoadSessionRequest) (schema.LoadSessionResponse, error) {
+	var result schema.LoadSessionResponse
+	if initialization.AgentCapabilities == nil || initialization.AgentCapabilities.LoadSession == nil || !*initialization.AgentCapabilities.LoadSession {
+		return result, fmt.Errorf("agent did not advertise session/load support")
+	}
+	if err := validatePaths(initialization, request.Cwd, request.AdditionalDirectories); err != nil {
+		return result, err
+	}
+	if err := acpvalidate.Identifier("session ID", string(request.SessionID)); err != nil {
+		return result, err
+	}
+	if err := validateServers(initialization, request.MCPServers); err != nil {
+		return result, err
+	}
+	if request.MCPServers == nil {
+		// mcpServers is required in v1, so send an empty array, not null.
+		request.MCPServers = []schema.McpServer{}
+	}
+	return result, connection.Call(ctx, schema.SessionLoadMethodName, request, &result)
 }
 
 // ResumeSession resumes a session with the unstable MCP server transports.

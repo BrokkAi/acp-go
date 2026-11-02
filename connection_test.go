@@ -659,3 +659,39 @@ func TestMalformedFrameAnswerIsNotOvertaken(t *testing.T) {
 		})
 	}
 }
+
+func TestInputClosedPrecedesDoneWhileHandlersRun(t *testing.T) {
+	started := make(chan struct{})
+	doneEarly := make(chan bool, 1)
+	ready := make(chan struct{})
+	var c *Connection
+	c, peer := pipeClient(t, func(context.Context, string, json.RawMessage) (any, error) {
+		<-ready
+		close(started)
+		<-c.InputClosed()
+		select {
+		case <-c.Done():
+			doneEarly <- true
+		default:
+			doneEarly <- false
+		}
+		return nil, nil
+	}, nil)
+	close(ready)
+	_, _ = io.WriteString(peer, `{"jsonrpc":"2.0","id":1,"method":"test/wait"}`+"\n")
+	<-started
+	_ = peer.Close()
+	select {
+	case early := <-doneEarly:
+		if early {
+			t.Fatal("Done closed before in-flight handlers returned")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("InputClosed did not close on EOF")
+	}
+	select {
+	case <-c.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done did not close after the handler returned")
+	}
+}

@@ -58,7 +58,11 @@ initialization refuse to run.
 | `ListProviders`, `SetProvider`, `DisableProvider` | `agentCapabilities.providers` | Requires a non-blank provider ID before writing. |
 | `ForkSession` | `sessionCapabilities.fork` | Requires a session ID and an absolute `cwd`; additional directories need `sessionCapabilities.additionalDirectories`, which the protocol requires before a client sends them, and must be absolute; rejects inline MCP servers so MCP stays behind its own import; requires a non-blank forked session ID in the response. |
 | `MessageClient` | — | Consumer side of the request-scoped `mcp/message` binding: requires a server ID, request ID, and inner MCP method, rejects duplicate active IDs, routes request-scoped notifications to the owning call, and cancels through the outer ACP request. Implemented for v1 and draft v2. |
-| `MessageRouter` | — | Provider side of the request-scoped binding: server-ID registry and dispatch, request-scoped notifications through `MessageRequest.Notify`, `Unregister` cancellation, and the binding's outer error codes (`-32602`, `-32800`, `-33001`, `-33002`). Implemented for v1 and draft v2. |
+| `MessageRouter` | — | Provider side of the request-scoped binding: server-ID registry and dispatch, request-scoped notifications through `MessageRequest.Notify`, `Unregister`/`UnregisterAndWait` cancellation, an optional `SetMaxActive` limit, and the binding's outer error codes (`-32602`, `-32800`, `-33000`, `-33001`, `-33002`). Implemented for v1 and draft v2. |
+| `Server`, `Service`, `ToolRegistry`, `NewToolServer`, `NewTool` | — | Standard-library MCP server framework and typed tool registry, shared by `mcp` and `v2/mcp` (see below). |
+| `MessageRouter.Attach`, `NewAttachedSession`, `ResumeAttachedSession`, `ForkAttachedSession` (+ v1 `LoadAttachedSession`) | `mcpCapabilities.acp` (v1), `session.mcp.acp` (v2) | Generates a unique `serverId`, registers before writing, appends the `acp` declaration, and releases the registration when validation or the request fails. v2 rejects a name the request already declares with `-32602` before writing. |
+| `Attachment.HandleSessionSetup`, `Attachment.AppendDeclarations` | — | Connection-scoped (global) attachment for proxies: appends the declaration to the raw params of every session setup request, so unknown fields keep their values (the encoding is semantically equal; members may be re-ordered). v2 rejects name collisions with `-32602` and does not forward the request. |
+| `LoadSession` (v1 `mcp`) | `agentCapabilities.loadSession` | session/load with the unstable MCP server transports. |
 | `Handle`, `Advertise` | — | Agent-side dispatch: routes providers/* and session/fork to optional `ProviderHandler`/`ForkHandler` implementations and delegates everything else to the next handler; `Advertise` announces the implemented capabilities. See [Agent-side dispatch](#agent-side-dispatch). |
 | `v2/unstable.ListProviders`, `SetProvider`, `DisableProvider` | `capabilities.providers` | Draft-v2 counterparts of the v1 provider facades, with the same non-blank provider ID check. |
 | `v2/unstable.ForkSession` | `capabilities.session.fork` | Counterpart of the reference SDK's `v2::ForkSessionBuilder`. Requires a session ID and an absolute `cwd`; additional directories need `capabilities.session.additionalDirectories`, as on the stable v2 `session/new`, and must be absolute. Rejects inline MCP servers (use `v2/mcp.ForkSession`) and requires a non-blank forked session ID in the response. `systemPrompt` is forwarded unchanged; its capability checks are #58. |
@@ -159,3 +163,97 @@ The released schema crate carried the change, and #39 delivered the mover in
 registry and dispatcher, with tests for the result/error split, request IDs,
 duplicate active IDs, notification ordering, late-notification rejection, and
 cancellation.
+
+## MCP server framework
+
+`mcp` and `v2/mcp` also carry a standard-library MCP server framework that
+mirrors Rust `agent-client-protocol` 5.0.0's `mcp_server` module and the tool
+semantics of `agent-client-protocol-rmcp`'s `rmcp_3` builder (rmcp 3.4.0),
+without an MCP SDK. The framework types are aliases of one internal
+implementation, so `mcp.Server` and the v2 `mcp.Server` are the same type:
+define a server once and attach it to v1 and v2 sessions.
+
+```go
+registry := mcp.NewToolRegistry()
+registry.Register(mcp.NewTool("greet", "Greet someone",
+	json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}`),
+	func(ctx context.Context, in struct{ Name string `json:"name"` }, rc *mcp.RequestContext) (string, error) {
+		return "Hello, " + in.Name + "!", nil
+	}))
+server := mcp.NewToolServer("project-tools", "1.0.0", registry)
+
+router := mcp.NewMessageRouter(connection) // install router.Handle(next) on the connection
+session, attachment, err := mcp.NewAttachedSession(ctx, router, initialization, directory, mcp.NewSessionOptions{}, server)
+defer attachment.Close(ctx)
+```
+
+- **Services.** `Service.Execute(ctx, Request, *RequestContext)` runs one
+  operation. `RequestContext` exposes the server ID, the logical request ID,
+  the validated `_meta` (protocol version and client capabilities), the outer
+  request's cancellation, operation cancellation, and `Notify` for
+  operation-scoped notifications. `ctx` is the operation context; its
+  `context.Cause` is `ErrRequestCancelled`, `ErrServerUnavailable` (the
+  registration was removed), or `ErrConnectionClosed` (input EOF or close).
+  Inner MCP errors travel in `Outcome.Error`; a returned Go error, including a
+  bare `context.Canceled` when the operation was not cancelled, is a binding
+  failure (`-33002`, `MCP backend failure`, the error text as `data`).
+- **Binding rules**, with the reference SDK's codes, messages, and data:
+  - Requests to an attached server must carry MCP 2026-07-28 `_meta`. A
+    missing or malformed field, including a protocol version that is not a
+    JSON string, is an inner `-32602` (`Invalid params`, detail in `data`);
+    another version is an inner `-32022`; `initialize` is an inner `-32601`.
+    `server/discover` results are restricted to `2026-07-28`.
+  - A malformed envelope and a duplicate active request ID are outer `-32602`
+    `Invalid params` (data: the decode error, or
+    `duplicate active MCP requestId`). An unknown server is `-33001`
+    `MCP server registration unavailable`; a removed one is `-33001`
+    `MCP provider removed`. A `SetMaxActive` limit is `-33000`.
+  - Outer cancellation, registration removal, and input EOF cancel the
+    operation; work already cancelled when it is admitted never starts. The
+    router waits for the service to return, holds the request ID until then,
+    discards a result that loses the race with cancellation, refuses late
+    notifications, and sends no response once the connection's input has
+    closed. Removal never waits on a stalled transport: notifications are
+    queued under the operation's gate and the queueing stops on cancellation,
+    so `Attachment.Close` and `UnregisterAndWait` return when the operations
+    do, or when their `ctx` ends.
+- **Tools.** Schemas are caller-supplied JSON Schema; no schema is generated.
+  `tools/list` reports enabled tools (with `ttlMs: 0` and
+  `cacheScope: "private"` on 2026-07-28 requests). In `tools/call`, an unknown
+  or disabled tool is an inner `-32602` whose message names the tool, with no
+  data, as rmcp sends it;
+  params that do not parse (no string `name`, non-object `arguments`) are an
+  inner `-32602` `Invalid MCP request`; arguments that fail the input schema or
+  do not decode, and errors returned by the tool, are results with
+  `isError: true`; a cancelled call is an inner `-32603` `operation cancelled`.
+  A result without an `outputSchema` is one text block holding its JSON
+  encoding (a string result is sent quoted, as rmcp does); with one, the result
+  is also `structuredContent`. Unknown methods are `-32601` with the method as
+  the message, and `prompts/list`, `resources/list`,
+  `resources/templates/list`, and `completion/complete` return the reference
+  handler's empty defaults. `serverInfo` reports the name and version (default
+  `0.0.0`). `ToolRegistry` supports allow/deny filtering (`EnableTool`,
+  `DisableTool`, `EnableAllTools`, `DisableAllTools`, which return
+  `*UnknownToolError` for a typo), instructions, and replacement of a tool by
+  name.
+- **Argument checks.** The reference SDK only decodes arguments into the tool's
+  type; Go decoding accepts missing and unknown fields, so arguments are first
+  checked against the input schema. Only the structural keywords that mirror
+  decoding are enforced (`type`, `enum`, `const`, `properties`, `required`,
+  `additionalProperties`, `items`, `allOf`, `anyOf`, `oneOf`). Any other
+  keyword, including `$ref` and string or numeric bounds, never causes a
+  rejection, and a `oneOf` with such a branch only requires some branch to
+  match.
+- **Standalone.** `Server.Serve(ctx, in, out)` serves a direct MCP client over
+  newline-delimited JSON-RPC with no ACP session; every request goes to the
+  service. A `NewToolServer` service also answers `initialize` and `ping` for
+  clients on revisions before 2026-07-28. A client `notifications/cancelled`
+  cancels the named request, which then gets no response, as in rmcp; input
+  EOF cancels in-flight work, which gets no response either.
+- **Low-level mover.** `MessageRouter.Register` with a `MessageService` serves
+  requests without MCP metadata validation, as before, but now shares the
+  binding rules above: EOF cancellation and suppressed responses, `-33001` for
+  removal, the reference error messages, and `-33002` for a returned error.
+  Like the reference SDK, the router keeps no record of released server IDs;
+  the RFD forbids rebinding one on a connection, so callers must not reuse an
+  ID.
