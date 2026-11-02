@@ -263,36 +263,14 @@ func ResumeAttachedSession(ctx context.Context, router *MessageRouter, initializ
 }
 
 // ForkAttachedSession is NewAttachedSession for the unstable session/fork,
-// the counterpart of the reference ForkSessionBuilder::with_mcp_server. The
-// agent must advertise capabilities.session.fork, and the response must carry
-// a forked session ID.
+// the counterpart of the reference ForkSessionBuilder::with_mcp_server. It
+// sends the request through ForkSession, so the agent must advertise
+// capabilities.session.fork and the response must carry a forked session ID.
 func ForkAttachedSession(ctx context.Context, router *MessageRouter, initialization unstable.InitializeResponse, request unstable.ForkSessionRequest, servers ...*Server) (unstable.ForkSessionResponse, *Attachment, error) {
 	return attachTo(ctx, router, servers, request.MCPServers, func(declared []unstable.McpServer) (unstable.ForkSessionResponse, error) {
 		request.MCPServers = declared
-		return forkSession(ctx, router, initialization, request)
+		return ForkSession(ctx, router.connection, initialization, request)
 	})
-}
-
-// forkSession validates and sends one session/fork. It stays private so the
-// public v2 fork facade (#61) can own that name.
-func forkSession(ctx context.Context, router *MessageRouter, initialization unstable.InitializeResponse, request unstable.ForkSessionRequest) (unstable.ForkSessionResponse, error) {
-	var response unstable.ForkSessionResponse
-	if initialization.Capabilities == nil || initialization.Capabilities.Session == nil || initialization.Capabilities.Session.Fork == nil {
-		return response, fmt.Errorf("agent did not advertise session/fork support")
-	}
-	if request.SessionID == "" {
-		return response, fmt.Errorf("session ID is required")
-	}
-	if err := validateUnstableSetup(initialization, string(request.Cwd), request.AdditionalDirectories, request.MCPServers); err != nil {
-		return response, err
-	}
-	if err := router.connection.Call(ctx, unstable.SessionForkMethodName, request, &response); err != nil {
-		return response, err
-	}
-	if response.SessionID == "" {
-		return response, fmt.Errorf("agent returned an empty forked session ID")
-	}
-	return response, nil
 }
 
 // validateUnstableSetup applies the session setup checks to the unstable v2
