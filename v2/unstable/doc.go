@@ -9,6 +9,9 @@ SetProvider, DisableProvider) and session fork (ForkSession, the counterpart of
 the reference SDK's v2::ForkSessionBuilder). Each checks its advertised
 capability and request invariants before writing to the wire. Forks that carry
 MCP servers go through github.com/BrokkAi/acp-go/v2/mcp.ForkSession instead.
+Session archive (ArchiveSession, UnarchiveSession, and ListSessions with the
+archived filter), status (SessionStatus), and title (SetSessionTitle) follow
+the same rule.
 
 Capability gating reads the unstable draft-v2 initialize response, which is the
 only place the optional capability fields are published. The stable
@@ -27,11 +30,18 @@ facades.
 
 On the agent side, Handle dispatches these methods to typed handlers and
 Advertise announces their capabilities in the initialize response. Install
-both on the v2/agent runtime, whose initialization gate, version negotiation,
-and baseline methods then sit in front of them, as in the reference SDK:
+sets both on the v2/agent runtime, together with the runtime overrides the
+facades need, so that the runtime's initialization gate, version negotiation,
+and baseline methods sit in front of them, as in the reference SDK:
 
 	runtime := agent.New(implementation)
-	runtime.Extensions = acpunstable.Handle(nil, implementation)
-	runtime.InitializeResult = acpunstable.Advertise(implementation)
+	if err := acpunstable.Install(runtime, implementation); err != nil {
+		return err
+	}
+
+For an ArchiveHandler, Install also serves session/list through
+Runtime.Overrides, because the runtime's stable dispatch cannot carry the
+archived filter or SessionInfo.archived, and only Install announces
+capabilities.session.archive.
 */
 package unstable

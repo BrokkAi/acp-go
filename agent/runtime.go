@@ -20,6 +20,7 @@ type Runtime struct {
 	// itself, such as the unstable methods that
 	// github.com/BrokkAi/acp-go/unstable.Handle dispatches. It runs behind the
 	// runtime's initialization gate. Unset, those requests answer -32601.
+	// The handler reaches the connection's Client through ClientFromContext.
 	Extensions acp.Handler
 
 	// InitializeResult, when set, receives the agent's initialize response
@@ -29,6 +30,25 @@ type Runtime struct {
 	// returned value as a stable initialize response and validates that view
 	// before sending the value.
 	InitializeResult func(schema.InitializeResponse) (any, error)
+
+	// Overrides, when set, serves the named methods in place of the runtime's
+	// own dispatch to Agent, keyed by method name. An override receives the
+	// raw params, so it can read and answer fields the stable schema does not
+	// carry. It runs behind the initialization gate and the method's
+	// capability check (session/list still requires
+	// sessionCapabilities.list, for example), and takes precedence over
+	// Extensions for methods the runtime does not own. initialize and
+	// session/prompt cannot be overridden, because the runtime itself
+	// validates the handshake and tracks prompt cancellation, and
+	// notifications such as session/cancel cannot either, because overrides
+	// answer requests; Serve refuses those keys and nil handlers before
+	// reading from the connection. An override, like an Extensions handler,
+	// reaches the connection's Client through ClientFromContext, so a
+	// session/load override can stream its replay as session/update
+	// notifications before it answers.
+	// github.com/BrokkAi/acp-go/unstable.Install sets the overrides the
+	// unstable facades need, such as session/list with the archived filter.
+	Overrides map[string]acp.Handler
 }
 
 func New(implementation Agent) *Runtime {
@@ -41,8 +61,12 @@ func (r *Runtime) Serve(ctx context.Context, in io.ReadCloser, out io.WriteClose
 	if r.Agent == nil {
 		return errors.New("agent implementation is required")
 	}
+	overrides, err := checkOverrides(r.Overrides)
+	if err != nil {
+		return err
+	}
 	client := &clientConnection{connectionReady: make(chan struct{})}
-	state := &server{agent: r.Agent, client: client, extensions: r.Extensions, initializeResult: r.InitializeResult}
+	state := &server{agent: r.Agent, client: client, extensions: r.Extensions, initializeResult: r.InitializeResult, overrides: overrides}
 	connection := acp.Connect(in, out, state.handle, state.notification)
 	client.attach(connection)
 	defer connection.Close()
@@ -63,6 +87,7 @@ type server struct {
 	client           *clientConnection
 	extensions       acp.Handler
 	initializeResult func(schema.InitializeResponse) (any, error)
+	overrides        map[string]acp.Handler
 
 	mu                sync.Mutex
 	initialized       bool
@@ -81,6 +106,13 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 	}
 	if !s.isInitialized() {
 		return nil, initializationRequired(method)
+	}
+	if !s.advertisesMethod(method) {
+		return nil, methodNotFound(method)
+	}
+	ctx = withClient(ctx, s.client)
+	if override, ok := s.overrides[method]; ok {
+		return override(ctx, method, raw)
 	}
 
 	switch method {
@@ -101,9 +133,6 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return s.agent.NewSession(ctx, s.client, request)
 	case schema.SessionLoadMethodName:
-		if !s.advertisesMethod(method) {
-			return nil, methodNotFound(method)
-		}
 		implementation, ok := s.agent.(SessionLoader)
 		if !ok {
 			return nil, methodNotFound(method)
@@ -114,9 +143,6 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return implementation.LoadSession(ctx, s.client, request)
 	case schema.SessionResumeMethodName:
-		if !s.advertisesMethod(method) {
-			return nil, methodNotFound(method)
-		}
 		implementation, ok := s.agent.(SessionResumer)
 		if !ok {
 			return nil, methodNotFound(method)
@@ -127,9 +153,6 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return implementation.ResumeSession(ctx, s.client, request)
 	case schema.SessionCloseMethodName:
-		if !s.advertisesMethod(method) {
-			return nil, methodNotFound(method)
-		}
 		implementation, ok := s.agent.(SessionCloser)
 		if !ok {
 			return nil, methodNotFound(method)
@@ -140,9 +163,6 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return implementation.CloseSession(ctx, s.client, request)
 	case schema.SessionListMethodName:
-		if !s.advertisesMethod(method) {
-			return nil, methodNotFound(method)
-		}
 		implementation, ok := s.agent.(SessionLister)
 		if !ok {
 			return nil, methodNotFound(method)
@@ -153,9 +173,6 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return implementation.ListSessions(ctx, s.client, request)
 	case schema.SessionDeleteMethodName:
-		if !s.advertisesMethod(method) {
-			return nil, methodNotFound(method)
-		}
 		implementation, ok := s.agent.(SessionDeleter)
 		if !ok {
 			return nil, methodNotFound(method)
@@ -188,9 +205,6 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return implementation.SetConfigOption(ctx, s.client, request)
 	case schema.LogoutMethodName:
-		if !s.advertisesMethod(method) {
-			return nil, methodNotFound(method)
-		}
 		implementation, ok := s.agent.(LoggerOuter)
 		if !ok {
 			return nil, methodNotFound(method)
@@ -260,23 +274,25 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 func (s *server) advertisesMethod(method string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.agentCapabilities == nil {
-		return false
+	capabilities := s.agentCapabilities
+	if capabilities == nil {
+		capabilities = &schema.AgentCapabilities{}
 	}
 	switch method {
 	case schema.SessionLoadMethodName:
-		return s.agentCapabilities.LoadSession != nil && *s.agentCapabilities.LoadSession
+		return capabilities.LoadSession != nil && *capabilities.LoadSession
 	case schema.SessionResumeMethodName:
-		return s.agentCapabilities.SessionCapabilities != nil && s.agentCapabilities.SessionCapabilities.Resume != nil
+		return capabilities.SessionCapabilities != nil && capabilities.SessionCapabilities.Resume != nil
 	case schema.SessionCloseMethodName:
-		return s.agentCapabilities.SessionCapabilities != nil && s.agentCapabilities.SessionCapabilities.Close != nil
+		return capabilities.SessionCapabilities != nil && capabilities.SessionCapabilities.Close != nil
 	case schema.SessionListMethodName:
-		return s.agentCapabilities.SessionCapabilities != nil && s.agentCapabilities.SessionCapabilities.List != nil
+		return capabilities.SessionCapabilities != nil && capabilities.SessionCapabilities.List != nil
 	case schema.SessionDeleteMethodName:
-		return s.agentCapabilities.SessionCapabilities != nil && s.agentCapabilities.SessionCapabilities.Delete != nil
+		return capabilities.SessionCapabilities != nil && capabilities.SessionCapabilities.Delete != nil
 	case schema.LogoutMethodName:
-		return s.agentCapabilities.Auth != nil && s.agentCapabilities.Auth.Logout != nil
+		return capabilities.Auth != nil && capabilities.Auth.Logout != nil
 	default:
+		// Methods without a capability gate, including extensions.
 		return true
 	}
 }

@@ -14,8 +14,8 @@ removed from the upstream unstable schema in crate 1.15, so acp-go no longer
 generates or wraps them.
 
 Several unstable surfaces in the 1.15.1 pin are generated but have no facade
-yet: client-provided system prompts (#58), subagents (#60), session
-archive/status/title (#71), auth status (#72), and proxy chains
+yet: client-provided system prompts (#58), subagents (#60), auth status
+(#72), and proxy chains
 (`proxy/initialize`, `proxy/successor`, registered with `SideProxy`; #69).
 
 ## Why a separate import
@@ -63,48 +63,126 @@ initialization refuse to run.
 | `MessageRouter.Attach`, `NewAttachedSession`, `ResumeAttachedSession`, `ForkAttachedSession` (+ v1 `LoadAttachedSession`) | `mcpCapabilities.acp` (v1), `session.mcp.acp` (v2) | Generates a unique `serverId`, registers before writing, appends the `acp` declaration, and releases the registration when validation or the request fails. v2 rejects a name the request already declares with `-32602` before writing. |
 | `Attachment.HandleSessionSetup`, `Attachment.AppendDeclarations` | — | Connection-scoped (global) attachment for proxies: appends the declaration to the raw params of every session setup request, so unknown fields keep their values (the encoding is semantically equal; members may be re-ordered). v2 rejects name collisions with `-32602` and does not forward the request. |
 | `LoadSession` (v1 `mcp`) | `agentCapabilities.loadSession` | session/load with the unstable MCP server transports. |
-| `Handle`, `Advertise` | — | Agent-side dispatch: routes providers/* and session/fork to optional `ProviderHandler`/`ForkHandler` implementations and delegates everything else to the next handler; `Advertise` announces the implemented capabilities. See [Agent-side dispatch](#agent-side-dispatch). |
+| `ArchiveSession`, `UnarchiveSession` | `sessionCapabilities.archive` | Require a non-blank session ID. An unknown session answers `-32002` (`acp.IsResourceNotFound`). |
+| `ListSessions` | `sessionCapabilities.list`; the `archived` filter also needs `sessionCapabilities.archive` | The unstable `session/list` request, whose `archived` filter (`exclude`, `include`, `only`, or any other value, sent unchanged) the stable `ListSessions` cannot carry. `cwd` must be absolute. `SessionInfo.Archived` reports the archive state. |
+| `SessionStatus` | `sessionCapabilities.status` | Requires a non-blank session ID. Unknown status values are preserved; treat anything other than `open` as `saved`. A response without `status` (omitted or `null`) is an error. An unknown session answers `-32002` with the session ID as data. |
+| `SetSessionTitle` | `sessionCapabilities.title` | Requires a non-blank session ID and title. The response carries the title the agent stored, which may be normalized; a response without `title` (omitted or `null`) is an error. |
+| `Install`, `Handle`, `Advertise` | — | Agent-side dispatch: `Handle` routes providers/*, session/fork, session/archive, session/unarchive, session/status, and session/set_title to optional `ProviderHandler`/`ForkHandler`/`ArchiveHandler`/`StatusHandler`/`TitleHandler` implementations and delegates everything else to the next handler; `Advertise` announces the implemented capabilities except `archive`; `Install` sets both on a runtime together with the runtime overrides, such as `session/list` with the archive filter, and is the only way to announce `archive`. See [Agent-side dispatch](#agent-side-dispatch). |
 | `v2/unstable.ListProviders`, `SetProvider`, `DisableProvider` | `capabilities.providers` | Draft-v2 counterparts of the v1 provider facades, with the same non-blank provider ID check. |
 | `v2/unstable.ForkSession` | `capabilities.session.fork` | Counterpart of the reference SDK's `v2::ForkSessionBuilder`. Requires a session ID and an absolute `cwd`; additional directories need `capabilities.session.additionalDirectories`, as on the stable v2 `session/new`, and must be absolute. Rejects inline MCP servers (use `v2/mcp.ForkSession`) and requires a non-blank forked session ID in the response. `systemPrompt` is forwarded unchanged; its capability checks are #58. |
 | `v2/mcp.ForkSession` | `capabilities.session.fork` | The same fork checks, plus the `v2/mcp` transport checks for each server: stdio, HTTP, and the native `acp` transport each need their `capabilities.session.mcp` entry. |
-| `v2/unstable.Handle`, `Advertise` | — | The draft-v2 counterparts of `Handle` and `Advertise`. |
+| `v2/unstable.ArchiveSession`, `UnarchiveSession`, `ListSessions`, `SetSessionTitle` | `capabilities.session.archive` / `.title`; `ListSessions` needs `capabilities.session`, plus `archive` for the filter | Draft-v2 counterparts of the v1 archive, list, and title facades, with the same checks. An unknown session answers `-32002` with `SessionNotFoundErrorData`, which `acpv2.SessionNotFoundData` decodes. |
+| `v2/unstable.SessionStatus` | `capabilities.session.status` | As in v1, plus the optional foreground `State` snapshot. `State` is nil when the agent omits it, sends `null`, or sends a malformed value; nil is not idle, and an idle snapshot is not a new completion. |
+| `v2/unstable.Install`, `Handle`, `Advertise` | — | The draft-v2 counterparts of `Install`, `Handle`, and `Advertise`. |
 | `Projection` | — | Client-side: folds plan operations and end-turn usage into ordered per-session state, and hands notices and compactions to the stable `acp.SessionProjection` (see below). `Projection.Notifications` adapts `session/update` notifications. |
 
 ## Agent-side dispatch
 
 `Handle(next, handler)` (v1 `unstable` and draft-v2 `v2/unstable` alike)
-serves `providers/list`, `providers/set`, `providers/disable`, and
-`session/fork` from whichever of `ProviderHandler` and `ForkHandler` the
-handler implements. As in the reference SDK's handler chain, every other
+serves `providers/list`, `providers/set`, `providers/disable`,
+`session/fork`, `session/archive`, `session/unarchive`, `session/status`, and
+`session/set_title` from whichever of `ProviderHandler`, `ForkHandler`,
+`ArchiveHandler`, `StatusHandler`, and `TitleHandler` the handler implements. As in the reference SDK's handler chain, every other
 request, including one of these methods the handler does not implement, goes
 to `next`, and with no `next` answers `-32601` (`Method not found`, with the
 method name as data). Params that do not decode answer `-32602`
 (`Invalid params`, with data `{"error", "json", "phase": "deserialization"}`
 echoing the received params, or `null` when absent) without reaching the
-handler, and a fork response with a blank session ID answers `-32603`
-(`Internal error`, with the detail as string data) instead of reaching the wire.
+handler. A fork response with a blank session ID answers `-32603`
+(`Internal error`, with the detail as string data) instead of reaching the
+wire. Status and title responses are sent as the handler returns them, as the
+reference SDK sends them.
+A v1 handler reports an unknown session with `acp.SessionNotFoundError(id)`,
+the reference SDK's v1 `session_not_found`: `-32002` (`Resource not found`)
+with data `{"sessionId": id}`. A draft-v2 handler uses
+`acpv2.SessionNotFoundError(id)`, whose data is the v2 schema's
+`SessionNotFoundErrorData`; `acpv2.SessionNotFoundData(err)` decodes it on the
+client.
 
-Install it on the agent runtime, whose initialization gate, version
-negotiation, repeat-initialize handling, and baseline methods then sit in front
-of every unstable method, as in the reference SDK:
+Install everything on the agent runtime in one call, so that the runtime's
+initialization gate, version negotiation, repeat-initialize handling, and
+baseline methods sit in front of every unstable method, as in the reference
+SDK:
 
 ```go
 runtime := agent.New(implementation) // agent or v2/agent
-runtime.Extensions = unstable.Handle(nil, implementation)
-runtime.InitializeResult = unstable.Advertise(implementation)
+if err := unstable.Install(runtime, implementation); err != nil { // or v2/unstable
+	return err
+}
 ```
 
-`Runtime.Extensions` serves the requests the runtime does not own, only after
-initialization completes; before that they get the runtime's `-32600`
-(`Invalid request`, data "ACP initialization must complete before
-`<method>` can be used"). `Runtime.InitializeResult` replaces the stable
-initialize response on the wire: `Advertise` carries it over to the unstable
-`InitializeResponse`, adds `providers` and `fork` for the implemented handlers,
-and applies optional customize functions, and the runtime validates the stable
-view of the value it sends. Neither runtime imports the unstable schema.
+`Install(runtime, handler, customize...)` sets three runtime fields together:
 
-Further unstable methods (session archive/status/title in #71, auth status in
-#72) join the same dispatch as additional handler interfaces.
+- `Runtime.Extensions` becomes `Handle`, chained in front of any `Extensions`
+  already set. It serves the requests the runtime does not own, only after
+  initialization completes; before that they get the runtime's `-32600`
+  (`Invalid request`, data "ACP initialization must complete before
+  `<method>` can be used").
+- `Runtime.InitializeResult` replaces the stable initialize response on the
+  wire. It carries it over to the unstable `InitializeResponse`, adds
+  `providers` and the `fork`, `archive`, `status`, and `title` session
+  capabilities for the implemented handlers, and applies the customize
+  functions; the runtime validates the stable view of the value it sends. The
+  session capabilities are only added to session capabilities the agent
+  already advertises in v2, and v1 `archive` only alongside the agent's own
+  `sessionCapabilities.list`, which the protocol requires with it. Whether
+  `archive` is added is decided from the `Agent`'s own response before the
+  customize functions run: one that adds `sessionCapabilities.list` (or, in
+  v2, the baseline `capabilities.session`) does not gain `archive`, and one
+  that removes `archive` leaves the `session/list` override installed.
+- `Runtime.Overrides` gains the stable methods whose unstable form the
+  handler serves. Today that is `session/list` for an `ArchiveHandler`.
+
+`Install` fails, changing nothing, for a nil runtime, a runtime whose
+`InitializeResult` is already set (including by an earlier `Install`), or one
+whose `Overrides` already serves a method it would override. `Handle` and
+`Advertise` remain for wiring by hand, but `Advertise` never announces
+`archive`: an agent that does must also serve the `archived` filter, which
+only `Install` wires up. Neither runtime imports the unstable schema.
+
+### Runtime overrides
+
+`Runtime.Overrides` (`agent` and `v2/agent`) maps a method name to an
+`acp.Handler` that serves it in place of the runtime's own dispatch to the
+`Agent`, with the raw params, so it can read and answer fields the stable
+schema drops. An override runs after the initialization gate and the
+method's capability check: an overridden `session/list` still needs v1
+`sessionCapabilities.list` or the v2 baseline `capabilities.session`, and
+still answers `-32601` without it. It also takes precedence over
+`Extensions`. In v2 an override for `auth/login`, `auth/logout`, or
+`session/delete` stands in for the `Agent` interface the matching capability
+otherwise requires at initialize. `Serve` refuses an override for
+`initialize` or `session/prompt`, which the runtime validates and tracks
+itself, for a notification such as `session/cancel` or `$/cancel_request`,
+which never reaches a request handler, and a nil handler, before reading from
+the connection.
+
+An override or `Extensions` handler takes no `Client` argument; it reaches the
+connection's client through `agent.ClientFromContext(ctx)` (or
+`v2/agent.ClientFromContext`), as the reference SDK hands every request
+handler its connection. It is the same client the stable dispatch passes to
+`NewSession`, `LoadSession`, and `ResumeSession`, so a `session/load` override
+can stream the replay as `session/update` notifications before it answers,
+and the client receives them in order ahead of the response. Serving the
+unstable form of another stable request, such as `session/new`,
+`session/load`, or `session/resume` with the client-provided system prompt,
+takes one `Install` route: the override decodes the raw params into the
+unstable request and reads the client from the context.
+
+`session/list` is a baseline method the runtime serves through the stable
+schema, which drops the `archived` filter and `SessionInfo.archived`. The
+archive capability covers both, so `ArchiveHandler` also serves
+`ListSessionsWithArchive` with the unstable request and response, and
+`Install` routes `session/list` to it through `Runtime.Overrides`. The handler
+must honor `exclude` (also the meaning of an absent filter), `include`, and
+`only`, and answer `-32602` for a value it does not support rather than fall
+back to `exclude`. A listed session without `archived` answers `-32603`. A
+handler that is not an `ArchiveHandler` keeps the stable dispatch. A client
+reads a malformed `archived` on a listed session as not reported (nil), as
+the reference SDK's `DefaultOnError` does, rather than failing the page.
+
+Further unstable methods (auth status in #72) join the same dispatch as
+additional handler interfaces.
 
 ## Session updates: projection, not request facades
 

@@ -81,16 +81,24 @@ type typeDef struct {
 	Upsert bool
 }
 
-// lenientDefs are the state-update snapshots whose optional fields must read
-// as not reported when malformed, as Rust's DefaultOnError does: a client has
-// to recognize an idle transition even when its stopReason or background list
-// is malformed, or active work never completes. Structs with a flattened
-// union are lenient too. Honoring the hints on every def is tracked in #82.
+// lenientDefs are the defs whose optional fields must read as not reported
+// when malformed, as Rust's DefaultOnError does. The state-update snapshots
+// are lenient because a client has to recognize an idle transition even when
+// its stopReason or background list is malformed, or active work never
+// completes. Structs with a flattened
+// union are lenient too. SessionStatusResponse is lenient because the
+// session-status RFD requires a malformed draft-v2 state snapshot to read as
+// not reported rather than fail the whole response. SessionInfo is lenient so
+// that a malformed archived (and the other hinted fields) reads as not
+// reported instead of failing the whole session/list page. Honoring the hints
+// on every def is tracked in #82.
 var lenientDefs = map[string]bool{
 	"IdleStateUpdate":           true,
 	"RunningStateUpdate":        true,
 	"RequiresActionStateUpdate": true,
 	"UnknownStateUpdate":        true,
+	"SessionStatusResponse":     true,
+	"SessionInfo":               true,
 }
 
 // patchDefs are the v2 updates whose optional fields are patches: omission

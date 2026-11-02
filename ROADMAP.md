@@ -124,11 +124,13 @@ only remaining work.
   - LLM providers,
   - plan operations,
   - session fork,
+  - session archive/unarchive (with the `session/list` archived filter),
+    status, and title,
   - MCP-over-ACP (session options and the request-scoped `mcp/message` mover),
   - end-turn token usage,
   - bidirectional `mcp/message` request/notification registry metadata,
   - generated types, without facades yet, for client-provided system prompts,
-    subagents, auth status, session archive/status/title, and proxy chains
+    subagents, auth status, and proxy chains
     (`proxy/initialize` and `proxy/successor`, registered as `SideProxy`).
 - Session notices and compaction on the stable surfaces (#57): v1 client
   capability helpers, update constructors, `acp.SessionProjection`, and the
@@ -153,12 +155,16 @@ only remaining work.
 ### 1. Optional typed facades for unstable methods
 
 The typed facade surface is delivered: client facades and agent dispatch for
-providers and session fork on v1 and draft v2 (#61), the session-update
+providers and session fork on v1 and draft v2 (#61), session
+archive/status/title on v1 and draft v2 (#71), the session-update
 projection helper, and the MCP session options, including the draft-v2 MCP
 fork, all live in [docs/unstable-facades.md](docs/unstable-facades.md)'s
 packages (`unstable`, `v2/unstable`, `mcp`, `v2/mcp`). Agents serve the
-unstable methods by installing `Handle` and `Advertise` on the v1 or draft-v2
-runtime's `Extensions` and `InitializeResult`, behind its initialization gate.
+unstable methods with `Install`, which sets `Handle`, `Advertise`, and the
+runtime `Overrides` on the v1 or draft-v2 runtime together, behind its
+initialization gate and capability checks; `session/list` with the archive
+filter is the first override. `Runtime.Overrides` is the one general
+mechanism for serving the unstable form of a stable method.
 
 The native MCP-over-ACP binding is delivered (#39): `mcp` and `v2/mcp` expose
 the standard-library message mover decided above, with `MessageClient` on the
@@ -193,8 +199,9 @@ standard-library-only and behind its own package or command.
 The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
 them is tracked separately: client-provided system prompts (#58), subagents
 (#60), `-32022` version negotiation (#62), the proxy-chain method rename
-(#69), v2 background work and `tool_call/cancel`/`terminal/cancel` (#70),
-unstable session archive/status/title (#71), and unstable auth status (#72).
+(#69), v2 background work and `tool_call/cancel`/`terminal/cancel` (#70), and
+unstable auth status (#72). Unstable session archive/status/title (#71) is
+delivered.
 
 ## Guardrails
 

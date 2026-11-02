@@ -245,3 +245,21 @@ func IsResourceNotFound(err error) bool {
 	code, ok := rpcErrorCode(err)
 	return ok && code == ErrorCodeResourceNotFound
 }
+
+// SessionNotFoundError builds the ACP v1 -32002 (Resource not found) error
+// for a session-scoped request naming a session that does not exist or is not
+// active, like the reference SDK's v1 Error::session_not_found: its data is
+// {"sessionId": sessionID}. Return it from a v1 handler, as session/archive,
+// session/unarchive, session/status, and session/set_title require. It is
+// v1-only; draft-v2 handlers use github.com/BrokkAi/acp-go/v2.SessionNotFoundError,
+// which carries the v2 schema's SessionNotFoundErrorData.
+func SessionNotFoundError(sessionID schema.SessionId) *RPCError {
+	data, err := json.Marshal(struct {
+		SessionID schema.SessionId `json:"sessionId"`
+	}{sessionID})
+	if err != nil {
+		// A session ID is a string, so this cannot happen.
+		panic(err)
+	}
+	return &RPCError{Code: ErrorCodeResourceNotFound, Message: "Resource not found", Data: data}
+}

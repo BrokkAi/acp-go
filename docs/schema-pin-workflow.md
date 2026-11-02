@@ -72,11 +72,12 @@ schema crate or when the Rust SDK moves its exact pin.
      not nullable fails generation;
    - JSON field names, integer widths, and defaults;
    - `x-deserialize-*` hints (default-on-error, default-on-null, skip invalid
-     items). `cmd/acpgen` honors default-on-error only on the state-update
-     snapshots (`lenientDefs` in `cmd/acpgen/ir.go`) and decodes every other
-     field strictly. That is a known divergence from Rust, tracked in #82: a
-     malformed value fails the whole message instead of reading as not
-     reported. Record newly affected fields on #82, and extend `lenientDefs`
+     items). `cmd/acpgen` honors default-on-error only on the defs in
+     `lenientDefs` (`cmd/acpgen/ir.go`): the state-update snapshots,
+     `SessionStatusResponse`, and `SessionInfo`. It decodes every other field
+     strictly and never skips invalid items. That is a known divergence from
+     Rust, tracked in #82: a malformed value fails the whole message instead
+     of reading as not reported. Record newly affected fields on #82, and extend `lenientDefs`
      where a malformed field would break a protocol MUST;
    - new `x-side` values or `meta.json` method groups (such as 1.15's
      `proxyMethods`): generation fails on a method outside the groups
