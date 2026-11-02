@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"strings"
@@ -178,35 +179,69 @@ func TestRuntimeRejectsV1InitializeOnV2Endpoint(t *testing.T) {
 	}
 }
 
+// requireInvalidRequest checks that err is the reference SDK's -32600 error:
+// the generic message, with the explanation as a JSON string in data.
+func requireInvalidRequest(t *testing.T, err error, detail string) {
+	t.Helper()
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "Invalid request" {
+		t.Fatalf("error = %v, want -32600 Invalid request", err)
+	}
+	var data string
+	if err := json.Unmarshal(rpcErr.Data, &data); err != nil || data != detail {
+		t.Fatalf("error data = %s, want %q", rpcErr.Data, detail)
+	}
+}
+
+const (
+	initializeInProgress    = "ACP initialization is already in progress on this connection"
+	initializeNotRepeatable = "ACP initialization cannot be repeated after any other request; reconnect to initialize again"
+	sessionListBeforeInit   = "ACP initialization must complete before `session/list` can be used"
+)
+
+func listSessionsCall(ctx context.Context, client *acpv2.Connection) error {
+	return client.Call(ctx, schema.SessionListMethodName, schema.ListSessionsRequest{}, nil)
+}
+
+type initializeOutcome struct {
+	response schema.InitializeResponse
+	err      error
+}
+
 // gatedInitializeAgent blocks every Initialize call until the test releases
-// it, so a second initialize can be sent while the first is still running.
+// it with an outcome, so other requests can be sent while it is running.
 type gatedInitializeAgent struct {
 	*echoAgent
 	calls   atomic.Int32
 	entered chan struct{}
-	release chan error
+	release chan initializeOutcome
 }
 
 func newGatedInitializeAgent() *gatedInitializeAgent {
 	return &gatedInitializeAgent{
 		echoAgent: &echoAgent{cancelled: make(chan schema.CancelSessionNotification, 1)},
 		entered:   make(chan struct{}, 2),
-		release:   make(chan error),
+		release:   make(chan initializeOutcome),
 	}
 }
 
-func (a *gatedInitializeAgent) Initialize(ctx context.Context, client Client, request schema.InitializeRequest) (schema.InitializeResponse, error) {
+func (a *gatedInitializeAgent) Initialize(ctx context.Context, _ Client, _ schema.InitializeRequest) (schema.InitializeResponse, error) {
 	a.calls.Add(1)
 	a.entered <- struct{}{}
 	select {
-	case err := <-a.release:
-		if err != nil {
-			return schema.InitializeResponse{}, err
-		}
-		return a.echoAgent.Initialize(ctx, client, request)
+	case outcome := <-a.release:
+		return outcome.response, outcome.err
 	case <-ctx.Done():
 		return schema.InitializeResponse{}, ctx.Err()
 	}
+}
+
+func initializeSucceeds() initializeOutcome {
+	return initializeOutcome{response: schema.InitializeResponse{
+		ProtocolVersion: version,
+		Info:            schema.Implementation{Name: "gated-v2", Version: "test"},
+		Capabilities:    &schema.AgentCapabilities{Session: &schema.SessionCapabilities{}},
+	}}
 }
 
 var v2InitializeRequest = schema.InitializeRequest{
@@ -231,13 +266,23 @@ func startBlockedInitialize(ctx context.Context, t *testing.T, client *acpv2.Con
 	return result
 }
 
+// requireInitializeInProgress checks the refusals a connection gives while an
+// initialize is still running: another initialize, and any other request.
 func requireInitializeInProgress(ctx context.Context, t *testing.T, client *acpv2.Connection) {
 	t.Helper()
-	err := client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil)
-	var rpcErr *acp.RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "ACP initialization is already in progress on this connection" {
-		t.Fatalf("concurrent initialize error = %v", err)
+	requireInvalidRequest(t, client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil), initializeInProgress)
+	requireInvalidRequest(t, listSessionsCall(ctx, client), sessionListBeforeInit)
+}
+
+func TestRuntimeRefusesRequestsBeforeAndRepeatsAfterInitialize(t *testing.T) {
+	client := startRuntime(t, &echoAgent{cancelled: make(chan schema.CancelSessionNotification, 1)}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	requireInvalidRequest(t, listSessionsCall(ctx, client), sessionListBeforeInit)
+	if _, err := client.Initialize(ctx, acpv2.Capabilities{}); err != nil {
+		t.Fatal(err)
 	}
+	requireInvalidRequest(t, client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil), initializeNotRepeatable)
 }
 
 func TestRuntimeRejectsConcurrentInitialize(t *testing.T) {
@@ -248,48 +293,55 @@ func TestRuntimeRejectsConcurrentInitialize(t *testing.T) {
 
 	first := startBlockedInitialize(ctx, t, client, implementation)
 	requireInitializeInProgress(ctx, t, client)
-	implementation.release <- nil
+	implementation.release <- initializeSucceeds()
 	if err := <-first; err != nil {
 		t.Fatalf("first initialize: %v", err)
 	}
 	if calls := implementation.calls.Load(); calls != 1 {
 		t.Fatalf("Initialize calls = %d, want 1", calls)
 	}
-	err := client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil)
-	var rpcErr *acp.RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "agent is already initialized" {
-		t.Fatalf("initialize after success error = %v", err)
-	}
+	requireInvalidRequest(t, client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil), initializeNotRepeatable)
 }
 
 func TestRuntimeAllowsInitializeRetryAfterFailure(t *testing.T) {
-	implementation := newGatedInitializeAgent()
-	client := startRuntime(t, implementation, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+	unsupportedVersion := initializeSucceeds()
+	unsupportedVersion.response.ProtocolVersion = 1
+	missingCapabilities := initializeSucceeds()
+	missingCapabilities.response.Capabilities = nil
+	for _, test := range []struct {
+		name    string
+		failure initializeOutcome
+	}{
+		{name: "handler error", failure: initializeOutcome{err: errors.New("initialize failed")}},
+		{name: "unsupported selected version", failure: unsupportedVersion},
+		{name: "missing capabilities", failure: missingCapabilities},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			implementation := newGatedInitializeAgent()
+			client := startRuntime(t, implementation, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
 
-	first := startBlockedInitialize(ctx, t, client, implementation)
-	requireInitializeInProgress(ctx, t, client)
-	implementation.release <- errors.New("initialize failed")
-	if err := <-first; err == nil {
-		t.Fatal("failed initialize returned no error")
-	}
-	err := client.Call(ctx, schema.SessionListMethodName, schema.ListSessionsRequest{}, nil)
-	var rpcErr *acp.RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "agent is not initialized" {
-		t.Fatalf("session/list after failed initialize error = %v", err)
-	}
+			first := startBlockedInitialize(ctx, t, client, implementation)
+			requireInitializeInProgress(ctx, t, client)
+			implementation.release <- test.failure
+			if err := <-first; err == nil {
+				t.Fatal("failed initialize returned no error")
+			}
+			requireInvalidRequest(t, listSessionsCall(ctx, client), sessionListBeforeInit)
 
-	retry := startBlockedInitialize(ctx, t, client, implementation)
-	implementation.release <- nil
-	if err := <-retry; err != nil {
-		t.Fatalf("retried initialize: %v", err)
-	}
-	if calls := implementation.calls.Load(); calls != 2 {
-		t.Fatalf("Initialize calls = %d, want 2", calls)
-	}
-	if err := client.Call(ctx, schema.SessionListMethodName, schema.ListSessionsRequest{}, nil); err != nil {
-		t.Fatalf("session/list after retried initialize: %v", err)
+			retry := startBlockedInitialize(ctx, t, client, implementation)
+			implementation.release <- initializeSucceeds()
+			if err := <-retry; err != nil {
+				t.Fatalf("retried initialize: %v", err)
+			}
+			if calls := implementation.calls.Load(); calls != 2 {
+				t.Fatalf("Initialize calls = %d, want 2", calls)
+			}
+			if err := listSessionsCall(ctx, client); err != nil {
+				t.Fatalf("session/list after retried initialize: %v", err)
+			}
+		})
 	}
 }
 

@@ -82,8 +82,10 @@ types, maps `session/cancel` to prompt-context cancellation, and rejects optiona
 methods omitted from the agent's advertised capabilities. It runs at most one
 `Initialize` at a time: an `initialize` that arrives while another is in
 progress gets `-32600` without reaching the agent, and a failed initialization
-leaves the connection uninitialized so the client can retry. The draft v2
-runtime behaves the same way.
+leaves the connection uninitialized so the client can retry. Lifecycle
+refusals use the reference SDK's shape: `-32600`, message `Invalid request`,
+and the explanation as a JSON string in `data`. The draft v2 runtime behaves
+the same way.
 
 The same package gives agents typed `agent.Client` methods for filesystem,
 permission, terminal, and elicitation callbacks. Client applications can compose
