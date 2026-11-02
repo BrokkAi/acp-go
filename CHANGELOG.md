@@ -366,6 +366,38 @@ series, minor releases may contain breaking API changes.
     capability. Inside a request the runtime dispatched, it fails before
     writing when that connection's initialize response did not announce
     `auth.status`.
+- The draft HTTP server reaches parity with the Rust
+  `agent-client-protocol-http` 5.0.0 server, apart from WebSocket (#65):
+  - Per-session event streams. `GET` with `Acp-Session-Id` opens the stream of
+    a session the agent has named: in a `session/new` or `session/fork`
+    result, in a successful response to a request scoped to the session, or in
+    a request or notification it sent (rust-sdk #483). The session is recorded
+    before the response naming it is queued. Responses go to the stream of the
+    session their request named when it has one, and to the connection stream
+    otherwise. `$/cancel_request`, also inside `proxy/successor` envelopes, is
+    connection-scoped. Up to 16 streams may be open for sessions not named
+    yet, for `session/load` replay; beyond that an unknown session gets `404`.
+    A second subscriber to a stream gets `409`. A successful `session/close`
+    or `session/delete` removes the session's stream.
+  - Agent frames are queued per stream without a bound until the client opens
+    it, including frames sent before the `initialize` response, and a
+    subscriber that leaves keeps what it did not read for the next one.
+  - `DELETE` with `Acp-Connection-Id` stops the agent, ends the streams after
+    what is queued, and answers `202`.
+  - `ServerOptions` with `Path` (default `/acp`), `CORS` (default disabled),
+    `DisableHealth` (`GET /health` answers `ok` by default), and
+    `MaxBodyBytes` (default `DefaultMaxBodyBytes`, 16 MiB). `NewServer`
+    validates them.
+  - `CORSOptions`, built with `CORSDisabled`, `AllowOrigins` (returning an
+    `*InvalidOriginError` for an origin that is not a valid header value), or
+    `AllowAnyOrigin`, answers preflights and sets the CORS headers as the
+    Rust crate's tower-http layer does, allowing the ACP transport headers but
+    not `Authorization` or credentials. The same policy is the origin check the
+    WebSocket binding (#64) will use.
+  - Event streams send an empty SSE comment after 15 idle seconds.
+- The HTTP client opens a session's event stream before it sends the first
+  message naming the session and when a `session/new` or `session/fork`
+  result names a new one, and `Close` sends `DELETE`, as the Rust client does.
 
 ### Changed
 
@@ -570,6 +602,97 @@ series, minor releases may contain breaking API changes.
   unchecked. They apply the system prompt checks above before writing.
   `v2/mcp.NewAttachedSession` and `ResumeAttachedSession` now share the
   `NewSession` and `ResumeSession` checks.
+- **Breaking:** `acphttp.Server.Path` moved to `Server.Options.Path`. Build a
+  server with `acphttp.NewServer(entry, acphttp.ServerOptions{...})`.
+- **Breaking:** the draft HTTP server answers with the Rust server's status
+  codes and bodies: `413 POST body too large` above 16 MiB (previously 8 MiB),
+  including when `Content-Length` declares more; an empty `404` for an unknown
+  connection or path; an empty `500` instead of `410` when the connection has
+  ended; an empty `202` without the `Acp-Connection-Id` header; the Rust texts
+  for the other plain-text errors; `405` with `Allow: POST,GET,HEAD,DELETE`.
+  `params.sessionId` now satisfies the session requirement without the header,
+  and the header is written into `params.sessionId` for the agent, refusing a
+  mismatch with `400`. Every `initialize` request opens a new connection,
+  whatever `Acp-Connection-Id` says. An `initialize` error response is
+  returned without a connection id and discards the connection. The 30-second
+  initialize timeout is gone, as in the Rust crate: a client that gives up
+  cancels its request, which discards the connection. `POST` frames are
+  queued for the agent instead of waiting for it to read them. Connection ids
+  are UUID v4 strings.
+- The draft HTTP server forwards every `POST` body the Rust SDK cannot read
+  as one JSON-RPC message, as the Rust crate forwards malformed frames: valid
+  JSON that is not a message (a non-object, a wrong `jsonrpc`, a non-string
+  method, params that are not an object or array, a bad id, or a response
+  without exactly one of `result` and a valid `error`) is now answered `202`
+  and the agent sends `-32600` on the stream, instead of a `400` that could
+  show Go type names. Such a body without a connection gets
+  `400 Acp-Connection-Id header required`. A body that spans lines is made one
+  line for the agent as the Rust line writer does: JSON is written again as
+  `serde_json` writes it, and anything else is sent as a JSON string, so a
+  multi-line body that is not JSON is answered `202` and `-32600` instead of
+  `400`.
+- The draft HTTP transport sends every JSON-RPC message as the Rust SDK
+  serializes its `RawJsonRpcMessage`, instead of forwarding the bytes it
+  received: the server for client `POST`s, the `initialize` response, and the
+  agent's event-stream frames, and the client for its `POST` bodies and the
+  frames it hands its connection. Members are written in the order
+  `jsonrpc`, `id`, `method`, `params` or `jsonrpc`, `id`, `result`/`error`;
+  other envelope members and a `null` `params` are dropped; an error object is
+  `code`, `message`, `data`, then its other members; and values are written as
+  `serde_json` writes them (escapes decoded, the last duplicate member kept,
+  non-integer numbers as `f64`, such as `1e2` as `100.0`). The
+  `Acp-Session-Id` header is appended at the end of `params`. A message with
+  an empty `method` is a request or notification, as in the Rust SDK.
+- The draft HTTP server sends an agent line that is not a JSON-RPC message to
+  the connection stream verbatim, empty and blank lines included (previously
+  dropped), and only a valid response to the `initialize` request answers the
+  `initialize` `POST`. Event data is written as axum writes it: an empty
+  frame is a blank line, and a `\r` in a frame starts a new `data:` field.
+- The HTTP client reads event streams as the Rust client's parser does: lines
+  end at `\r\n`, `\r`, or `\n`, a `data` field loses one leading space instead
+  of all surrounding whitespace, `data` fields are joined with `\n`, and an
+  event the stream ends in the middle of is dropped. Bytes that are not UTF-8
+  stall the stream, as in the Rust parser: nothing after them is delivered,
+  and when the stream ends it fails with the UTF-8 error. A stream opens on
+  any `2xx` status (previously only `200`), and a stream that cannot open or
+  ends fails the transport with the Rust client's message:
+  `connection SSE stream ended: ` or `<session id> SSE stream ended: `, then
+  `HTTP 404 Not Found`, `SSE stream closed`, or
+  `UTF8 error: invalid utf-8 sequence of 1 bytes from index 0`. Later frames
+  fail with that error.
+- The HTTP client's errors are the Rust client's error data:
+  `initialize: HTTP 500 Internal Server Error: ` and the body,
+  `initialize: invalid initialize response: ` and the Rust SDK's error,
+  `initialize: server did not return acp-connection-id header`,
+  `POST: HTTP 500 Internal Server Error: ` and the body,
+  ``POST: method `session/prompt` requires sessionId in params`` for a
+  session method without a session, and
+  ``ACP HTTP transport: first message must be `initialize` `` for a first
+  frame that is not an `initialize` request.
+- The HTTP client posts a frame its connection writes that is not one
+  JSON-RPC message verbatim, as the Rust client does, with no session header
+  and no stream bookkeeping, instead of failing.
+- The draft HTTP server ends a connection whose agent writes a line that is
+  not UTF-8, as the Rust line reader's error ends the agent's transport: the
+  frames before the line are delivered and the streams end, the line and
+  everything after it are dropped, the agent's input closes, and later
+  requests for the connection get `404`. Before the `initialize` response,
+  the `initialize` `POST` gets `500 agent closed before initialize response`.
+  Previously the line was forwarded.
+- A `POST` body that is not valid UTF-8 gets the Rust text,
+  `Invalid JSON-RPC: ` followed by `std::str::Utf8Error`'s message, such as
+  `invalid utf-8 sequence of 1 bytes from index 0` or
+  `incomplete utf-8 byte sequence from index 5`.
+- Once the agent behind a connection closes its input or returns, later
+  `POST`s get `500`, as in the Rust crate, instead of `202`.
+- The HTTP client reads the `initialize` response body whole instead of
+  cutting it at 16 MiB, sends `Accept: application/json` on every `POST`, and
+  accepts any `2xx` status for later `POST`s, as the Rust client does. It
+  stores `Acp-Connection-Id` before checking the `initialize` response, so a
+  non-`2xx` status or a body that is not a JSON-RPC message sends `DELETE` for
+  that connection. An `initialize` error response rejects the connection even
+  when it carries the header: the error is delivered, the connection is
+  deleted, and the next frame must be `initialize`.
 - v1 `unstable.Handle` follows the reference SDK's handler chain and error
   shapes, the same as `v2/unstable.Handle`: an unstable method the handler
   does not implement now goes to `next` instead of answering method-not-found
@@ -939,16 +1062,22 @@ series, minor releases may contain breaking API changes.
   Rust crate does. Without a connection it is still a plain-text `400`. On an
   unknown connection it is now `404`. On a live connection it is forwarded and
   answered `202`, and the agent sends the parse error on the stream. A body
-  that is not valid UTF-8 is a plain-text `400`. A malformed body that spans
-  lines stays a `400`: the Rust crate re-encodes it as one JSON string, which
-  acp-go agents cannot answer in place until #73. The HTTP client fails an
-  `initialize` whose response body is not valid JSON.
+  that is not valid UTF-8 is a plain-text `400`. The HTTP client fails an
+  `initialize` whose response body is not valid JSON. (#65 extends this to
+  every body that is not a JSON-RPC message, including multi-line ones.)
 
 ### Fixed
 
 - Two concurrent `initialize` requests on the v1 agent runtime could leave
   the client capabilities of one and the agent capabilities of the other;
   both are now recorded together (#62).
+- The draft HTTP server's event stream takes queued frames one at a time, as
+  the Rust crate does, so a write that fails on a departing subscriber no
+  longer drops every frame queued behind it; they stay for the next
+  subscriber.
+- The draft HTTP server queues the `initialize` request before it starts the
+  agent, so an agent that returns at once always gets
+  `500 agent closed before initialize response`.
 - The v1 and draft v2 agent runtimes could call `Agent.Initialize` twice when
   two `initialize` requests were in flight at once, because the
   already-initialized check released its lock before the handler ran. The

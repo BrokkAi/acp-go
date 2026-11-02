@@ -244,11 +244,16 @@ func TestHTTPClientAnswersMalformedStreamEvents(t *testing.T) {
 	}
 }
 
+// The client fails a malformed initialize response with the Rust client's
+// message: "initialize: invalid initialize response: " and the Rust SDK's
+// display of the frame's error.
 func TestHTTPClientRejectsMalformedInitializeResponse(t *testing.T) {
 	for body, want := range map[string]string{
-		`[{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}]`: "JSON-RPC batches are not supported",
-		`{"jsonrpc":"2.0","id":1,"result":`:                         "not valid JSON",
-		`[{"jsonrpc":"2.0","id":1,"result":{"n":1e400}}]`:           "not valid JSON",
+		`[{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}]`: `initialize: invalid initialize response: Invalid request: "JSON-RPC batches are not supported; send each message individually"`,
+		`{"jsonrpc":"2.0","id":1,"result":`:                         "initialize: invalid initialize response: Parse error: {\n  \"line\": \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1,\\\"result\\\":\"\n}",
+		`[{"jsonrpc":"2.0","id":1,"result":{"n":1e400}}]`:           "initialize: invalid initialize response: Parse error: {\n  \"line\": \"[{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1,\\\"result\\\":{\\\"n\\\":1e400}}]\"\n}",
+		`{"jsonrpc":"2.0","id":1}`:                                  "initialize: invalid initialize response: Invalid request",
+		"\t{\"a\":\"\u00e9\"}\n":                                    "initialize: invalid initialize response: Invalid request",
 	} {
 		fake := &fakeHTTPAgent{initializeBody: body, posts: make(chan string, 1)}
 		server := httptest.NewServer(fake)
@@ -258,7 +263,7 @@ func TestHTTPClientRejectsMalformedInitializeResponse(t *testing.T) {
 			t.Fatal(err)
 		}
 		err = client.Call(ctx, "initialize", map[string]any{"protocolVersion": 1}, nil)
-		if err == nil || !strings.Contains(err.Error(), want) {
+		if err == nil || err.Error() != want {
 			t.Errorf("initialize with response %s = %v, want %q", body, err, want)
 		}
 		_ = client.Close()
@@ -349,14 +354,45 @@ func TestHTTPServerForwardsUnparsableBodyLikeRust(t *testing.T) {
 			t.Fatalf("stream event = %s, want %s", got, want)
 		}
 	}
-	// The Rust crate would re-encode a multi-line body as one JSON string;
-	// acp-go refuses it until agents can answer such values in place.
-	if response := post(t, "not\njson", connectionID); response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("multi-line malformed body status = %d", response.StatusCode)
+	// Valid JSON that is not a JSON-RPC message is forwarded too, and the
+	// agent answers it with -32600. A multi-line body that is not JSON is
+	// re-encoded as one JSON string, as the Rust line writer does, and valid
+	// JSON spanning lines is compacted.
+	invalidRequest := `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}`
+	for _, body := range []string{
+		`{"foo":1}`,
+		`5`,
+		`"text"`,
+		`{"jsonrpc":"2.0","method":5}`,
+		`{"jsonrpc":"1.0","id":7,"method":"session/new"}`,
+		`{"jsonrpc":"2.0","id":7,"method":"session/new","params":5}`,
+		`{"jsonrpc":"2.0","id":1.5,"method":"session/new"}`,
+		`{"jsonrpc":"2.0","id":7,"method":"session/new","result":{}}`,
+		"not\njson",
+		"{\n  \"foo\": 1\n}",
+	} {
+		response := post(t, body, connectionID)
+		text, _ := io.ReadAll(response.Body)
+		if response.StatusCode != http.StatusAccepted || len(text) != 0 {
+			t.Fatalf("%q on a live connection: status %d, body %q", body, response.StatusCode, text)
+		}
+		if got := readEvent(t, stream); got != invalidRequest {
+			t.Fatalf("%q: stream event = %s, want %s", body, got, invalidRequest)
+		}
+	}
+	// A body that is not a message never opens a connection, and says so
+	// without Go type names.
+	for _, body := range []string{`{"foo":1}`, `{"jsonrpc":"2.0","method":5,"id":1}`, `{"jsonrpc":"2.0","method":"initialize","id":{}}`} {
+		response := post(t, body, "")
+		text, _ := io.ReadAll(response.Body)
+		if response.StatusCode != http.StatusBadRequest || string(text) != "Acp-Connection-Id header required" {
+			t.Fatalf("%s without a connection: status %d, body %q", body, response.StatusCode, text)
+		}
 	}
 
-	// The agent connection keeps serving.
-	if response := post(t, `{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/","mcpServers":[]}}`, connectionID); response.StatusCode != http.StatusAccepted {
+	// The agent connection keeps serving, and a message spanning lines is
+	// sent to it as one line.
+	if response := post(t, "{\"jsonrpc\":\"2.0\",\n\"id\":3,\"method\":\"session/new\",\"params\":{\"cwd\":\"/\",\"mcpServers\":[]}}\n", connectionID); response.StatusCode != http.StatusAccepted {
 		t.Fatalf("request after parse errors: status %d", response.StatusCode)
 	}
 	if got := readEvent(t, stream); !strings.HasPrefix(got, `{"jsonrpc":"2.0","id":3,`) {

@@ -140,8 +140,12 @@ func TestHTTPTransportRejectsMisuse(t *testing.T) {
 	if connectionID == "" {
 		t.Fatal("initialize response is missing the connection id")
 	}
-	if response := post(t, `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s"}}`, map[string]string{"Content-Type": "application/json", acphttp.HeaderConnectionID: connectionID}); response.StatusCode != http.StatusBadRequest {
+	if response := post(t, `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"prompt":[]}}`, map[string]string{"Content-Type": "application/json", acphttp.HeaderConnectionID: connectionID}); response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("missing session header status = %d", response.StatusCode)
+	}
+	// params.sessionId identifies the session as well as the header does.
+	if response := post(t, `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s"}}`, map[string]string{"Content-Type": "application/json", acphttp.HeaderConnectionID: connectionID}); response.StatusCode != http.StatusAccepted {
+		t.Fatalf("params.sessionId status = %d", response.StatusCode)
 	}
 	if response := post(t, `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s"}}`, map[string]string{"Content-Type": "application/json", acphttp.HeaderConnectionID: connectionID, acphttp.HeaderSessionID: "s"}); response.StatusCode != http.StatusAccepted {
 		t.Fatalf("session-scoped status = %d", response.StatusCode)
