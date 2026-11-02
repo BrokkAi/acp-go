@@ -43,6 +43,11 @@ only remaining work.
   `mcp/message` mover.
 - Exact JSON Schema integer formats, notably Rust-compatible `uint16`
   `ProtocolVersion` and `int32` error codes.
+- Lossless JSON-RPC error objects, mirroring Rust's raw JSON-RPC error:
+  `acp.RPCError` keeps omitted, `null`, and value `data` apart and preserves
+  unknown members on both `Call` results and handler-returned errors (#66).
+  Typed decoding of the draft-v2 `ErrorData` variants follows the v2 schema
+  bump (#56).
 - Stable programmatic tool-call names in v1 and draft v2, surfaced by the
   reference client host with `tool_call_update` patch semantics.
 - Required draft-v2 prompt acceptance identity: the client returns the

@@ -6,6 +6,17 @@ series, minor releases may contain breaking API changes.
 
 ## Unreleased
 
+### Added
+
+- `acp.RPCError` gains `Extra`, which keeps the members of a JSON-RPC error
+  object other than `code`, `message`, and `data`, matching the reference
+  SDK's raw JSON-RPC error (#66). Errors returned by `Call` keep the peer's
+  extension members, and handler-returned errors encode theirs. Extra
+  entries named `code`, `message`, or `data` are never encoded, so an error
+  object cannot carry a member twice.
+- `RPCError.SchemaError` converts to the typed v1 `schema.Error`, dropping
+  `Extra`, as an explicit boundary like Rust's `into_acp_error`.
+
 ### Changed
 
 - The v1 and draft v2 agent runtimes now send their initialization lifecycle
@@ -17,6 +28,24 @@ series, minor releases may contain breaking API changes.
   cannot be repeated after any other request; reconnect to initialize again",
   replacing `agent is already initialized`. Clients that matched on the old
   messages must match on `data` instead (#74).
+- **Breaking:** the new `Extra` field means unkeyed `RPCError` literals such
+  as `acp.RPCError{-32602, "bad", nil}` no longer compile; use keyed fields.
+  Keyed literals keep working and encode as before.
+- **Breaking:** `RPCError` now has its own `MarshalJSON` and `UnmarshalJSON`.
+  A struct that embeds `acp.RPCError` inherits them, so the outer struct's
+  other fields no longer appear in its JSON.
+- `acp.RPCError` decodes as strictly as the reference SDK: an error object
+  whose `code` or `message` is missing, null, or mistyped, whose `code` is not
+  an integer in the `int32` range (including `1.0`, `1e3`, and `-0`), or that
+  repeats `code`, `message`, or `data` is rejected. A peer error response like
+  that is now a malformed frame. Member names match exactly, as JSON-RPC
+  requires: a differently cased `"Code"` is an extension member, not the code.
+  Decoding into an existing value replaces it instead of merging. Re-encoding
+  is semantically unchanged; members after `code`, `message`, and `data` are
+  emitted in sorted key order.
+- A handler error whose `Data` or `Extra` is not valid JSON, or whose `Code`
+  does not fit `int32`, is answered with `-32603` instead of failing to send
+  any response.
 
 ### Fixed
 
@@ -34,6 +63,9 @@ series, minor releases may contain breaking API changes.
   `initialize` to the handler. The acp-go v1 runtime still refuses every
   repeat, so it refuses the concurrent one too, until #62 aligns v1 repeat
   handling (#74).
+- The `RPCError` documentation claimed it preserved extension data while it
+  dropped unknown members. It now documents the omitted, `null`, and value
+  forms of `data`, which were already preserved and are now tested.
 
 ## 0.12.1 - 2026-10-05
 
