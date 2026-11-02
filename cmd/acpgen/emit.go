@@ -112,6 +112,9 @@ func emitNullable(b *strings.Builder) {
 	b.WriteString(`// Nullable preserves the difference between an omitted field, an explicit
 // JSON null, and a concrete value. Set controls wire presence; Null requests
 // an explicit null; Value carries the concrete payload when Null is false.
+// A field is sent only when Set is true, so callers set Set: true both to
+// send a value (Nullable[T]{Set: true, Value: v}) and to send null
+// (Nullable[T]{Set: true, Null: true}); the zero value omits the field.
 type Nullable[T any] struct {
 	Set   bool
 	Null  bool
@@ -148,8 +151,10 @@ func emitTypes(r *ir, pin, packageName string) []byte {
 	b.WriteString("// Meta is the reserved _meta channel for extension data.\ntype Meta map[string]any\n\n")
 	// Shared helpers are written once per generated file.
 	probeHelpersEmitted, withoutKeyEmitted, unchangedEmitted = false, false, false
-	if r.PreserveNull {
+	if r.PreserveNull || r.HasNullable {
 		emitNullable(&b)
+	}
+	if r.PreserveNull {
 		emitMetaPatch(&b)
 	}
 

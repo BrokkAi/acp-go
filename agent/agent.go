@@ -10,6 +10,11 @@ import (
 
 // SessionUpdater reports progress while a prompt turn runs. The runtime
 // supplies the enclosing session ID and emits the session/update notification.
+// It refuses, without writing them to the wire, notice updates unless the
+// client advertised session.notices, compaction updates unless it advertised
+// session.compaction, and config_option_update payloads with boolean options
+// unless it advertised session.configOptions.boolean. A refusal is an
+// *acp.RPCError with code -32601, as for an unadvertised host method.
 type SessionUpdater interface {
 	Update(schema.SessionUpdate) error
 }
@@ -20,7 +25,9 @@ type UpdateFunc func(schema.SessionUpdate) error
 func (f UpdateFunc) Update(update schema.SessionUpdate) error { return f(update) }
 
 // Client is the typed editor-side API available to an agent. The runtime
-// rejects host methods that the client did not advertise during initialize.
+// rejects host methods that the client did not advertise during initialize,
+// and Notify applies the SessionUpdater checks to session/update params of
+// type acp.Update, such as session/load history replay.
 type Client interface {
 	// Call and Notify allow protocol extensions while the typed methods below
 	// remain the preferred surface for every registered ACP method.

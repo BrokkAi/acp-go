@@ -10,6 +10,38 @@ import (
 // Meta is the reserved _meta channel for extension data.
 type Meta map[string]any
 
+// Nullable preserves the difference between an omitted field, an explicit
+// JSON null, and a concrete value. Set controls wire presence; Null requests
+// an explicit null; Value carries the concrete payload when Null is false.
+// A field is sent only when Set is true, so callers set Set: true both to
+// send a value (Nullable[T]{Set: true, Value: v}) and to send null
+// (Nullable[T]{Set: true, Null: true}); the zero value omits the field.
+type Nullable[T any] struct {
+	Set   bool
+	Null  bool
+	Value T
+}
+
+func (v Nullable[T]) MarshalJSON() ([]byte, error) {
+	if !v.Set || v.Null {
+		return []byte("null"), nil
+	}
+	return json.Marshal(v.Value)
+}
+
+func (v *Nullable[T]) UnmarshalJSON(data []byte) error {
+	v.Set = true
+	if string(data) == "null" {
+		v.Null = true
+		var zero T
+		v.Value = zero
+		return nil
+	}
+	return json.Unmarshal(data, &v.Value)
+}
+
+func (v Nullable[T]) IsZero() bool { return !v.Set }
+
 // Authentication-related capabilities supported by the agent.
 type AgentAuthCapabilities struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -651,15 +683,15 @@ type CompactionSummaryChunk struct {
 // summary: [] also clears the summary.
 type CompactionUpdate struct {
 	// Extensible metadata patch for this compaction.
-	Meta Meta `json:"_meta,omitempty"`
+	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The Agent-owned ID of this compaction, unique within the session.
 	CompactionID CompactionId `json:"compactionId"`
 	// Human-readable error details for the compaction.
-	Error *string `json:"error,omitempty"`
+	Error Nullable[string] `json:"error,omitzero"`
 	// Current lifecycle status.
 	Status CompactionStatus `json:"status"`
 	// Complete replacement user-displayable summary content for the compaction.
-	Summary []ContentBlock `json:"summary,omitempty"`
+	Summary Nullable[[]ContentBlock] `json:"summary,omitzero"`
 }
 
 // Notification sent by the agent when a URL-based elicitation is complete.
@@ -4403,9 +4435,9 @@ type SessionInfoUpdate struct {
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
 	// Human-readable title for the session. Set to null to clear.
-	Title *string `json:"title,omitempty"`
+	Title Nullable[string] `json:"title,omitzero"`
 	// ISO 8601 timestamp of last activity. Set to null to clear.
-	UpdatedAt *string `json:"updatedAt,omitempty"`
+	UpdatedAt Nullable[string] `json:"updatedAt,omitzero"`
 }
 
 // Capabilities for the session/list method.
@@ -4424,28 +4456,28 @@ type SessionListCapabilities struct {
 type SessionMessage struct {
 	// Omitted leaves metadata unchanged. null removes it.
 	// Implementations MUST NOT make assumptions about values in _meta.
-	Meta Meta `json:"_meta,omitempty"`
+	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// Omitted leaves content unchanged. null or [] clears it.
 	// A non-empty array replaces all content.
-	Content []ContentBlock `json:"content,omitempty"`
+	Content Nullable[[]ContentBlock] `json:"content,omitzero"`
 	// Identifier of this message within the enclosing session's transcript.
 	MessageID MessageId `json:"messageId"`
 	// On an outgoing view, the messageId of the same message's incoming view in the
 	// recipient's transcript.
 	// Omitted leaves the stored value unchanged. null clears it. A value replaces it. It can arrive
 	// after the message starts streaming.
-	RecipientMessageID *MessageId `json:"recipientMessageId,omitempty"`
+	RecipientMessageID Nullable[MessageId] `json:"recipientMessageId,omitzero"`
 	// The receiving session.
 	// Omitted leaves the stored value unchanged. null clears it. A value replaces it.
-	RecipientSessionID *SessionId `json:"recipientSessionId,omitempty"`
+	RecipientSessionID Nullable[SessionId] `json:"recipientSessionId,omitzero"`
 	// On an incoming view, the messageId of the same message's outgoing view in the
 	// sender's transcript.
 	// Omitted leaves the stored value unchanged. null clears it. A value replaces it. It can arrive
 	// after the message starts streaming.
-	SenderMessageID *MessageId `json:"senderMessageId,omitempty"`
+	SenderMessageID Nullable[MessageId] `json:"senderMessageId,omitzero"`
 	// The sending session.
 	// Omitted leaves the stored value unchanged. null clears it. A value replaces it.
-	SenderSessionID *SessionId `json:"senderSessionId,omitempty"`
+	SenderSessionID Nullable[SessionId] `json:"senderSessionId,omitzero"`
 }
 
 // UNSTABLE
@@ -5742,31 +5774,31 @@ type SubagentUpdate struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	// Omitted means unchanged. null removes the metadata.
-	Meta Meta `json:"_meta,omitempty"`
+	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// Additional workspace roots for the child. Each path must be absolute.
 	// Optional and nullable. Omitted means unchanged. null clears the
 	// reported value. While unset, the child inherits its immediate parent's
 	// effective additional directories, independently of cwd. A concrete
 	// array replaces the whole list. [] reports no additional directories.
 	// Clients use these values for the child's root set.
-	AdditionalDirectories []string `json:"additionalDirectories,omitempty"`
+	AdditionalDirectories Nullable[[]string] `json:"additionalDirectories,omitzero"`
 	// Client-initiated session mutations permitted for this subagent session.
 	// Omitted means unchanged. null clears the capability set and disables
 	// child mutations. If never supplied, no session mutations are permitted.
 	// Read-only operations retain their normal protocol semantics and capability
 	// requirements. A concrete object replaces the whole capability set.
-	Capabilities *SubagentSessionCapabilities `json:"capabilities,omitempty"`
+	Capabilities Nullable[SubagentSessionCapabilities] `json:"capabilities,omitzero"`
 	// The child's working directory. Must be an absolute path.
 	// Optional and nullable. Omitted means unchanged. null clears the
 	// reported value. While unset, the child inherits its immediate parent's
 	// effective working directory. Clients use this value for the child's
 	// root set and as the default terminal working directory.
-	Cwd *string `json:"cwd,omitempty"`
+	Cwd Nullable[string] `json:"cwd,omitzero"`
 	// The parent's human-readable description of the child's role or purpose.
 	// Omitted means unchanged. null clears it. If unset, the Client chooses
 	// a fallback presentation. This is current display metadata, not the
 	// history of instructions sent to the child.
-	Description *string `json:"description,omitempty"`
+	Description Nullable[string] `json:"description,omitzero"`
 	// The opaque session ID identifying the child in all ACP messages.
 	SessionID SessionId `json:"sessionId"`
 	// Current state snapshot for the child session.
@@ -5774,11 +5806,11 @@ type SubagentUpdate struct {
 	// asserting idle or sending an unknown snapshot. A concrete state
 	// replaces the previous state object wholesale. If never supplied, the
 	// current activity is unset/unconfirmed.
-	State *StateUpdate `json:"state,omitempty"`
+	State Nullable[StateUpdate] `json:"state,omitzero"`
 	// The parent's human-readable display title for this child. It need not be unique.
 	// Omitted means unchanged. null clears it. If unset, the Client chooses
 	// a fallback presentation.
-	Title *string `json:"title,omitempty"`
+	Title Nullable[string] `json:"title,omitzero"`
 }
 
 // UNSTABLE

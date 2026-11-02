@@ -10,10 +10,11 @@ import (
 
 // UpdateProjection folds v2 session updates into stored entity state: user
 // messages, Agent messages, Agent thoughts, tool calls, terminals,
-// compactions, session info, and usage. Plans, notices, and other session
-// updates are not stored. Live delivery and replay go through the same
-// Apply, so replaying the original updates in receive order reproduces the
-// stored state, including removals.
+// compactions, session info, and usage. It also keeps notices, which are live
+// events rather than entities: Notices returns those received since the last
+// DrainNotices. Plans and other session updates are not stored. Live
+// delivery and replay go through the same Apply, so replaying the original
+// updates in receive order reproduces the stored state, including removals.
 //
 // Each upsert is applied with the generated ApplyUpdate of its schema type:
 // omitted fields leave the stored value unchanged, null is stored as an
@@ -39,6 +40,7 @@ type UpdateProjection struct {
 	compactions   map[schema.CompactionId]*schema.CompactionUpdate
 	sessionInfo   *schema.SessionInfoUpdate
 	usage         *schema.UsageUpdate
+	notices       []schema.Notice
 }
 
 // EntityKind names a type of session entity. An entity ID is unique only
@@ -158,6 +160,8 @@ func (p *UpdateProjection) Apply(update schema.SessionUpdate) {
 		p.sessionInfo.ApplyUpdate(*update.SessionInfoUpdate)
 	case update.UsageUpdate != nil:
 		p.applyUsage(*update.UsageUpdate)
+	case update.Notice != nil:
+		p.notices = append(p.notices, *update.Notice)
 	}
 }
 
@@ -326,10 +330,45 @@ func (p *UpdateProjection) Terminal(id schema.TerminalId) (TerminalState, bool) 
 
 // Compaction returns the stored compaction with the given ID.
 func (p *UpdateProjection) Compaction(id schema.CompactionId) (schema.CompactionUpdate, bool) {
-	return lookup(p, p.compactions, id, func(compaction schema.CompactionUpdate) schema.CompactionUpdate {
-		compaction.Summary.Value = slices.Clip(compaction.Summary.Value)
-		return compaction
-	})
+	return lookup(p, p.compactions, id, compactionSnapshot)
+}
+
+func compactionSnapshot(compaction schema.CompactionUpdate) schema.CompactionUpdate {
+	compaction.Summary.Value = slices.Clip(compaction.Summary.Value)
+	return compaction
+}
+
+// Compactions returns every stored compaction in the order it was first
+// seen, the order Timeline lists them in.
+func (p *UpdateProjection) Compactions() []schema.CompactionUpdate {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	compactions := make([]schema.CompactionUpdate, 0, len(p.compactions))
+	for _, ref := range p.timeline {
+		if ref.Kind != EntityCompaction {
+			continue
+		}
+		compactions = append(compactions, compactionSnapshot(*p.compactions[schema.CompactionId(ref.ID)]))
+	}
+	return compactions
+}
+
+// Notices returns the notices received since the last DrainNotices, in
+// receive order, without consuming them. Notices are live events: they are
+// not session entities and do not appear in Timeline.
+func (p *UpdateProjection) Notices() []schema.Notice {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return slices.Clone(p.notices)
+}
+
+// DrainNotices returns and clears the stored notices.
+func (p *UpdateProjection) DrainNotices() []schema.Notice {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	notices := p.notices
+	p.notices = nil
+	return notices
 }
 
 // SessionInfo returns the stored session info once a session_info_update has

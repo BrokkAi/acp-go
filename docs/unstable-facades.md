@@ -68,7 +68,7 @@ initialization refuse to run.
 | `v2/unstable.ForkSession` | `capabilities.session.fork` | Counterpart of the reference SDK's `v2::ForkSessionBuilder`. Requires a session ID and an absolute `cwd`; additional directories need `capabilities.session.additionalDirectories`, as on the stable v2 `session/new`, and must be absolute. Rejects inline MCP servers (use `v2/mcp.ForkSession`) and requires a non-blank forked session ID in the response. `systemPrompt` is forwarded unchanged; its capability checks are #58. |
 | `v2/mcp.ForkSession` | `capabilities.session.fork` | The same fork checks, plus the `v2/mcp` transport checks for each server: stdio, HTTP, and the native `acp` transport each need their `capabilities.session.mcp` entry. |
 | `v2/unstable.Handle`, `Advertise` | — | The draft-v2 counterparts of `Handle` and `Advertise`. |
-| `Projection` | — | Client-side: folds optional session updates into ordered per-session state (see below). `Projection.Notifications` adapts `session/update` notifications. |
+| `Projection` | — | Client-side: folds plan operations and end-turn usage into ordered per-session state, and hands notices and compactions to the stable `acp.SessionProjection` (see below). `Projection.Notifications` adapts `session/update` notifications. |
 
 ## Agent-side dispatch
 
@@ -108,24 +108,26 @@ Further unstable methods (session archive/status/title in #71, auth status in
 
 ## Session updates: projection, not request facades
 
-Plan operations, compaction, notices, and end-turn token usage do not have
-methods of their own; they arrive as `session/update` payloads the client has to
-interpret. A request facade would be the wrong shape, so they are served by
-`unstable.Projection`, which folds updates in wire order and keeps the reference
-rules:
+Plan operations and end-turn token usage do not have methods of their own;
+they arrive as `session/update` payloads the client has to interpret. A request
+facade would be the wrong shape, so they are served by `unstable.Projection`,
+which folds updates in wire order and keeps the reference rules:
 
 - `plan` replaces the session's plan entries, `plan_update` replaces the plan
   payload, and `plan_removed` clears it.
-- `compaction_update` upserts by compaction id and its summary is a complete
-  replacement; `compaction_summary_chunk` appends to that compaction. Compactions
-  keep first-seen order.
-- `notice` is a live event rather than history: `Notices` peeks and
-  `DrainNotices` consumes.
 - `usage_update` keeps the latest end-turn token usage (used, size, cost).
 
-Notices and compaction are stable types since schema crate 1.11, so the stable
-`schema` and `schema/v2` packages generate them too. The projection still reads
-the unstable bindings; stable helpers are tracked in #57.
+Session notices and compaction are not unstable features: they are part of
+stable ACP v1 and the draft-v2 baseline, and the stable packages serve them.
+v1 clients advertise them with `acp.SessionNoticesClientCapabilities` and
+`acp.SessionCompactionClientCapabilities` and project them with
+`acp.SessionProjection`; draft-v2 clients need no capability and read them from
+`acpv2.UpdateProjection`. `unstable.Projection` hands both update kinds to an
+`acp.SessionProjection`, so its `Compactions`, `Notices`, and `DrainNotices`
+return the stable types (`CompactionState` is an alias of
+`acp.CompactionState`). Both schemas are ACP v1, so every update that decodes
+from the wire converts; `Projection.Notifications` returns the error for one
+that does not instead of dropping it.
 
 MCP-over-ACP for the v1 surface landed as `github.com/BrokkAi/acp-go/mcp`,
 mirroring `v2/mcp`: session create, resume, and fork helpers that

@@ -39,9 +39,18 @@ against the agent's advertised capabilities before a request is sent. Use
 Explicit selections must be acknowledged by the agent; they never silently fall back.
 
 `acp.SessionUpdates` adapts `session/update` notifications to the generated
-discriminated union. `acp.HandleElicitation`, the elicitation response
-constructors, `ElicitationComplete`, and `CombineNotifications` provide typed
-form/URL host support, including the agent's URL-completion notification.
+discriminated union. Session notices and compaction are stable v1 features: a
+client advertises them with `SessionNoticesClientCapabilities` and
+`SessionCompactionClientCapabilities` (combined with other session
+capabilities through `SessionClientCapabilities`), and `acp.SessionProjection`
+folds them per session in receive order. Compactions keep first-seen order and
+apply `summary`, `error`, and `_meta` as patches (unset keeps, `null` or
+`summary: []` clears, a value replaces), with summary chunks appending to the
+current summary; notices are live events that `Notices` peeks and
+`DrainNotices` consumes. Replay through `session/load` takes the same path.
+`acp.HandleElicitation`, the elicitation response constructors,
+`ElicitationComplete`, and `CombineNotifications` provide typed form/URL host
+support, including the agent's URL-completion notification.
 `NewSessionWithOptions`, `LoadSession`, and `ResumeSession` validate MCP
 transports and additional workspace roots against initialization capabilities.
 
@@ -111,7 +120,15 @@ themselves consume it, so the harness cannot drift.
 mandatory `agent.Agent` interface (`Initialize`, `NewSession`, and `Prompt`);
 optional lifecycle and config methods are discovered as narrow interfaces such
 as `SessionLoader`, `SessionCloser`, and `ConfigOptionSetter`. During a prompt,
-call `SessionUpdater.Update` to emit typed `session/update` notifications. The
+call `SessionUpdater.Update` to emit typed `session/update` notifications.
+Before writing an update, the runtime refuses a `notice` unless the client
+advertised `session.notices`, compaction updates unless it advertised
+`session.compaction`, and a `config_option_update` with a boolean option
+unless it advertised `session.configOptions.boolean`. `Client.Notify` applies
+the same check to `session/update` params of type `acp.Update`, so history
+replay during `session/load` is gated too. A refusal is an `*acp.RPCError`
+with code `-32601`, like an unadvertised host method;
+`acp.RequireSessionUpdateCapability` exposes the check. The
 runtime enforces protocol initialization, dispatches generated request/response
 types, maps `session/cancel` to prompt-context cancellation, and rejects optional
 methods omitted from the agent's advertised capabilities. It runs at most one
@@ -185,8 +202,9 @@ expose any of it. See [docs/unstable-facades.md](docs/unstable-facades.md).
 extensibility conventions reserve for W3C Trace Context, so MCP and
 OpenTelemetry integrations can correlate ACP requests, responses, and
 notifications with the surrounding trace. `IntoMeta` and `FromMeta` operate on
-the generated `schema.Meta` and `v2.Meta` maps (and the draft-v2
-`Nullable[Meta]` field that wraps them), while `ValidTraceparent` checks the
+the generated `schema.Meta` and `v2.Meta` maps (and the `Nullable[Meta]`
+fields that wrap them in draft v2 and in v1 `compaction_update`), while
+`ValidTraceparent` checks the
 fixed W3C grammar without parsing the opaque `tracestate` or `baggage` values.
 The package is standard-library only.
 
@@ -201,7 +219,11 @@ typed `session/update` dispatch. There is intentionally no v1/v2
 conversion layer. The artifacts match Rust schema crate 1.15.1 byte for byte.
 The generated v2 types use `Nullable[T]` where the draft
 distinguishes omitted fields from explicit JSON null, such as message-content
-patches.
+patches. The stable v1 types use it only for the patch fields Rust models with
+`MaybeUndefined`: `compaction_update`'s `summary`, `error`, and `_meta`, and
+`session_info_update`'s `title` and `updatedAt`. A `Nullable` is sent only
+when `Set` is true, for a value and for `null` alike. These fields still
+decode strictly where Rust skips a malformed value (#82).
 
 Draft-v2 upserts (`tool_call_update`, `terminal_update`, the message updates,
 `session_info_update`, and `compaction_update`) have a generated `ApplyUpdate`
@@ -214,7 +236,11 @@ the others whole without merging nested objects. v1 is unchanged: there a
 `acpv2.UpdateProjection` uses these helpers to store messages, thoughts, tool
 calls, terminals, compactions, session info, and usage by kind and ID,
 applying chunks in receive order, so live delivery and replay share one code
-path. Plans and notices are not projected.
+path. `Compactions` lists compactions in first-seen order. Notices need no
+client capability in v2; the projection keeps them as live events, outside
+the timeline, which `Notices` peeks and `DrainNotices` consumes.
+`acpv2.NewNoticeUpdate`, `NewCompactionUpdate`, and
+`NewCompactionSummaryChunkUpdate` build the updates. Plans are not projected.
 
 ACP v2 changes prompt semantics: `session/prompt` returns once the agent inserts
 the user message into the conversation, while completion is reported later
