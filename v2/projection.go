@@ -3,28 +3,65 @@ package v2
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
-// WorkResult is the projected output and stop reason at an idle update.
+// WorkResult is the projected Agent text and the stop reason reported by the
+// idle state update that ended one foreground-work turn.
 type WorkResult struct {
-	Text       string
+	Text string
+	// StopReason is why the work stopped, or nil when the idle update reported
+	// no stop reason or a malformed one. The type is open: a custom or future
+	// reason is kept as received, and its other fields are in
+	// StopReasonFields. Without a recognized reason a client cannot infer how
+	// the work ended.
 	StopReason *schema.StopReason
+	// Error is the failure the Agent reported beside the StopReasonError
+	// stop reason, or nil when it reported none. It is always nil for other
+	// stop reasons.
+	Error *schema.Error
+	// StopReasonFields keeps the other fields of a custom or future stop
+	// reason, as received. It is nil for the known reasons.
+	StopReasonFields map[string]json.RawMessage
+}
+
+// Err returns a *WorkError when the work ended with StopReasonError, so a
+// caller can tell a failure from a completed turn without comparing stop
+// reason strings. It returns nil for every other stop reason, including
+// cancelled, custom, and unknown ones, and when none was reported.
+func (r WorkResult) Err() error {
+	if r.StopReason == nil || *r.StopReason != schema.StopReasonError {
+		return nil
+	}
+	return &WorkError{Failure: r.Error}
 }
 
 // ActiveWork follows one foreground-work turn. Like the reference one-shot
-// client, it ignores updates queued before Running and completes at the next
-// Idle update.
+// client, it ignores updates queued before the turn reports an active state
+// (running, requires_action, or any state other than idle) and completes at
+// the next idle update, whatever its stop reason: an omitted, null,
+// malformed, custom, or unknown reason, an error, or a non-empty background
+// list all end the foreground work. The result is fixed at that idle update;
+// later updates, including a repeated idle snapshot, are not a new completion
+// and do not change it.
+//
+// Tracking assumes each prompt starts new foreground work. The v2 prompt
+// lifecycle lets a Client prompt in any state, and an Agent may instead insert
+// a prompt sent during active work into the running turn, or hold it until
+// that turn ends. A prompt that steers the current turn, or that the Agent
+// never starts work for, may not be followed by a new active state, so the
+// ActiveWork begun for it can stay incomplete. Bound every wait with ctx.
 type ActiveWork struct {
-	mu              sync.RWMutex
-	observedRunning bool
-	projection      *UpdateProjection
-	stopReason      *schema.StopReason
-	done            chan struct{}
-	once            sync.Once
+	mu             sync.RWMutex
+	observedActive bool
+	completed      bool
+	projection     *UpdateProjection
+	result         WorkResult
+	done           chan struct{}
 }
 
 func BeginActiveWork() *ActiveWork {
@@ -34,17 +71,28 @@ func BeginActiveWork() *ActiveWork {
 func (w *ActiveWork) Apply(update schema.SessionUpdate) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if !w.observedRunning {
-		if update.StateUpdate != nil && update.StateUpdate.Running != nil {
-			w.observedRunning = true
+	if w.completed {
+		return
+	}
+	state := update.StateUpdate
+	if !w.observedActive {
+		if state != nil && state.Idle == nil {
+			w.observedActive = true
 		}
 		return
 	}
-	if state := update.StateUpdate; state != nil && state.Idle != nil {
-		if w.stopReason == nil {
-			w.stopReason = state.Idle.StopReason
-			w.once.Do(func() { close(w.done) })
+	if state != nil && state.Idle != nil {
+		idle := state.Idle
+		w.result = WorkResult{
+			Text:             w.projection.Text(),
+			StopReason:       clonePtr(idle.StopReason),
+			StopReasonFields: maps.Clone(idle.StopReasonFields),
 		}
+		if idle.StopReason != nil && *idle.StopReason == schema.StopReasonError {
+			w.result.Error = clonePtr(idle.Error)
+		}
+		w.completed = true
+		close(w.done)
 		return
 	}
 	w.projection.Apply(update)
@@ -52,12 +100,19 @@ func (w *ActiveWork) Apply(update schema.SessionUpdate) {
 
 func (w *ActiveWork) Done() <-chan struct{} { return w.done }
 
+// Result returns the work's result once Done is closed. Before then it
+// returns the text projected so far and no stop reason.
 func (w *ActiveWork) Result() WorkResult {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return WorkResult{Text: w.projection.Text(), StopReason: w.stopReason}
+	if w.completed {
+		return w.result
+	}
+	return WorkResult{Text: w.projection.Text()}
 }
 
+// Wait blocks until the work completes or ctx ends. Completion with the error
+// stop reason is not a Wait error; check WorkResult.Err.
 func (w *ActiveWork) Wait(ctx context.Context) (WorkResult, error) {
 	select {
 	case <-w.done:
@@ -189,7 +244,9 @@ func (t *SessionTracker) Work(sessionID SessionID) *ActiveWork {
 }
 
 // BeginWork resets the session's work projection before submitting a new
-// prompt. The session's entity projection is kept.
+// prompt. The session's entity projection is kept. It assumes the prompt
+// starts new foreground work; see ActiveWork for prompts sent during active
+// work, and bound waits with ctx.
 func (t *SessionTracker) BeginWork(sessionID SessionID) *ActiveWork {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -205,4 +262,14 @@ func (t *SessionTracker) workLocked(sessionID SessionID) *ActiveWork {
 	work := BeginActiveWork()
 	t.sessions[sessionID] = work
 	return work
+}
+
+// clonePtr returns a shallow copy of *p, so a frozen WorkResult does not
+// change when the caller later mutates the update it observed.
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }

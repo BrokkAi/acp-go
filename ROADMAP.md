@@ -34,8 +34,9 @@ only remaining work.
 - Draft-v2 client and baseline agent runtime.
 - Typed permission and elicitation host adapters.
 - One-shot v2 runner with the reference update projection:
-  ignore until `running`, apply message chunks and patch snapshots, complete at
-  the next `idle`.
+  ignore until an active state (`running`, `requires_action`, or an unknown
+  state), apply message chunks and patch snapshots, complete at the next
+  `idle`, and report the `error` stop reason as a typed failure.
 - Explicit MCP-over-ACP opt-in through `github.com/BrokkAi/acp-go/mcp` and
   `github.com/BrokkAi/acp-go/v2/mcp`, mirroring Rust's separate
   `unstable_mcp_over_acp` feature boundary, including the request-scoped
@@ -94,12 +95,15 @@ only remaining work.
     (`ApplyMetaUpdate` and generated `ApplyUpdate` upserts, #67), shared by
     live delivery and replay, with permission subjects applied in receive
     order and full replays rebuilding the projection,
-  - per-session active-work tracker using running→idle completion,
+  - per-session active-work tracker using active→idle completion on any
+    idle stop reason (including `error`, custom, unknown, and none), keeping
+    the typed reason and error details and ignoring repeated idle snapshots
+    (#59),
   - explicit `SessionHandle`,
   - prompt acceptance, config-option replacement, and close commands,
   - pending permission cancellation,
   - exact Rust `CancelActiveWork` notification behavior plus an optional
-    cancellation-completion barrier,
+    cancellation-completion barrier that only `cancelled` satisfies,
   - from-start resume replay after preinstalled handlers.
 - Explicit client protocol connector:
   - select the highest configured v1/v2 client implementation,
@@ -183,11 +187,10 @@ standard-library-only and behind its own package or command.
 
 The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
 them is tracked separately: stable notice and compaction helpers (#57),
-client-provided system prompts (#58), v2 error and custom stop reasons (#59),
-subagents (#60), `-32022` version negotiation (#62), the proxy-chain method
-rename (#69), v2 background work and `tool_call/cancel`/`terminal/cancel`
-(#70), unstable session archive/status/title (#71), and unstable auth status
-(#72).
+client-provided system prompts (#58), subagents (#60), `-32022` version
+negotiation (#62), the proxy-chain method rename (#69), v2 background work and
+`tool_call/cancel`/`terminal/cancel` (#70), unstable session
+archive/status/title (#71), and unstable auth status (#72).
 
 ## Guardrails
 

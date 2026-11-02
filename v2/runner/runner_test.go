@@ -17,8 +17,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/osrun"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
+	acpv2 "github.com/BrokkAi/acp-go/v2"
 	agentv2 "github.com/BrokkAi/acp-go/v2/agent"
 )
 
@@ -27,6 +29,8 @@ const (
 	testFailSessionEnv = "ACP_GO_V2_RUNNER_TEST_FAIL_SESSION"
 	testFailInitEnv    = "ACP_GO_V2_RUNNER_TEST_FAIL_INITIALIZE"
 	testFailPromptEnv  = "ACP_GO_V2_RUNNER_TEST_FAIL_PROMPT"
+	testErrorStopEnv   = "ACP_GO_V2_RUNNER_TEST_ERROR_STOP"
+	testFailCloseEnv   = "ACP_GO_V2_RUNNER_TEST_FAIL_CLOSE"
 	testShutdownEnv    = "ACP_GO_V2_RUNNER_TEST_SHUTDOWN"
 	testSleeperEnv     = "ACP_GO_V2_RUNNER_TEST_SLEEPER"
 )
@@ -43,6 +47,8 @@ func TestMain(m *testing.M) {
 			failSession: os.Getenv(testFailSessionEnv) == "1",
 			failInit:    os.Getenv(testFailInitEnv) == "1",
 			failPrompt:  os.Getenv(testFailPromptEnv) == "1",
+			errorStop:   os.Getenv(testErrorStopEnv) == "1",
+			failClose:   os.Getenv(testFailCloseEnv) == "1",
 		}
 		if implementation.failSession {
 			fmt.Fprintln(os.Stderr, "v2 runner test diagnostics")
@@ -113,6 +119,8 @@ type echoV2Agent struct {
 	failSession bool
 	failInit    bool
 	failPrompt  bool
+	errorStop   bool
+	failClose   bool
 }
 
 func (a *echoV2Agent) Initialize(context.Context, agentv2.Client, schema.InitializeRequest) (schema.InitializeResponse, error) {
@@ -176,10 +184,11 @@ func (a *echoV2Agent) Prompt(_ context.Context, client agentv2.Client, request s
 			return schema.PromptResponse{}, err
 		}
 	}
-	reason := schema.StopReasonEndTurn
-	if err := updates.Update(schema.SessionUpdate{StateUpdate: &schema.StateUpdate{
-		Idle: &schema.IdleStateUpdate{StopReason: &reason},
-	}}); err != nil {
+	idle := acpv2.NewIdleStateUpdate(schema.StopReasonEndTurn)
+	if a.errorStop {
+		idle = acpv2.NewErrorIdleStateUpdate(&schema.Error{Code: -32000, Message: "Authentication required"})
+	}
+	if err := updates.Update(idle); err != nil {
 		return schema.PromptResponse{}, err
 	}
 	return schema.PromptResponse{MessageID: "user-message"}, nil
@@ -205,6 +214,9 @@ func (a *echoV2Agent) ResumeSession(context.Context, agentv2.Client, schema.Resu
 
 func (a *echoV2Agent) CloseSession(context.Context, agentv2.Client, schema.CloseSessionRequest) (schema.CloseSessionResponse, error) {
 	a.closed.Store(true)
+	if a.failClose {
+		return schema.CloseSessionResponse{}, errors.New("close refused by test agent")
+	}
 	return schema.CloseSessionResponse{}, nil
 }
 
@@ -329,6 +341,82 @@ func shortenShutdown(t *testing.T, s osrun.Shutdown) {
 	previous := shutdown
 	shutdown = s
 	t.Cleanup(func() { shutdown = previous })
+}
+
+// An error stop reason is a typed failure that keeps the projected text and
+// the reported JSON-RPC error. The run itself completed: the session is
+// closed and the agent is shut down gracefully.
+func TestRunnerReportsErrorStopReason(t *testing.T) {
+	result, err, transcript := runShutdown(t, context.Background(), "report", map[string]string{testErrorStopEnv: "1"})
+	var failed *acpv2.WorkError
+	if !errors.As(err, &failed) {
+		t.Fatalf("Execute error = %v, want *acpv2.WorkError", err)
+	}
+	var setup *SetupError
+	if errors.As(err, &setup) {
+		t.Fatalf("work failure reported as a setup failure: %v", err)
+	}
+	if failed.Failure == nil || failed.Failure.Code != -32000 || failed.Failure.Message != "Authentication required" {
+		t.Fatalf("failure = %+v", failed.Failure)
+	}
+	if result.Text != "v2 runner" || result.UserMessageID != "user-message" || result.Error != failed.Failure ||
+		result.StopReason == nil || *result.StopReason != schema.StopReasonError {
+		t.Fatalf("result = %+v", result)
+	}
+	if !strings.Contains(transcript, `"phase":"session/close"`) {
+		t.Fatalf("session was not closed:\n%s", transcript)
+	}
+	if !strings.Contains(transcript, "agent saw stdin EOF") {
+		t.Fatalf("agent was not shut down gracefully:\n%s", transcript)
+	}
+}
+
+// An agent that reports an error turn and then fails its exit keeps both
+// failures.
+func TestRunnerKeepsErrorStopReasonWhenAgentExitFails(t *testing.T) {
+	result, err, _ := runShutdown(t, context.Background(), "fail", map[string]string{testErrorStopEnv: "1"})
+	var failed *acpv2.WorkError
+	if !errors.As(err, &failed) || failed.Failure == nil || failed.Failure.Code != -32000 {
+		t.Fatalf("Execute error = %v, want *acpv2.WorkError", err)
+	}
+	var exit *AgentExitError
+	if !errors.As(err, &exit) || exitCode(exit) != 3 || !strings.Contains(exit.Stderr, "agent failing on stdin EOF") {
+		t.Fatalf("Execute error = %v, want AgentExitError with status 3 and stderr", err)
+	}
+	if result.Text != "v2 runner" || result.Error != failed.Failure {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+// A session/close failure after an error turn keeps the work failure, and
+// the failed run kills the agent instead of shutting it down gracefully.
+func TestRunnerKeepsErrorStopReasonWhenCloseFails(t *testing.T) {
+	start := time.Now()
+	result, err, transcript := runShutdown(t, context.Background(), "hang", map[string]string{
+		testErrorStopEnv: "1",
+		testFailCloseEnv: "1",
+	})
+	var failed *acpv2.WorkError
+	if !errors.As(err, &failed) || failed.Failure == nil || failed.Failure.Code != -32000 {
+		t.Fatalf("Execute error = %v, want *acpv2.WorkError", err)
+	}
+	var rpc *acp.RPCError
+	if !errors.As(err, &rpc) || !strings.Contains(err.Error(), "close refused by test agent") {
+		t.Fatalf("Execute error = %v, want the session/close failure", err)
+	}
+	var setup *SetupError
+	if errors.As(err, &setup) {
+		t.Fatalf("close failure reported as a setup failure: %v", err)
+	}
+	if result.Text != "v2 runner" || result.Error != failed.Failure {
+		t.Fatalf("result = %+v", result)
+	}
+	if !strings.Contains(transcript, `"phase":"session/close"`) {
+		t.Fatalf("session/close was not attempted:\n%s", transcript)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Execute took %v; a failed close must not wait for the agent", elapsed)
+	}
 }
 
 func TestRunnerLetsAgentExitOnStdinEOF(t *testing.T) {

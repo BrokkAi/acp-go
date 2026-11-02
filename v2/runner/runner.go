@@ -40,12 +40,15 @@ type Config struct {
 }
 
 // Result contains the projected agent text and the stop reason from the idle
-// state update. A nil StopReason means the agent reported idle without one.
+// state update. A nil StopReason means the agent reported idle without one, or
+// with a malformed one; a custom or unknown reason is kept as received. Error
+// is the failure the agent reported with the error stop reason, if any.
 // UserMessageID is the ID the agent assigned to the inserted user message when
 // it accepted the prompt.
 type Result struct {
 	Text          string
 	StopReason    *schema.StopReason
+	Error         *schema.Error
 	UserMessageID schema.MessageId
 }
 
@@ -100,6 +103,12 @@ func (e *AgentExitError) Unwrap() error { return e.Err }
 // process group at once. endAgent returns the exit error of an agent that failed on its own,
 // whether during the run (crashed) or after its stdin closed.
 func endAgent(ctx context.Context, process *osrun.Agent, runErr, crashed error) error {
+	if isWorkError(runErr) {
+		// The agent reported a failed turn over a working connection and the
+		// session closed; the run itself completed. A WorkError joined with
+		// a later failure, such as session/close, is a failed run.
+		runErr = nil
+	}
 	if runErr == nil && crashed == nil {
 		return process.Stop(ctx, shutdown)
 	}
@@ -108,11 +117,17 @@ func endAgent(ctx context.Context, process *osrun.Agent, runErr, crashed error) 
 }
 
 // withAgentExit reports an agent's failed exit in place of the run error,
-// keeping a setup failure's phase.
+// keeping a setup failure's phase. A failure the agent reported for its turn
+// is not replaced: the *acpv2.WorkError, and any error joined with it, is
+// joined with the exit so errors.As finds each.
 func withAgentExit(runErr error, exit *AgentExitError) error {
 	if setup, ok := runErr.(*SetupError); ok {
 		setup.Err = exit
 		return setup
+	}
+	var workFailed *acpv2.WorkError
+	if errors.As(runErr, &workFailed) {
+		return errors.Join(runErr, exit)
 	}
 	return exit
 }
@@ -127,6 +142,16 @@ type SetupError struct {
 func (e *SetupError) Error() string { return "agent setup failed before prompt: " + e.Err.Error() }
 func (e *SetupError) Unwrap() error { return e.Err }
 
+// Execute runs the agent, submits prompt, and waits for the session's
+// foreground work to become idle. When the agent ends that work with the error
+// stop reason, Execute closes the session as usual and returns the result,
+// including any projected text, together with an *acpv2.WorkError carrying
+// the reported JSON-RPC error. Every other stop reason, including cancelled,
+// custom, and unknown ones, returns a nil error. As for a successful run, the
+// agent's stderr is recorded but not appended to that error. If closing the
+// session or the agent's exit then fails too, the *acpv2.WorkError is joined
+// with that failure (an *AgentExitError for the exit), so errors.As finds
+// each.
 func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runErr error) {
 	log := r.Log
 	if log == nil {
@@ -188,7 +213,10 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 		switch {
 		case exitErr != nil:
 			runErr = withAgentExit(runErr, &AgentExitError{Err: exitErr, Stderr: text})
-		case runErr != nil && text != "":
+		case runErr != nil && text != "" && !isWorkError(runErr):
+			// A bare *acpv2.WorkError means the run completed with the
+			// error stop reason, so, as for a successful run, the agent's
+			// stderr is recorded but not appended.
 			runErr = fmt.Errorf("%w\nAgent diagnostics: %s", runErr, text)
 		}
 	}()
@@ -256,14 +284,17 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	promptAccepted = true
 	_ = host.Record(map[string]any{"event": "prompt_accepted", "user_message_id": userMessageID})
 	phase = "wait-for-idle"
+	var workErr error
 	select {
 	case <-work.Done():
 		workResult := work.Result()
 		result = Result{
 			Text:          workResult.Text,
 			StopReason:    workResult.StopReason,
+			Error:         workResult.Error,
 			UserMessageID: userMessageID,
 		}
+		workErr = workResult.Err()
 	case <-ctx.Done():
 		return result, ctx.Err()
 	case <-connection.Done():
@@ -271,9 +302,12 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	}
 	phase = "session/close"
 	if err := connection.CloseSession(ctx, initialization, session.SessionID); err != nil {
+		if workErr != nil {
+			return result, errors.Join(workErr, err)
+		}
 		return result, err
 	}
-	return result, nil
+	return result, workErr
 }
 
 type runHost struct {
@@ -315,4 +349,11 @@ type cancelPermissions struct{}
 
 func (cancelPermissions) RequestPermission(context.Context, schema.RequestPermissionRequest) (schema.RequestPermissionResponse, error) {
 	return acpv2.CancelPermission(), nil
+}
+
+// isWorkError reports whether err is a bare *acpv2.WorkError: the turn ended
+// with the error stop reason and nothing else failed.
+func isWorkError(err error) bool {
+	_, ok := err.(*acpv2.WorkError)
+	return ok
 }

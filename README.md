@@ -237,9 +237,15 @@ go run ./examples/minimal-agent-v2
 before `session/new` because updates and interactive requests can arrive before
 setup responses. `github.com/BrokkAi/acp-go/v2/runner` mirrors the reference
 SDK's one-shot client: it ignores queued updates until the matching session
-reports `running`, projects subsequent agent-message chunks and patch
-snapshots, completes at the next `idle` update, and cancels permission requests
-by default. Run the reference-shaped example with:
+reports an active state (`running`, `requires_action`, or an unknown state),
+projects subsequent agent-message chunks and patch snapshots, completes at the
+next `idle` update whatever its stop reason, and cancels permission requests
+by default. Repeated idle snapshots are not new completions. Work that ends
+with the `error` stop reason returns the projected text together with a
+`*acpv2.WorkError` carrying the reported JSON-RPC error (`WorkResult.Err` gives
+the same for `ActiveWork`); custom and unknown reasons are kept as received.
+Agents can build idle updates with `acpv2.NewIdleStateUpdate` and
+`acpv2.NewErrorIdleStateUpdate`. Run the reference-shaped example with:
 
 ```sh
 go run ./examples/v2-one-shot-client \
