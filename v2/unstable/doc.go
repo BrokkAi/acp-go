@@ -8,8 +8,9 @@ The client facades cover agent provider configuration (ListProviders,
 SetProvider, DisableProvider), session fork (ForkSession, the counterpart of
 the reference SDK's v2::ForkSessionBuilder), session archive (ArchiveSession,
 UnarchiveSession, and ListSessions with the archived filter), status
-(SessionStatus), and title (SetSessionTitle), and the session lifecycle
-requests that carry a client-provided system prompt (NewSession,
+(SessionStatus), title (SetSessionTitle), and auth status (AuthStatus, with
+AuthStatusUpdates for the auth/status_update notification), and the session
+lifecycle requests that carry a client-provided system prompt (NewSession,
 ResumeSession, and ForkSession, with NewSystemPrompt and NewTextSystemPrompt).
 Each checks its advertised capability and request invariants before writing
 to the wire. Requests that carry MCP servers go through

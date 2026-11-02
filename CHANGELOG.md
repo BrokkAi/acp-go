@@ -350,9 +350,31 @@ series, minor releases may contain breaking API changes.
     announces it.
   - `mcp.NewSessionOptions` and `v2/mcp.NewSessionOptions` gain
     `SystemPrompt`, so MCP servers and a system prompt can be combined.
+- Unstable auth status on v1 and draft v2 (#72), following the auth-status
+  RFD and the reference SDK's `unstable_auth_status` feature:
+  - `unstable.AuthStatus` and `v2/unstable.AuthStatus` send `auth/status`,
+    gated on `agentCapabilities.auth.status` (v1) or `capabilities.auth.status`
+    (v2) before writing. A response without `state` (omitted or `null`) is an
+    error; an unknown `state` is preserved.
+  - `AuthStatusUpdates` adapts the agent's `auth/status_update` notification to
+    a typed handler and composes with the existing notification handlers, such
+    as `clienthost.Host.Notification`, through `acp.CombineNotifications` or
+    `acpv2.CombineNotifications`.
+  - `AuthStatusHandler` serves `auth/status` on the agent side through
+    `Handle` (and `Install`), and `Advertise` announces `auth.status` for it.
+  - `NotifyAuthStatusUpdate` sends `auth/status_update`, which needs no client
+    capability. Inside a request the runtime dispatched, it fails before
+    writing when that connection's initialize response did not announce
+    `auth.status`.
 
 ### Changed
 
+- Every method the unstable `Handle` and `Install` routes serve (v1 and
+  draft v2) decodes absent params as `null`, as the reference SDK's JSON-RPC
+  layer does for every message: `providers/list`, `auth/status`, and the
+  archive-aware `session/list`, which read `null` as the default request, no
+  longer answer `-32602` without params, and a method with required fields
+  answers absent and `null` params with the same error.
 - The generated v1 and draft-v2 unstable `SessionStatusResponse` decode a
   malformed optional field as not reported, per its
   `x-deserialize-default-on-error` hints, so a malformed draft-v2 `state`

@@ -193,8 +193,9 @@ operations, session fork/archive/status/title, auth status, client-provided
 system prompts, subagents, proxy chains, and end-turn token usage. The
 `unstable` (v1) and `v2/unstable` (draft v2) packages add typed facades on
 top: capability-gated provider configuration, session fork, session
-archive/unarchive, status, title, archived-filter listing, and the session
-lifecycle requests that carry a client-provided system prompt for clients, and
+archive/unarchive, status, title, archived-filter listing, auth status (with
+`auth/status_update` notifications), and the session lifecycle requests that
+carry a client-provided system prompt for clients, and
 `Install` for agents, which sets `Handle` dispatch, the `Advertise`
 initialize hook, and the runtime `Overrides` (such as `session/list` with the
 archive filter, and `session/new`, `session/load`, and `session/resume` with

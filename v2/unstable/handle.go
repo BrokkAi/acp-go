@@ -66,6 +66,7 @@ var routes = map[string]unstabledispatch.Binding{
 	schema.SessionUnarchiveMethodName: unstabledispatch.Route(ArchiveHandler.UnarchiveSession, nil),
 	schema.SessionStatusMethodName:    unstabledispatch.Route(StatusHandler.SessionStatus, nil),
 	schema.SessionSetTitleMethodName:  unstabledispatch.Route(TitleHandler.SetSessionTitle, nil),
+	schema.AuthStatusMethodName:       unstabledispatch.Route(AuthStatusHandler.AuthStatus, nil),
 }
 
 func checkForkResponse(response schema.ForkSessionResponse) error {
@@ -79,7 +80,8 @@ func checkForkResponse(response schema.ForkSessionResponse) error {
 // carries the agent's stable initialize response over to the unstable
 // InitializeResponse field for field (through its JSON form, which the
 // unstable schema extends), advertises capabilities.providers when handler
-// implements ProviderHandler and the capabilities.session entry of each
+// implements ProviderHandler, capabilities.auth.status when it implements
+// AuthStatusHandler, and the capabilities.session entry of each
 // session handler it implements (fork for ForkHandler, status for
 // StatusHandler, and title for TitleHandler), keeping any value the agent
 // already set, and then applies each customize function in order.
@@ -126,6 +128,7 @@ func advertise(handler any, install bool, customize []func(*schema.InitializeRes
 			}
 		}
 		advertiseSessionHandlers(handler, install, &extended)
+		advertiseAuthStatus(handler, &extended)
 		if install {
 			advertiseSystemPrompt(handler, &extended)
 		}

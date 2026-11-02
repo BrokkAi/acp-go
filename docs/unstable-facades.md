@@ -14,7 +14,7 @@ removed from the upstream unstable schema in crate 1.15, so acp-go no longer
 generates or wraps them.
 
 Several unstable surfaces in the 1.15.1 pin are generated but have no facade
-yet: subagents (#60), auth status (#72), and proxy chains
+yet: subagents (#60) and proxy chains
 (`proxy/initialize`, `proxy/successor`, registered with `SideProxy`; #69).
 
 ## Why a separate import
@@ -66,7 +66,10 @@ initialization refuse to run.
 | `ListSessions` | `sessionCapabilities.list`; the `archived` filter also needs `sessionCapabilities.archive` | The unstable `session/list` request, whose `archived` filter (`exclude`, `include`, `only`, or any other value, sent unchanged) the stable `ListSessions` cannot carry. `cwd` must be absolute. `SessionInfo.Archived` reports the archive state. |
 | `SessionStatus` | `sessionCapabilities.status` | Requires a non-blank session ID. Unknown status values are preserved; treat anything other than `open` as `saved`. A response without `status` (omitted or `null`) is an error. An unknown session answers `-32002` with the session ID as data. |
 | `SetSessionTitle` | `sessionCapabilities.title` | Requires a non-blank session ID and title. The response carries the title the agent stored, which may be normalized; a response without `title` (omitted or `null`) is an error. |
-| `Install`, `Handle`, `Advertise` | — | Agent-side dispatch: `Handle` routes providers/*, session/fork, session/archive, session/unarchive, session/status, and session/set_title to optional `ProviderHandler`/`ForkHandler`/`ArchiveHandler`/`StatusHandler`/`TitleHandler` implementations and delegates everything else to the next handler; `Advertise` announces the implemented capabilities except `archive` and `systemPrompt`; `Install` sets both on a runtime together with the runtime overrides, such as `session/list` with the archive filter and `session/new`, `session/load`, and `session/resume` with the system prompt, and is the only way to announce `archive` and `systemPrompt`. See [Agent-side dispatch](#agent-side-dispatch). |
+| `AuthStatus` | `agentCapabilities.auth.status` | The unstable `auth/status` query. A response without `state` (omitted or `null`) is an error; unknown states are preserved, and clients treat them as `unknown`. See [Auth status](#auth-status). |
+| `AuthStatusUpdates` | — | Client-side adapter for the agent's `auth/status_update` notification, composed with the connection's other notification handlers. |
+| `AuthStatusHandler`, `NotifyAuthStatusUpdate` | `agentCapabilities.auth.status` | Agent side: `Handle` serves `auth/status`, `Advertise` announces the capability, and `NotifyAuthStatusUpdate` pushes `auth/status_update`. |
+| `Install`, `Handle`, `Advertise` | — | Agent-side dispatch: `Handle` routes providers/*, session/fork, session/archive, session/unarchive, session/status, session/set_title, and auth/status to optional `ProviderHandler`/`ForkHandler`/`ArchiveHandler`/`StatusHandler`/`TitleHandler`/`AuthStatusHandler` implementations and delegates everything else to the next handler; `Advertise` announces the implemented capabilities except `archive` and `systemPrompt`; `Install` sets both on a runtime together with the runtime overrides, such as `session/list` with the archive filter and `session/new`, `session/load`, and `session/resume` with the system prompt, and is the only way to announce `archive` and `systemPrompt`. See [Agent-side dispatch](#agent-side-dispatch). |
 | `ValidateSessionSystemPrompt`, `SystemPromptHandler` (+ v1 `SystemPromptLoader`, `SystemPromptResumer`) | `sessionCapabilities.systemPrompt` (v1), `session.systemPrompt` (v2) | Client and agent sides of client-provided system prompts, v1 and draft v2. See [Client-provided system prompts](#client-provided-system-prompts). |
 | `v2/unstable.ListProviders`, `SetProvider`, `DisableProvider` | `capabilities.providers` | Draft-v2 counterparts of the v1 provider facades, with the same non-blank provider ID check. |
 | `v2/unstable.ForkSession` | `capabilities.session.fork` | Counterpart of the reference SDK's `v2::ForkSessionBuilder`. Requires a session ID and an absolute `cwd`; additional directories need `capabilities.session.additionalDirectories`, as on the stable v2 `session/new`, and must be absolute. Rejects inline MCP servers (use `v2/mcp.ForkSession`), checks `systemPrompt`, and requires a non-blank forked session ID in the response. |
@@ -75,6 +78,7 @@ initialization refuse to run.
 | `mcp.NewSession`, `LoadSession`, `ResumeSession`, `ForkSession` | as their `unstable` counterparts | v1 MCP session helpers with the unstable MCP server transports; `NewSessionOptions.SystemPrompt` and the requests' `SystemPrompt` get the same checks. The attached-session helpers send through them. |
 | `v2/unstable.ArchiveSession`, `UnarchiveSession`, `ListSessions`, `SetSessionTitle` | `capabilities.session.archive` / `.title`; `ListSessions` needs `capabilities.session`, plus `archive` for the filter | Draft-v2 counterparts of the v1 archive, list, and title facades, with the same checks. An unknown session answers `-32002` with `SessionNotFoundErrorData`, which `acpv2.SessionNotFoundData` decodes. |
 | `v2/unstable.SessionStatus` | `capabilities.session.status` | As in v1, plus the optional foreground `State` snapshot. `State` is nil when the agent omits it, sends `null`, or sends a malformed value; nil is not idle, and an idle snapshot is not a new completion. |
+| `v2/unstable.AuthStatus`, `AuthStatusUpdates`, `AuthStatusHandler`, `NotifyAuthStatusUpdate` | `capabilities.auth.status` | Draft-v2 counterparts of the v1 auth-status surface, with the same checks. |
 | `v2/unstable.Install`, `Handle`, `Advertise` | — | The draft-v2 counterparts of `Install`, `Handle`, and `Advertise`. |
 | `Projection` | — | Client-side: folds plan operations and end-turn usage into ordered per-session state, and hands notices and compactions to the stable `acp.SessionProjection` (see below). `Projection.Notifications` adapts `session/update` notifications. |
 
@@ -82,15 +86,21 @@ initialization refuse to run.
 
 `Handle(next, handler)` (v1 `unstable` and draft-v2 `v2/unstable` alike)
 serves `providers/list`, `providers/set`, `providers/disable`,
-`session/fork`, `session/archive`, `session/unarchive`, `session/status`, and
-`session/set_title` from whichever of `ProviderHandler`, `ForkHandler`,
-`ArchiveHandler`, `StatusHandler`, and `TitleHandler` the handler implements. As in the reference SDK's handler chain, every other
+`session/fork`, `session/archive`, `session/unarchive`, `session/status`,
+`session/set_title`, and `auth/status` from whichever of `ProviderHandler`,
+`ForkHandler`, `ArchiveHandler`, `StatusHandler`, `TitleHandler`, and
+`AuthStatusHandler` the handler implements. As in the reference SDK's handler chain, every other
 request, including one of these methods the handler does not implement, goes
 to `next`, and with no `next` answers `-32601` (`Method not found`, with the
 method name as data). Params that do not decode answer `-32602`
 (`Invalid params`, with data `{"error", "json", "phase": "deserialization"}`
 echoing the received params, or `null` when absent) without reaching the
-handler. A fork response with a blank session ID answers `-32603`
+handler. The params decode as the reference SDK's schema crate decodes them,
+array params and malformed members included, and absent params decode as
+`null` for every routed method, as the reference SDK's JSON-RPC layer hands
+them over: `providers/list`, `auth/status`, and the archive-aware
+`session/list` read them as the default request, and a method with required
+fields answers them as it answers `null`. A fork response with a blank session ID answers `-32603`
 (`Internal error`, with the detail as string data) instead of reaching the
 wire. Status and title responses are sent as the handler returns them, as the
 reference SDK sends them.
@@ -122,8 +132,8 @@ if err := unstable.Install(runtime, implementation); err != nil { // or v2/unsta
   `<method>` can be used").
 - `Runtime.InitializeResult` replaces the stable initialize response on the
   wire. It carries it over to the unstable `InitializeResponse`, adds
-  `providers` and the `fork`, `archive`, `status`, and `title` session
-  capabilities for the implemented handlers, and applies the customize
+  `providers`, `auth.status`, and the `fork`, `archive`, `status`, and
+  `title` session capabilities for the implemented handlers, and applies the customize
   functions; the runtime validates the stable view of the value it sends. The
   session capabilities are only added to session capabilities the agent
   already advertises in v2, and v1 `archive` only alongside the agent's own
@@ -191,8 +201,81 @@ handler that is not an `ArchiveHandler` keeps the stable dispatch. A client
 reads a malformed `archived` on a listed session as not reported (nil), as
 the reference SDK's `DefaultOnError` does, rather than failing the page.
 
-Further unstable methods (auth status in #72) join the same dispatch as
-additional handler interfaces.
+Further unstable methods join the same dispatch as additional handler
+interfaces, as auth status does (see [Auth status](#auth-status)).
+`auth/status` is not a method the runtime owns, so it needs no override; the
+`auth/status_update` notification it pairs with goes from agent to client and
+never reaches an override or `Handle`, which only see requests.
+
+## Auth status
+
+Auth status follows the
+[RFD](https://agentclientprotocol.com/rfds/get-auth-state) and the reference
+SDK's `unstable_auth_status` feature. It is unstable and lives only in the
+unstable schemas. The agent advertises it as `agentCapabilities.auth.status`
+(v1) or `capabilities.auth.status` (draft v2); `{}` means the agent answers
+`auth/status` and may send `auth/status_update`.
+
+A client checks the capability before it asks; `AuthStatus` fails before
+writing without it:
+
+```go
+status, err := unstable.AuthStatus(ctx, connection, initialization, unstableschema.AuthStatusRequest{})
+switch status.State {
+case unstableschema.AuthStateAuthenticated, unstableschema.AuthStateNotRequired:
+	// Create sessions.
+case unstableschema.AuthStateUnauthenticated:
+	// Offer a sign-in, such as authenticate (v1) or auth/login (v2).
+default:
+	// unknown, and any value the client does not recognize.
+}
+```
+
+`state` is the only field to act on. It is required and strict: a response
+without it (omitted or `null`) or with a non-string value is an error, and a
+value other than `authenticated`, `unauthenticated`, `not_required`, and
+`unknown` is preserved as it arrived and means `unknown`. `accounts` is
+display information only, so it decodes as the reference SDK decodes it: a
+malformed value reads as no accounts, an invalid entry (one without `label`,
+for example) is skipped, and a malformed optional account field reads as not
+reported. Do not use accounts to decide whether to authenticate, as stable
+account identifiers, or in logs and telemetry.
+
+Updates are full snapshots that replace the previous status. `AuthStatusUpdates`
+adapts them, and composes with the connection's other notification handlers,
+such as the reference client host, without changing their interfaces:
+
+```go
+notifications := acp.CombineNotifications(host.Notification, unstable.AuthStatusUpdates(func(update unstableschema.AuthStatusUpdateNotification) error {
+	showAuthStatus(update.State, update.Accounts)
+	return nil
+}))
+connection := acp.Connect(stdout, stdin, host.Request, notifications)
+```
+
+On the agent side, `AuthStatusHandler.AuthStatus` serves the request through
+`Handle` (and `Install`), and `Advertise` announces the capability for it.
+The query must have no side effects and must not answer `auth_required`
+(`-32000`); a check that would block should answer `unknown` and send an
+update once it completes. Absent, `null`, and positional params decode as in
+the reference SDK (see [Agent-side dispatch](#agent-side-dispatch)); params
+that do not decode answer `-32602`. The response is sent as the handler
+returns it, as the reference SDK sends it.
+
+`NotifyAuthStatusUpdate(ctx, client, notification)` sends
+`auth/status_update`. The RFD gates it on no client capability, only on the
+agent's own `auth.status`: inside a request the runtime dispatched (an
+`Authenticate`, `Logout`, `auth/login`, or `auth/logout` that changed the
+status, for example), it reads that connection's initialize response and
+fails before writing when `auth.status` was not announced; to keep that
+check for an update sent after the request ends (after answering `unknown`,
+for example), send with `context.WithoutCancel` of the request's context.
+Outside a request
+it has no initialize response to check, so an agent that sends later, after a
+sign-in in another terminal, for example, must only do so on connections it
+advertised `auth.status` on. Send only when the status differs from the last
+one sent on the connection. The notification is connection-scoped, never
+per session.
 
 ## Client-provided system prompts
 
