@@ -20,17 +20,26 @@ func roundTrip(t *testing.T, wire string, value any) {
 }
 
 // The subagent idle state flattens its own open stop-reason union. The v1
-// prompt StopReason keeps its def, so the flattened enum is prefixed.
+// prompt StopReason keeps its def, so the flattened enum takes Rust's name.
 func TestSubagentIdleStopReason(t *testing.T) {
 	var failed IdleStateUpdate
 	roundTrip(t, `{"stopReason":"error","error":{"code":-32603,"message":"boom"}}`, &failed)
-	if failed.StopReason == nil || *failed.StopReason != IdleStateUpdateStopReasonError || failed.Error == nil {
+	if failed.StopReason == nil || *failed.StopReason != IdleStopReasonError || failed.Error == nil {
 		t.Fatalf("error stop = %+v", failed)
 	}
 	var custom IdleStateUpdate
 	roundTrip(t, `{"stopReason":"_vendor"}`, &custom)
-	if custom.StopReason == nil || *custom.StopReason != IdleStateUpdateStopReason("_vendor") {
+	if custom.StopReason == nil || *custom.StopReason != IdleStopReason("_vendor") {
 		t.Fatalf("custom stop = %+v", custom)
+	}
+	var extra IdleStateUpdate
+	roundTrip(t, `{"stopReason":"_vendor","detail":[1]}`, &extra)
+	var malformed IdleStateUpdate
+	if err := json.Unmarshal([]byte(`{"stopReason":{"x":1},"usage":"bad","_meta":5}`), &malformed); err != nil {
+		t.Fatalf("malformed optional fields must read as not reported: %v", err)
+	}
+	if encoded, _ := json.Marshal(malformed); string(encoded) != `{}` {
+		t.Fatalf("malformed idle re-encoded as %s", encoded)
 	}
 	var prompt PromptResponse
 	roundTrip(t, `{"stopReason":"end_turn"}`, &prompt)

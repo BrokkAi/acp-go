@@ -23,8 +23,8 @@ series, minor releases may contain breaking API changes.
   `ClientSessionCapabilities.Notices` and `.Compaction`.
 - Draft v2 generates background work (`BackgroundWork` with terminal and
   tool-call variants, the `background` snapshot on the idle, running, and
-  requires-action state updates, and on the unstable unknown state update), the `tool_call/cancel` and
-  `terminal/cancel` methods with their request, response, and capability types,
+  requires-action state updates, and on the unstable unknown state update),
+  the `tool_call/cancel` and `terminal/cancel` methods with their request, response, and capability types,
   `TerminalUpdate.Size`/`.Capabilities`, `ToolCallUpdate.Capabilities`,
   `ToolCallStatusPaused`, `ErrorCodeUnsupportedProtocolVersion` (`-32022`), the
   defined error data (`ErrorData`, `UnsupportedProtocolVersionErrorData`,
@@ -45,7 +45,8 @@ series, minor releases may contain breaking API changes.
 - `cmd/acpgen` models the 1.15.1 schema shapes: the `proxyMethods` meta group
   and `x-side: "proxy"`; a tagged union flattened into its parent object
   (`IdleStateUpdate.stopReason`), generated as an open string enum plus the
-  variant payload's fields on the parent; untyped "any other value" union arms,
+  variant payload's fields on the parent, with a codec that follows the
+  union's wire rules; untyped "any other value" union arms,
   preserved verbatim in an `Other` variant (`ErrorData`) or as `any`
   (`ElicitationContentValue`); defs that are exactly another def, generated as
   aliases (`InitializeProxyRequest = InitializeRequest`); and typeless method
@@ -106,15 +107,25 @@ series, minor releases may contain breaking API changes.
 - Breaking (draft v2, both v2 packages):
   - The top-level `StopReason` def is gone upstream; `IdleStateUpdate` now
     flattens a stop-reason union. `StopReason` and its constants are
-    regenerated from that union with the same names, the type stays an open
-    string (custom and future reasons decode unchanged), and the `error`
-    variant's details arrive in the new `IdleStateUpdate.Error`.
+    regenerated from that union with the same names, and the type stays an
+    open string. The `error` variant's details arrive in the new
+    `IdleStateUpdate.Error`, which is decoded and encoded only with
+    `StopReasonError`. A custom or future reason keeps its other fields in
+    `IdleStateUpdate.StopReasonFields` and re-encodes them, as Rust does.
+  - The idle, running, requires-action, and unstable unknown state updates
+    read a malformed `stopReason`, `error`, `background`, `_meta`, or `usage`
+    as not reported, like Rust's `DefaultOnError`, instead of failing the whole
+    `session/update`. A malformed idle update therefore still completes
+    `ActiveWork`.
   - `AvailableCommand` is a union discriminated by `type`: the `command`
     variant is `Command{Name, Description, Input, Meta}` and other kinds are
     preserved in `Other`.
   - `Error.Data` is `*ErrorData` instead of `json.RawMessage`. Data that does
     not match a defined shape, including primitives, stays raw in
-    `ErrorData.Other`.
+    `ErrorData.Other`. A decoded `UnsupportedProtocolVersion` or
+    `SessionNotFound` variant re-encodes its original bytes, unknown keys
+    included, until the variant is changed, so `data` round-trips like Rust's
+    `serde_json::Value`.
   - `AuthCapabilities` is renamed `ClientAuthCapabilities`;
     `RequestPermissionOutcomeCancelled` is replaced by the named
     `CancelledPermissionOutcome`; `ProtocolLevelNotification` is removed.
@@ -124,13 +135,17 @@ series, minor releases may contain breaking API changes.
   - `ResourceLink.Size` is `Nullable[uint64]` and `TerminalExitStatus.ExitCode`
     is `Nullable[int64]`.
 - Breaking (v1 unstable): `IdleStateUpdate.StopReason` is the new open
-  `IdleStateUpdateStopReason` (its union adds `error` with the new
-  `IdleStateUpdate.Error`; the stable v1 `StopReason` is unchanged), and
-  `SessionMessageChunk` drops `SenderSessionID` and `RecipientSessionID`.
-- The `x-deserialize-default-on-null` hints that replace
-  `x-deserialize-default-on-error` on several v1 request fields need no Go
-  change: `cmd/acpgen` does not read these hints, `null` already decodes as
-  empty, and malformed values still fail to decode.
+  `IdleStopReason`, Rust's name for it (its union adds `error` with the new
+  `IdleStateUpdate.Error`, and custom reasons keep `StopReasonFields`; the
+  stable v1 `StopReason` is unchanged).
+- Breaking (both unstable packages): `SessionMessageChunk` drops
+  `SenderSessionID` and `RecipientSessionID`.
+- Outside the state updates, `cmd/acpgen` still ignores the
+  `x-deserialize-*` hints (default-on-error, default-on-null, skip invalid
+  items), so a malformed value in such a field fails the whole message where
+  Rust reads it as not reported. This is a known gap, tracked in #82. The
+  1.15 default-on-null hints on v1 request fields are unaffected: `null`
+  already decodes as empty.
 
 ### Fixed
 

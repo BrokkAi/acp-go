@@ -18,9 +18,13 @@
 //
 // A union flattened into its parent object is generated as plain fields on
 // the parent. IdleStateUpdate carries the stopReason discriminator as an
-// open StopReason string (custom and future values decode unchanged) and the
-// error variant's payload as its Error field. Untyped "any other value" arms,
-// such as ErrorData's Other, keep the raw JSON verbatim.
+// open StopReason string (custom and future values decode unchanged, with
+// their other fields in StopReasonFields) and the error variant's payload as
+// its Error field, encoded only with StopReasonError. The state updates read
+// a malformed stopReason, error, background, or _meta as not reported, as
+// Rust does; elsewhere decoding is still strict (#82). Untyped "any other
+// value" arms, such as ErrorData's Other, keep the raw JSON verbatim, and a
+// decoded ErrorData variant re-encodes its original bytes until changed.
 //
 // ACP v2 patch fields distinguish an omitted property from JSON null. Those
 // fields use Nullable[T], whose Set, Null, and Value members preserve all

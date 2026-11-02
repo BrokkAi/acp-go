@@ -2673,12 +2673,29 @@ type ErrorData struct {
 	UnsupportedProtocolVersion *UnsupportedProtocolVersionErrorData `json:"-"`
 	SessionNotFound            *SessionNotFoundErrorData            `json:"-"`
 	Other                      *ErrorDataOther                      `json:"-"`
+	raw                        json.RawMessage                      // wire bytes of the decoded variant
+	rawVariant                 string                               // variant raw was decoded into
 }
 
 // ErrorDataOther preserves an unrecognized ErrorData payload verbatim.
 type ErrorDataOther struct{ Raw json.RawMessage }
 
 func (v ErrorDataOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }
+
+// unchangedSince reports whether current still encodes exactly like a
+// fresh decode of raw, so raw can be re-sent verbatim with its unknown keys.
+func unchangedSince[T any](raw json.RawMessage, current *T) bool {
+	var fresh T
+	if json.Unmarshal(raw, &fresh) != nil {
+		return false
+	}
+	a, err := json.Marshal(&fresh)
+	if err != nil {
+		return false
+	}
+	c, err := json.Marshal(current)
+	return err == nil && string(a) == string(c)
+}
 
 func (v ErrorData) MarshalJSON() ([]byte, error) {
 	obj := map[string]json.RawMessage{}
@@ -2694,6 +2711,16 @@ func (v ErrorData) MarshalJSON() ([]byte, error) {
 	}
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "ErrorData", set)
+	}
+	switch v.rawVariant {
+	case "UnsupportedProtocolVersion":
+		if v.UnsupportedProtocolVersion != nil && unchangedSince(v.raw, v.UnsupportedProtocolVersion) {
+			return v.raw, nil
+		}
+	case "SessionNotFound":
+		if v.SessionNotFound != nil && unchangedSince(v.raw, v.SessionNotFound) {
+			return v.raw, nil
+		}
 	}
 	if v.UnsupportedProtocolVersion != nil {
 		payload, err := json.Marshal(v.UnsupportedProtocolVersion)
@@ -2733,6 +2760,7 @@ func (v *ErrorData) UnmarshalJSON(data []byte) error {
 		payload := new(UnsupportedProtocolVersionErrorData)
 		if json.Unmarshal(data, payload) == nil {
 			v.UnsupportedProtocolVersion = payload
+			v.raw, v.rawVariant = append(json.RawMessage(nil), data...), "UnsupportedProtocolVersion"
 			return nil
 		}
 	}
@@ -2740,6 +2768,7 @@ func (v *ErrorData) UnmarshalJSON(data []byte) error {
 		payload := new(SessionNotFoundErrorData)
 		if json.Unmarshal(data, payload) == nil {
 			v.SessionNotFound = payload
+			v.raw, v.rawVariant = append(json.RawMessage(nil), data...), "SessionNotFound"
 			return nil
 		}
 	}
@@ -2904,7 +2933,7 @@ type IdleStateUpdate struct {
 	// The failure, as a JSON-RPC error object.
 	// Optional. Omitted and null are equivalent and mean the agent is not reporting failure details.
 	// Agents SHOULD include it.
-	// Sent only with stopReason "error".
+	// Sent only with stopReason "error"; encoding drops it otherwise.
 	Error *Error `json:"error,omitempty"`
 	// Why foreground work stopped. The value selects one of this type's variants, which may add fields of their own.
 	// Optional. Omitted and null are equivalent and mean the agent is not reporting a stop reason; a malformed value is treated the same way.
@@ -2916,6 +2945,101 @@ type IdleStateUpdate struct {
 	// Optional. Omitted and null are equivalent and mean the agent is not reporting token
 	// usage for this state update.
 	Usage *Usage `json:"usage,omitempty"`
+	// StopReasonFields keeps the other fields of a custom or future stopReason, which are
+	// re-encoded with it. It is ignored for the known values.
+	StopReasonFields map[string]json.RawMessage `json:"-"`
+}
+
+// idleStateUpdateShadow mirrors IdleStateUpdate without its codec methods.
+type idleStateUpdateShadow IdleStateUpdate
+
+func (v IdleStateUpdate) MarshalJSON() ([]byte, error) {
+	encoded, err := json.Marshal(idleStateUpdateShadow(v))
+	if err != nil {
+		return nil, err
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &obj); err != nil {
+		return nil, err
+	}
+	var tag StopReason
+	if v.StopReason != nil {
+		tag = *v.StopReason
+	}
+	if tag != "error" {
+		delete(obj, "error")
+	}
+	switch tag {
+	case "", "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled", "error":
+	default:
+		for key, raw := range v.StopReasonFields {
+			if _, owned := obj[key]; !owned {
+				obj[key] = raw
+			}
+		}
+	}
+	return json.Marshal(obj)
+}
+
+func (v *IdleStateUpdate) UnmarshalJSON(data []byte) error {
+	var raws map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return err
+	}
+	*v = IdleStateUpdate{}
+	if raw, ok := raws["_meta"]; ok {
+		var value Nullable[Meta]
+		if json.Unmarshal(raw, &value) == nil {
+			v.Meta = value
+		}
+	}
+	if raw, ok := raws["background"]; ok {
+		var value Nullable[[]BackgroundWork]
+		if json.Unmarshal(raw, &value) == nil {
+			v.Background = value
+		}
+	}
+	if raw, ok := raws["usage"]; ok {
+		var value *Usage
+		if json.Unmarshal(raw, &value) == nil {
+			v.Usage = value
+		}
+	}
+	if raw, ok := raws["stopReason"]; ok {
+		var tag *string
+		if json.Unmarshal(raw, &tag) == nil && tag != nil {
+			v.StopReason = (*StopReason)(tag)
+		}
+	}
+	if v.StopReason == nil {
+		return nil
+	}
+	switch *v.StopReason {
+	case "end_turn":
+	case "max_tokens":
+	case "max_turn_requests":
+	case "refusal":
+	case "cancelled":
+	case "error":
+		if raw, ok := raws["error"]; ok {
+			var value *Error
+			if json.Unmarshal(raw, &value) == nil {
+				v.Error = value
+			}
+		}
+	default:
+		for key, raw := range raws {
+			switch key {
+			case "_meta", "background", "stopReason", "usage":
+			default:
+				if v.StopReasonFields == nil {
+					v.StopReasonFields = map[string]json.RawMessage{}
+				}
+				v.StopReasonFields[key] = raw
+			}
+		}
+	}
+	return nil
 }
 
 // StopReason is the "stopReason" discriminator flattened into IdleStateUpdate. Unknown values decode unchanged.
@@ -4839,6 +4963,27 @@ type RequiresActionStateUpdate struct {
 	Background Nullable[[]BackgroundWork] `json:"background,omitzero"`
 }
 
+func (v *RequiresActionStateUpdate) UnmarshalJSON(data []byte) error {
+	var raws map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return err
+	}
+	*v = RequiresActionStateUpdate{}
+	if raw, ok := raws["_meta"]; ok {
+		var value Nullable[Meta]
+		if json.Unmarshal(raw, &value) == nil {
+			v.Meta = value
+		}
+	}
+	if raw, ok := raws["background"]; ok {
+		var value Nullable[[]BackgroundWork]
+		if json.Unmarshal(raw, &value) == nil {
+			v.Background = value
+		}
+	}
+	return nil
+}
+
 // A link to a resource that the receiver may be able to read, included in a prompt or tool call result.
 type ResourceLink struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -4963,6 +5108,27 @@ type RunningStateUpdate struct {
 	// update for the session. A malformed list is treated as not reported.
 	// See protocol docs: Background Work
 	Background Nullable[[]BackgroundWork] `json:"background,omitzero"`
+}
+
+func (v *RunningStateUpdate) UnmarshalJSON(data []byte) error {
+	var raws map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return err
+	}
+	*v = RunningStateUpdate{}
+	if raw, ok := raws["_meta"]; ok {
+		var value Nullable[Meta]
+		if json.Unmarshal(raw, &value) == nil {
+			v.Meta = value
+		}
+	}
+	if raw, ok := raws["background"]; ok {
+		var value Nullable[[]BackgroundWork]
+		if json.Unmarshal(raw, &value) == nil {
+			v.Background = value
+		}
+	}
+	return nil
 }
 
 // The user selected one of the provided options.
@@ -5593,6 +5759,21 @@ type SessionTitleCapabilities struct {
 // Different types of updates that can be sent while a session exists.
 // These updates report messages, progress, and other session activity.
 // See protocol docs: Agent Reports Output
+// withoutKey drops a union discriminator before its payload is decoded, so
+// payloads that keep unknown keys do not keep the discriminator too.
+func withoutKey(data []byte, key string) []byte {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) != nil {
+		return data
+	}
+	delete(obj, key)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return data
+	}
+	return out
+}
+
 type SessionUpdateKind string
 
 const (
@@ -6195,7 +6376,7 @@ func (v *SessionUpdate) UnmarshalJSON(data []byte) error {
 	case "state_update":
 		v.Kind = SessionUpdateKindStateUpdate
 		v.StateUpdate = new(StateUpdate)
-		return json.Unmarshal(data, v.StateUpdate)
+		return json.Unmarshal(withoutKey(data, "sessionUpdate"), v.StateUpdate)
 	case "tool_call_content_chunk":
 		v.Kind = SessionUpdateKindToolCallContentChunk
 		v.ToolCallContentChunk = new(ToolCallContentChunk)
@@ -6651,7 +6832,7 @@ func (v *StateUpdate) UnmarshalJSON(data []byte) error {
 	case "idle":
 		v.Kind = StateUpdateKindIdle
 		v.Idle = new(IdleStateUpdate)
-		return json.Unmarshal(data, v.Idle)
+		return json.Unmarshal(withoutKey(data, "state"), v.Idle)
 	case "requires_action":
 		v.Kind = StateUpdateKindRequiresAction
 		v.RequiresAction = new(RequiresActionStateUpdate)
@@ -7430,6 +7611,27 @@ type UnknownStateUpdate struct {
 	// update for the session. A malformed list is treated as not reported.
 	// See protocol docs: Background Work
 	Background Nullable[[]BackgroundWork] `json:"background,omitzero"`
+}
+
+func (v *UnknownStateUpdate) UnmarshalJSON(data []byte) error {
+	var raws map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return err
+	}
+	*v = UnknownStateUpdate{}
+	if raw, ok := raws["_meta"]; ok {
+		var value Nullable[Meta]
+		if json.Unmarshal(raw, &value) == nil {
+			v.Meta = value
+		}
+	}
+	if raw, ok := raws["background"]; ok {
+		var value Nullable[[]BackgroundWork]
+		if json.Unmarshal(raw, &value) == nil {
+			v.Background = value
+		}
+	}
+	return nil
 }
 
 // Data for the -32022 (Unsupported protocol version) error.

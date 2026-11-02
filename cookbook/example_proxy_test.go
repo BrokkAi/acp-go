@@ -24,8 +24,10 @@ const (
 )
 
 // successorMessage is the conductor's envelope for traffic between a proxy and
-// its successor. The pinned schema has no _proxy/* methods, so acp-go does not
-// generate it; this mirrors SuccessorMessage in the Rust SDK 2.2.0. Like the
+// its successor under the Rust SDK 2.2.0 _proxy/successor name; it mirrors
+// that SDK's SuccessorMessage. The pinned unstable schema now defines the
+// renamed proxy/successor envelope (schema/unstable.ProxySuccessorRequest);
+// moving to it is tracked in #69. Like the
 // reference conductor, the proxy sets no envelope _meta and does not forward
 // it; the inner params, including their own _meta, pass through unchanged.
 type successorMessage struct {

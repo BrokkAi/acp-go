@@ -2052,37 +2052,126 @@ type IdleStateUpdate struct {
 	// The failure, as a JSON-RPC error object.
 	// Optional. Omitted or null both mean the agent is not reporting failure details.
 	// Agents SHOULD include it.
-	// Sent only with stopReason "error".
+	// Sent only with stopReason "error"; encoding drops it otherwise.
 	Error *Error `json:"error,omitempty"`
 	// Why foreground work stopped. The value selects one of this type's variants, which may add fields of their own.
 	// Optional. Omitted or null both mean the agent is not reporting a stop reason; a malformed value is treated the same way.
 	// See protocol docs: Current work state
-	StopReason *IdleStateUpdateStopReason `json:"stopReason,omitempty"`
+	StopReason *IdleStopReason `json:"stopReason,omitempty"`
 	// UNSTABLE Token usage for completed foreground work.
 	// Optional. Omitted or null means not reported.
 	Usage *Usage `json:"usage,omitempty"`
+	// StopReasonFields keeps the other fields of a custom or future stopReason, which are
+	// re-encoded with it. It is ignored for the known values.
+	StopReasonFields map[string]json.RawMessage `json:"-"`
 }
 
-// IdleStateUpdateStopReason is the "stopReason" discriminator flattened into IdleStateUpdate. Unknown values decode unchanged.
+// idleStateUpdateShadow mirrors IdleStateUpdate without its codec methods.
+type idleStateUpdateShadow IdleStateUpdate
+
+func (v IdleStateUpdate) MarshalJSON() ([]byte, error) {
+	encoded, err := json.Marshal(idleStateUpdateShadow(v))
+	if err != nil {
+		return nil, err
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &obj); err != nil {
+		return nil, err
+	}
+	var tag IdleStopReason
+	if v.StopReason != nil {
+		tag = *v.StopReason
+	}
+	if tag != "error" {
+		delete(obj, "error")
+	}
+	switch tag {
+	case "", "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled", "error":
+	default:
+		for key, raw := range v.StopReasonFields {
+			if _, owned := obj[key]; !owned {
+				obj[key] = raw
+			}
+		}
+	}
+	return json.Marshal(obj)
+}
+
+func (v *IdleStateUpdate) UnmarshalJSON(data []byte) error {
+	var raws map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return err
+	}
+	*v = IdleStateUpdate{}
+	if raw, ok := raws["_meta"]; ok {
+		var value Meta
+		if json.Unmarshal(raw, &value) == nil {
+			v.Meta = value
+		}
+	}
+	if raw, ok := raws["usage"]; ok {
+		var value *Usage
+		if json.Unmarshal(raw, &value) == nil {
+			v.Usage = value
+		}
+	}
+	if raw, ok := raws["stopReason"]; ok {
+		var tag *string
+		if json.Unmarshal(raw, &tag) == nil && tag != nil {
+			v.StopReason = (*IdleStopReason)(tag)
+		}
+	}
+	if v.StopReason == nil {
+		return nil
+	}
+	switch *v.StopReason {
+	case "end_turn":
+	case "max_tokens":
+	case "max_turn_requests":
+	case "refusal":
+	case "cancelled":
+	case "error":
+		if raw, ok := raws["error"]; ok {
+			var value *Error
+			if json.Unmarshal(raw, &value) == nil {
+				v.Error = value
+			}
+		}
+	default:
+		for key, raw := range raws {
+			switch key {
+			case "_meta", "stopReason", "usage":
+			default:
+				if v.StopReasonFields == nil {
+					v.StopReasonFields = map[string]json.RawMessage{}
+				}
+				v.StopReasonFields[key] = raw
+			}
+		}
+	}
+	return nil
+}
+
+// IdleStopReason is the "stopReason" discriminator flattened into IdleStateUpdate. Unknown values decode unchanged.
 // Why foreground work stopped. The value selects one of this type's variants, which may add fields of their own.
 // Optional. Omitted or null both mean the agent is not reporting a stop reason; a malformed value is treated the same way.
 // See protocol docs: Current work state
-type IdleStateUpdateStopReason string
+type IdleStopReason string
 
 const (
 	// The work ended successfully.
-	IdleStateUpdateStopReasonEndTurn IdleStateUpdateStopReason = "end_turn"
+	IdleStopReasonEndTurn IdleStopReason = "end_turn"
 	// The work ended because the agent reached the maximum number of tokens.
-	IdleStateUpdateStopReasonMaxTokens IdleStateUpdateStopReason = "max_tokens"
+	IdleStopReasonMaxTokens IdleStopReason = "max_tokens"
 	// The work ended because the agent reached the maximum number of allowed
 	// agent requests.
-	IdleStateUpdateStopReasonMaxTurnRequests IdleStateUpdateStopReason = "max_turn_requests"
+	IdleStopReasonMaxTurnRequests IdleStopReason = "max_turn_requests"
 	// The work ended because the agent refused to continue.
-	IdleStateUpdateStopReasonRefusal IdleStateUpdateStopReason = "refusal"
+	IdleStopReasonRefusal IdleStopReason = "refusal"
 	// The work was cancelled.
-	IdleStateUpdateStopReasonCancelled IdleStateUpdateStopReason = "cancelled"
+	IdleStopReasonCancelled IdleStopReason = "cancelled"
 	// The work ended because something failed.
-	IdleStateUpdateStopReasonError IdleStateUpdateStopReason = "error"
+	IdleStopReasonError IdleStopReason = "error"
 )
 
 // An image provided to or from an LLM.
@@ -3774,6 +3863,21 @@ type RequiresActionStateUpdate struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v *RequiresActionStateUpdate) UnmarshalJSON(data []byte) error {
+	var raws map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return err
+	}
+	*v = RequiresActionStateUpdate{}
+	if raw, ok := raws["_meta"]; ok {
+		var value Meta
+		if json.Unmarshal(raw, &value) == nil {
+			v.Meta = value
+		}
+	}
+	return nil
+}
+
 // A resource that the server is capable of reading, included in a prompt or tool call result.
 type ResourceLink struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -3860,6 +3964,21 @@ type RunningStateUpdate struct {
 	// Implementations MUST NOT make assumptions about values at these keys.
 	// Optional. Omitted and null mean no metadata for this state snapshot.
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v *RunningStateUpdate) UnmarshalJSON(data []byte) error {
+	var raws map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return err
+	}
+	*v = RunningStateUpdate{}
+	if raw, ok := raws["_meta"]; ok {
+		var value Meta
+		if json.Unmarshal(raw, &value) == nil {
+			v.Meta = value
+		}
+	}
+	return nil
 }
 
 // The user selected one of the provided options.
@@ -5307,6 +5426,21 @@ type SetSessionTitleResponse struct {
 // Each update is a whole-object snapshot. Idle does not terminate the child.
 // The parent can message it again, transitioning it back to running.
 // Background activity may still emit other session updates while idle.
+// withoutKey drops a union discriminator before its payload is decoded, so
+// payloads that keep unknown keys do not keep the discriminator too.
+func withoutKey(data []byte, key string) []byte {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) != nil {
+		return data
+	}
+	delete(obj, key)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return data
+	}
+	return out
+}
+
 type StateUpdateKind string
 
 const (
@@ -5452,7 +5586,7 @@ func (v *StateUpdate) UnmarshalJSON(data []byte) error {
 	case "idle":
 		v.Kind = StateUpdateKindIdle
 		v.Idle = new(IdleStateUpdate)
-		return json.Unmarshal(data, v.Idle)
+		return json.Unmarshal(withoutKey(data, "state"), v.Idle)
 	case "requires_action":
 		v.Kind = StateUpdateKindRequiresAction
 		v.RequiresAction = new(RequiresActionStateUpdate)
@@ -6096,6 +6230,21 @@ type UnknownStateUpdate struct {
 	// Implementations MUST NOT make assumptions about values at these keys.
 	// Optional. Omitted and null mean no metadata for this state snapshot.
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v *UnknownStateUpdate) UnmarshalJSON(data []byte) error {
+	var raws map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return err
+	}
+	*v = UnknownStateUpdate{}
+	if raw, ok := raws["_meta"]; ok {
+		var value Meta
+		if json.Unmarshal(raw, &value) == nil {
+			v.Meta = value
+		}
+	}
+	return nil
 }
 
 // All text that was typed after the command name is provided as input.

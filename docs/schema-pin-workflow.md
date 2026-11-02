@@ -58,8 +58,12 @@ schema crate or when the Rust SDK moves its exact pin.
      differences between v1 and v2;
    - JSON field names, integer widths, and defaults;
    - `x-deserialize-*` hints (default-on-error, default-on-null, skip invalid
-     items), which `cmd/acpgen` does not read: decide whether Go's strict
-     decoding is still acceptable for each affected field;
+     items). `cmd/acpgen` honors default-on-error only on the state-update
+     snapshots (`lenientDefs` in `cmd/acpgen/ir.go`) and decodes every other
+     field strictly. That is a known divergence from Rust, tracked in #82: a
+     malformed value fails the whole message instead of reading as not
+     reported. Record newly affected fields on #82, and extend `lenientDefs`
+     where a malformed field would break a protocol MUST;
    - new `x-side` values or `meta.json` method groups (such as 1.15's
      `proxyMethods`): generation fails on a method outside the groups
      `cmd/acpgen` models, so teach it the group and its side constant;

@@ -30,6 +30,21 @@ type field struct {
 	Required bool
 	Nullable bool // JSON null is distinct from an omitted optional field
 	Doc      string
+	// Lenient mirrors x-deserialize-default-on-error: a value that does not
+	// decode reads as not reported. Only defs with Lenient set honor it.
+	Lenient bool
+	// Variant names the flattened tag value this lifted payload field
+	// belongs to; it is decoded and encoded only alongside that value.
+	Variant string
+}
+
+// flattenInfo describes a tagged union flattened into its parent struct.
+type flattenInfo struct {
+	TagJSON  string   // wire key of the discriminator
+	TagGo    string   // Go field name of the discriminator
+	Enum     string   // synthesized open enum type
+	Known    []string // const tag values
+	ExtrasGo string   // Go field holding a custom variant's other fields
 }
 
 type variant struct {
@@ -57,6 +72,29 @@ type typeDef struct {
 	// discriminator enum of a union flattened into a struct. They are
 	// emitted right after the def itself.
 	Extra []*typeDef
+	// Flatten is set on a struct carrying a flattened tagged union.
+	Flatten *flattenInfo
+	// Lenient structs get a decoder that honors their fields'
+	// x-deserialize-default-on-error hints (see lenientDefs).
+	Lenient bool
+}
+
+// lenientDefs are the state-update snapshots whose optional fields must read
+// as not reported when malformed, as Rust's DefaultOnError does: a client has
+// to recognize an idle transition even when its stopReason or background list
+// is malformed, or active work never completes. Structs with a flattened
+// union are lenient too. Honoring the hints on every def is tracked in #82.
+var lenientDefs = map[string]bool{
+	"IdleStateUpdate":           true,
+	"RunningStateUpdate":        true,
+	"RequiresActionStateUpdate": true,
+	"UnknownStateUpdate":        true,
+}
+
+// rustEnumNames gives the Rust type name of a flattened union's enum when
+// the tag-derived name is already a def (the schema does not carry it).
+var rustEnumNames = map[string]string{
+	"IdleStateUpdate.stopReason": "IdleStopReason",
 }
 
 type methodDesc struct {
@@ -109,6 +147,9 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 			return nil, err
 		}
 		td.Side, td.Method = def.Side, def.Method
+		if td.Kind == kindStruct && (lenientDefs[name] || td.Flatten != nil) {
+			td.Lenient = true
+		}
 		for _, out := range append([]*typeDef{td}, td.Extra...) {
 			if _, taken := r.ByName[out.Name]; taken {
 				return nil, fmt.Errorf("%s: generated type name is already taken", out.Name)
@@ -242,10 +283,10 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 
 	enumName := goNameOf(tag)
 	if _, taken := root.Defs[enumName]; taken || enumName == name {
-		enumName = name + enumName
+		enumName = rustEnumNames[name+"."+tag]
 	}
-	if _, taken := root.Defs[enumName]; taken {
-		return nil, true, fmt.Errorf("%s: no free name for the flattened %q enum", name, tag)
+	if _, taken := root.Defs[enumName]; taken || enumName == "" {
+		return nil, true, fmt.Errorf("%s: no free name for the flattened %q enum; add its Rust name to rustEnumNames", name, tag)
 	}
 	tagDoc := def.Properties[tag].Description
 	enum := &typeDef{
@@ -282,7 +323,8 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 				}
 				// Payload fields exist only alongside their variant, so they
 				// are optional on the flattened struct.
-				f.Doc = strings.TrimSpace(f.Doc + fmt.Sprintf("\nSent only with %s %q.", tag, cv))
+				f.Doc = strings.TrimSpace(f.Doc + fmt.Sprintf("\nSent only with %s %q; encoding drops it otherwise.", tag, cv))
+				f.Variant = cv
 				lifted = append(lifted, f)
 			}
 		case tp.Const == nil && tp.soleType() == "string" && !tp.isNull():
@@ -298,6 +340,10 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 	}
 
 	td := &typeDef{Name: name, Doc: def.Description, Kind: kindStruct, Extra: []*typeDef{enum}}
+	td.Flatten = &flattenInfo{TagJSON: tag, TagGo: goNameOf(tag), Enum: enumName, ExtrasGo: goNameOf(tag) + "Fields"}
+	for _, v := range enum.Variants {
+		td.Flatten.Known = append(td.Flatten.Known, v.Const)
+	}
 	required := map[string]bool{}
 	for _, k := range def.Required {
 		required[k] = true
@@ -309,7 +355,7 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 			// is otherwise preserved.
 			td.Fields = append(td.Fields, field{
 				JSONName: tag, GoName: goNameOf(tag), GoType: enumName,
-				Required: required[tag], Doc: tagDoc,
+				Required: required[tag], Doc: tagDoc, Lenient: p.value.DefaultOnError,
 			})
 			continue
 		}
@@ -322,7 +368,7 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 	}
 	for _, f := range lifted {
 		for _, existing := range td.Fields {
-			if existing.JSONName == f.JSONName || existing.GoName == f.GoName {
+			if existing.JSONName == f.JSONName || existing.GoName == f.GoName || f.GoName == td.Flatten.ExtrasGo {
 				return nil, true, fmt.Errorf("%s: flattened variant field %q collides with a struct field", name, f.JSONName)
 			}
 		}
@@ -680,7 +726,7 @@ func unionTagProp(v *rawSchema) (string, bool) {
 
 // fieldFrom maps one object property to a Go field.
 func fieldFrom(prop string, ps *rawSchema, root *rootSchema, preserveNull bool) (field, error) {
-	f := field{JSONName: prop, GoName: goNameOf(prop), Doc: ps.Description}
+	f := field{JSONName: prop, GoName: goNameOf(prop), Doc: ps.Description, Lenient: ps.DefaultOnError}
 	inner := ps.unwrap()
 	f.Nullable = preserveNull && ps.isNull()
 

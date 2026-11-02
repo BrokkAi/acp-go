@@ -185,9 +185,11 @@
 // _proxy/successor envelopes carrying the inner method and params. Like the
 // reference conductor, the recipe neither sets nor forwards the envelope's own
 // _meta; the params, including their _meta, pass through unchanged.
-// The pinned schema has no _proxy/* methods, so the recipe hand-models the
-// envelope from the Rust SDK 2.2.0 and acp-go ships no helper for it; the
-// conductor itself is recorded as won't port (#24). Run a Go proxy under the
+// The recipe hand-models the envelope under the _proxy/* names of the Rust
+// SDK 2.2.0 conductor. The pinned unstable schema (crate 1.15.1) now defines
+// the renamed proxy/initialize and proxy/successor methods and their
+// envelopes in schema/unstable; moving this recipe and proxyrouter to them is
+// tracked in #69. The conductor itself is recorded as won't port (#24). Run a Go proxy under the
 // reference agent-client-protocol-conductor.
 //
 // [github.com/BrokkAi/acp-go/proxyrouter.Router] hands each connection to the

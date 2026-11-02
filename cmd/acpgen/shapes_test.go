@@ -29,7 +29,7 @@ func idleDef() (*rawSchema, *rootSchema) {
 	def := &rawSchema{
 		Type: json.RawMessage(`"object"`),
 		Properties: map[string]*rawSchema{
-			"stopReason": {Type: json.RawMessage(`["string","null"]`), Description: "Why work stopped."},
+			"stopReason": {Type: json.RawMessage(`["string","null"]`), Description: "Why work stopped.", DefaultOnError: true},
 			"_meta":      {Type: json.RawMessage(`["object","null"]`), Additional: json.RawMessage(`true`)},
 		},
 		AnyOf: []*rawSchema{constTag("stopReason", "end_turn"), errorArm, other, none},
@@ -71,13 +71,35 @@ func TestFlattenedUnionBecomesStructAndOpenEnum(t *testing.T) {
 		t.Fatalf("enum = %+v", enum)
 	}
 
-	// A def already named after the tag keeps its name; the enum is prefixed.
+	if td.Flatten == nil || td.Flatten.ExtrasGo != "StopReasonFields" || td.Fields[1].Variant != "error" {
+		t.Fatalf("flatten = %+v, error field = %+v", td.Flatten, td.Fields[1])
+	}
+	td.Lenient = true
+	failure, err := classify("Failure", root.Defs["Failure"], root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(emitTypes(&ir{PreserveNull: true, ByName: map[string]*typeDef{"IdleStateUpdate": td, "Failure": failure, "StopReason": enum},
+		Defs: []*typeDef{failure, td, enum}}, "test", "testpkg"))
+	for _, want := range []string{
+		"StopReasonFields map[string]json.RawMessage `json:\"-\"`",
+		"if tag != \"error\" {\n\t\tdelete(obj, \"error\")",
+		"if json.Unmarshal(raw, &tag) == nil && tag != nil {",
+		"case \"_meta\", \"stopReason\":",
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("generated source missing %q:\n%s", want, src)
+		}
+	}
+
+	// A def already named after the tag keeps its name; the enum takes the
+	// Rust type name.
 	root.Defs["StopReason"] = &rawSchema{Type: json.RawMessage(`"string"`)}
 	td, err = classify("IdleStateUpdate", def, root, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if td.Extra[0].Name != "IdleStateUpdateStopReason" {
+	if td.Extra[0].Name != "IdleStopReason" {
 		t.Fatalf("enum name = %s", td.Extra[0].Name)
 	}
 }

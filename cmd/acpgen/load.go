@@ -24,6 +24,9 @@ type rawSchema struct {
 	Method       string                `json:"x-method"`
 	Discriminate json.RawMessage       `json:"discriminator"` // OpenAPI-style; informational only
 	Not          *rawSchema            `json:"not"`
+	// DefaultOnError marks a field whose malformed value Rust reads as
+	// absent (x-deserialize-default-on-error).
+	DefaultOnError bool `json:"x-deserialize-default-on-error"`
 }
 
 type rootSchema struct {
