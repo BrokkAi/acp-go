@@ -35,6 +35,8 @@ type Agent struct {
 	Stdout io.ReadCloser
 
 	stderr  *os.File
+	treeMu  sync.Mutex
+	tree    tree
 	drained chan struct{}
 	exited  chan struct{}
 	err     error
@@ -69,7 +71,8 @@ func StartAgent(dir string, args []string, env map[string]string, stderr io.Writ
 		closeFiles(stdinW, stdoutR, stderrR)
 		return nil, err
 	}
-	a := &Agent{Cmd: cmd, Stdin: stdinW, Stdout: stdoutR, stderr: stderrR, drained: make(chan struct{}), exited: make(chan struct{})}
+	a := &Agent{Cmd: cmd, Stdin: stdinW, Stdout: stdoutR, stderr: stderrR, tree: startTree(cmd),
+		drained: make(chan struct{}), exited: make(chan struct{})}
 	go func() {
 		_, _ = io.Copy(stderr, stderrR)
 		close(a.drained)
@@ -110,7 +113,7 @@ func (a *Agent) Supervise(p Protocol, s Shutdown) (release func() error) {
 			return
 		case <-a.exited:
 		}
-		_ = Kill(a.Cmd)
+		a.kill(s.Exit)
 		wait := p.Done()
 		if a.err != nil {
 			wait = a.drained
@@ -179,7 +182,7 @@ func (a *Agent) Kill(s Shutdown) { a.finish(s.Exit) }
 // closes stdin and stdout, and then gives stderr up to grace to reach EOF
 // before closing it.
 func (a *Agent) finish(grace time.Duration) {
-	_ = Kill(a.Cmd)
+	a.kill(grace)
 	<-a.exited
 	_ = a.Stdin.Close()
 	_ = a.Stdout.Close()
@@ -192,4 +195,17 @@ func (a *Agent) finish(grace time.Duration) {
 		// read end ends the copy; captured bytes stay with the writer.
 	}
 	_ = a.stderr.Close()
+	a.treeMu.Lock()
+	a.tree.close()
+	a.treeMu.Unlock()
+}
+
+// kill kills the agent's process group (process tree on Windows), including
+// descendants of an agent that has already exited, waiting up to grace for
+// them on Windows.
+func (a *Agent) kill(grace time.Duration) {
+	_ = Kill(a.Cmd)
+	a.treeMu.Lock()
+	defer a.treeMu.Unlock()
+	a.tree.kill(grace)
 }
