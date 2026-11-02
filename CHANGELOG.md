@@ -146,6 +146,34 @@ series, minor releases may contain breaking API changes.
   Rust reads it as not reported. This is a known gap, tracked in #82. The
   1.15 default-on-null hints on v1 request fields are unaffected: `null`
   already decodes as empty.
+- **Breaking:** JSON-RPC batches are rejected on both v1 and v2, matching the
+  ACP v2 transports "No batches" rule and the reference Rust SDK 5.0 (#68). A
+  JSON array, including `[]`, now gets exactly one error,
+  `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"JSON-RPC batches are not supported; send each message individually"}}`,
+  and none of its entries runs: no request or notification handler is called,
+  `$/cancel_request` entries cancel nothing, and response entries complete no
+  pending call. The connection keeps serving later single messages.
+- **Breaking:** `agentrouter` and `proxyrouter` answer a batched first frame,
+  including one that holds `initialize` or `_proxy/initialize`, with that same
+  error and keep reading, so a following single initialize is routed
+  normally. Previously they validated and dispatched the batch.
+- **Breaking:** the draft HTTP transport answers a JSON array `POST` body with
+  `400`, `Content-Type: application/json`, and the JSON-RPC error above
+  instead of a plain-text `400`, before checking connection headers and
+  without creating a connection. Its client treats an array from the server as
+  malformed: on the event stream the connection answers it with the same
+  error, and as an `initialize` response body it fails the initialize.
+- Input that starts with `[` but is not valid JSON is no longer treated as a
+  batch. It is malformed JSON and is handled like any other malformed frame,
+  which today closes the connection; answering malformed frames in place is
+  tracked separately (#73).
+
+### Removed
+
+- **Breaking:** `Connection.CallBatch` and `BatchCall`, and all inbound batch
+  processing (grouped response arrays, response-batch routing, and the agent
+  router's batched-initialize validation). Send each message individually
+  (#68).
 
 ### Fixed
 

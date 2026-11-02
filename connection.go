@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/BrokkAi/acp-go/internal/nobatch"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -160,8 +161,8 @@ func (c *Connection) Notify(ctx context.Context, method string, params any) erro
 //
 // requestID identifies the request exactly as the peer saw it on the wire: a
 // JSON string or number, supplied as a Go string, an integer, or a
-// json.RawMessage for exact bytes. Call and CallBatch number their own outbound
-// requests from 1, so those IDs are integers. Null, empty, and non-scalar IDs
+// json.RawMessage for exact bytes. Call numbers its own outbound requests
+// from 1, so those IDs are integers. Null, empty, and non-scalar IDs
 // are rejected.
 func (c *Connection) CancelRequest(ctx context.Context, requestID any) error {
 	id, err := encodeRequestID(requestID)
@@ -256,8 +257,11 @@ func (c *Connection) readLoop() {
 	s.Buffer(make([]byte, 4096), 8<<20)
 	for s.Scan() {
 		trimmed := bytes.TrimSpace(s.Bytes())
-		if len(trimmed) > 0 && trimmed[0] == '[' {
-			c.startBatch(append([]byte(nil), trimmed...))
+		if nobatch.IsArray(trimmed) {
+			// JSON-RPC batches are not supported on any protocol version. The
+			// array is one invalid request: answer it once with id null, run
+			// none of its entries, and keep reading.
+			c.rejectBatch()
 			continue
 		}
 		var p packet
@@ -311,6 +315,17 @@ func (c *Connection) readLoop() {
 		err = io.EOF
 	}
 	c.stop(err)
+}
+
+// rejectBatch answers a JSON-RPC batch array with the reference SDK's single
+// Invalid Request error. The write runs as a task so a peer that keeps writing
+// without reading cannot stall the read loop, and EOF still flushes it.
+func (c *Connection) rejectBatch() {
+	c.tasks.Add(1)
+	go func() {
+		defer c.tasks.Done()
+		_ = c.sendJSON(c.ctx, json.RawMessage(nobatch.Rejection()))
+	}()
 }
 
 func (c *Connection) startRequest(p packet) {

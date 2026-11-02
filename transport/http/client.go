@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/nobatch"
 )
 
 // Client connects one ACP connection to a draft Streamable HTTP endpoint. The
@@ -141,6 +142,10 @@ func (t *httpTransport) initialize(payload []byte) error {
 	}
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("ACP HTTP initialize returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	if nobatch.IsArray(body) {
+		// A batch array is malformed, never an initialize response.
+		return fmt.Errorf("invalid ACP HTTP initialize response: %w", errBatch)
 	}
 	connectionID := strings.TrimSpace(response.Header.Get(HeaderConnectionID))
 	if connectionID == "" {

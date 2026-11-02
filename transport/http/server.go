@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BrokkAi/acp-go/internal/nobatch"
 )
 
 // initializeTimeout bounds how long one initialize POST waits for the agent's
@@ -94,6 +96,15 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	payload := bytes.TrimSpace(body)
+	if nobatch.IsArray(payload) {
+		// JSON-RPC batches are not supported. Answer the array with one
+		// Invalid Request error, forward none of its entries, and create no
+		// connection, whatever the headers say.
+		w.Header().Set("Content-Type", jsonMIME)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(nobatch.Rejection())
+		return
+	}
 	parsed, err := parseFrame(payload)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)

@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -432,5 +433,112 @@ func TestIncomingRequestConcurrencyLimit(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("concurrency limit was not enforced")
+	}
+}
+
+// batchRejection is the exact line the reference SDK sends for any JSON-RPC
+// batch array.
+const batchRejection = `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"JSON-RPC batches are not supported; send each message individually"}}`
+
+func TestBatchArraysGetOneInvalidRequestAndRunNothing(t *testing.T) {
+	batches := map[string]string{
+		"empty":             `[]`,
+		"padded empty":      " [ ] ",
+		"request only":      `[{"jsonrpc":"2.0","id":1,"method":"test/echo","params":{}},{"jsonrpc":"2.0","id":2,"method":"test/echo","params":{}}]`,
+		"notification only": `[{"jsonrpc":"2.0","method":"test/notify","params":{}}]`,
+		"mixed":             `[{"jsonrpc":"2.0","id":1,"method":"test/echo","params":{}},{"jsonrpc":"2.0","method":"test/notify","params":{}},17,{"jsonrpc":"2.0","id":99,"result":{}}]`,
+		"cancel request":    `[{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":7}}]`,
+		"initialize":        `[{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}]`,
+		"scalars":           `[1,2,3]`,
+	}
+	for name, batch := range batches {
+		t.Run(name, func(t *testing.T) {
+			var mu sync.Mutex
+			var ran []string
+			record := func(method string) {
+				mu.Lock()
+				ran = append(ran, method)
+				mu.Unlock()
+			}
+			_, peer := pipeClient(t, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+				record(method)
+				return map[string]bool{"ok": true}, nil
+			}, func(method string, _ json.RawMessage) error {
+				record(method)
+				return nil
+			})
+			reader := bufio.NewReader(peer)
+
+			if _, err := io.WriteString(peer, batch+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(line); got != batchRejection {
+				t.Fatalf("batch response = %s, want %s", got, batchRejection)
+			}
+
+			// The connection keeps serving single messages afterwards, and the
+			// only handlers that run are for the messages sent after the batch.
+			if _, err := io.WriteString(peer, `{"jsonrpc":"2.0","method":"after/notify","params":{}}`+"\n"+
+				`{"jsonrpc":"2.0","id":"after","method":"after/request","params":{}}`+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			line, err = reader.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(line); got != `{"jsonrpc":"2.0","id":"after","result":{"ok":true}}` {
+				t.Fatalf("response after batch = %s", got)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if strings.Join(ran, ",") != "after/notify,after/request" {
+				t.Fatalf("handlers ran %v; batch entries must not run", ran)
+			}
+		})
+	}
+}
+
+func TestResponseArrayDoesNotCompletePendingCall(t *testing.T) {
+	c, peer := pipeClient(t, nil, nil)
+	reader := bufio.NewReader(peer)
+	done := make(chan error, 1)
+	var result map[string]bool
+	go func() { done <- c.Call(context.Background(), "test/call", map[string]any{}, &result) }()
+
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(line), &request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintf(peer, `[{"jsonrpc":"2.0","id":%s,"result":{"batched":true}}]`+"\n", request.ID); err != nil {
+		t.Fatal(err)
+	}
+	if line, err = reader.ReadString('\n'); err != nil || strings.TrimSpace(line) != batchRejection {
+		t.Fatalf("response array answer = %q, %v", line, err)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("a batched response completed the call: %v", err)
+	default:
+	}
+	if _, err := fmt.Fprintf(peer, `{"jsonrpc":"2.0","id":%s,"result":{"single":true}}`+"\n", request.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil || !result["single"] || result["batched"] {
+			t.Fatalf("call = %v, %v", result, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("single response did not complete the call")
 	}
 }

@@ -25,7 +25,24 @@ draft today.
 | `POST` later frames | Also `application/json`, with `Acp-Connection-Id`; answered `202 Accepted` and the response arrives on the stream. |
 | `Acp-Session-Id` | Required for the session-scoped methods the Rust crate lists (`session/prompt`, `session/cancel`, `session/close`, `session/delete`, `session/fork`, `session/load`, `session/resume`, `session/set_config_option`, `session/set_mode`, `session/set_model`). |
 | `GET` stream | `Accept: text/event-stream` with `Acp-Connection-Id`; server-to-client frames arrive as `data:` events. |
-| Status codes | `415` for a missing JSON content type, `400` for a missing connection id or session header, `404` for an unknown connection, `406` for a stream without the event-stream `Accept`. |
+| Status codes | `415` for a missing JSON content type, `400` for a JSON-RPC batch, a missing connection id, or a missing session header, `404` for an unknown connection, `406` for a stream without the event-stream `Accept`. |
+
+## JSON-RPC batches
+
+JSON-RPC batches are not supported, matching the ACP v2 transports rule and the
+Rust crate's "JSON-RPC Batches" section. They are rejected on both protocol
+versions:
+
+- A `POST` body that is a JSON array, including `[]`, gets `400 Bad Request`
+  with `Content-Type: application/json` and a single JSON-RPC error body:
+  `-32600` (`Invalid request`) with `id: null` and the data
+  `"JSON-RPC batches are not supported; send each message individually"`.
+  None of its entries is forwarded, and no connection is created, whatever
+  `Acp-Connection-Id` says.
+- The client sends every message individually. A JSON array received from the
+  server is malformed: on the event stream the connection answers it with the
+  same error and runs none of its entries, and as an `initialize` response
+  body it fails the initialize.
 
 ## Usage
 
@@ -59,8 +76,6 @@ full parity with the Rust crate:
   stream per session and route session-scoped frames to it. This package keeps a
   single connection-level stream; the session header is validated but routing is
   connection-wide.
-- **No JSON-RPC batch bodies.** A `[`-prefixed body is rejected with `400`; the
-  draft crate accepts batches.
 - **Connections live until the agent exits.** There is no idle timeout, so a
   server must call `Server.Close` (or shut the process down) to release them.
 
@@ -70,4 +85,5 @@ full parity with the Rust crate:
 `httptest` server: initialize is answered inline, `session/new` and
 `session/prompt` are `POST`ed, the agent's `session/update` is delivered on the
 event stream, and the prompt completes with the agent's stop reason. Separate
-tests cover the status-code error paths and the stream `Accept` requirement.
+tests cover the status-code error paths, the stream `Accept` requirement, and
+batch rejection on both the server and the client.

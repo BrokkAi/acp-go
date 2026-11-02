@@ -49,12 +49,13 @@ transports and additional workspace roots against initialization capabilities.
 responses and must return promptly without calling back into the connection.
 Requests run concurrently and must honor cancellation. Frames are bounded at
 8 MiB and incoming requests at 32. `Close` cancels and joins handlers.
-Generic `Call`, `CallBatch`, and `Notify` permit extensions. `CancelRequest`
+Generic `Call` and `Notify` permit extensions. `CancelRequest`
 sends a typed `$/cancel_request` for a single outstanding request, preserving
-the peer's string or numeric ID. Inbound and outgoing JSON-RPC batches retain
-member order where Rust does; request-bearing
-inbound batches receive one grouped response array, response batches route by
-ID, and malformed response-shaped members are ignored. This root transport is
+the peer's string or numeric ID. JSON-RPC batches are not supported on either
+protocol version, matching the ACP v2 transports rule and the reference Rust
+SDK 5.0: a JSON array, including `[]`, gets one `-32600` (`Invalid request`)
+error with `id: null`, none of its entries run, and the connection keeps
+serving. Send each message individually. This root transport is
 also used by the draft-v2 package, while its typed v1 facade remains v1-only.
 
 `*acp.RPCError` is the JSON-RPC error object as it appears on the wire, kept
@@ -312,8 +313,8 @@ draft Streamable HTTP transport: `POST` with `application/json` for frames,
 callers drive it with the usual methods, and any `agent.Runtime` can be served
 with `acphttp.Server`. Stdio stays the default and the transport never falls
 back between bindings; see [docs/http-transport.md](docs/http-transport.md) for
-the binding and its draft limits (no WebSocket, CORS, per-session streams, or
-batch bodies yet).
+the binding and its draft limits (no WebSocket, CORS, or per-session streams
+yet). A JSON array `POST` body gets `400` with the JSON-RPC batch rejection.
 
 ## Contributing
 

@@ -3,6 +3,7 @@ package agentrouter
 import (
 	"bufio"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/BrokkAi/acp-go/acptest"
@@ -160,80 +161,70 @@ func TestRouterRejectsMalformedProtocolVersion(t *testing.T) {
 	}
 }
 
-func TestRouterValidatesInitializeBeforeBatchDispatch(t *testing.T) {
-	requests := make(chan schema2.InitializeRequest, 1)
-	rw := startRouter(t, New().WithV2(&acptest.V2Agent{Requests: requests}))
-	batch, err := json.Marshal([]map[string]any{
-		{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": 2}},
-		{"jsonrpc": "2.0", "id": 2, "method": "session/list", "params": map[string]any{}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rw.Write(append(batch, '\n')); err != nil {
-		t.Fatal(err)
-	}
-	if err := rw.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	var responses []struct {
-		ID    int `json:"id"`
-		Error *struct {
-			Code int `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(rw).Decode(&responses); err != nil {
-		t.Fatal(err)
-	}
-	if len(responses) != 2 || responses[0].ID != 1 || responses[1].ID != 2 ||
-		responses[0].Error == nil || responses[1].Error == nil ||
-		responses[0].Error.Code != -32602 || responses[1].Error.Code != -32602 {
-		t.Fatalf("responses = %+v", responses)
-	}
-	select {
-	case <-requests:
-		t.Fatal("invalid initialize handler ran")
-	default:
-	}
-}
+// batchRejection is the exact line the reference SDK sends for any JSON-RPC
+// batch array.
+const batchRejection = `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"JSON-RPC batches are not supported; send each message individually"}}`
 
-func TestRouterAcceptsInitialBatchAndPreservesFutureNotification(t *testing.T) {
-	requests := make(chan schema2.InitializeRequest, 1)
-	rw := startRouter(t, New().WithV2(&acptest.V2Agent{Requests: requests}))
-	batch, err := json.Marshal([]map[string]any{
-		{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
-			"protocolVersion": 2,
-			"info":            map[string]any{"name": "batch-client", "version": "1"},
-		}},
-		{"jsonrpc": "2.0", "method": "_future/notification", "params": map[string]any{"preserved": true}},
-	})
-	if err != nil {
-		t.Fatal(err)
+func TestRouterRejectsBatchedFirstFrameAndKeepsReading(t *testing.T) {
+	batches := []string{
+		`[]`,
+		`[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"batch","version":"1"}}}]`,
+		`[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}},{"jsonrpc":"2.0","method":"_future/notification","params":{}}]`,
+		`[{"jsonrpc":"2.0","method":"_future/notification","params":{}}]`,
+		`[{"jsonrpc":"2.0","id":1,"result":{}}]`,
 	}
-	if _, err := rw.Write(append(batch, '\n')); err != nil {
-		t.Fatal(err)
-	}
-	if err := rw.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	var responses []struct {
-		ID     int `json:"id"`
-		Result *struct {
-			ProtocolVersion uint16 `json:"protocolVersion"`
-		} `json:"result"`
-	}
-	if err := json.NewDecoder(rw).Decode(&responses); err != nil {
-		t.Fatal(err)
-	}
-	if len(responses) != 1 || responses[0].ID != 1 || responses[0].Result == nil || responses[0].Result.ProtocolVersion != 2 {
-		t.Fatalf("responses = %+v", responses)
-	}
-	select {
-	case request := <-requests:
-		if request.Info.Name != "batch-client" {
-			t.Fatalf("initialize request = %+v", request)
+	for _, version := range []uint16{1, 2} {
+		v1Requests := make(chan schema1.InitializeRequest, len(batches)+1)
+		v2Requests := make(chan schema2.InitializeRequest, len(batches)+1)
+		router := New()
+		if version == 1 {
+			router.WithV1(&acptest.V1Agent{Requests: v1Requests})
+		} else {
+			router.WithV2(&acptest.V2Agent{Requests: v2Requests})
 		}
-	default:
-		t.Fatal("initialize handler did not run")
+		rw := startRouter(t, router)
+		for _, batch := range batches {
+			if _, err := rw.WriteString(batch + "\n"); err != nil {
+				t.Fatal(err)
+			}
+			if err := rw.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			line, err := rw.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(line); got != batchRejection {
+				t.Fatalf("v%d batch %s response = %s, want %s", version, batch, got, batchRejection)
+			}
+		}
+		if len(v1Requests) != 0 || len(v2Requests) != 0 {
+			t.Fatalf("v%d initialize handler ran for a batch", version)
+		}
+
+		// A single initialize after the rejected batches is routed normally.
+		acptest.WriteInitialize(t, rw, map[string]any{
+			"protocolVersion": version,
+			"info":            map[string]any{"name": "client", "version": "1"},
+		})
+		line, err := rw.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response struct {
+			ID     int `json:"id"`
+			Result *struct {
+				ProtocolVersion uint16 `json:"protocolVersion"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(line), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.ID != 1 || response.Result == nil || response.Result.ProtocolVersion != version {
+			t.Fatalf("v%d initialize after batches = %s", version, line)
+		}
+		if len(v1Requests)+len(v2Requests) != 1 {
+			t.Fatalf("v%d initialize handler calls = %d", version, len(v1Requests)+len(v2Requests))
+		}
 	}
 }
