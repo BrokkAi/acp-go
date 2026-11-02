@@ -19,7 +19,7 @@ import (
 type messageFixture struct {
 	client       *mcp.MessageClient
 	router       *mcp.MessageRouter
-	clientConn   *acpv2.Connection
+	clientConn   *acp.Connection
 	providerConn *acpv2.Connection
 }
 
@@ -35,12 +35,12 @@ func newMessageFixture(t *testing.T) *messageFixture {
 	}
 
 	var client *mcp.MessageClient
-	clientConn := acpv2.Connect(p2cPeer, c2pLocal, nil, func(method string, raw json.RawMessage) error {
+	clientConn := acp.Connect(p2cPeer, c2pLocal, agentSide(nil), func(method string, raw json.RawMessage) error {
 		if client == nil {
 			return nil
 		}
 		return client.Notifications(nil)(method, raw)
-	})
+	}, acp.WithProtocolVersion(2))
 	client = mcp.NewMessageClient(clientConn)
 
 	var handler acp.Handler
@@ -61,6 +61,7 @@ func newMessageFixture(t *testing.T) *messageFixture {
 		_ = p2cLocal.Close()
 		_ = p2cPeer.Close()
 	})
+	initializeClient(t, providerConn)
 	return &messageFixture{client: client, router: router, clientConn: clientConn, providerConn: providerConn}
 }
 

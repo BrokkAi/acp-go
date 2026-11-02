@@ -58,6 +58,17 @@ func Classify(line []byte) Kind {
 
 // Valid reports whether data is one JSON value that serde_json accepts.
 func Valid(data []byte) bool {
+	return valid(data, maxDepth)
+}
+
+// ValidAnyDepth is Valid without serde_json's recursion limit, for a value
+// the reference SDK builds in memory rather than parses, such as one
+// serde_json::to_value produces.
+func ValidAnyDepth(data []byte) bool {
+	return valid(data, math.MaxInt)
+}
+
+func valid(data []byte, maxDepth int) bool {
 	if !utf8.Valid(data) || !json.Valid(data) {
 		return false
 	}
@@ -111,8 +122,26 @@ var pow10 = func() [309]float64 {
 // just below math.MaxFloat64, such as 1.7976931348623158e308, and so does
 // this.
 func numberInRange(token []byte) bool {
+	_, ok := ParseFloat(token)
+	return ok
+}
+
+// ParseFloat evaluates a JSON number token, already checked against the JSON
+// grammar, as serde_json built without float_roundtrip does when it reads the
+// number as an f64, and reports whether serde_json accepts it. The value is
+// not always the correctly rounded one, exactly as in serde_json. An integer
+// that fits u64 or i64 is returned as its float64 conversion; serde_json keeps
+// those as integers.
+func ParseFloat(token []byte) (float64, bool) {
+	negative := token[0] == '-'
+	signed := func(f float64) float64 {
+		if negative {
+			return -f
+		}
+		return f
+	}
 	i := 0
-	if token[i] == '-' {
+	if negative {
 		i++
 	}
 	isDigit := func() bool { return i < len(token) && token[i] >= '0' && token[i] <= '9' }
@@ -141,7 +170,7 @@ func numberInRange(token []byte) bool {
 	}
 	if i == len(token) && exponent == 0 {
 		// A u64 or i64 integer (or -0) is always in range.
-		return true
+		return signed(float64(significand)), true
 	}
 	if i < len(token) && token[i] == '.' {
 		i++
@@ -172,7 +201,7 @@ func numberInRange(token []byte) bool {
 			if exp >= math.MaxInt32/10 && (exp > math.MaxInt32/10 || digit > math.MaxInt32%10) {
 				// parse_exponent_overflow: an error instead of infinity,
 				// and zero for a tiny or zero value.
-				return significand == 0 || !positive
+				return signed(0), significand == 0 || !positive
 			}
 			exp = exp*10 + digit
 			i++
@@ -183,12 +212,13 @@ func numberInRange(token []byte) bool {
 			exponent = max(exponent-exp, math.MinInt32)
 		}
 	}
-	return fromParts(significand, exponent)
+	f, ok := fromParts(significand, exponent)
+	return signed(f), ok
 }
 
-// fromParts is serde_json's f64_from_parts without float_roundtrip, reporting
-// whether it returns a finite value.
-func fromParts(significand uint64, exponent int64) bool {
+// fromParts is serde_json's f64_from_parts without float_roundtrip: the value
+// and whether it is finite.
+func fromParts(significand uint64, exponent int64) (float64, bool) {
 	f := float64(significand)
 	for {
 		index := exponent
@@ -197,15 +227,16 @@ func fromParts(significand uint64, exponent int64) bool {
 		}
 		if index < int64(len(pow10)) {
 			if exponent >= 0 {
-				return !math.IsInf(f*pow10[index], 0)
+				f *= pow10[index]
+				return f, !math.IsInf(f, 0)
 			}
-			return true
+			return f / pow10[index], true
 		}
 		if f == 0 {
-			return true
+			return f, true
 		}
 		if exponent >= 0 {
-			return false
+			return f, false
 		}
 		f /= 1e308
 		exponent += 308

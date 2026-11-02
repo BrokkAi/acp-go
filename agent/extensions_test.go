@@ -95,12 +95,36 @@ func TestRuntimeSendsAndValidatesTheExtendedInitializeResult(t *testing.T) {
 		t.Fatalf("initialize result = %s", raw)
 	}
 
+	// As in the reference SDK, the runtime sets the negotiated version on the
+	// value sent, whatever the hook returned.
 	for name, hook := range map[string]func(schema.InitializeResponse) (any, error){
-		"hook error": func(schema.InitializeResponse) (any, error) { return nil, errors.New("cannot extend") },
-		"wrong version": func(response schema.InitializeResponse) (any, error) {
+		"typed": func(response schema.InitializeResponse) (any, error) {
 			response.ProtocolVersion = 2
 			return response, nil
 		},
+		"raw": func(schema.InitializeResponse) (any, error) {
+			return map[string]any{"protocolVersion": "two", "agentCapabilities": map[string]any{}}, nil
+		},
+		"missing": func(schema.InitializeResponse) (any, error) {
+			return map[string]any{"agentCapabilities": map[string]any{}}, nil
+		},
+	} {
+		runtime := New(testAgent{})
+		runtime.InitializeResult = hook
+		connection := startExtendedRuntime(t, runtime)
+		var result struct {
+			ProtocolVersion json.RawMessage `json:"protocolVersion"`
+		}
+		if err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: acp.Version}, &result); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if string(result.ProtocolVersion) != "1" {
+			t.Fatalf("%s: protocolVersion = %s, want 1", name, result.ProtocolVersion)
+		}
+	}
+
+	for name, hook := range map[string]func(schema.InitializeResponse) (any, error){
+		"hook error":                 func(schema.InitializeResponse) (any, error) { return nil, errors.New("cannot extend") },
 		"not an initialize response": func(schema.InitializeResponse) (any, error) { return "initialized", nil },
 	} {
 		runtime := New(testAgent{})

@@ -46,7 +46,7 @@ func start(t *testing.T, router *Router) *bufio.ReadWriter {
 	return acptest.Serve(t, router.Serve)
 }
 
-func TestProxyRouterRequiresExactVersion(t *testing.T) {
+func TestProxyRouterSelectsRequestedV2(t *testing.T) {
 	v1 := make(chan string, 1)
 	v2 := make(chan string, 1)
 	rw := start(t, New().
@@ -186,49 +186,137 @@ func TestProxyRouterAnswersUnreadableFirstFramesAndKeepsReading(t *testing.T) {
 	}
 }
 
-func TestProxyRouterRejectsFutureVersion(t *testing.T) {
-	rw := start(t, New().WithV2(recordingProxy{name: "v2", started: make(chan string, 1)}))
-	_ = json.NewEncoder(rw).Encode(map[string]any{
-		"jsonrpc": "2.0", "id": 1, "method": "_proxy/initialize",
-		"params": map[string]any{"protocolVersion": 3},
-	})
-	if err := rw.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	var response struct {
-		Error *struct {
-			Code int `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(rw).Decode(&response); err != nil {
-		t.Fatal(err)
-	}
-	if response.Error == nil || response.Error.Code != -32600 {
-		t.Fatalf("response = %+v", response)
+// replayingProxy reports the initial frame it is handed, then answers it
+// with the protocolVersion that frame carries.
+func replayingProxy(seen chan<- string) acptest.ProxyFunc {
+	return func(_ context.Context, in io.ReadCloser, out io.WriteCloser) error {
+		defer in.Close()
+		line, err := bufio.NewReader(in).ReadString('\n')
+		if err != nil {
+			return err
+		}
+		seen <- strings.TrimSpace(line)
+		var request struct {
+			ID     json.RawMessage `json:"id"`
+			Params struct {
+				ProtocolVersion uint16 `json:"protocolVersion"`
+			} `json:"params"`
+		}
+		if err := json.Unmarshal([]byte(line), &request); err != nil {
+			return err
+		}
+		return json.NewEncoder(out).Encode(map[string]any{
+			"jsonrpc": "2.0", "id": request.ID,
+			"result": map[string]any{"protocolVersion": request.Params.ProtocolVersion},
+		})
 	}
 }
 
-func TestProxyRouterValidatesExactV2Schema(t *testing.T) {
-	rw := start(t, New().WithV2(acptest.ProxyFunc(func(context.Context, io.ReadCloser, io.WriteCloser) error {
-		t.Error("invalid v2 proxy initialize must not reach implementation")
-		return nil
-	})))
-	_ = json.NewEncoder(rw).Encode(map[string]any{
-		"jsonrpc": "2.0", "id": 1, "method": "_proxy/initialize",
-		"params": map[string]any{"protocolVersion": 2},
-	})
+func exchange(t *testing.T, rw *bufio.ReadWriter, line string) string {
+	t.Helper()
+	if _, err := rw.WriteString(line + "\n"); err != nil {
+		t.Fatal(err)
+	}
 	if err := rw.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	var response struct {
-		Error *struct {
-			Code int `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(rw).Decode(&response); err != nil {
+	response, err := rw.ReadString('\n')
+	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Error == nil || response.Error.Code != -32600 {
-		t.Fatalf("response = %+v", response)
+	return strings.TrimSuffix(response, "\n")
+}
+
+// TestProxyRouterNegotiatesLikeAgentRouter checks that _proxy/initialize
+// selects the highest configured version at or below the requested one and
+// normalizes a request for another version for the selected implementation.
+func TestProxyRouterNegotiatesLikeAgentRouter(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		v1, v2    bool
+		params    string
+		selected  uint16
+		wantFrame string
+	}{
+		{
+			name: "newer version selects v2", v1: true, v2: true,
+			params:    `{"protocolVersion":3,"info":{"name":"conductor","version":"3"},"_future":true}`,
+			selected:  2,
+			wantFrame: `{"id":1,"jsonrpc":"2.0","method":"_proxy/initialize","params":{"info":{"name":"conductor","version":"3"},"protocolVersion":2}}`,
+		},
+		{
+			name: "newer version without info selects v2", v2: true,
+			params:    `{"protocolVersion":3}`,
+			selected:  2,
+			wantFrame: `{"id":1,"jsonrpc":"2.0","method":"_proxy/initialize","params":{"info":{"name":"unknown","version":"unknown"},"protocolVersion":2}}`,
+		},
+		{
+			name: "v2 request selects configured v1", v1: true,
+			params:    `{"protocolVersion":2,"info":{"name":"conductor","version":"2"}}`,
+			selected:  1,
+			wantFrame: `{"id":1,"jsonrpc":"2.0","method":"_proxy/initialize","params":{"clientCapabilities":{"session":{"configOptions":{"boolean":{}}}},"clientInfo":{"name":"conductor","version":"2"},"protocolVersion":1}}`,
+		},
+		{
+			name: "exact version is handed over unchanged", v1: true, v2: true,
+			params:    `{"protocolVersion":1,"future":true}`,
+			selected:  1,
+			wantFrame: `{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize","params":{"protocolVersion":1,"future":true}}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			seen := make(chan string, 1)
+			router := New()
+			if test.v1 {
+				router.WithV1(replayingProxy(seen))
+			}
+			if test.v2 {
+				router.WithV2(replayingProxy(seen))
+			}
+			rw := start(t, router)
+			answer := exchange(t, rw, `{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize","params":`+test.params+`}`)
+			if frame := <-seen; frame != test.wantFrame {
+				t.Fatalf("replayed frame = %s, want %s", frame, test.wantFrame)
+			}
+			want := `{"id":1,"jsonrpc":"2.0","result":{"protocolVersion":` + string(rune('0'+test.selected)) + `}}`
+			if answer != want {
+				t.Fatalf("answer = %s, want %s", answer, want)
+			}
+		})
+	}
+}
+
+// TestProxyRouterRejectionsKeepReading checks that a v2-only proxy router
+// answers a request below v2 with -32022 and an invalid exact v2 request with
+// -32602, without starting the proxy, and keeps reading.
+func TestProxyRouterRejectionsKeepReading(t *testing.T) {
+	seen := make(chan string, 1)
+	rw := start(t, New().WithV2(replayingProxy(seen)))
+	for _, frame := range []struct{ wire, answer string }{
+		{
+			`{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize","params":{"protocolVersion":1}}`,
+			`{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"requested":1,"supported":[2]}}}`,
+		},
+		{
+			`{"jsonrpc":"2.0","id":2,"method":"_proxy/initialize","params":{"protocolVersion":2}}`,
+			`{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Invalid params","data":"invalid initialize params: missing field ` + "`info`" + `"}}`,
+		},
+		{
+			`{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":2}}`,
+			`{"jsonrpc":"2.0","id":3,"error":{"code":-32600,"message":"Invalid request","data":"first ACP request must be ` + "`_proxy/initialize`" + `"}}`,
+		},
+	} {
+		if got := exchange(t, rw, frame.wire); got != frame.answer {
+			t.Fatalf("frame %s response = %s, want %s", frame.wire, got, frame.answer)
+		}
+	}
+	if _, err := rw.WriteString(`{"jsonrpc":"2.0","method":"_proxy/initialize","params":{"protocolVersion":2}}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	answer := exchange(t, rw, `{"jsonrpc":"2.0","id":4,"method":"_proxy/initialize","params":{"protocolVersion":2,"info":{"name":"c","version":"1"}}}`)
+	if answer != `{"id":4,"jsonrpc":"2.0","result":{"protocolVersion":2}}` {
+		t.Fatalf("answer = %s", answer)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("proxy started %d times, want 1", len(seen))
 	}
 }

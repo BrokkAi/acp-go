@@ -10,6 +10,8 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/initresult"
+	"github.com/BrokkAi/acp-go/internal/negotiate"
+	"github.com/BrokkAi/acp-go/internal/rpcctl"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -69,7 +71,12 @@ func (r *Runtime) Serve(ctx context.Context, in io.ReadCloser, out io.WriteClose
 	}
 	client := &clientConnection{connectionReady: make(chan struct{})}
 	state := &server{agent: r.Agent, client: client, extensions: r.Extensions, initializeResult: r.InitializeResult, overrides: overrides}
-	connection := acp.Connect(in, out, state.handle, state.notification, acp.WithProtocolVersion(uint16(version)))
+	connection := acp.Connect(in, out, state.handle, state.notification, acp.WithProtocolVersion(uint16(version)),
+		rpcctl.WithRequestGuard(state.guard).(acp.ConnectOption),
+		rpcctl.WithNotificationGuard(func(method string) error { return state.allowed(method, true) }).(acp.ConnectOption),
+		rpcctl.WithOutgoingGuard(state.outgoing).(acp.ConnectOption),
+		rpcctl.WithOutgoingResponseGuard(state.outgoingResponse).(acp.ConnectOption),
+		rpcctl.WithIncomingResponseGuard(state.incomingResponse).(acp.ConnectOption))
 	client.attach(connection)
 	defer connection.Close()
 
@@ -84,6 +91,15 @@ func (r *Runtime) Serve(ctx context.Context, in io.ReadCloser, out io.WriteClose
 	}
 }
 
+// initState is the reference SDK's v2 responder lifecycle.
+type initState int
+
+const (
+	uninitialized initState = iota
+	initializing
+	ready
+)
+
 type server struct {
 	agent            Agent
 	client           *clientConnection
@@ -91,23 +107,30 @@ type server struct {
 	initializeResult func(schema.InitializeResponse) (any, error)
 	overrides        map[string]acp.Handler
 
-	mu           sync.Mutex
-	initialized  bool
-	initializing bool
-	caps         *schema.AgentCapabilities
-	auth         bool
+	mu    sync.Mutex
+	state initState
+	// initialized records whether any initialize has completed, so a failed
+	// repeat restores the previous initialization.
+	initialized bool
+	// repeatable records whether a completed initialize may still be
+	// repeated. The client may repeat initialize after the previous one
+	// completed and before it sends any other request; the first other
+	// request closes this window for the rest of the connection.
+	repeatable bool
+	caps       *schema.AgentCapabilities
+	auth       bool
 	// sent is the encoded initialize response, which handlers read through
 	// initresult.From.
 	sent json.RawMessage
+	// pending is the initialize whose response is about to be queued.
+	pending *initializeCommit
 }
 
 func (s *server) handle(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 	if method == schema.InitializeMethodName {
 		return s.initialize(ctx, raw)
 	}
-	if !s.isInitialized() {
-		return nil, initializationRequired(method)
-	}
+	// The request guard has already refused requests before initialization.
 	if err := s.gate(method); err != nil {
 		return nil, err
 	}
@@ -200,49 +223,150 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 	}
 }
 
-func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, error) {
-	request, err := decodeRequest[schema.InitializeRequest](raw)
+// guard applies the reference SDK's v2 responder lifecycle to each request in
+// wire order, on the connection's read loop, as the reference incoming actor
+// does. An initialize request is negotiated: a request below v2 gets -32022
+// listing v2, a request for a newer version keeps what parses under v2, and a
+// request for exactly v2 must carry a valid info. A negotiated initialize then
+// begins, which is refused while another is in progress or after another
+// request was admitted. Any other request is refused until an initialize has
+// completed, including while a repeat is in progress; an admitted one closes
+// the repeat window. A refusal leaves the previous initialization in place.
+func (s *server) guard(method string, raw json.RawMessage) error {
+	if method == schema.InitializeMethodName {
+		if _, err := negotiate.V2Params(raw); err != nil {
+			return err
+		}
+		return s.beginInitialize()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != ready {
+		return negotiate.InitializationRequired(method)
+	}
+	s.repeatable = false
+	return nil
+}
+
+// allowed applies the reference SDK's ensure_initialized and, for a
+// notification, ensure_notification_allowed: traffic other than the
+// handshake flows only once an initialization has completed, except that
+// $/cancel_request may cancel an initialize in progress. It vets incoming
+// notifications, which are dropped when refused, and the agent's outgoing
+// requests and notifications, which fail without being written.
+func (s *server) allowed(method string, notification bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case s.state == ready:
+		return nil
+	case notification && s.state == initializing && method == schema.CancelRequestMethodName:
+		return nil
+	}
+	return negotiate.InitializationRequired(method)
+}
+
+// outgoing vets a request or notification the agent sends. As in the
+// reference SDK's responder, an initialize the agent sends is set to v2 and
+// validated like any outgoing initialize, then refused: agents never send it.
+func (s *server) outgoing(method string, params json.RawMessage, notification bool) (json.RawMessage, error) {
+	if !notification && negotiate.SuccessorEnclosesInitialize(method, params) {
+		return nil, negotiate.InvalidPrewrappedInitialize()
+	}
+	if !notification && method == schema.InitializeMethodName {
+		if _, err := negotiate.OutgoingV2Params(params); err != nil {
+			return nil, err
+		}
+		return nil, negotiate.InvalidInitializeDirection()
+	}
+	return nil, s.allowed(method, notification)
+}
+
+// outgoingResponse completes or fails an initialize when its response is
+// queued, as the reference SDK's outgoing_response_to does, so nothing the
+// agent sends afterwards can precede it on the wire. Any other successful
+// response is refused while no initialization is complete, including during
+// a repeat (ensure_initialized).
+func (s *server) outgoingResponse(_ json.RawMessage, method string, result json.RawMessage, err error) (json.RawMessage, error) {
+	if method == schema.InitializeMethodName {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		commit := s.pending
+		s.pending = nil
+		if err != nil || commit == nil {
+			if s.initialized {
+				s.state = ready
+				s.repeatable = true
+			} else {
+				s.state = uninitialized
+			}
+			if err == nil {
+				err = negotiate.InvalidRequest("received an initialize response before an initialize request was received")
+			}
+			return nil, err
+		}
+		s.client.initialize(commit.clientCapabilities)
+		s.state = ready
+		s.initialized = true
+		s.repeatable = true
+		s.caps = commit.caps
+		s.auth = commit.auth
+		s.sent = commit.sent
+		return result, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	if request.ProtocolVersion != version {
-		return nil, &acp.RPCError{Code: -32600, Message: fmt.Sprintf(
-			"unsupported ACP protocol version %d; this endpoint only supports ACP protocol version 2",
-			request.ProtocolVersion,
-		)}
+	if err := s.allowed(method, false); err != nil {
+		return nil, err
 	}
-	s.mu.Lock()
-	if s.initialized {
-		s.mu.Unlock()
-		// The reference SDK's refusal for a repeat it does not accept. It
-		// also accepts a repeat sent before any other request; until #62
-		// implements that, every repeat is refused here.
-		return nil, invalidRequest("ACP initialization cannot be repeated after any other request; reconnect to initialize again")
-	}
-	if s.initializing {
-		s.mu.Unlock()
-		return nil, invalidRequest("ACP initialization is already in progress on this connection")
-	}
-	s.initializing = true
-	s.mu.Unlock()
-	// Clear the in-progress state on every exit so that a failed attempt
-	// leaves the connection uninitialized and a later initialize can retry.
-	defer func() {
-		s.mu.Lock()
-		s.initializing = false
-		s.mu.Unlock()
-	}()
+	return result, nil
+}
 
+// incomingResponse refuses a successful response to the agent's own request
+// that arrives while no initialization is complete, as the reference SDK's
+// incoming_response does.
+func (s *server) incomingResponse(method string, _ bool, result json.RawMessage, err error) (json.RawMessage, error) {
+	if err != nil {
+		return nil, err
+	}
+	if err := s.allowed(method, false); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// initializeCommit is a validated initialize waiting for its response to be
+// queued.
+type initializeCommit struct {
+	clientCapabilities *schema.ClientCapabilities
+	caps               *schema.AgentCapabilities
+	auth               bool
+	sent               json.RawMessage
+}
+
+// initialize runs an initialize request the guard has begun and validates the
+// agent's response. The initialization completes, or fails and restores the
+// previous state, when the response is queued (outgoingResponse). As in the
+// reference SDK, the response always carries protocolVersion 2, whatever the
+// agent or the InitializeResult hook set.
+func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, error) {
+	params, err := negotiate.V2Params(raw)
+	if err != nil {
+		return nil, err
+	}
+	request, err := decodeRequest[schema.InitializeRequest](params)
+	if err != nil {
+		return nil, err
+	}
 	response, err := s.agent.Initialize(ctx, s.client, request)
 	if err != nil {
 		return nil, err
 	}
+	response.ProtocolVersion = version
 	result, response, err := s.extendInitialize(response)
 	if err != nil {
 		return nil, err
-	}
-	if response.ProtocolVersion != version {
-		return nil, fmt.Errorf("agent selected unsupported ACP version %d", response.ProtocolVersion)
 	}
 	if response.Capabilities == nil || response.Capabilities.Session == nil {
 		return nil, errors.New("v2 agent must advertise baseline session capabilities")
@@ -265,14 +389,31 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 	if err != nil {
 		return nil, fmt.Errorf("encode initialize response: %w", err)
 	}
-	s.client.initialize(request.Capabilities)
 	s.mu.Lock()
-	s.initialized = true
-	s.caps = response.Capabilities
-	s.auth = len(response.AuthMethods) > 0
-	s.sent = sent
+	s.pending = &initializeCommit{
+		clientCapabilities: request.Capabilities,
+		caps:               response.Capabilities,
+		auth:               len(response.AuthMethods) > 0,
+		sent:               sent,
+	}
 	s.mu.Unlock()
-	return result, nil
+	return json.RawMessage(sent), nil
+}
+
+// beginInitialize starts a first or repeated initialization, refusing one
+// while another is in progress or after another request has been admitted.
+func (s *server) beginInitialize() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case s.state == initializing:
+		return negotiate.InvalidRequest("ACP initialization is already in progress on this connection")
+	case s.state == ready && !s.repeatable:
+		return negotiate.InvalidRequest("ACP initialization cannot be repeated after any other request; reconnect to initialize again")
+	}
+	s.state = initializing
+	s.repeatable = false
+	return nil
 }
 
 func (s *server) notification(method string, raw json.RawMessage) error {
@@ -291,12 +432,6 @@ func (s *server) sentInitialize() json.RawMessage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sent
-}
-
-func (s *server) isInitialized() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.initialized
 }
 
 // gate applies the capability check of a method the runtime owns, before
@@ -363,19 +498,6 @@ func decodeRequest[T any](raw json.RawMessage) (T, error) {
 		return request, &acp.RPCError{Code: -32602, Message: err.Error()}
 	}
 	return request, nil
-}
-
-// invalidRequest builds a -32600 error in the reference SDK's shape: the
-// generic JSON-RPC message, with the explanation as a JSON string in data.
-func invalidRequest(detail string) error {
-	data, _ := json.Marshal(detail)
-	return &acp.RPCError{Code: -32600, Message: "Invalid request", Data: data}
-}
-
-// initializationRequired refuses a request that arrives before initialize
-// has completed, matching the reference SDK.
-func initializationRequired(method string) error {
-	return invalidRequest(fmt.Sprintf("ACP initialization must complete before `%s` can be used", method))
 }
 
 func methodNotFound(method string) error {

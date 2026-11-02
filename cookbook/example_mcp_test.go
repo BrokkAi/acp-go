@@ -18,7 +18,7 @@ import (
 // stable facade decodes only stable fields, and the unstable MCP capability
 // flags that the mcp package checks (acp, http, sse) are not all among them,
 // so the raw result is captured once and decoded into both shapes. It replaces
-// InitializeWithInfo for this connection: never call both on one connection.
+// InitializeWithInfo for this connection.
 func initializeForMCP(ctx context.Context, connection *acp.Connection, info acp.ClientInfo) (acp.Initialization, unstable.InitializeResponse, error) {
 	var stable acp.Initialization
 	var optional unstable.InitializeResponse
@@ -37,9 +37,9 @@ func initializeForMCP(ctx context.Context, connection *acp.Connection, info acp.
 		return stable, optional, err
 	}
 	if stable.ProtocolVersion != acp.Version {
-		// Like InitializeWithInfo, refuse to keep a connection whose version
-		// this client does not speak.
-		_ = connection.Close()
+		// Like InitializeWithInfo, report a version this client does not
+		// speak; the connection stays open, so the caller decides whether to
+		// close it.
 		return stable, optional, fmt.Errorf("agent selected unsupported ACP version %d", stable.ProtocolVersion)
 	}
 	return stable, optional, nil

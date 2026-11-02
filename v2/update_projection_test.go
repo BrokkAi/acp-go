@@ -182,6 +182,7 @@ func TestTrackerRequestsApplyPermissionSubjectInReceiveOrder(t *testing.T) {
 		acp.WithRequestObserver(tracker.TrackerRequests(nil)),
 	)
 	t.Cleanup(func() { _ = client.Close(); _ = peer.Close() })
+	initializeRaw(t, client, peer, bufio.NewReader(peer))
 
 	frames := `{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"sessionId":"s","title":"Allow?","options":[],` +
 		`"subject":{"type":"tool_call","toolCall":{"toolCallId":"call","status":"pending","_meta":{"stale":1,"keep":1}}}}}` + "\n" +

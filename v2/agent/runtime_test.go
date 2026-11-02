@@ -167,15 +167,154 @@ func TestRuntimeRejectsInvalidAdvertisements(t *testing.T) {
 	})
 }
 
+// recordingAgent records each initialize request it receives.
+type recordingAgent struct {
+	*echoAgent
+	calls    atomic.Int32
+	requests chan schema.InitializeRequest
+}
+
+func newRecordingAgent() *recordingAgent {
+	return &recordingAgent{echoAgent: &echoAgent{cancelled: make(chan schema.CancelSessionNotification, 1)}, requests: make(chan schema.InitializeRequest, 4)}
+}
+
+func (a *recordingAgent) Initialize(ctx context.Context, client Client, request schema.InitializeRequest) (schema.InitializeResponse, error) {
+	a.calls.Add(1)
+	a.requests <- request
+	return a.echoAgent.Initialize(ctx, client, request)
+}
+
 func TestRuntimeRejectsV1InitializeOnV2Endpoint(t *testing.T) {
-	client := startRuntime(t, &echoAgent{cancelled: make(chan schema.CancelSessionNotification, 1)}, nil)
-	err := client.Call(context.Background(), schema.InitializeMethodName, schema.InitializeRequest{
-		ProtocolVersion: 1,
-		Info:            schema.Implementation{Name: "client", Version: "1"},
-	}, nil)
+	implementation := newRecordingAgent()
+	client := startRawClient(t, implementation)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for _, params := range []string{
+		`{"protocolVersion":1,"clientCapabilities":{}}`,
+		`{"protocolVersion":0}`,
+	} {
+		err := client.Connection.Call(ctx, schema.InitializeMethodName, json.RawMessage(params), nil)
+		var rpcErr *acp.RPCError
+		if !errors.As(err, &rpcErr) || rpcErr.Code != -32022 || rpcErr.Message != "Unsupported protocol version" {
+			t.Fatalf("%s: error = %v, want -32022", params, err)
+		}
+		data, ok := acpv2.UnsupportedProtocolVersionData(err)
+		if !ok || len(data.Supported) != 1 || data.Supported[0] != 2 {
+			t.Fatalf("%s: error data = %s", params, rpcErr.Data)
+		}
+	}
+	err := client.Connection.Call(ctx, schema.InitializeMethodName, json.RawMessage(`{"protocolVersion":1}`), nil)
 	var rpcErr *acp.RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || !strings.Contains(rpcErr.Message, "only supports ACP protocol version 2") {
-		t.Fatalf("mismatched initialize error = %v", err)
+	if !errors.As(err, &rpcErr) || string(rpcErr.Data) != `{"requested":1,"supported":[2]}` {
+		t.Fatalf("error = %v, data %s", err, rpcErr.Data)
+	}
+	if calls := implementation.calls.Load(); calls != 0 {
+		t.Fatalf("Initialize calls = %d, want 0", calls)
+	}
+	// The rejection leaves the connection uninitialized: v2 still works.
+	if _, err := client.Initialize(ctx, acpv2.Capabilities{}); err != nil {
+		t.Fatalf("initialize after rejection: %v", err)
+	}
+}
+
+func TestRuntimeAcceptsNewerVersionAsV2(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		params string
+		check  func(*testing.T, schema.InitializeRequest)
+	}{
+		{
+			name:   "with info",
+			params: `{"protocolVersion":3,"info":{"name":"future-client","version":"3.0.0"},"_meta":{"kept":true},"_futureField":true}`,
+			check: func(t *testing.T, request schema.InitializeRequest) {
+				if request.Info.Name != "future-client" || request.Info.Version != "3.0.0" {
+					t.Fatalf("info = %+v", request.Info)
+				}
+				if !request.Meta.Set || request.Meta.Value["kept"] != true {
+					t.Fatalf("_meta = %+v", request.Meta)
+				}
+			},
+		},
+		{
+			name: "without info",
+			params: `{"protocolVersion":65535,"info":{"name":"future-client"},` +
+				`"capabilities":{"auth":"malformed","elicitation":{},"_futureCapability":{"dropped":true}},"_meta":"malformed"}`,
+			check: func(t *testing.T, request schema.InitializeRequest) {
+				if request.Info.Name != "unknown" || request.Info.Version != "unknown" {
+					t.Fatalf("info = %+v", request.Info)
+				}
+				if request.Capabilities == nil || request.Capabilities.Auth != nil || request.Capabilities.Elicitation == nil {
+					t.Fatalf("capabilities = %+v", request.Capabilities)
+				}
+				if request.Meta.Set {
+					t.Fatalf("_meta = %+v", request.Meta)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			implementation := newRecordingAgent()
+			client := startRawClient(t, implementation)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			var response schema.InitializeResponse
+			if err := client.Connection.Call(ctx, schema.InitializeMethodName, json.RawMessage(test.params), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.ProtocolVersion != version {
+				t.Fatalf("selected protocol = %d", response.ProtocolVersion)
+			}
+			request := <-implementation.requests
+			if request.ProtocolVersion != version {
+				t.Fatalf("agent saw protocol %d", request.ProtocolVersion)
+			}
+			test.check(t, request)
+		})
+	}
+}
+
+func TestRuntimeRejectsMalformedInitialize(t *testing.T) {
+	for _, test := range []struct {
+		params string
+		detail string
+	}{
+		{`{"info":{"name":"c","version":"1"}}`, "initialize.protocolVersion must be a valid ACP protocol version"},
+		{`{"protocolVersion":null}`, "initialize.protocolVersion must be a valid ACP protocol version"},
+		{`{"protocolVersion":"2"}`, "initialize.protocolVersion must be a valid ACP protocol version"},
+		{`{"protocolVersion":2.5}`, "initialize.protocolVersion must be a valid ACP protocol version"},
+		{`{"protocolVersion":100000}`, "initialize.protocolVersion must be a valid ACP protocol version"},
+		// An exact v2 request must carry an info that parses. Like the
+		// reference responder, the data is the deserialization failure.
+		{`{"protocolVersion":2,"info":{"name":"client"}}`, `{"error":"missing field ` + "`version`" + `","json":{"protocolVersion":2,"info":{"name":"client"}},"phase":"deserialization"}`},
+		{`{"protocolVersion":2}`, `{"error":"missing field ` + "`info`" + `","json":{"protocolVersion":2},"phase":"deserialization"}`},
+		{`{"protocolVersion":2,"info":"bad"}`, `{"error":"invalid type: string \"bad\", expected struct Implementation","json":{"protocolVersion":2,"info":"bad"},"phase":"deserialization"}`},
+		{`{"protocolVersion":2,"info":{"name":5,"version":"1"}}`, `{"error":"invalid type: integer ` + "`5`" + `, expected a string","json":{"protocolVersion":2,"info":{"name":5,"version":"1"}},"phase":"deserialization"}`},
+	} {
+		t.Run(test.params, func(t *testing.T) {
+			implementation := newRecordingAgent()
+			client := startRawClient(t, implementation)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := client.Connection.Call(ctx, schema.InitializeMethodName, json.RawMessage(test.params), nil)
+			var rpcErr *acp.RPCError
+			if !errors.As(err, &rpcErr) || rpcErr.Code != -32602 || rpcErr.Message != "Invalid params" {
+				t.Fatalf("error = %v, want -32602", err)
+			}
+			if strings.HasPrefix(test.detail, "{") {
+				if string(rpcErr.Data) != test.detail {
+					t.Fatalf("error data = %s, want %s", rpcErr.Data, test.detail)
+				}
+			} else {
+				var data string
+				if err := json.Unmarshal(rpcErr.Data, &data); err != nil || data != test.detail {
+					t.Fatalf("error data = %s, want %q", rpcErr.Data, test.detail)
+				}
+			}
+			if calls := implementation.calls.Load(); calls != 0 {
+				t.Fatalf("Initialize calls = %d, want 0", calls)
+			}
+			requireInvalidRequest(t, listSessionsCall(ctx, client), sessionListBeforeInit)
+		})
 	}
 }
 
@@ -199,7 +338,7 @@ const (
 	sessionListBeforeInit   = "ACP initialization must complete before `session/list` can be used"
 )
 
-func listSessionsCall(ctx context.Context, client *acpv2.Connection) error {
+func listSessionsCall(ctx context.Context, client caller) error {
 	return client.Call(ctx, schema.SessionListMethodName, schema.ListSessionsRequest{}, nil)
 }
 
@@ -252,7 +391,7 @@ var v2InitializeRequest = schema.InitializeRequest{
 // startBlockedInitialize sends an initialize request and returns once the
 // agent's Initialize handler is running and blocked. The returned channel
 // yields the request's outcome after the handler is released.
-func startBlockedInitialize(ctx context.Context, t *testing.T, client *acpv2.Connection, implementation *gatedInitializeAgent) <-chan error {
+func startBlockedInitialize(ctx context.Context, t *testing.T, client caller, implementation *gatedInitializeAgent) <-chan error {
 	t.Helper()
 	result := make(chan error, 1)
 	go func() {
@@ -268,21 +407,98 @@ func startBlockedInitialize(ctx context.Context, t *testing.T, client *acpv2.Con
 
 // requireInitializeInProgress checks the refusals a connection gives while an
 // initialize is still running: another initialize, and any other request.
-func requireInitializeInProgress(ctx context.Context, t *testing.T, client *acpv2.Connection) {
+func requireInitializeInProgress(ctx context.Context, t *testing.T, client caller) {
 	t.Helper()
 	requireInvalidRequest(t, client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil), initializeInProgress)
 	requireInvalidRequest(t, listSessionsCall(ctx, client), sessionListBeforeInit)
 }
 
 func TestRuntimeRefusesRequestsBeforeAndRepeatsAfterInitialize(t *testing.T) {
-	client := startRuntime(t, &echoAgent{cancelled: make(chan schema.CancelSessionNotification, 1)}, nil)
+	implementation := newRecordingAgent()
+	client := startRawClient(t, implementation)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	requireInvalidRequest(t, listSessionsCall(ctx, client), sessionListBeforeInit)
 	if _, err := client.Initialize(ctx, acpv2.Capabilities{}); err != nil {
 		t.Fatal(err)
 	}
+	// Notifications do not close the repeat window.
+	if err := client.Notify(ctx, schema.SessionCancelMethodName, schema.CancelSessionNotification{SessionID: "none"}); err != nil {
+		t.Fatal(err)
+	}
+	// A repeat before any other request is negotiated like the first one,
+	// including the newer-version leniency, and reaches the agent.
+	for _, params := range []string{
+		`{"protocolVersion":2,"info":{"name":"client","version":"2"}}`,
+		`{"protocolVersion":3}`,
+	} {
+		var response schema.InitializeResponse
+		if err := client.Connection.Call(ctx, schema.InitializeMethodName, json.RawMessage(params), &response); err != nil {
+			t.Fatalf("repeated initialize %s: %v", params, err)
+		}
+		if response.ProtocolVersion != version {
+			t.Fatalf("repeat selected %d", response.ProtocolVersion)
+		}
+	}
+	if calls := implementation.calls.Load(); calls != 3 {
+		t.Fatalf("Initialize calls = %d, want 3", calls)
+	}
+	// The first other request closes the window; the connection stays ready.
+	if err := listSessionsCall(ctx, client); err != nil {
+		t.Fatal(err)
+	}
 	requireInvalidRequest(t, client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil), initializeNotRepeatable)
+	if err := listSessionsCall(ctx, client); err != nil {
+		t.Fatalf("session/list after refused repeat: %v", err)
+	}
+	if calls := implementation.calls.Load(); calls != 3 {
+		t.Fatalf("Initialize calls = %d, want 3", calls)
+	}
+}
+
+func TestRuntimeFailedRepeatKeepsPreviousInitialization(t *testing.T) {
+	implementation := newGatedInitializeAgent()
+	client := startRawClient(t, implementation)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	first := startBlockedInitialize(ctx, t, client, implementation)
+	implementation.release <- initializeSucceeds()
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+
+	// A repeat in progress refuses other requests and a concurrent repeat.
+	repeat := startBlockedInitialize(ctx, t, client, implementation)
+	requireInitializeInProgress(ctx, t, client)
+	implementation.release <- initializeOutcome{err: errors.New("repeat failed")}
+	if err := <-repeat; err == nil {
+		t.Fatal("failed repeat returned no error")
+	}
+
+	// A repeat requesting v1 is answered like a first initialize, without
+	// reaching the agent, and a malformed repeat is refused before it begins.
+	err := client.Connection.Call(ctx, schema.InitializeMethodName, json.RawMessage(`{"protocolVersion":1,"clientCapabilities":{}}`), nil)
+	if data, ok := acpv2.UnsupportedProtocolVersionData(err); !ok || data.Requested != 1 || len(data.Supported) != 1 || data.Supported[0] != 2 {
+		t.Fatalf("v1 repeat error = %v", err)
+	}
+	err = client.Connection.Call(ctx, schema.InitializeMethodName, json.RawMessage(`{"protocolVersion":2}`), nil)
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32602 {
+		t.Fatalf("malformed repeat error = %v", err)
+	}
+	if calls := implementation.calls.Load(); calls != 2 {
+		t.Fatalf("Initialize calls = %d, want 2", calls)
+	}
+
+	// The window is still open after the failures.
+	again := startBlockedInitialize(ctx, t, client, implementation)
+	implementation.release <- initializeSucceeds()
+	if err := <-again; err != nil {
+		t.Fatalf("repeat after failures: %v", err)
+	}
+	if err := listSessionsCall(ctx, client); err != nil {
+		t.Fatalf("session/list after repeat: %v", err)
+	}
 }
 
 func TestRuntimeRejectsConcurrentInitialize(t *testing.T) {
@@ -300,12 +516,13 @@ func TestRuntimeRejectsConcurrentInitialize(t *testing.T) {
 	if calls := implementation.calls.Load(); calls != 1 {
 		t.Fatalf("Initialize calls = %d, want 1", calls)
 	}
+	if err := listSessionsCall(ctx, client); err != nil {
+		t.Fatal(err)
+	}
 	requireInvalidRequest(t, client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil), initializeNotRepeatable)
 }
 
 func TestRuntimeAllowsInitializeRetryAfterFailure(t *testing.T) {
-	unsupportedVersion := initializeSucceeds()
-	unsupportedVersion.response.ProtocolVersion = 1
 	missingCapabilities := initializeSucceeds()
 	missingCapabilities.response.Capabilities = nil
 	for _, test := range []struct {
@@ -313,7 +530,6 @@ func TestRuntimeAllowsInitializeRetryAfterFailure(t *testing.T) {
 		failure initializeOutcome
 	}{
 		{name: "handler error", failure: initializeOutcome{err: errors.New("initialize failed")}},
-		{name: "unsupported selected version", failure: unsupportedVersion},
 		{name: "missing capabilities", failure: missingCapabilities},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -192,9 +192,11 @@
 // tracked in #69. The conductor itself is recorded as won't port (#24). Run a Go proxy under the
 // reference agent-client-protocol-conductor.
 //
-// [github.com/BrokkAi/acp-go/proxyrouter.Router] hands each connection to the
-// implementation configured for the exact _proxy/initialize version, replays
-// that first frame unchanged, and rejects other versions without downgrading.
+// [github.com/BrokkAi/acp-go/proxyrouter.Router] negotiates _proxy/initialize
+// like the agent router negotiates initialize: it hands each connection to the
+// highest configured implementation at or below the requested version,
+// replays a request for exactly that version unchanged and normalizes any
+// other, and answers a request no configured version can serve with -32022.
 // The recipe's v1 proxy forwards everything and appends an MCP server
 // declaration to session/new and session/load, preserving fields it does not
 // model.

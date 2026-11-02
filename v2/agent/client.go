@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/negotiate"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -34,17 +35,20 @@ func (c *clientConnection) initialize(capabilities *schema.ClientCapabilities) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.initialized = true
+	// The latest initialization is authoritative, including a repeat that
+	// advertises no capabilities.
 	if capabilities != nil {
 		copied := *capabilities
-		c.capabilities = &copied
+		capabilities = &copied
 	}
+	c.capabilities = capabilities
 }
 
-func (c *clientConnection) ready() error {
+func (c *clientConnection) ready(method string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if !c.initialized {
-		return &acp.RPCError{Code: -32600, Message: "client has not initialized the agent"}
+		return negotiate.InitializationRequired(method)
 	}
 	return nil
 }
@@ -68,7 +72,7 @@ func (c *clientConnection) Notify(ctx context.Context, method string, params any
 
 func (c *clientConnection) RequestPermission(ctx context.Context, request schema.RequestPermissionRequest) (schema.RequestPermissionResponse, error) {
 	var result schema.RequestPermissionResponse
-	if err := c.ready(); err != nil {
+	if err := c.ready(schema.SessionRequestPermissionMethodName); err != nil {
 		return result, err
 	}
 	return result, c.connection().Call(ctx, schema.SessionRequestPermissionMethodName, request, &result)
@@ -104,7 +108,7 @@ func (c *clientConnection) CompleteElicitation(ctx context.Context, elicitationI
 }
 
 func (c *clientConnection) requireHostMethod(supported bool, method string) error {
-	if err := c.ready(); err != nil {
+	if err := c.ready(method); err != nil {
 		return err
 	}
 	if !supported {

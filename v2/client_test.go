@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -30,6 +31,127 @@ func pipeClient(t *testing.T, handler acp.Handler, notifications acp.Notificatio
 	return client, server
 }
 
+// readyClient is pipeClient with the connection initialized: the peer answers
+// initialize with sessionInitialization and passes every other request to
+// handler.
+func readyClient(t *testing.T, handler acp.Handler, notifications acp.Notifications) (*Connection, *acp.Connection) {
+	t.Helper()
+	client, server := pipeClient(t, func(ctx context.Context, method string, raw json.RawMessage) (any, error) {
+		if method == schema.InitializeMethodName {
+			return sessionInitialization(), nil
+		}
+		if handler == nil {
+			return nil, &acp.RPCError{Code: -32601}
+		}
+		return handler(ctx, method, raw)
+	}, notifications)
+	if _, err := client.Initialize(context.Background(), Capabilities{}); err != nil {
+		t.Fatal(err)
+	}
+	return client, server
+}
+
+// initializeRaw initializes a client whose peer is driven frame by frame:
+// it answers the client's initialize request read from peer.
+func initializeRaw(t *testing.T, client *Connection, peer io.ReadWriter, reader *bufio.Reader) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Initialize(context.Background(), Capabilities{})
+		done <- err
+	}()
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(line), &request); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := json.Marshal(sessionInitialization())
+	if _, err := io.WriteString(peer, `{"jsonrpc":"2.0","id":`+string(request.ID)+`,"result":`+string(result)+"}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func isInitializationRequired(err error, method string) bool {
+	var rpcErr *acp.RPCError
+	return errors.As(err, &rpcErr) && rpcErr.Code == -32600 && rpcErr.Message == "Invalid request" &&
+		string(rpcErr.Data) == "\"ACP initialization must complete before `"+method+"` can be used\""
+}
+
+// TestV2ClientFollowsTheInitiatorLifecycle matches the reference SDK's v2
+// initiator: before initialize completes the client refuses its own requests
+// and notifications without writing them, answers the agent's requests with
+// -32600 without running the handler, drops the agent's notifications, and
+// refuses an initialize from the agent.
+func TestV2ClientFollowsTheInitiatorLifecycle(t *testing.T) {
+	local, peer := net.Pipe()
+	_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
+	handled := make(chan string, 4)
+	notified := make(chan string, 4)
+	client := Connect(local, local, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+		handled <- method
+		return map[string]bool{"ok": true}, nil
+	}, func(method string, _ json.RawMessage) error {
+		notified <- method
+		return nil
+	})
+	t.Cleanup(func() { _ = client.Close(); _ = peer.Close() })
+	ctx := context.Background()
+	reader := bufio.NewReader(peer)
+
+	if err := client.Call(ctx, schema.SessionListMethodName, schema.ListSessionsRequest{}, nil); !isInitializationRequired(err, schema.SessionListMethodName) {
+		t.Fatalf("request before initialize: %v", err)
+	}
+	if err := client.Notify(ctx, "_custom/note", map[string]any{}); !isInitializationRequired(err, "_custom/note") {
+		t.Fatalf("notification before initialize: %v", err)
+	}
+	frames := `{"jsonrpc":"2.0","method":"session/update","params":{}}` + "\n" +
+		`{"jsonrpc":"2.0","id":1,"method":"fs/read_text_file","params":{}}` + "\n" +
+		`{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":1}}` + "\n" +
+		`{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":2}}` + "\n" +
+		`{"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"a","version":"1"}}}` + "\n"
+	go func() { _, _ = io.WriteString(peer, frames) }()
+	// An initialize from the agent is negotiated before it is refused, as in
+	// the reference SDK's incoming_initialize_request.
+	for _, want := range []string{
+		`{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request","data":"ACP initialization must complete before ` + "`fs/read_text_file`" + ` can be used"}}`,
+		`{"jsonrpc":"2.0","id":2,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"requested":1,"supported":[2]}}}`,
+		`{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Invalid params","data":{"error":"missing field ` + "`info`" + `","json":{"protocolVersion":2},"phase":"deserialization"}}}`,
+		`{"jsonrpc":"2.0","id":4,"error":{"code":-32600,"message":"Invalid request","data":"ACP clients send ` + "`initialize`" + ` requests and ACP agents respond to them"}}`,
+	} {
+		line, err := reader.ReadString('\n')
+		if err != nil || strings.TrimSpace(line) != want {
+			t.Fatalf("answer = %q, %v, want %s", line, err, want)
+		}
+	}
+
+	initializeRaw(t, client, peer, reader)
+	go func() {
+		_, _ = io.WriteString(peer, `{"jsonrpc":"2.0","method":"_custom/after","params":{}}`+"\n"+`{"jsonrpc":"2.0","id":3,"method":"fs/read_text_file","params":{}}`+"\n")
+	}()
+	if line, err := reader.ReadString('\n'); err != nil || strings.TrimSpace(line) != `{"jsonrpc":"2.0","id":3,"result":{"ok":true}}` {
+		t.Fatalf("request after initialize = %q, %v", line, err)
+	}
+	if method := <-notified; method != "_custom/after" {
+		t.Fatalf("notification before initialize reached the handler: %s", method)
+	}
+	if method := <-handled; method != "fs/read_text_file" {
+		t.Fatalf("handled %s", method)
+	}
+	select {
+	case method := <-handled:
+		t.Fatalf("handler also ran for %s", method)
+	default:
+	}
+}
+
 func TestV2ConnectRejectsNullRequestIDs(t *testing.T) {
 	local, peer := net.Pipe()
 	_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
@@ -40,6 +162,7 @@ func TestV2ConnectRejectsNullRequestIDs(t *testing.T) {
 	}, nil, acp.WithProtocolVersion(1))
 	t.Cleanup(func() { _ = client.Close(); _ = peer.Close() })
 	reader := bufio.NewReader(peer)
+	initializeRaw(t, client, peer, reader)
 	// The v2 rule applies even when an earlier option names another version.
 	if _, err := io.WriteString(peer, `{"jsonrpc":"2.0","id":null,"method":"fs/read_text_file","params":{}}`+"\n"); err != nil {
 		t.Fatal(err)
@@ -139,7 +262,7 @@ func TestV2LifecycleAndSessionUpdates(t *testing.T) {
 
 func TestV2SessionUpdateAdapter(t *testing.T) {
 	updates := make(chan Update, 1)
-	_, server := pipeClient(t, nil, SessionUpdates(func(value Update) error {
+	_, server := readyClient(t, nil, SessionUpdates(func(value Update) error {
 		updates <- value
 		return nil
 	}))
@@ -265,20 +388,63 @@ func TestV2PromptContentValidation(t *testing.T) {
 	}
 }
 
-func TestV2ClientAllowsOnlyOneSuccessfulInitialize(t *testing.T) {
-	client, server := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
-		if method != schema.InitializeMethodName {
-			return nil, &acp.RPCError{Code: -32601}
+// TestV2ClientRepeatsInitializeUntilAnotherRequest follows the reference
+// SDK's initiator: a completed initialization may be repeated until the
+// client sends another request, a failed repeat keeps the previous
+// initialization, and a repeat after another request fails locally.
+func TestV2ClientRepeatsInitializeUntilAnotherRequest(t *testing.T) {
+	calls := 0
+	client, _ := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
+		switch method {
+		case schema.InitializeMethodName:
+			calls++
+			if calls == 2 {
+				return nil, &acp.RPCError{Code: -32603, Message: "repeat failed"}
+			}
+			var request schema.InitializeRequest
+			_ = json.Unmarshal(raw, &request)
+			initialization := sessionInitialization()
+			initialization.Info.Name = request.Info.Name
+			return initialization, nil
+		case schema.SessionListMethodName:
+			return schema.ListSessionsResponse{}, nil
 		}
-		return sessionInitialization(), nil
+		return nil, &acp.RPCError{Code: -32601}
 	}, nil)
-	_ = server
-	if _, err := client.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "once", Version: "1"}); err != nil {
+	ctx := context.Background()
+	recorded := func() string {
+		initialization, ok := client.initializationSnapshot()
+		if !ok {
+			t.Fatal("connection lost its initialization")
+		}
+		return initialization.Info.Name
+	}
+	if _, err := client.InitializeWithInfo(ctx, Capabilities{}, ClientInfo{Name: "first", Version: "1"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "twice", Version: "1"}); err == nil ||
-		!strings.Contains(err.Error(), "may only be initialized once") {
-		t.Fatalf("duplicate initialize error = %v", err)
+	if _, err := client.InitializeWithInfo(ctx, Capabilities{}, ClientInfo{Name: "failed", Version: "1"}); err == nil {
+		t.Fatal("failed repeat succeeded")
+	}
+	if got := recorded(); got != "first" {
+		t.Fatalf("after a failed repeat the initialization is %q, want first", got)
+	}
+	if _, err := client.InitializeWithInfo(ctx, Capabilities{}, ClientInfo{Name: "second", Version: "1"}); err != nil {
+		t.Fatalf("repeat after a failed repeat: %v", err)
+	}
+	if got := recorded(); got != "second" {
+		t.Fatalf("initialization = %q, want second", got)
+	}
+	if err := client.Call(ctx, schema.SessionListMethodName, schema.ListSessionsRequest{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err := client.InitializeWithInfo(ctx, Capabilities{}, ClientInfo{Name: "third", Version: "1"})
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 ||
+		string(rpcErr.Data) != `"ACP initialization cannot be repeated after any other request; reconnect to initialize again"` {
+		t.Fatalf("repeat after another request: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("initialize reached the agent %d times, want 3", calls)
 	}
 }
 
@@ -290,12 +456,17 @@ func TestV2ClientCanRetryMalformedInitializeResponse(t *testing.T) {
 		}
 		calls++
 		if calls == 1 {
-			return schema.InitializeResponse{ProtocolVersion: Version}, nil
+			return json.RawMessage(`{"protocolVersion":2,"Info":{"name":"x","version":"1"}}`), nil
 		}
 		return sessionInitialization(), nil
 	}, nil)
-	if _, err := client.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "retry", Version: "1"}); err == nil {
-		t.Fatal("malformed initialize response accepted")
+	// As in the reference SDK's json_cast, a v2 response without info is a
+	// -32700 with the serde reason; "Info" is not "info".
+	_, err := client.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "retry", Version: "1"})
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32700 ||
+		string(rpcErr.Data) != `{"error":"missing field `+"`info`"+`","json":{"protocolVersion":2,"Info":{"name":"x","version":"1"}},"phase":"deserialization"}` {
+		t.Fatalf("malformed initialize response error = %v", err)
 	}
 	initialization, err := client.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "retry", Version: "1"})
 	if err != nil {
@@ -311,7 +482,7 @@ func TestV2ClientCanRetryMalformedInitializeResponse(t *testing.T) {
 
 func TestV2AuthLoginUsesAdvertisedAgentMethod(t *testing.T) {
 	seen := make(chan schema.LoginAuthRequest, 1)
-	client, _ := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
+	client, _ := readyClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
 		if method != schema.AuthLoginMethodName {
 			t.Errorf("method = %q", method)
 			return nil, &acp.RPCError{Code: -32601}
@@ -387,6 +558,11 @@ func TestV2CancelRequestReusesTransportHelper(t *testing.T) {
 	_ = peer.SetDeadline(deadline)
 	client := Connect(local, local, nil, nil)
 	t.Cleanup(func() { _ = client.Close(); _ = peer.Close() })
+	// Before initialization the reference initiator refuses even a cancel.
+	if err := client.CancelRequest(context.Background(), "early"); !isInitializationRequired(err, schema.CancelRequestMethodName) {
+		t.Fatalf("CancelRequest before initialize: %v", err)
+	}
+	initializeRaw(t, client, peer, bufio.NewReader(peer))
 
 	seen := make(chan struct {
 		method string
@@ -479,7 +655,7 @@ func TestV2SessionPathsAcceptEitherPlatformAbsolutePaths(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			client, _ := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
+			client, _ := readyClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
 				switch method {
 				case schema.SessionNewMethodName:
 					request := decode[schema.NewSessionRequest](t, raw)

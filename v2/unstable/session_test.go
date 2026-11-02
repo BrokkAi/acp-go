@@ -48,6 +48,10 @@ func rawPeer(t *testing.T, respond func(method string) string) (*acpv2.Connectio
 			if err := decoder.Decode(&request); err != nil {
 				return
 			}
+			if request.Method == "initialize" {
+				_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": json.RawMessage(`{"protocolVersion":2,"info":{"name":"agent","version":"1"},"capabilities":{"session":{}}}`)})
+				continue
+			}
 			requests <- rawRequest{method: request.Method, params: request.Params}
 			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": json.RawMessage(respond(request.Method))})
 		}
@@ -56,6 +60,9 @@ func rawPeer(t *testing.T, respond func(method string) string) (*acpv2.Connectio
 		_ = peer.Close()
 		_ = connection.Close()
 	})
+	if _, err := connection.Initialize(context.Background(), acpv2.Capabilities{}); err != nil {
+		t.Fatal(err)
+	}
 	return connection, requests
 }
 

@@ -19,16 +19,17 @@ func rawPeer(t *testing.T) (*acpv2.Connection, chan json.RawMessage) {
 	t.Helper()
 	pair := acptest.NewPairWithDeadline(time.Now().Add(5 * time.Second))
 	requests := make(chan json.RawMessage, 8)
-	server := acp.Connect(pair.B, pair.B, func(_ context.Context, _ string, raw json.RawMessage) (any, error) {
+	server := acp.Connect(pair.B, pair.B, agentSide(func(_ context.Context, _ string, raw json.RawMessage) (any, error) {
 		requests <- raw
 		return map[string]any{"sessionId": "s"}, nil
-	}, nil)
+	}), nil)
 	connection := acpv2.Connect(pair.A, pair.A, nil, nil)
 	t.Cleanup(func() {
 		_ = connection.Close()
 		_ = server.Close()
 		pair.Close()
 	})
+	initializeClient(t, connection)
 	return connection, requests
 }
 

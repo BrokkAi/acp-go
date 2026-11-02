@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/schema"
@@ -20,7 +21,9 @@ func (s *server) serveExtension(ctx context.Context, method string, raw json.Raw
 
 // extendInitialize applies Runtime.InitializeResult. It returns the value to
 // send and the stable view of that exact value, which the runtime validates
-// and records instead of the agent's original response.
+// and records instead of the agent's original response. As the reference SDK
+// sets the negotiated version on the serialized result, the protocolVersion
+// member of the value sent is always 1, whatever the hook returned.
 func (s *server) extendInitialize(response schema.InitializeResponse) (any, schema.InitializeResponse, error) {
 	if s.initializeResult == nil {
 		return response, response, nil
@@ -31,6 +34,14 @@ func (s *server) extendInitialize(response schema.InitializeResponse) (any, sche
 	}
 	encoded, err := json.Marshal(extended)
 	if err != nil {
+		return nil, response, fmt.Errorf("encode extended initialize response: %w", err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &object); err != nil || object == nil {
+		return nil, response, fmt.Errorf("extended initialize response is not an initialize response: %s", encoded)
+	}
+	object["protocolVersion"] = json.RawMessage(strconv.Itoa(int(acp.Version)))
+	if encoded, err = json.Marshal(object); err != nil {
 		return nil, response, fmt.Errorf("encode extended initialize response: %w", err)
 	}
 	var view schema.InitializeResponse

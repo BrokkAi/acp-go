@@ -248,7 +248,10 @@ func TestLifecycleFacadesRejectUnsupportedSystemPromptsBeforeWriting(t *testing.
 
 func TestNewSessionRequiresASessionIDInTheResponse(t *testing.T) {
 	pair := acptest.NewPairWithDeadline(time.Now().Add(5 * time.Second))
-	server := acp.Connect(pair.B, pair.B, func(context.Context, string, json.RawMessage) (any, error) {
+	server := acp.Connect(pair.B, pair.B, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+		if method == "initialize" {
+			return json.RawMessage(`{"protocolVersion":2,"info":{"name":"agent","version":"1"},"capabilities":{"session":{}}}`), nil
+		}
 		return schema.NewSessionResponse{SessionID: " "}, nil
 	}, nil)
 	connection := acpv2.Connect(pair.A, pair.A, nil, nil)
@@ -257,6 +260,9 @@ func TestNewSessionRequiresASessionIDInTheResponse(t *testing.T) {
 		_ = server.Close()
 		pair.Close()
 	})
+	if _, err := connection.Initialize(context.Background(), acpv2.Capabilities{}); err != nil {
+		t.Fatal(err)
+	}
 	_, err := acpunstable.NewSession(context.Background(), connection, forkInitialization(), schema.NewSessionRequest{Cwd: "/repo"})
 	if err == nil || !strings.Contains(err.Error(), "session ID is required") {
 		t.Fatalf("blank session ID error = %v", err)

@@ -155,15 +155,16 @@ func TestForkSessionCarriesServers(t *testing.T) {
 
 func TestForkSessionRejectsBlankForkedSessionID(t *testing.T) {
 	pair := acptest.NewPairWithDeadline(time.Now().Add(5 * time.Second))
-	server := acp.Connect(pair.B, pair.B, func(context.Context, string, json.RawMessage) (any, error) {
+	server := acp.Connect(pair.B, pair.B, agentSide(func(context.Context, string, json.RawMessage) (any, error) {
 		return schema.ForkSessionResponse{}, nil
-	}, nil)
+	}), nil)
 	connection := acpv2.Connect(pair.A, pair.A, nil, nil)
 	t.Cleanup(func() {
 		_ = connection.Close()
 		_ = server.Close()
 		pair.Close()
 	})
+	initializeClient(t, connection)
 	_, err := mcp.ForkSession(context.Background(), connection, forkInitialization(allTransports()), schema.ForkSessionRequest{SessionID: "source", Cwd: "/repo"})
 	if err == nil || !strings.Contains(err.Error(), "forked session ID is required") {
 		t.Fatalf("blank forked session ID error = %v", err)

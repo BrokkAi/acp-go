@@ -21,7 +21,7 @@ var _ *v1mcp.Server = (*mcp.Server)(nil)
 
 type v2Host struct {
 	router *mcp.MessageRouter
-	agent  *acpv2.Connection
+	agent  *acp.Connection
 	caller *mcp.MessageClient
 	setups chan json.RawMessage
 }
@@ -36,15 +36,16 @@ func newV2Host(t *testing.T) *v2Host {
 		return h.router.Handle(nil)(ctx, method, raw)
 	}, nil)
 	h.router = mcp.NewMessageRouter(client)
-	h.agent = acpv2.Connect(pair.B, pair.B, func(_ context.Context, _ string, raw json.RawMessage) (any, error) {
+	h.agent = acp.Connect(pair.B, pair.B, agentSide(func(_ context.Context, _ string, raw json.RawMessage) (any, error) {
 		h.setups <- append(json.RawMessage(nil), raw...)
 		return map[string]any{"sessionId": "v2-session"}, nil
-	}, func(method string, raw json.RawMessage) error {
+	}), func(method string, raw json.RawMessage) error {
 		<-ready
 		return h.caller.Notifications(nil)(method, raw)
-	})
+	}, acp.WithProtocolVersion(2))
 	h.caller = mcp.NewMessageClient(h.agent)
 	close(ready)
+	initializeClient(t, client)
 	t.Cleanup(func() {
 		_ = h.agent.Close()
 		_ = client.Close()

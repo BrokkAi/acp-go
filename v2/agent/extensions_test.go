@@ -116,12 +116,34 @@ func TestRuntimeSendsTheExtendedInitializeResult(t *testing.T) {
 
 func TestRuntimeValidatesTheExtendedInitializeResult(t *testing.T) {
 	ctx := context.Background()
+	// As in the reference SDK, the runtime sets the negotiated version on the
+	// value sent, whatever the hook returned.
 	for name, hook := range map[string]func(schema.InitializeResponse) (any, error){
-		"hook error": func(schema.InitializeResponse) (any, error) { return nil, errors.New("cannot extend") },
-		"wrong version": func(response schema.InitializeResponse) (any, error) {
+		"typed": func(response schema.InitializeResponse) (any, error) {
 			response.ProtocolVersion = 1
 			return response, nil
 		},
+		"raw": func(response schema.InitializeResponse) (any, error) {
+			return map[string]any{"protocolVersion": 7, "info": response.Info, "capabilities": response.Capabilities}, nil
+		},
+		"missing": func(response schema.InitializeResponse) (any, error) {
+			return map[string]any{"info": response.Info, "capabilities": response.Capabilities}, nil
+		},
+	} {
+		runtime := New(&echoAgent{})
+		runtime.InitializeResult = hook
+		client := startExtendedRuntime(t, runtime)
+		initialization, err := client.Initialize(ctx, acpv2.Capabilities{})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if initialization.ProtocolVersion != 2 {
+			t.Fatalf("%s: protocolVersion = %d, want 2", name, initialization.ProtocolVersion)
+		}
+	}
+
+	for name, hook := range map[string]func(schema.InitializeResponse) (any, error){
+		"hook error": func(schema.InitializeResponse) (any, error) { return nil, errors.New("cannot extend") },
 		"sessions dropped": func(response schema.InitializeResponse) (any, error) {
 			return map[string]any{"protocolVersion": 2, "info": response.Info}, nil
 		},

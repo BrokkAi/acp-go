@@ -9,6 +9,21 @@ import (
 )
 
 func init() {
+	rpcctl.WithRequestGuard = func(guard rpcctl.RequestGuard) any {
+		return ConnectOption(func(c *Connection) { c.guard = guard })
+	}
+	rpcctl.WithNotificationGuard = func(guard rpcctl.NotificationGuard) any {
+		return ConnectOption(func(c *Connection) { c.notifyGuard = guard })
+	}
+	rpcctl.WithOutgoingGuard = func(guard rpcctl.OutgoingGuard) any {
+		return ConnectOption(func(c *Connection) { c.outGuard = guard })
+	}
+	rpcctl.WithOutgoingResponseGuard = func(guard rpcctl.OutgoingResponseGuard) any {
+		return ConnectOption(func(c *Connection) { c.outResponse = guard })
+	}
+	rpcctl.WithIncomingResponseGuard = func(guard rpcctl.IncomingResponseGuard) any {
+		return ConnectOption(func(c *Connection) { c.inResponse = guard })
+	}
 	rpcctl.QueueNotification = func(connection any, ctx context.Context, method string, params any) (func(context.Context) error, error) {
 		c, ok := connection.(*Connection)
 		if !ok || c == nil {
@@ -26,20 +41,18 @@ func (c *Connection) queueNotification(ctx context.Context, method string, param
 	if err != nil {
 		return nil, err
 	}
-	frame, err := json.Marshal(packet{Version: "2.0", Method: method, Params: encoded})
-	if err != nil {
-		return nil, err
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	w := outgoing{data: append(frame, '\n'), sent: make(chan error, 1)}
-	select {
-	case c.writes <- w:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-c.ctx.Done():
-		return nil, c.Err()
+	w, _, err := c.queue(ctx, func() (any, error) {
+		guarded, err := c.guardOutgoing(method, encoded, true)
+		if err != nil {
+			return nil, err
+		}
+		return packet{Version: "2.0", Method: method, Params: guarded}, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return func(waitCtx context.Context) error {
 		select {

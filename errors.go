@@ -17,6 +17,13 @@ import (
 const (
 	ErrorCodeAuthRequired     = -32000
 	ErrorCodeResourceNotFound = -32002
+	// ErrorCodeUnsupportedProtocolVersion answers an initialize request when
+	// the endpoint supports no protocol version at or below the requested one.
+	// The code is defined by draft-v2 version negotiation, not by a change to
+	// v1: a v1 client receives it as an unknown code. Its data is the draft-v2
+	// schema's UnsupportedProtocolVersionErrorData; the v2 package builds and
+	// decodes it.
+	ErrorCodeUnsupportedProtocolVersion = -32022
 )
 
 // RPCError is a JSON-RPC error object as it appears on the wire. Connection.Call
@@ -262,4 +269,59 @@ func SessionNotFoundError(sessionID schema.SessionId) *RPCError {
 		panic(err)
 	}
 	return &RPCError{Code: ErrorCodeResourceNotFound, Message: "Resource not found", Data: data}
+}
+
+// IsUnsupportedProtocolVersion reports whether err is, or wraps, an *RPCError
+// with code -32022. Only the code is inspected; the v2 package's
+// UnsupportedProtocolVersionData decodes the requested and supported versions.
+func IsUnsupportedProtocolVersion(err error) bool {
+	code, ok := rpcErrorCode(err)
+	return ok && code == ErrorCodeUnsupportedProtocolVersion
+}
+
+// InitializationVersionMismatch is a successful initialize response that
+// selected a lower protocol version than the local connection requested, like
+// the reference SDK's crate-root type of the same name. It is not the -32022
+// error an agent returns when it supports no version at or below the
+// requested one: the agent answered, but with a version the local API cannot
+// use.
+//
+// The draft-v2 client reports it when a v1 agent answers its initialize
+// request. It lives in this package because it is not tied to one protocol
+// version. The connection that received it stays open with its previous
+// initialization, if any, unchanged; the caller may fall back to an
+// implementation of the selected version, or close the connection.
+type InitializationVersionMismatch struct {
+	// Requested is the protocol version the local connection requested.
+	Requested schema.ProtocolVersion
+	// Response is the peer's validated initialize response for the version
+	// it selected.
+	Response SelectedInitializeResponse
+}
+
+// Selected is the lower protocol version the peer selected: the version of
+// Response.
+func (m *InitializationVersionMismatch) Selected() schema.ProtocolVersion {
+	return m.Response.ProtocolVersion()
+}
+
+func (m *InitializationVersionMismatch) Error() string {
+	return fmt.Sprintf("requested ACP protocol version %d but peer selected %d", m.Requested, m.Selected())
+}
+
+// SelectedInitializeResponse is a peer's initialize response, typed by the
+// protocol version it selected. Exactly one field is set. A version is only
+// ever selected below a higher requested one, so V1 is the only variant until
+// a later protocol version makes more versions selectable.
+type SelectedInitializeResponse struct {
+	// V1 is set when the peer selected ACP protocol v1.
+	V1 *schema.InitializeResponse
+}
+
+// ProtocolVersion is the protocol version the response selects.
+func (r SelectedInitializeResponse) ProtocolVersion() schema.ProtocolVersion {
+	if r.V1 != nil {
+		return r.V1.ProtocolVersion
+	}
+	return 0
 }

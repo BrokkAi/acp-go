@@ -56,21 +56,29 @@ type Connection struct {
 	onRequest   Handler
 	onNotify    Notifications
 	onObserve   RequestObserver
-	writes      chan outgoing
-	version     uint16
-	onError     func(error)
-	mu          sync.Mutex
-	sequence    uint64
-	inboundSeq  uint64
-	pending     map[string]chan packet
-	inbound     map[string][]inboundCancellation
-	failure     error
-	initOnce    bool
-	initPending bool
-	inputDone   chan struct{}
-	once        sync.Once
-	loops       sync.WaitGroup
-	tasks       sync.WaitGroup
+	guard       rpcctl.RequestGuard
+	notifyGuard rpcctl.NotificationGuard
+	outGuard    rpcctl.OutgoingGuard
+	outResponse rpcctl.OutgoingResponseGuard
+	inResponse  rpcctl.IncomingResponseGuard
+	// sendLock, a one-slot semaphore, orders guarded frames: a guard runs and
+	// its frame is queued while holding it, so no frame queued later can
+	// overtake one a guard admitted. It is acquired with the caller's context,
+	// and only when a guard is installed.
+	sendLock   chan struct{}
+	writes     chan outgoing
+	version    uint16
+	onError    func(error)
+	mu         sync.Mutex
+	sequence   uint64
+	inboundSeq uint64
+	pending    map[string]pendingCall
+	inbound    map[string][]inboundCancellation
+	failure    error
+	inputDone  chan struct{}
+	once       sync.Once
+	loops      sync.WaitGroup
+	tasks      sync.WaitGroup
 }
 
 // RequestObserver sees each incoming request in wire order, on the read loop,
@@ -146,7 +154,7 @@ func (p *HandlerPanic) Error() string {
 // transport failure closes the connection.
 func Connect(in io.ReadCloser, out io.WriteCloser, h Handler, n Notifications, options ...ConnectOption) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Connection{in: in, out: out, ctx: ctx, cancel: cancel, onRequest: h, onNotify: n, writes: make(chan outgoing, 32), inputDone: make(chan struct{}), pending: make(map[string]chan packet), inbound: make(map[string][]inboundCancellation)}
+	c := &Connection{in: in, out: out, ctx: ctx, cancel: cancel, onRequest: h, onNotify: n, writes: make(chan outgoing, 32), sendLock: make(chan struct{}, 1), inputDone: make(chan struct{}), pending: make(map[string]pendingCall), inbound: make(map[string][]inboundCancellation)}
 	for _, option := range options {
 		option(c)
 	}
@@ -182,24 +190,61 @@ func (c *Connection) Done() <-chan struct{} { return c.ctx.Done() }
 func (c *Connection) InputClosed() <-chan struct{} { return c.inputDone }
 func (c *Connection) Err() error                   { c.mu.Lock(); defer c.mu.Unlock(); return c.failure }
 
-func (c *Connection) send(ctx context.Context, p packet) error {
-	p.Version = "2.0"
-	return c.sendJSON(ctx, p)
+// guarded reports whether an outgoing or response guard is installed, which
+// is when frames must be ordered under sendLock.
+func (c *Connection) guarded() bool {
+	return c.outGuard != nil || c.outResponse != nil
 }
 
-func (c *Connection) sendJSON(ctx context.Context, value any) error {
+// lockSend acquires sendLock unless ctx or the connection ends first. It
+// returns a release function, which is a no-op when no guard is installed.
+func (c *Connection) lockSend(ctx context.Context) (func(), error) {
+	if !c.guarded() {
+		return func() {}, nil
+	}
+	select {
+	case c.sendLock <- struct{}{}:
+		return func() { <-c.sendLock }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.ctx.Done():
+		return nil, c.Err()
+	}
+}
+
+// queue builds a frame and queues it for writing. When a guard is installed,
+// build runs under sendLock immediately before the frame is queued, so a
+// frame a guard admitted inside build cannot be overtaken by one queued after
+// it. A caller whose ctx ends while it waits for the lock gives up before
+// build runs, so nothing is begun. built reports whether build succeeded, so a
+// caller can settle what a guard began when queueing then fails.
+func (c *Connection) queue(ctx context.Context, build func() (any, error)) (w outgoing, built bool, err error) {
+	release, err := c.lockSend(ctx)
+	if err != nil {
+		return outgoing{}, false, err
+	}
+	defer release()
+	value, err := build()
+	if err != nil {
+		return outgoing{}, false, err
+	}
 	b, err := json.Marshal(value)
 	if err != nil {
-		return err
+		return outgoing{}, true, err
 	}
-	w := outgoing{data: append(b, '\n'), sent: make(chan error, 1)}
+	w = outgoing{data: append(b, '\n'), sent: make(chan error, 1)}
 	select {
 	case c.writes <- w:
+		return w, true, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return outgoing{}, true, ctx.Err()
 	case <-c.ctx.Done():
-		return c.Err()
+		return outgoing{}, true, c.Err()
 	}
+}
+
+// awaitWrite waits until a queued frame is written.
+func (c *Connection) awaitWrite(ctx context.Context, w outgoing) error {
 	select {
 	case err := <-w.sent:
 		return err
@@ -223,6 +268,41 @@ func (c *Connection) sendJSON(ctx context.Context, value any) error {
 		return c.Err()
 	}
 }
+
+// guardOutgoing runs the internal outgoing guard, returning the params to
+// send.
+func (c *Connection) guardOutgoing(method string, params json.RawMessage, notification bool) (json.RawMessage, error) {
+	if c.outGuard == nil {
+		return params, nil
+	}
+	rewritten, err := c.outGuard(method, params, notification)
+	if err != nil {
+		return nil, err
+	}
+	if rewritten != nil {
+		return rewritten, nil
+	}
+	return params, nil
+}
+
+func (c *Connection) Notify(ctx context.Context, method string, params any) error {
+	b, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	w, _, err := c.queue(ctx, func() (any, error) {
+		guarded, err := c.guardOutgoing(method, b, true)
+		if err != nil {
+			return nil, err
+		}
+		return packet{Version: "2.0", Method: method, Params: guarded}, nil
+	})
+	if err != nil {
+		return err
+	}
+	return c.awaitWrite(ctx, w)
+}
+
 func (c *Connection) writeLoop() {
 	defer c.loops.Done()
 	for {
@@ -238,14 +318,6 @@ func (c *Connection) writeLoop() {
 			}
 		}
 	}
-}
-
-func (c *Connection) Notify(ctx context.Context, method string, params any) error {
-	b, err := json.Marshal(params)
-	if err != nil {
-		return err
-	}
-	return c.send(ctx, packet{Method: method, Params: b})
 }
 
 // CancelRequest asks the peer to cancel one outstanding request by sending a
@@ -291,6 +363,36 @@ func encodeRequestID(requestID any) (json.RawMessage, error) {
 	}
 }
 
+// pendingCall is a request awaiting its response. The response is settled
+// once, on the read loop, even when the caller stopped waiting.
+type pendingCall struct {
+	method       string
+	acceptsLower bool
+	reply        chan reply
+}
+
+type reply struct {
+	result json.RawMessage
+	err    error
+}
+
+// settle passes a call's outcome through the internal incoming-response
+// guard, as the reference SDK checks every response against its protocol
+// state, and delivers it to the caller if it is still waiting.
+func (c *Connection) settle(call pendingCall, result json.RawMessage, err error) {
+	if c.inResponse != nil {
+		result, err = c.inResponse(call.method, call.acceptsLower, result, err)
+	}
+	call.reply <- reply{result: result, err: err}
+}
+
+func rpcErrorOrNil(e *RPCError) error {
+	if e == nil {
+		return nil
+	}
+	return e
+}
+
 func (c *Connection) Call(ctx context.Context, method string, params, result any) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -302,24 +404,56 @@ func (c *Connection) Call(ctx context.Context, method string, params, result any
 	c.mu.Lock()
 	c.sequence++
 	id := strconv.FormatUint(c.sequence, 10)
-	reply := make(chan packet, 1)
-	c.pending[id] = reply
+	call := pendingCall{method: method, acceptsLower: rpcctl.AcceptsLowerVersion(ctx), reply: make(chan reply, 1)}
+	c.pending[id] = call
 	c.mu.Unlock()
-	defer func() { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }()
-	if err := c.send(ctx, packet{ID: json.RawMessage(id), Method: method, Params: b}); err != nil {
+	forget := func() { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }
+	// abandon settles a call whose request was admitted but never answered,
+	// so the protocol state it began is not left waiting.
+	abandon := func(err error) {
+		c.mu.Lock()
+		_, waiting := c.pending[id]
+		delete(c.pending, id)
+		c.mu.Unlock()
+		if waiting {
+			c.settle(call, nil, err)
+		}
+	}
+	w, built, err := c.queue(ctx, func() (any, error) {
+		guarded, err := c.guardOutgoing(method, b, false)
+		if err != nil {
+			return nil, err
+		}
+		return packet{Version: "2.0", ID: json.RawMessage(id), Method: method, Params: guarded}, nil
+	})
+	if err != nil {
+		if built {
+			abandon(err)
+		} else {
+			forget()
+		}
+		return err
+	}
+	if err := c.awaitWrite(ctx, w); err != nil {
 		// A fast peer can answer and exit before the writer goroutine reports
 		// completion. The queued response takes precedence over that EOF.
 		select {
-		case p := <-reply:
-			return decodeReply(p, result)
+		case r := <-call.reply:
+			return decodeReply(r, result)
 		default:
+			abandon(err)
 			return err
 		}
 	}
 	select {
-	case p := <-reply:
-		return decodeReply(p, result)
+	case r := <-call.reply:
+		return decodeReply(r, result)
 	case <-ctx.Done():
+		// As in the reference SDK, the call stays pending: its response,
+		// when it arrives, still passes through the protocol state.
+		if c.inResponse == nil {
+			forget()
+		}
 		cancelCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 		_ = c.CancelRequest(cancelCtx, json.RawMessage(id))
 		cancel()
@@ -327,22 +461,23 @@ func (c *Connection) Call(ctx context.Context, method string, params, result any
 	case <-c.ctx.Done():
 		// An agent may exit immediately after writing a valid final response.
 		select {
-		case p := <-reply:
-			return decodeReply(p, result)
+		case r := <-call.reply:
+			return decodeReply(r, result)
 		default:
+			forget()
 			return c.Err()
 		}
 	}
 }
 
-func decodeReply(p packet, result any) error {
-	if p.Error != nil {
-		return p.Error
+func decodeReply(r reply, result any) error {
+	if r.err != nil {
+		return r.err
 	}
 	if result == nil {
 		return nil
 	}
-	return json.Unmarshal(p.Result, result)
+	return json.Unmarshal(r.result, result)
 }
 
 func (c *Connection) readLoop() {
@@ -380,15 +515,18 @@ func (c *Connection) readLoop() {
 			// response is dropped: it completes no call and gets no answer.
 		case responseMessage:
 			c.mu.Lock()
-			ch := c.pending[string(p.ID)]
+			call, ok := c.pending[string(p.ID)]
 			// The first response settles the call; a repeated one finds no
 			// pending call and is ignored, as in the reference SDK.
 			delete(c.pending, string(p.ID))
 			c.mu.Unlock()
-			if ch != nil {
-				ch <- p
+			if ok {
+				c.settle(call, p.Result, rpcErrorOrNil(p.Error))
 			}
 		case notificationMessage:
+			if c.notifyGuard != nil && !c.admitNotification(p.Method) {
+				continue
+			}
 			if p.Method == "$/cancel_request" {
 				var v struct {
 					ID json.RawMessage `json:"requestId"`
@@ -404,6 +542,9 @@ func (c *Connection) readLoop() {
 				// Protocol v2 forbids null request ids. The reference SDK
 				// answers before dispatch and keeps serving.
 				c.answerFrame(jsonline.NullV2RequestID())
+				continue
+			}
+			if c.guard != nil && !c.admit(p) {
 				continue
 			}
 			if c.onObserve != nil {
@@ -429,9 +570,15 @@ func (c *Connection) readLoop() {
 // waiting for the write runs as a task, which EOF still waits for.
 func (c *Connection) answerFrame(response []byte) {
 	w := outgoing{data: append(response, '\n'), sent: make(chan error, 1)}
+	release, err := c.lockSend(c.ctx)
+	if err != nil {
+		return
+	}
 	select {
 	case c.writes <- w:
+		release()
 	case <-c.ctx.Done():
+		release()
 		return
 	}
 	c.tasks.Add(1)
@@ -606,8 +753,21 @@ func (c *Connection) startRequest(p packet) {
 		defer cancel()
 		response, answer := c.executeRequest(rpcctl.WithRequestID(ctx, p.ID), p)
 		c.unregisterInbound(string(p.ID), generation)
-		if answer {
-			_ = c.send(c.ctx, response)
+		if !answer {
+			return
+		}
+		w, _, err := c.queue(c.ctx, func() (any, error) {
+			if c.outResponse != nil {
+				result, err := c.outResponse(p.ID, p.Method, response.Result, rpcErrorOrNil(response.Error))
+				response.Result, response.Error = result, nil
+				if err != nil {
+					response.Result, response.Error = nil, errorObject(err)
+				}
+			}
+			return response, nil
+		})
+		if err == nil {
+			_ = c.awaitWrite(c.ctx, w)
 		}
 	}()
 }
@@ -679,17 +839,7 @@ func (c *Connection) executeRequest(ctx context.Context, p packet) (response pac
 	}
 	response = packet{Version: "2.0", ID: p.ID}
 	if err != nil {
-		if !errors.As(err, &response.Error) {
-			response.Error = &RPCError{Code: -32603, Message: err.Error()}
-		}
-		if errors.Is(err, context.Canceled) {
-			response.Error = &RPCError{Code: -32800, Message: "Request cancelled"}
-		}
-		// A handler error with invalid Data or Extra JSON would otherwise fail
-		// to encode and leave the peer waiting for a response forever.
-		if _, encodeErr := json.Marshal(response.Error); encodeErr != nil {
-			response.Error = &RPCError{Code: -32603, Message: "encode error response: " + encodeErr.Error()}
-		}
+		response.Error = errorObject(err)
 	} else {
 		response.Result, err = json.Marshal(value)
 		if err != nil {
@@ -698,6 +848,73 @@ func (c *Connection) executeRequest(ctx context.Context, p packet) (response pac
 		}
 	}
 	return response, true
+}
+
+// errorObject converts a handler or guard error to the error object answering
+// its request: an *RPCError as is, cancellation as -32800, and anything else
+// as -32603 with the error's text.
+func errorObject(err error) *RPCError {
+	var object *RPCError
+	if !errors.As(err, &object) {
+		object = &RPCError{Code: -32603, Message: err.Error()}
+	}
+	if errors.Is(err, context.Canceled) {
+		object = &RPCError{Code: -32800, Message: "Request cancelled"}
+	}
+	// An error with invalid Data or Extra JSON would otherwise fail to encode
+	// and leave the peer waiting for a response forever.
+	if _, encodeErr := json.Marshal(object); encodeErr != nil {
+		object = &RPCError{Code: -32603, Message: "encode error response: " + encodeErr.Error()}
+	}
+	return object
+}
+
+// admit runs the internal request guard on the read loop. A refused request is
+// answered in wire order, before the read loop handles the next frame, and is
+// neither observed nor dispatched. A panicking guard is reported and its
+// request answered as a panicking handler's would be.
+func (c *Connection) admit(p packet) (admitted bool) {
+	var refusal *RPCError
+	func() {
+		defer func() {
+			if value := recover(); value != nil {
+				c.reportPanic(p.Method, value)
+				refusal = panicError(c.ctx, p.Method)
+			}
+		}()
+		if err := c.guard(p.Method, p.Params); err != nil {
+			refusal = errorObject(err)
+		}
+	}()
+	if refusal == nil {
+		return true
+	}
+	frame, err := json.Marshal(packet{Version: "2.0", ID: p.ID, Error: refusal})
+	if err != nil {
+		frame, _ = json.Marshal(packet{Version: "2.0", ID: p.ID, Error: &RPCError{Code: -32603, Message: "encode error response: " + err.Error()}})
+	}
+	c.answerFrame(frame)
+	return false
+}
+
+// admitNotification runs the internal notification guard on the read loop. A
+// refused notification is dropped, as the reference SDK ignores it, and the
+// refusal goes to the error hook. A panicking guard is reported and its
+// notification dropped.
+func (c *Connection) admitNotification(method string) (admitted bool) {
+	defer func() {
+		if value := recover(); value != nil {
+			c.reportPanic(method, value)
+			admitted = false
+		}
+	}()
+	if err := c.notifyGuard(method); err != nil {
+		if c.onError != nil {
+			c.report(fmt.Errorf("acp: %s notification ignored: %w", method, err))
+		}
+		return false
+	}
+	return true
 }
 
 // closedChannel reports whether done is closed.
