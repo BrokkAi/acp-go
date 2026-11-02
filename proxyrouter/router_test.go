@@ -121,19 +121,30 @@ func TestProxyRouterPreservesInitialFrameAndFutureFields(t *testing.T) {
 // batch array.
 const batchRejection = `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"JSON-RPC batches are not supported; send each message individually"}}`
 
-func TestProxyRouterRejectsBatchedFirstFrameAndKeepsReading(t *testing.T) {
+// parseErrorLine is the exact line the reference SDK sends for a line that is
+// not valid JSON; quoted is the line, without its terminator, as a JSON string.
+func parseErrorLine(quoted string) string {
+	return `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error","data":{"line":` + quoted + `}}}`
+}
+
+func TestProxyRouterAnswersUnreadableFirstFramesAndKeepsReading(t *testing.T) {
 	v1 := make(chan string, 1)
 	v2 := make(chan string, 1)
 	rw := start(t, New().
 		WithV1(recordingProxy{name: "v1", started: v1}).
 		WithV2(recordingProxy{name: "v2", started: v2}))
-	for _, batch := range []string{
-		`[]`,
-		`[{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize","params":{"protocolVersion":2,"info":{"name":"client","version":"1"}}},{"jsonrpc":"2.0","method":"future/notification","params":{}}]`,
-		`[{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize","params":{"protocolVersion":1}}]`,
-		`[{"jsonrpc":"2.0","id":1,"result":{}}]`,
+	for _, frame := range []struct{ wire, answer string }{
+		{"[]\n", batchRejection},
+		{`[{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize","params":{"protocolVersion":2,"info":{"name":"client","version":"1"}}},{"jsonrpc":"2.0","method":"future/notification","params":{}}]` + "\n", batchRejection},
+		{`[{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize","params":{"protocolVersion":1}}]` + "\n", batchRejection},
+		{`[{"jsonrpc":"2.0","id":1,"result":{}}]` + "\n", batchRejection},
+		{"[\n", parseErrorLine(`"["`)},
+		{" [1,\r\n", parseErrorLine(`" [1,"`)},
+		{"\n", parseErrorLine(`""`)},
+		{`{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize"` + "\n", parseErrorLine(`"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"_proxy/initialize\""`)},
+		{"[1e400]\n", parseErrorLine(`"[1e400]"`)},
 	} {
-		if _, err := rw.WriteString(batch + "\n"); err != nil {
+		if _, err := rw.WriteString(frame.wire); err != nil {
 			t.Fatal(err)
 		}
 		if err := rw.Flush(); err != nil {
@@ -143,12 +154,12 @@ func TestProxyRouterRejectsBatchedFirstFrameAndKeepsReading(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := strings.TrimSpace(line); got != batchRejection {
-			t.Fatalf("batch %s response = %s, want %s", batch, got, batchRejection)
+		if got := strings.TrimSuffix(line, "\n"); got != frame.answer {
+			t.Fatalf("frame %q response = %s, want %s", frame.wire, got, frame.answer)
 		}
 	}
 	if len(v1) != 0 || len(v2) != 0 {
-		t.Fatal("a proxy implementation ran for a batch")
+		t.Fatal("a proxy implementation ran for an unreadable frame")
 	}
 
 	// A single _proxy/initialize after the rejected batches is routed.

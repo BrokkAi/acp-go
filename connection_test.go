@@ -169,9 +169,11 @@ func TestCancelRequestRejectsInvalidIDs(t *testing.T) {
 }
 
 func TestInvalidFrameAndBlockedWriter(t *testing.T) {
-	t.Run("malformed", func(t *testing.T) {
+	t.Run("invalid envelope", func(t *testing.T) {
+		// Valid JSON that is not a JSON-RPC 2.0 message still closes the
+		// connection; answering it in place is tracked separately (#73).
 		c, peer := pipeClient(t, nil, nil)
-		_, _ = io.WriteString(peer, "not-json\n")
+		_, _ = io.WriteString(peer, `{"jsonrpc":"1.0","method":"x"}`+"\n")
 		select {
 		case <-c.Done():
 			if c.Err() == nil {
@@ -540,5 +542,120 @@ func TestResponseArrayDoesNotCompletePendingCall(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("single response did not complete the call")
+	}
+}
+
+// parseErrorLine is the exact line the reference SDK sends for a line that is
+// not valid JSON: -32700 with id null and the line, without its terminator, as
+// data. quoted is the line as a JSON string.
+func parseErrorLine(quoted string) string {
+	return `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error","data":{"line":` + quoted + `}}}`
+}
+
+func TestInvalidJSONGetsOneParseErrorAndConnectionContinues(t *testing.T) {
+	loneSurrogate := `"\` + `ud800"`
+	cases := map[string]struct{ wire, quoted string }{
+		"not json":           {"not-json\n", `"not-json"`},
+		"crlf":               {"not-json\r\n", `"not-json"`},
+		"open bracket":       {"[\n", `"["`},
+		"truncated array":    {"  [1,\n", `"  [1,"`},
+		"truncated object":   {`{"jsonrpc":"2.0",` + "\n", `"{\"jsonrpc\":\"2.0\","`},
+		"empty line":         {"\n", `""`},
+		"blank line":         {" \t\n", `" \t"`},
+		"two values":         {"{} {}\n", `"{} {}"`},
+		"lone surrogate":     {`{"jsonrpc":"2.0","method":` + loneSurrogate + "}\n", `"{\"jsonrpc\":\"2.0\",\"method\":\"\\` + `ud800\"}"`},
+		"number out of f64":  {`{"jsonrpc":"2.0","id":1e400,"method":"x"}` + "\n", `"{\"jsonrpc\":\"2.0\",\"id\":1e400,\"method\":\"x\"}"`},
+		"array out of f64":   {"[1e400]\n", `"[1e400]"`},
+		"near max float":     {"[1.7976931348623158e308]\n", `"[1.7976931348623158e308]"`},
+		"nested 128 deep":    {strings.Repeat("[", 128) + strings.Repeat("]", 128) + "\n", `"` + strings.Repeat("[", 128) + strings.Repeat("]", 128) + `"`},
+		"surrogate in batch": {"[" + loneSurrogate + "]\n", `"[\"\\` + `ud800\"]"`},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var mu sync.Mutex
+			var ran []string
+			c, peer := pipeClient(t, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+				mu.Lock()
+				ran = append(ran, method)
+				mu.Unlock()
+				return map[string]bool{"ok": true}, nil
+			}, nil)
+			reader := bufio.NewReader(peer)
+			if _, err := io.WriteString(peer, tc.wire); err != nil {
+				t.Fatal(err)
+			}
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := strings.TrimSuffix(line, "\n"), parseErrorLine(tc.quoted); got != want {
+				t.Fatalf("response = %s, want %s", got, want)
+			}
+			if _, err := io.WriteString(peer, `{"jsonrpc":"2.0","id":"after","method":"after/request","params":{}}`+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			if line, err = reader.ReadString('\n'); err != nil || strings.TrimSpace(line) != `{"jsonrpc":"2.0","id":"after","result":{"ok":true}}` {
+				t.Fatalf("response after parse error = %q, %v (connection error %v)", line, err, c.Err())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if strings.Join(ran, ",") != "after/request" {
+				t.Fatalf("handlers ran %v", ran)
+			}
+		})
+	}
+}
+
+func TestInvalidUTF8StillClosesConnection(t *testing.T) {
+	// The reference SDK reads lines as UTF-8 text, so invalid UTF-8 is a
+	// transport failure there, not a parse error.
+	c, peer := pipeClient(t, nil, nil)
+	_, _ = io.WriteString(peer, "\xff\n")
+	select {
+	case <-c.Done():
+	case <-time.After(time.Second):
+		t.Fatal("invalid UTF-8 was accepted")
+	}
+}
+
+func TestMalformedFrameAnswerIsNotOvertaken(t *testing.T) {
+	for name, malformed := range map[string]struct{ wire, answer string }{
+		"batch":       {"[]\n", batchRejection},
+		"parse error": {"[\n", parseErrorLine(`"["`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var c *Connection
+			notified := make(chan error, 1)
+			c, peer := pipeClient(t, func(context.Context, string, json.RawMessage) (any, error) {
+				return map[string]bool{"ok": true}, nil
+			}, func(method string, _ json.RawMessage) error {
+				// A synchronous send from the handler of the frame right after
+				// the malformed one.
+				go func() { notified <- c.Notify(context.Background(), "handler/sent", map[string]any{}) }()
+				return <-notified
+			})
+			reader := bufio.NewReader(peer)
+			if _, err := io.WriteString(peer, malformed.wire+
+				`{"jsonrpc":"2.0","method":"trigger","params":{}}`+"\n"+
+				`{"jsonrpc":"2.0","id":7,"method":"fast","params":{}}`+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			var lines []string
+			for range 3 {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					t.Fatal(err)
+				}
+				lines = append(lines, strings.TrimSpace(line))
+			}
+			want := []string{
+				malformed.answer,
+				`{"jsonrpc":"2.0","method":"handler/sent","params":{}}`,
+				`{"jsonrpc":"2.0","id":7,"result":{"ok":true}}`,
+			}
+			if strings.Join(lines, "\n") != strings.Join(want, "\n") {
+				t.Fatalf("wire order:\n%s\nwant:\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
+			}
+		})
 	}
 }

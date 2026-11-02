@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/BrokkAi/acp-go/internal/nobatch"
+	"github.com/BrokkAi/acp-go/internal/jsonline"
 )
 
 const (
@@ -39,7 +39,7 @@ type frame struct {
 var errBatch = errors.New("JSON-RPC batches are not supported; send each message individually")
 
 func parseFrame(data []byte) (frame, error) {
-	if nobatch.IsArray(data) {
+	if jsonline.Classify(data) == jsonline.Batch {
 		return frame{}, errBatch
 	}
 	var parsed frame

@@ -44,6 +44,23 @@ versions:
   same error and runs none of its entries, and as an `initialize` response
   body it fails the initialize.
 
+## Bodies that are not valid JSON
+
+Validity follows `serde_json`, as in the Rust crate, so `[1e400]` is not valid
+JSON rather than a batch.
+
+- Without `Acp-Connection-Id`, such a body gets a plain-text `400`; on an
+  unknown connection, `404`. It never creates a connection.
+- On a live connection it is forwarded and answered `202`, and the agent sends
+  `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error","data":{"line":"<body>"}}}`
+  on the stream.
+- A body that is not valid UTF-8 is a plain-text `400`.
+- A malformed body that spans lines is a plain-text `400`. The Rust crate
+  re-encodes it as one JSON string for the agent, which acp-go agents cannot
+  answer in place yet (#73).
+- The client fails an `initialize` whose response body is not valid JSON, and
+  its connection answers an event that is not valid JSON with the parse error.
+
 ## Usage
 
 Server side, serve any existing agent runtime over HTTP:
@@ -86,4 +103,4 @@ full parity with the Rust crate:
 `session/prompt` are `POST`ed, the agent's `session/update` is delivered on the
 event stream, and the prompt completes with the agent's stop reason. Separate
 tests cover the status-code error paths, the stream `Accept` requirement, and
-batch rejection on both the server and the client.
+batch and parse-error handling on both the server and the client.

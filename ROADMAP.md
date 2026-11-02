@@ -68,6 +68,12 @@ only remaining work.
     with `id: null` and the Rust error data, and none of its entries run,
   - the connection, agent protocol router, and proxy protocol router keep
     reading after the rejection,
+  - a line that is not valid JSON, judged as `serde_json` judges it (lone
+    surrogate escapes, float64 overflow, and nesting 128 deep are invalid),
+    gets one `-32700` error with `id: null` and the line as data, with the
+    same keep-reading behavior, so `[`-prefixed garbage is a parse error,
+  - both answers are queued before the next frame is handled, so nothing can
+    overtake them,
   - the HTTP transport answers an array `POST` with `400` and the same
     JSON-RPC body without creating a connection; its client treats an array
     from the server as malformed.

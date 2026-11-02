@@ -13,7 +13,7 @@ import (
 	"io"
 	"unicode/utf8"
 
-	"github.com/BrokkAi/acp-go/internal/nobatch"
+	"github.com/BrokkAi/acp-go/internal/jsonline"
 	schema1 "github.com/BrokkAi/acp-go/schema"
 	schema2 "github.com/BrokkAi/acp-go/schema/v2"
 )
@@ -59,15 +59,24 @@ func (r *Router) Serve(ctx context.Context, in io.ReadCloser, out io.WriteCloser
 		if err != nil {
 			return err
 		}
-		if nobatch.IsArray(line) {
-			// JSON-RPC batches are not supported on any protocol version. A
-			// batched first frame selects nothing: answer it once with id null
-			// and keep reading, so the peer can still initialize.
-			if _, err := out.Write(append(nobatch.Rejection(), '\n')); err != nil {
+		// Like the reference SDK's select_protocol_peer, a first frame that is
+		// not one JSON-RPC message selects nothing: answer it once with id
+		// null and keep reading, so the peer can still initialize.
+		var answer []byte
+		switch jsonline.Classify(line) {
+		case jsonline.Invalid:
+			answer = jsonline.ParseError(line)
+		case jsonline.Batch:
+			// JSON-RPC batches are not supported on any protocol version.
+			answer = jsonline.BatchRejection()
+		}
+		if answer != nil {
+			if _, err := out.Write(append(answer, '\n')); err != nil {
 				return err
 			}
 			continue
 		}
+		line = bytes.TrimSpace(line)
 		selection, err := selectProxy(line)
 		if errors.Is(err, errResponseOnlyFrame) {
 			// Response-only traffic before proxy initialization has no route.
@@ -163,7 +172,10 @@ func readLine(reader *bufio.Reader) ([]byte, error) {
 		}
 		break
 	}
-	line = bytes.TrimSpace(line)
+	// Strip one line terminator, "\n" or "\r\n", as the reference SDK's line
+	// reader does, so a parse error reports the same line.
+	line = bytes.TrimSuffix(line, []byte("\n"))
+	line = bytes.TrimSuffix(line, []byte("\r"))
 	if !utf8.Valid(line) {
 		return nil, errors.New("ACP frame is not valid UTF-8")
 	}

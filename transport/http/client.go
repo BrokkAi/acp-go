@@ -13,7 +13,7 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
-	"github.com/BrokkAi/acp-go/internal/nobatch"
+	"github.com/BrokkAi/acp-go/internal/jsonline"
 )
 
 // Client connects one ACP connection to a draft Streamable HTTP endpoint. The
@@ -143,9 +143,13 @@ func (t *httpTransport) initialize(payload []byte) error {
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("ACP HTTP initialize returned %s: %s", response.Status, strings.TrimSpace(string(body)))
 	}
-	if nobatch.IsArray(body) {
-		// A batch array is malformed, never an initialize response.
+	// A malformed body, a batch array included, is never an initialize
+	// response, as in the Rust client.
+	switch jsonline.Classify(body) {
+	case jsonline.Batch:
 		return fmt.Errorf("invalid ACP HTTP initialize response: %w", errBatch)
+	case jsonline.Invalid:
+		return errors.New("invalid ACP HTTP initialize response: not valid JSON")
 	}
 	connectionID := strings.TrimSpace(response.Header.Get(HeaderConnectionID))
 	if connectionID == "" {

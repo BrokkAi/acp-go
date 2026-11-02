@@ -163,10 +163,33 @@ series, minor releases may contain breaking API changes.
   without creating a connection. Its client treats an array from the server as
   malformed: on the event stream the connection answers it with the same
   error, and as an `initialize` response body it fails the initialize.
-- Input that starts with `[` but is not valid JSON is no longer treated as a
-  batch. It is malformed JSON and is handled like any other malformed frame,
-  which today closes the connection; answering malformed frames in place is
-  tracked separately (#73).
+- A line that is not valid JSON, including an empty line and one that only
+  starts like an array, now gets exactly one parse error, as the reference SDK
+  sends it:
+  `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error","data":{"line":"<the line>"}}}`,
+  with the line as read, without its `\n` or `\r\n` terminator. The connection,
+  `agentrouter`, and `proxyrouter` keep reading afterwards. Previously the
+  connection closed, the agent router exited, and the proxy router answered
+  `-32600` and exited. Invalid UTF-8 still closes the connection, because the
+  reference SDK cannot read it as a line either. Valid JSON that is not a
+  JSON-RPC message still closes it; that is tracked in #73.
+- Validity follows `serde_json`, which the reference SDK parses with, rather
+  than `encoding/json`. A lone UTF-16 surrogate escape such as `"\ud800"`, a
+  number whose float64 evaluation overflows (including values just below
+  `math.MaxFloat64` such as `1.7976931348623158e308`, which `serde_json`
+  rejects), and arrays or objects nested 128 deep are parse errors. So
+  `[1e400]` is a parse error, not a batch.
+- The `-32600` batch rejection and the `-32700` parse error are queued before
+  the next frame is handled, so a later response, or a send from the next
+  frame's notification handler, can no longer overtake them.
+- The draft HTTP server handles a `POST` body that is not valid JSON as the
+  Rust crate does. Without a connection it is still a plain-text `400`. On an
+  unknown connection it is now `404`. On a live connection it is forwarded and
+  answered `202`, and the agent sends the parse error on the stream. A body
+  that is not valid UTF-8 is a plain-text `400`. A malformed body that spans
+  lines stays a `400`: the Rust crate re-encodes it as one JSON string, which
+  acp-go agents cannot answer in place until #73. The HTTP client fails an
+  `initialize` whose response body is not valid JSON.
 
 ### Removed
 

@@ -55,7 +55,10 @@ the peer's string or numeric ID. JSON-RPC batches are not supported on either
 protocol version, matching the ACP v2 transports rule and the reference Rust
 SDK 5.0: a JSON array, including `[]`, gets one `-32600` (`Invalid request`)
 error with `id: null`, none of its entries run, and the connection keeps
-serving. Send each message individually. This root transport is
+serving. Send each message individually. Likewise, a line that is not valid
+JSON (judged as `serde_json` judges it) gets one `-32700` error with
+`id: null` and the line as `data`, and the connection keeps serving. This root
+transport is
 also used by the draft-v2 package, while its typed v1 facade remains v1-only.
 
 `*acp.RPCError` is the JSON-RPC error object as it appears on the wire, kept

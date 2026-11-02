@@ -14,7 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/BrokkAi/acp-go/agent"
-	"github.com/BrokkAi/acp-go/internal/nobatch"
+	"github.com/BrokkAi/acp-go/internal/jsonline"
 	schema1 "github.com/BrokkAi/acp-go/schema"
 	schema2 "github.com/BrokkAi/acp-go/schema/v2"
 	agent2 "github.com/BrokkAi/acp-go/v2/agent"
@@ -56,13 +56,27 @@ func (r *Agent) Serve(ctx context.Context, in io.ReadCloser, out io.WriteCloser)
 			}
 			return err
 		}
-		if !nobatch.IsArray(line) {
+		// Like the reference SDK's select_protocol_peer, a first frame that is
+		// not one JSON-RPC message selects nothing: answer it once with id
+		// null and keep reading, so the peer can still initialize either
+		// version. Invalid UTF-8 is left to routeFrame, as the reference SDK
+		// cannot read it as a line at all.
+		raw := bytes.TrimSuffix(line, []byte("\n"))
+		if !utf8.Valid(raw) {
 			break
 		}
-		// JSON-RPC batches are not supported on any protocol version. A
-		// batched first frame selects nothing: answer it once with id null
-		// and keep reading, so the peer can still initialize either version.
-		if _, err := out.Write(append(nobatch.Rejection(), '\n')); err != nil {
+		var answer []byte
+		switch jsonline.Classify(raw) {
+		case jsonline.Invalid:
+			answer = jsonline.ParseError(raw)
+		case jsonline.Batch:
+			// JSON-RPC batches are not supported on any protocol version.
+			answer = jsonline.BatchRejection()
+		}
+		if answer == nil {
+			break
+		}
+		if _, err := out.Write(append(answer, '\n')); err != nil {
 			return err
 		}
 	}
@@ -163,7 +177,11 @@ func readInitialLine(reader *bufio.Reader) ([]byte, error) {
 	}
 	// The line can be followed by more input already buffered in reader.
 	// prependReader below receives both this line and the original stream.
-	return append(bytes.TrimRight(line, "\r\n"), '\n'), nil
+	// Strip one line terminator, "\n" or "\r\n", as the reference SDK's line
+	// reader does, so a parse error reports the same line.
+	line = bytes.TrimSuffix(line, []byte("\n"))
+	line = bytes.TrimSuffix(line, []byte("\r"))
+	return append(line, '\n'), nil
 }
 
 func routeFrame(line []byte) (wireFrame, json.RawMessage, uint16, error) {
