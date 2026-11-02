@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Fixed
+
+- The v1 and draft v2 agent runtimes could call `Agent.Initialize` twice when
+  two `initialize` requests were in flight at once, because the
+  already-initialized check released its lock before the handler ran. The
+  runtimes now mark initialization as in progress under the lock and answer a
+  concurrent `initialize` with `-32600` ("ACP initialization is already in
+  progress on this connection") without reaching the handler, as the reference
+  Rust SDK does. A failed initialization clears the in-progress state, so a
+  later `initialize` can retry (#74).
+
 ## 0.12.1 - 2026-10-05
 
 ### Fixed

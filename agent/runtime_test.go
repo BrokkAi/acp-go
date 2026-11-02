@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -167,6 +168,116 @@ func TestRuntimeRequiresAndAllowsInitializeOnlyOnce(t *testing.T) {
 	}, nil)
 	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "agent is already initialized" {
 		t.Fatalf("duplicate initialize error = %v", err)
+	}
+}
+
+// gatedInitializeAgent blocks every Initialize call until the test releases
+// it, so a second initialize can be sent while the first is still running.
+type gatedInitializeAgent struct {
+	testAgent
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan error
+}
+
+func newGatedInitializeAgent() *gatedInitializeAgent {
+	return &gatedInitializeAgent{entered: make(chan struct{}, 2), release: make(chan error)}
+}
+
+func (a *gatedInitializeAgent) Initialize(ctx context.Context, _ Client, _ schema.InitializeRequest) (schema.InitializeResponse, error) {
+	a.calls.Add(1)
+	a.entered <- struct{}{}
+	select {
+	case err := <-a.release:
+		if err != nil {
+			return schema.InitializeResponse{}, err
+		}
+		return schema.InitializeResponse{ProtocolVersion: acp.Version}, nil
+	case <-ctx.Done():
+		return schema.InitializeResponse{}, ctx.Err()
+	}
+}
+
+// startBlockedInitialize sends an initialize request and returns once the
+// agent's Initialize handler is running and blocked. The returned channel
+// yields the request's outcome after the handler is released.
+func startBlockedInitialize(ctx context.Context, t *testing.T, connection *acp.Connection, implementation *gatedInitializeAgent) <-chan error {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() {
+		result <- connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: acp.Version}, nil)
+	}()
+	select {
+	case <-implementation.entered:
+	case <-ctx.Done():
+		t.Fatal("initialize did not reach the agent")
+	}
+	return result
+}
+
+func requireInitializeInProgress(ctx context.Context, t *testing.T, connection *acp.Connection) {
+	t.Helper()
+	err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: acp.Version}, nil)
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "ACP initialization is already in progress on this connection" {
+		t.Fatalf("concurrent initialize error = %v", err)
+	}
+}
+
+func TestRuntimeRejectsConcurrentInitialize(t *testing.T) {
+	implementation := newGatedInitializeAgent()
+	connection := startRuntime(t, implementation, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	first := startBlockedInitialize(ctx, t, connection, implementation)
+	requireInitializeInProgress(ctx, t, connection)
+	implementation.release <- nil
+	if err := <-first; err != nil {
+		t.Fatalf("first initialize: %v", err)
+	}
+	if calls := implementation.calls.Load(); calls != 1 {
+		t.Fatalf("Initialize calls = %d, want 1", calls)
+	}
+	err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: acp.Version}, nil)
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "agent is already initialized" {
+		t.Fatalf("initialize after success error = %v", err)
+	}
+}
+
+func TestRuntimeAllowsInitializeRetryAfterFailure(t *testing.T) {
+	implementation := newGatedInitializeAgent()
+	connection := startRuntime(t, implementation, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	first := startBlockedInitialize(ctx, t, connection, implementation)
+	requireInitializeInProgress(ctx, t, connection)
+	implementation.release <- errors.New("initialize failed")
+	if err := <-first; err == nil {
+		t.Fatal("failed initialize returned no error")
+	}
+	err := connection.Call(ctx, schema.SessionNewMethodName, schema.NewSessionRequest{
+		Cwd: hostRoot + "/tmp", MCPServers: []schema.McpServer{},
+	}, nil)
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "agent is not initialized" {
+		t.Fatalf("session/new after failed initialize error = %v", err)
+	}
+
+	retry := startBlockedInitialize(ctx, t, connection, implementation)
+	implementation.release <- nil
+	if err := <-retry; err != nil {
+		t.Fatalf("retried initialize: %v", err)
+	}
+	if calls := implementation.calls.Load(); calls != 2 {
+		t.Fatalf("Initialize calls = %d, want 2", calls)
+	}
+	if err := connection.Call(ctx, schema.SessionNewMethodName, schema.NewSessionRequest{
+		Cwd: hostRoot + "/tmp", MCPServers: []schema.McpServer{},
+	}, nil); err != nil {
+		t.Fatalf("session/new after retried initialize: %v", err)
 	}
 }
 

@@ -50,6 +50,7 @@ type server struct {
 
 	mu                sync.Mutex
 	initialized       bool
+	initializing      bool
 	agentCapabilities *schema.AgentCapabilities
 	promptCancels     map[schema.SessionId]*promptCancel
 }
@@ -204,7 +205,19 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 		s.mu.Unlock()
 		return nil, &acp.RPCError{Code: -32600, Message: "agent is already initialized"}
 	}
+	if s.initializing {
+		s.mu.Unlock()
+		return nil, &acp.RPCError{Code: -32600, Message: "ACP initialization is already in progress on this connection"}
+	}
+	s.initializing = true
 	s.mu.Unlock()
+	// Clear the in-progress state on every exit so that a failed attempt
+	// leaves the connection uninitialized and a later initialize can retry.
+	defer func() {
+		s.mu.Lock()
+		s.initializing = false
+		s.mu.Unlock()
+	}()
 
 	response, err := s.agent.Initialize(ctx, s.client, request)
 	if err != nil {

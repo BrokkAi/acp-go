@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -174,6 +175,121 @@ func TestRuntimeRejectsV1InitializeOnV2Endpoint(t *testing.T) {
 	var rpcErr *acp.RPCError
 	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || !strings.Contains(rpcErr.Message, "only supports ACP protocol version 2") {
 		t.Fatalf("mismatched initialize error = %v", err)
+	}
+}
+
+// gatedInitializeAgent blocks every Initialize call until the test releases
+// it, so a second initialize can be sent while the first is still running.
+type gatedInitializeAgent struct {
+	*echoAgent
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan error
+}
+
+func newGatedInitializeAgent() *gatedInitializeAgent {
+	return &gatedInitializeAgent{
+		echoAgent: &echoAgent{cancelled: make(chan schema.CancelSessionNotification, 1)},
+		entered:   make(chan struct{}, 2),
+		release:   make(chan error),
+	}
+}
+
+func (a *gatedInitializeAgent) Initialize(ctx context.Context, client Client, request schema.InitializeRequest) (schema.InitializeResponse, error) {
+	a.calls.Add(1)
+	a.entered <- struct{}{}
+	select {
+	case err := <-a.release:
+		if err != nil {
+			return schema.InitializeResponse{}, err
+		}
+		return a.echoAgent.Initialize(ctx, client, request)
+	case <-ctx.Done():
+		return schema.InitializeResponse{}, ctx.Err()
+	}
+}
+
+var v2InitializeRequest = schema.InitializeRequest{
+	ProtocolVersion: version,
+	Info:            schema.Implementation{Name: "client", Version: "1"},
+}
+
+// startBlockedInitialize sends an initialize request and returns once the
+// agent's Initialize handler is running and blocked. The returned channel
+// yields the request's outcome after the handler is released.
+func startBlockedInitialize(ctx context.Context, t *testing.T, client *acpv2.Connection, implementation *gatedInitializeAgent) <-chan error {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() {
+		result <- client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil)
+	}()
+	select {
+	case <-implementation.entered:
+	case <-ctx.Done():
+		t.Fatal("initialize did not reach the agent")
+	}
+	return result
+}
+
+func requireInitializeInProgress(ctx context.Context, t *testing.T, client *acpv2.Connection) {
+	t.Helper()
+	err := client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil)
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "ACP initialization is already in progress on this connection" {
+		t.Fatalf("concurrent initialize error = %v", err)
+	}
+}
+
+func TestRuntimeRejectsConcurrentInitialize(t *testing.T) {
+	implementation := newGatedInitializeAgent()
+	client := startRuntime(t, implementation, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	first := startBlockedInitialize(ctx, t, client, implementation)
+	requireInitializeInProgress(ctx, t, client)
+	implementation.release <- nil
+	if err := <-first; err != nil {
+		t.Fatalf("first initialize: %v", err)
+	}
+	if calls := implementation.calls.Load(); calls != 1 {
+		t.Fatalf("Initialize calls = %d, want 1", calls)
+	}
+	err := client.Call(ctx, schema.InitializeMethodName, v2InitializeRequest, nil)
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "agent is already initialized" {
+		t.Fatalf("initialize after success error = %v", err)
+	}
+}
+
+func TestRuntimeAllowsInitializeRetryAfterFailure(t *testing.T) {
+	implementation := newGatedInitializeAgent()
+	client := startRuntime(t, implementation, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	first := startBlockedInitialize(ctx, t, client, implementation)
+	requireInitializeInProgress(ctx, t, client)
+	implementation.release <- errors.New("initialize failed")
+	if err := <-first; err == nil {
+		t.Fatal("failed initialize returned no error")
+	}
+	err := client.Call(ctx, schema.SessionListMethodName, schema.ListSessionsRequest{}, nil)
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || rpcErr.Message != "agent is not initialized" {
+		t.Fatalf("session/list after failed initialize error = %v", err)
+	}
+
+	retry := startBlockedInitialize(ctx, t, client, implementation)
+	implementation.release <- nil
+	if err := <-retry; err != nil {
+		t.Fatalf("retried initialize: %v", err)
+	}
+	if calls := implementation.calls.Load(); calls != 2 {
+		t.Fatalf("Initialize calls = %d, want 2", calls)
+	}
+	if err := client.Call(ctx, schema.SessionListMethodName, schema.ListSessionsRequest{}, nil); err != nil {
+		t.Fatalf("session/list after retried initialize: %v", err)
 	}
 }
 
