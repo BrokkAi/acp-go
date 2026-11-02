@@ -49,9 +49,28 @@ func TestUpdateConstructorsProduceEveryWireShape(t *testing.T) {
 		{"current mode", func(id SessionID) Update { return NewCurrentModeUpdate(id, "plan") }, `{"sessionId":"s","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}`},
 		{"config options", func(id SessionID) Update { return NewConfigOptionUpdate(id, options) }, `{"sessionId":"s","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","name":"Model","type":"select","currentValue":"large","options":[{"value":"large","name":"Large"}]}]}}`},
 		{"session info", func(id SessionID) Update {
-			return NewSessionInfoUpdate(id, schema.SessionInfoUpdate{Title: &title})
+			return NewSessionInfoUpdate(id, schema.SessionInfoUpdate{Title: schema.Nullable[string]{Set: true, Value: title}})
 		}, `{"sessionId":"s","update":{"sessionUpdate":"session_info_update","title":"Release"}}`},
 		{"usage", func(id SessionID) Update { return NewUsageUpdate(id, 12, 64) }, `{"sessionId":"s","update":{"sessionUpdate":"usage_update","used":12,"size":64}}`},
+		{"notice", func(id SessionID) Update {
+			return NewNoticeUpdate(id, schema.Notice{Severity: schema.NoticeSeverityWarning, Title: "Provider degraded", Description: &title})
+		}, `{"sessionId":"s","update":{"sessionUpdate":"notice","severity":"warning","title":"Provider degraded","description":"Release"}}`},
+		{"compaction", func(id SessionID) Update {
+			return NewCompactionUpdate(id, schema.CompactionUpdate{
+				CompactionID: "c1", Status: schema.CompactionStatusFailed,
+				Summary: schema.Nullable[[]schema.ContentBlock]{Set: true, Null: true},
+				Error:   schema.Nullable[string]{Set: true, Value: "boom"},
+			})
+		}, `{"sessionId":"s","update":{"sessionUpdate":"compaction_update","compactionId":"c1","status":"failed","summary":null,"error":"boom"}}`},
+		{"compaction clearing summary", func(id SessionID) Update {
+			return NewCompactionUpdate(id, schema.CompactionUpdate{
+				CompactionID: "c1", Status: schema.CompactionStatusCompleted,
+				Summary: schema.Nullable[[]schema.ContentBlock]{Set: true, Value: []schema.ContentBlock{}},
+			})
+		}, `{"sessionId":"s","update":{"sessionUpdate":"compaction_update","compactionId":"c1","status":"completed","summary":[]}}`},
+		{"compaction summary chunk", func(id SessionID) Update {
+			return NewCompactionSummaryChunkUpdate(id, schema.CompactionSummaryChunk{CompactionID: "c1", Content: NewTextContent("kept")})
+		}, `{"sessionId":"s","update":{"sessionUpdate":"compaction_summary_chunk","compactionId":"c1","content":{"type":"text","text":"kept"}}}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -94,7 +94,8 @@ only remaining work.
     omitted/null/value patch semantics and top-level `_meta` metadata patches
     (`ApplyMetaUpdate` and generated `ApplyUpdate` upserts, #67), shared by
     live delivery and replay, with permission subjects applied in receive
-    order and full replays rebuilding the projection,
+    order and full replays rebuilding the projection, plus notices kept as
+    live events,
   - per-session active-work tracker using active→idle completion on any
     idle stop reason (including `error`, custom, unknown, and none), keeping
     the typed reason and error details and ignoring repeated idle snapshots
@@ -129,7 +130,11 @@ only remaining work.
   - generated types, without facades yet, for client-provided system prompts,
     subagents, auth status, session archive/status/title, and proxy chains
     (`proxy/initialize` and `proxy/successor`, registered as `SideProxy`).
-- Session notices and compaction are stable types in v1 and draft v2.
+- Session notices and compaction on the stable surfaces (#57): v1 client
+  capability helpers, update constructors, `acp.SessionProjection`, and the
+  agent runtime's capability gate; draft-v2 constructors and notice and
+  compaction projection in `acpv2.UpdateProjection`, with no capability gate.
+  `unstable.Projection` delegates both to the stable projection.
 - Optional credential-backed v2 integration coverage: the draft-v2 runner is
   exercised against a real adapter when it advertises v2, and the CI integration
   job runs the v1 and v2 tests together.
@@ -186,11 +191,10 @@ standard-library-only and behind its own package or command.
 ### 3. Schema crate 1.15.1 follow-ups
 
 The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
-them is tracked separately: stable notice and compaction helpers (#57),
-client-provided system prompts (#58), subagents (#60), `-32022` version
-negotiation (#62), the proxy-chain method rename (#69), v2 background work and
-`tool_call/cancel`/`terminal/cancel` (#70), unstable session
-archive/status/title (#71), and unstable auth status (#72).
+them is tracked separately: client-provided system prompts (#58), subagents
+(#60), `-32022` version negotiation (#62), the proxy-chain method rename
+(#69), v2 background work and `tool_call/cancel`/`terminal/cancel` (#70),
+unstable session archive/status/title (#71), and unstable auth status (#72).
 
 ## Guardrails
 
@@ -198,6 +202,7 @@ archive/status/title (#71), and unstable auth status (#72).
   [licenses/README.md](licenses/README.md) enforces it.
 - Open-world enums and preserved unknown tags must continue to decode.
 - No silent fallbacks or v1/v2 conversion.
-- Capability-gated methods must fail before writing to the wire.
+- Capability-gated methods and session-update variants must fail before
+  writing to the wire.
 - Generated files must remain byte-deterministic for both pinned artifacts.
 - The module version is independent of the negotiated wire version.

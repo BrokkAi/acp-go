@@ -182,6 +182,36 @@ series, minor releases may contain breaking API changes.
   - `acpv2.ErrWorkNotCancelled` is wrapped by
     `SessionHandle.CancelActiveWorkAndWait` when the work became idle without
     `cancelled`.
+- Session notices and compaction on the stable surfaces (#57):
+  - v1 clients advertise them with `acp.SessionNoticesClientCapabilities`
+    (`session.notices: {}`) and `acp.SessionCompactionClientCapabilities`
+    (`session.compaction: {}`); `acp.SessionClientCapabilities` combines
+    these with other session capabilities such as
+    `ConfigOptionsClientCapabilities`.
+  - `acp.NewNoticeUpdate`, `NewCompactionUpdate`, and
+    `NewCompactionSummaryChunkUpdate` build the v1 updates, and
+    `acpv2.NewNoticeUpdate`, `NewCompactionUpdate`, and
+    `NewCompactionSummaryChunkUpdate` the draft-v2 ones.
+  - `acp.SessionProjection` folds v1 notices and compactions per session in
+    receive order, live and in `session/load` replay: compactions keep
+    first-seen order, a first-seen ID starts `in_progress`, `summary`,
+    `error`, and `_meta` are patches (unset keeps the stored value, `null`
+    clears it, a value replaces it, and `summary: []` also clears), summary
+    chunks append to the current summary, and unknown statuses are kept.
+    Notices are live events that `Notices` peeks and `DrainNotices`
+    consumes. `Notifications` adapts `session/update` and passes each
+    notification on to an optional next callback.
+  - `acp.RequireSessionUpdateCapability` reports whether an agent may send an
+    update to a v1 client, live or in replay: `notice` needs
+    `session.notices`, `compaction_update` and `compaction_summary_chunk`
+    need `session.compaction`, and a `config_option_update` carrying a
+    `type: "boolean"` option needs `session.configOptions.boolean`. A refusal
+    is an `*acp.RPCError` with code `-32601`, the agent runtime's
+    host-method refusal.
+  - `acpv2.UpdateProjection` keeps draft-v2 notices, which need no client
+    capability, as live events outside the timeline (`Notices`,
+    `DrainNotices`), and `Compactions` lists its compactions in first-seen
+    order.
 
 ### Changed
 
@@ -236,6 +266,53 @@ series, minor releases may contain breaking API changes.
   included; the agent's stderr is recorded but not appended to that error.
   If `session/close` or the agent's exit then fails as well, that failure is
   joined with the `*acpv2.WorkError`, so `errors.As` finds each.
+- Breaking: the v1 agent runtime refuses a `notice` unless the client advertised
+  `session.notices`, a `compaction_update` or `compaction_summary_chunk`
+  unless it advertised `session.compaction`, and a `config_option_update`
+  carrying a boolean option unless it advertised
+  `session.configOptions.boolean`, returning an `*acp.RPCError` `-32601`
+  (the shape of its host-method refusals) without writing the update (#57).
+  The check covers `SessionUpdater.Update` and `Client.Notify` with
+  `session/update` params of type `acp.Update` or `*acp.Update`, so history
+  replay during `session/load` is gated as the protocol requires. Updates
+  sent through `Client.Notify` with other params types, such as raw JSON,
+  are not checked. Boolean options in responses (`session/new`,
+  `session/load`, `session/set_config_option`) are not gated.
+- Breaking: v1 `schema.CompactionUpdate` and `schema/unstable.CompactionUpdate`
+  generate `Summary`, `Error`, and `Meta` as `Nullable`
+  (`Nullable[[]ContentBlock]`, `Nullable[string]`, `Nullable[Meta]`), as
+  Rust's `MaybeUndefined` does, so omission, `null`, and `[]` stay distinct
+  on decode and can all be sent (#57). The v1 packages gain the `Nullable`
+  type for them. v1 `_meta` still replaces as a whole.
+- Breaking: v1 `schema.SessionInfoUpdate` and
+  `schema/unstable.SessionInfoUpdate` generate `Title` and `UpdatedAt` as
+  `Nullable[string]` instead of `*string`, matching Rust's `MaybeUndefined`
+  (#57): an omitted field keeps the stored value and `null` clears it, and
+  both can now be sent. `_meta` stays a plain optional `Meta`, as in Rust.
+  `cmd/acpgen`'s `v1PatchDefs` lists patch fields per def and field, and
+  fails generation if a listed field is missing, required, or not nullable.
+- Breaking (unstable): `schema/unstable.SessionMessage` (sender and
+  recipient session and message IDs, `content`, `_meta`) and
+  `schema/unstable.SubagentUpdate` (`title`, `description`, `capabilities`,
+  `state`, `cwd`, `additionalDirectories`, `_meta`) generate those fields as
+  `Nullable`, matching Rust's `MaybeUndefined`, so `null` can be sent and is
+  kept distinct from omission.
+- A `Nullable` field is sent only when `Set` is true: callers set
+  `Set: true` to send a value as well as to send `null`.
+- Remaining limit: the new v1 `Nullable` fields decode strictly, while Rust
+  reads a malformed value as omitted (`DefaultOnError`) and skips invalid
+  summary blocks (`VecSkipError`); tracked in #82.
+- Breaking: `unstable.Projection` hands notices and compactions to
+  `acp.SessionProjection` (#57). `CompactionState` is now an alias of
+  `acp.CompactionState`, which uses the stable schema types and adds `Meta`;
+  `Notices` and `DrainNotices` return stable `schema.Notice` values; and
+  compactions follow the patch rules above, so an omitted `summary` or `error`
+  keeps the stored value instead of clearing it, and a compaction first seen
+  through a summary chunk starts `in_progress` instead of with no status.
+  `Notifications` returns the error when a notice or compaction does not
+  convert to its stable form instead of dropping it; `Observe` skips such a
+  value, which only Go code can build (every content shape that decodes from
+  the wire converts).
 - v1 `unstable.Handle` follows the reference SDK's handler chain and error
   shapes, the same as `v2/unstable.Handle`: an unstable method the handler
   does not implement now goes to `next` instead of answering method-not-found

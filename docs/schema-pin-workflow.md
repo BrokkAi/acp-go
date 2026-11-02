@@ -61,7 +61,15 @@ schema crate or when the Rust SDK moves its exact pin.
      their upserts get a generated `ApplyUpdate` that patches the top-level
      `_meta` with `ApplyMetaUpdate`. Add a new upsert to `patchDefs` (a field
      it cannot patch fails generation), and check that the Metadata Patches
-     rule still lists the same updates;
+     rule still lists the same updates. v1 otherwise treats `null` like
+     omission; a v1 field that Rust models with `MaybeUndefined` (today
+     `CompactionUpdate`'s `summary`, `error`, and `_meta`, and
+     `SessionInfoUpdate`'s `title` and `updatedAt`, and in the unstable pin
+     `SessionMessage`'s and `SubagentUpdate`'s optional fields) is listed by
+     def and field
+     in `v1PatchDefs`, which keeps `null` distinct as `Nullable` without the
+     v2 metadata patch helpers. A listed field that is missing, required, or
+     not nullable fails generation;
    - JSON field names, integer widths, and defaults;
    - `x-deserialize-*` hints (default-on-error, default-on-null, skip invalid
      items). `cmd/acpgen` honors default-on-error only on the state-update

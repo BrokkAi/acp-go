@@ -63,7 +63,28 @@ func (c *clientConnection) Call(ctx context.Context, method string, params, resu
 	return c.connection().Call(ctx, method, params, result)
 }
 
+// Notify refuses, before writing to the wire, a session/update whose update
+// needs a client capability the client did not advertise (see
+// acp.RequireSessionUpdateCapability). The check covers params of type
+// acp.Update (schema.SessionNotification) or a pointer to one, so it applies
+// to session/load history replay as well as live updates.
 func (c *clientConnection) Notify(ctx context.Context, method string, params any) error {
+	if method == schema.SessionUpdateMethodName {
+		var update *schema.SessionUpdate
+		switch notification := params.(type) {
+		case schema.SessionNotification:
+			update = &notification.Update
+		case *schema.SessionNotification:
+			if notification != nil {
+				update = &notification.Update
+			}
+		}
+		if update != nil {
+			if err := acp.RequireSessionUpdateCapability(c.clientCapabilities(), *update); err != nil {
+				return err
+			}
+		}
+	}
 	return c.connection().Notify(ctx, method, params)
 }
 

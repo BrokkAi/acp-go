@@ -292,7 +292,7 @@ func (s *server) prompt(parent context.Context, raw json.RawMessage) (any, error
 		cancel()
 		s.untrackPrompt(request.SessionID, prompt)
 	}()
-	updates := &promptUpdater{connection: s.client.connection(), sessionID: request.SessionID}
+	updates := &promptUpdater{client: s.client, sessionID: request.SessionID}
 	return s.agent.Prompt(ctx, s.client, request, updates)
 }
 
@@ -342,12 +342,15 @@ func (s *server) untrackPrompt(sessionID schema.SessionId, prompt *promptCancel)
 }
 
 type promptUpdater struct {
-	connection *acp.Connection
-	sessionID  schema.SessionId
+	client    *clientConnection
+	sessionID schema.SessionId
 }
 
+// Update sends through the client connection's Notify, which refuses, before
+// writing to the wire, an update that needs a client capability the client
+// did not advertise (see acp.RequireSessionUpdateCapability).
 func (u *promptUpdater) Update(update schema.SessionUpdate) error {
-	return u.connection.Notify(context.Background(), schema.SessionUpdateMethodName, acp.Update{
+	return u.client.Notify(context.Background(), schema.SessionUpdateMethodName, acp.Update{
 		SessionID: u.sessionID,
 		Update:    update,
 	})

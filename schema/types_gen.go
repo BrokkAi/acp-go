@@ -10,6 +10,38 @@ import (
 // Meta is the reserved _meta channel for extension data.
 type Meta map[string]any
 
+// Nullable preserves the difference between an omitted field, an explicit
+// JSON null, and a concrete value. Set controls wire presence; Null requests
+// an explicit null; Value carries the concrete payload when Null is false.
+// A field is sent only when Set is true, so callers set Set: true both to
+// send a value (Nullable[T]{Set: true, Value: v}) and to send null
+// (Nullable[T]{Set: true, Null: true}); the zero value omits the field.
+type Nullable[T any] struct {
+	Set   bool
+	Null  bool
+	Value T
+}
+
+func (v Nullable[T]) MarshalJSON() ([]byte, error) {
+	if !v.Set || v.Null {
+		return []byte("null"), nil
+	}
+	return json.Marshal(v.Value)
+}
+
+func (v *Nullable[T]) UnmarshalJSON(data []byte) error {
+	v.Set = true
+	if string(data) == "null" {
+		v.Null = true
+		var zero T
+		v.Value = zero
+		return nil
+	}
+	return json.Unmarshal(data, &v.Value)
+}
+
+func (v Nullable[T]) IsZero() bool { return !v.Set }
+
 // Authentication-related capabilities supported by the agent.
 type AgentAuthCapabilities struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -479,15 +511,15 @@ type CompactionSummaryChunk struct {
 // summary: [] also clears the summary.
 type CompactionUpdate struct {
 	// Extensible metadata patch for this compaction.
-	Meta Meta `json:"_meta,omitempty"`
+	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The Agent-owned ID of this compaction, unique within the session.
 	CompactionID CompactionId `json:"compactionId"`
 	// Human-readable error details for the compaction.
-	Error *string `json:"error,omitempty"`
+	Error Nullable[string] `json:"error,omitzero"`
 	// Current lifecycle status.
 	Status CompactionStatus `json:"status"`
 	// Complete replacement user-displayable summary content for the compaction.
-	Summary []ContentBlock `json:"summary,omitempty"`
+	Summary Nullable[[]ContentBlock] `json:"summary,omitzero"`
 }
 
 // Notification sent by the agent when a URL-based elicitation is complete.
@@ -3155,9 +3187,9 @@ type SessionInfoUpdate struct {
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
 	// Human-readable title for the session. Set to null to clear.
-	Title *string `json:"title,omitempty"`
+	Title Nullable[string] `json:"title,omitzero"`
 	// ISO 8601 timestamp of last activity. Set to null to clear.
-	UpdatedAt *string `json:"updatedAt,omitempty"`
+	UpdatedAt Nullable[string] `json:"updatedAt,omitzero"`
 }
 
 // Capabilities for the session/list method.

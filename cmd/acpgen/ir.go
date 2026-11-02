@@ -115,6 +115,23 @@ var patchDefs = map[string]struct{ upsert bool }{
 	"UserMessage":       {upsert: true},
 }
 
+// v1PatchDefs lists, per v1 def, the optional fields that are patches. v1
+// otherwise treats omission and null as equivalent, but a few of its updates
+// give fields patch semantics (omission leaves the stored value unchanged,
+// null clears it, and a value replaces it), and Rust models exactly those
+// fields with MaybeUndefined. Only the listed fields keep null distinct as
+// Nullable; the def's other fields stay plain optionals (SessionInfoUpdate's
+// _meta is an Option<Meta> in Rust). v1 has no Metadata Patches rule, so
+// these defs get no ApplyUpdate: a concrete _meta replaces the stored
+// metadata as a whole.
+var v1PatchDefs = map[string][]string{
+	"CompactionUpdate":  {"summary", "error", "_meta"},
+	"SessionInfoUpdate": {"title", "updatedAt"},
+	// Unstable subagent updates (present only in the unstable v1 pin).
+	"SessionMessage": {"senderSessionId", "recipientSessionId", "senderMessageId", "recipientMessageId", "content", "_meta"},
+	"SubagentUpdate": {"title", "description", "capabilities", "state", "cwd", "additionalDirectories", "_meta"},
+}
+
 // rustEnumNames gives the Rust type name of a flattened union's enum when
 // the tag-derived name is already a def (the schema does not carry it).
 var rustEnumNames = map[string]string{
@@ -134,9 +151,12 @@ type methodDesc struct {
 type ir struct {
 	Pin          string
 	PreserveNull bool
-	Defs         []*typeDef
-	ByName       map[string]*typeDef
-	Methods      []methodDesc
+	// HasNullable is set when any generated field is Nullable, so the
+	// package needs the Nullable type even without PreserveNull.
+	HasNullable bool
+	Defs        []*typeDef
+	ByName      map[string]*typeDef
+	Methods     []methodDesc
 }
 
 // skippedDefs are JSON-RPC routing envelopes. The acp runtime dispatches by
@@ -170,6 +190,14 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 		if err != nil {
 			return nil, err
 		}
+		if !preserveNull {
+			if err := applyV1PatchFields(td, def, v1PatchDefs[name]); err != nil {
+				return nil, err
+			}
+		}
+		for _, f := range td.Fields {
+			r.HasNullable = r.HasNullable || f.Nullable
+		}
 		td.Side, td.Method = def.Side, def.Method
 		if td.Kind == kindStruct && (lenientDefs[name] || td.Flatten != nil) {
 			td.Lenient = true
@@ -198,6 +226,32 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 		return nil, err
 	}
 	return r, nil
+}
+
+// applyV1PatchFields makes the named optional fields of a v1 struct def
+// Nullable. It fails when a listed field is missing, required, or does not
+// admit null in the schema, so a schema change cannot silently drop a patch.
+func applyV1PatchFields(td *typeDef, def *rawSchema, fields []string) error {
+	for _, name := range fields {
+		found := false
+		for i := range td.Fields {
+			f := &td.Fields[i]
+			if f.JSONName != name {
+				continue
+			}
+			found = true
+			ps := def.Properties[name]
+			_, ref := nullableRef(ps.unwrap())
+			if td.Kind != kindStruct || f.Required || f.Variant != "" || !(ps.isNull() || ref) {
+				return fmt.Errorf("%s.%s: v1 patch field is not an optional nullable struct field", td.Name, name)
+			}
+			f.Nullable = true
+		}
+		if !found {
+			return fmt.Errorf("%s.%s: v1 patch field is not in the schema", td.Name, name)
+		}
+	}
+	return nil
 }
 
 // checkUpsert fails when an upsert has a field ApplyUpdate cannot patch

@@ -2,8 +2,11 @@ package unstable_test
 
 import (
 	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 
+	stableschema "github.com/BrokkAi/acp-go/schema"
 	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	acpunstable "github.com/BrokkAi/acp-go/unstable"
 )
@@ -48,7 +51,7 @@ func TestProjectionCompactionLifecycle(t *testing.T) {
 	}})
 	projection.Observe(session, schema.SessionUpdate{CompactionUpdate: &schema.CompactionUpdate{
 		CompactionID: "c1", Status: schema.CompactionStatusCompleted,
-		Summary: []schema.ContentBlock{{Text: &schema.TextContent{Text: "final"}}},
+		Summary: schema.Nullable[[]schema.ContentBlock]{Set: true, Value: []schema.ContentBlock{{Text: &schema.TextContent{Text: "final"}}}},
 	}})
 	projection.Observe(session, schema.SessionUpdate{CompactionUpdate: &schema.CompactionUpdate{
 		CompactionID: "c2", Status: schema.CompactionStatusFailed,
@@ -61,14 +64,14 @@ func TestProjectionCompactionLifecycle(t *testing.T) {
 	if compactions[0].ID != "c1" || compactions[1].ID != "c2" {
 		t.Fatalf("first-seen order = %q, %q", compactions[0].ID, compactions[1].ID)
 	}
-	if compactions[0].Status != schema.CompactionStatusCompleted {
+	if compactions[0].Status != stableschema.CompactionStatusCompleted {
 		t.Fatalf("status = %q", compactions[0].Status)
 	}
 	// The summary field is a complete replacement, so the chunk is gone.
 	if len(compactions[0].Summary) != 1 || compactions[0].Summary[0].Text.Text != "final" {
 		t.Fatalf("summary = %+v", compactions[0].Summary)
 	}
-	if compactions[1].Status != schema.CompactionStatusFailed {
+	if compactions[1].Status != stableschema.CompactionStatusFailed {
 		t.Fatalf("second status = %q", compactions[1].Status)
 	}
 }
@@ -117,7 +120,7 @@ func TestProjectionNotificationsAdapter(t *testing.T) {
 		Update: schema.SessionUpdate{CompactionUpdate: &schema.CompactionUpdate{
 			CompactionID: "c1",
 			Status:       schema.CompactionStatusCompleted,
-			Summary:      []schema.ContentBlock{{Text: &schema.TextContent{Text: "done"}}},
+			Summary:      schema.Nullable[[]schema.ContentBlock]{Set: true, Value: []schema.ContentBlock{{Text: &schema.TextContent{Text: "done"}}}},
 		}},
 	}
 	encoded, err := json.Marshal(notification)
@@ -129,7 +132,7 @@ func TestProjectionNotificationsAdapter(t *testing.T) {
 		t.Fatal(err)
 	}
 	compactions := projection.Compactions("session-1")
-	if len(compactions) != 1 || compactions[0].Status != schema.CompactionStatusCompleted {
+	if len(compactions) != 1 || compactions[0].Status != stableschema.CompactionStatusCompleted {
 		t.Fatalf("compactions = %+v", compactions)
 	}
 	if err := notifications("session/cancel", json.RawMessage(`{}`)); err != nil {
@@ -137,5 +140,88 @@ func TestProjectionNotificationsAdapter(t *testing.T) {
 	}
 	if err := notifications(schema.SessionUpdateMethodName, json.RawMessage(`{`)); err == nil {
 		t.Fatal("malformed session/update was accepted")
+	}
+}
+
+// Notices and compactions go through the stable acp.SessionProjection, so
+// the compaction patch rules hold here too.
+func TestProjectionDelegatesStablePatchSemantics(t *testing.T) {
+	projection := acpunstable.NewProjection()
+	notifications := projection.Notifications()
+	for _, update := range []string{
+		`{"sessionUpdate":"compaction_summary_chunk","compactionId":"c","content":{"type":"text","text":"partial"}}`,
+		`{"sessionUpdate":"compaction_update","compactionId":"c","status":"failed","summary":null,"error":"boom"}`,
+		`{"sessionUpdate":"notice","severity":"_custom","title":"heads up"}`,
+	} {
+		raw := json.RawMessage(`{"sessionId":"s","update":` + update + `}`)
+		if err := notifications(schema.SessionUpdateMethodName, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	compactions := projection.Compactions("s")
+	if len(compactions) != 1 || compactions[0].Summary != nil || compactions[0].Error == nil || *compactions[0].Error != "boom" {
+		t.Fatalf("compactions = %+v", compactions)
+	}
+	if notices := projection.DrainNotices("s"); len(notices) != 1 || notices[0].Severity != "_custom" {
+		t.Fatalf("notices = %+v", notices)
+	}
+}
+
+// Every content shape the unstable schema decodes, with annotations and
+// _meta, converts to the stable summary unchanged, whether it arrives as a
+// compaction_summary_chunk or in a compaction_update summary. The adapter
+// returns a conversion failure rather than dropping the update.
+func TestProjectionConvertsEveryContentShapeToStable(t *testing.T) {
+	blocks := []string{
+		`{"type":"text","text":"t","annotations":{"audience":["user"],"priority":0.5},"_meta":{"k":"v"}}`,
+		`{"type":"image","data":"aGk=","mimeType":"image/png","uri":"file:///i.png","_meta":{"k":"v"}}`,
+		`{"type":"audio","data":"aGk=","mimeType":"audio/wav","annotations":{"lastModified":"2026-01-01T00:00:00Z"}}`,
+		`{"type":"resource_link","uri":"file:///a","name":"a","title":"A","description":"d","mimeType":"text/plain","size":3}`,
+		`{"type":"resource","resource":{"uri":"file:///b","text":"b","mimeType":"text/plain"},"_meta":{"k":"v"}}`,
+		`{"type":"resource","resource":{"uri":"file:///c","blob":"aGk="}}`,
+	}
+	same := func(t *testing.T, got stableschema.ContentBlock, want string) {
+		t.Helper()
+		encoded, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var gotValue, wantValue any
+		if err := json.Unmarshal(encoded, &gotValue); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(want), &wantValue); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(gotValue, wantValue) {
+			t.Fatalf("stable block = %s, want %s", encoded, want)
+		}
+	}
+	projection := acpunstable.NewProjection()
+	notifications := projection.Notifications()
+	send := func(update string) {
+		t.Helper()
+		raw := json.RawMessage(`{"sessionId":"s","update":` + update + `}`)
+		if err := notifications(schema.SessionUpdateMethodName, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, block := range blocks {
+		send(`{"sessionUpdate":"compaction_summary_chunk","compactionId":"chunks","content":` + block + `}`)
+	}
+	send(`{"sessionUpdate":"compaction_update","compactionId":"whole","status":"completed","summary":[` + strings.Join(blocks, ",") + `]}`)
+	for _, id := range []stableschema.CompactionId{"chunks", "whole"} {
+		var summary []stableschema.ContentBlock
+		for _, compaction := range projection.Compactions("s") {
+			if compaction.ID == id {
+				summary = compaction.Summary
+			}
+		}
+		if len(summary) != len(blocks) {
+			t.Fatalf("%s summary = %+v", id, summary)
+		}
+		for i, block := range blocks {
+			same(t, summary[i], block)
+		}
 	}
 }

@@ -13,6 +13,9 @@ type Meta map[string]any
 // Nullable preserves the difference between an omitted field, an explicit
 // JSON null, and a concrete value. Set controls wire presence; Null requests
 // an explicit null; Value carries the concrete payload when Null is false.
+// A field is sent only when Set is true, so callers set Set: true both to
+// send a value (Nullable[T]{Set: true, Value: v}) and to send null
+// (Nullable[T]{Set: true, Null: true}); the zero value omits the field.
 type Nullable[T any] struct {
 	Set   bool
 	Null  bool
