@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -40,6 +41,14 @@ func main() {
 			ClientInfo: acpv2.ClientInfo{Name: "v2-one-shot-client", Version: "0.3.0"},
 		},
 	}.Execute(ctx, *prompt)
+	var failed *acpv2.WorkError
+	if errors.As(err, &failed) {
+		// The agent ended the turn with the error stop reason; keep the
+		// output it produced before failing.
+		fmt.Println(result.Text)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	if err != nil {
 		panic(err)
 	}

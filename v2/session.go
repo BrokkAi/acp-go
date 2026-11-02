@@ -101,6 +101,15 @@ func (s *SessionHandle) CancelActiveWork(ctx context.Context) error {
 	})
 }
 
+// CancelActiveWorkAndWait cancels like CancelActiveWork, then waits for the
+// tracked work to become idle. Only the cancelled stop reason confirms the
+// cancellation, which per the v2 prompt lifecycle covers stops the user or
+// Client chose. Any other idle, including error, a custom or unknown reason,
+// or none, returns the work's result with an error wrapping
+// ErrWorkNotCancelled (and the result's *WorkError for error). So does work
+// that had already completed before the cancellation was sent. When no
+// foreground work is active the Agent sends no idle update, so bound the wait
+// with ctx.
 func (s *SessionHandle) CancelActiveWorkAndWait(ctx context.Context) (WorkResult, error) {
 	if err := s.CancelActiveWork(ctx); err != nil {
 		return WorkResult{}, err
@@ -109,10 +118,17 @@ func (s *SessionHandle) CancelActiveWorkAndWait(ctx context.Context) (WorkResult
 	if err != nil {
 		return result, err
 	}
-	if result.StopReason == nil || *result.StopReason != schema.StopReasonCancelled {
-		return result, fmt.Errorf("active work stopped without cancelled reason: %v", result.StopReason)
+	if result.StopReason != nil && *result.StopReason == schema.StopReasonCancelled {
+		return result, nil
 	}
-	return result, nil
+	reason := "no stop reason"
+	if result.StopReason != nil {
+		reason = fmt.Sprintf("stop reason %q", *result.StopReason)
+	}
+	if failure := result.Err(); failure != nil {
+		return result, fmt.Errorf("%w (%s): %w", ErrWorkNotCancelled, reason, failure)
+	}
+	return result, fmt.Errorf("%w (%s)", ErrWorkNotCancelled, reason)
 }
 
 func (s *SessionHandle) SetConfigOptionID(ctx context.Context, configID, valueID string) ([]schema.SessionConfigOption, error) {

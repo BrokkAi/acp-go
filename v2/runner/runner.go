@@ -40,12 +40,15 @@ type Config struct {
 }
 
 // Result contains the projected agent text and the stop reason from the idle
-// state update. A nil StopReason means the agent reported idle without one.
+// state update. A nil StopReason means the agent reported idle without one, or
+// with a malformed one; a custom or unknown reason is kept as received. Error
+// is the failure the agent reported with the error stop reason, if any.
 // UserMessageID is the ID the agent assigned to the inserted user message when
 // it accepted the prompt.
 type Result struct {
 	Text          string
 	StopReason    *schema.StopReason
+	Error         *schema.Error
 	UserMessageID schema.MessageId
 }
 
@@ -100,6 +103,12 @@ func (e *AgentExitError) Unwrap() error { return e.Err }
 // process group at once. endAgent returns the exit error of an agent that failed on its own,
 // whether during the run (crashed) or after its stdin closed.
 func endAgent(ctx context.Context, process *osrun.Agent, runErr, crashed error) error {
+	var workFailed *acpv2.WorkError
+	if errors.As(runErr, &workFailed) {
+		// The agent reported a failed turn over a working connection; the
+		// run itself completed.
+		runErr = nil
+	}
 	if runErr == nil && crashed == nil {
 		return process.Stop(ctx, shutdown)
 	}
@@ -127,6 +136,12 @@ type SetupError struct {
 func (e *SetupError) Error() string { return "agent setup failed before prompt: " + e.Err.Error() }
 func (e *SetupError) Unwrap() error { return e.Err }
 
+// Execute runs the agent, submits prompt, and waits for the session's
+// foreground work to become idle. When the agent ends that work with the error
+// stop reason, Execute closes the session as usual and returns the result,
+// including any projected text, together with an *acpv2.WorkError carrying
+// the reported JSON-RPC error. Every other stop reason, including cancelled,
+// custom, and unknown ones, returns a nil error.
 func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runErr error) {
 	log := r.Log
 	if log == nil {
@@ -256,14 +271,17 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	promptAccepted = true
 	_ = host.Record(map[string]any{"event": "prompt_accepted", "user_message_id": userMessageID})
 	phase = "wait-for-idle"
+	var workErr error
 	select {
 	case <-work.Done():
 		workResult := work.Result()
 		result = Result{
 			Text:          workResult.Text,
 			StopReason:    workResult.StopReason,
+			Error:         workResult.Error,
 			UserMessageID: userMessageID,
 		}
+		workErr = workResult.Err()
 	case <-ctx.Done():
 		return result, ctx.Err()
 	case <-connection.Done():
@@ -273,7 +291,7 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	if err := connection.CloseSession(ctx, initialization, session.SessionID); err != nil {
 		return result, err
 	}
-	return result, nil
+	return result, workErr
 }
 
 type runHost struct {
