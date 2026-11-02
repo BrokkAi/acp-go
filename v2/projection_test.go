@@ -90,6 +90,45 @@ func TestSessionTrackerNotifications(t *testing.T) {
 	}
 }
 
+// An idle update must complete active work even when its optional fields are
+// malformed: the v2 prompt lifecycle requires clients to recognize the idle
+// transition, and malformed stopReason, background, and _meta read as not
+// reported, as in the Rust SDK.
+func TestSessionTrackerCompletesOnMalformedIdle(t *testing.T) {
+	for name, idle := range map[string]string{
+		"stop reason object":  `"stopReason":{"x":1}`,
+		"stop reason number":  `"stopReason":5`,
+		"error not an object": `"stopReason":"error","error":"boom"`,
+		"background string":   `"stopReason":"end_turn","background":"x"`,
+		"meta number":         `"_meta":5`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tracker := NewSessionTracker()
+			notifications := tracker.TrackerNotifications(nil)
+			for _, update := range []string{
+				`{"sessionUpdate":"state_update","state":"running","background":{"bad":true}}`,
+				`{"sessionUpdate":"state_update","state":"idle",` + idle + `}`,
+			} {
+				raw := json.RawMessage(`{"sessionId":"session","update":` + update + `}`)
+				if err := notifications(schema.SessionUpdateMethodName, raw); err != nil {
+					t.Fatalf("%s: %v", update, err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			result, err := tracker.Work("session").Wait(ctx)
+			if err != nil {
+				t.Fatalf("active work did not complete: %v", err)
+			}
+			if name == "error not an object" {
+				if result.StopReason == nil || *result.StopReason != schema.StopReasonError {
+					t.Fatalf("stop reason = %v", result.StopReason)
+				}
+			}
+		})
+	}
+}
+
 func TestActiveWorkWaitHonorsContext(t *testing.T) {
 	work := BeginActiveWork()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)

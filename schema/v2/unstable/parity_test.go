@@ -62,7 +62,7 @@ func TestMethodRegistry(t *testing.T) {
 		}
 		seen[name] = true
 		switch method.Side {
-		case SideAgent, SideClient, SideBoth, SideProtocol:
+		case SideAgent, SideClient, SideBoth, SideProtocol, SideProxy:
 		default:
 			t.Errorf("method %q has unknown side %q", name, method.Side)
 		}

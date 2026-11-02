@@ -1,10 +1,12 @@
 // Package unstable provides the complete v1 schema surface generated from Rust
-// schema crate 1.7.0's unstable artifacts. It is an explicit import boundary
+// schema crate 1.15.1's unstable artifacts. It is an explicit import boundary
 // equivalent to enabling Rust's optional schema-crate features; none of these
 // types are exposed by the stable schema package.
 //
-// The unstable artifact includes LLM providers, MCP-over-ACP, NES, session
-// fork, document events, and other feature-gated surfaces. It is a collective
+// The unstable artifact includes LLM providers, MCP-over-ACP, session fork,
+// archive, status, and titles, auth status, client-provided system prompts,
+// subagents, proxy chains (proxy/initialize and proxy/successor, registered
+// with SideProxy), and other feature-gated surfaces. It is a collective
 // opt-in because the published unstable JSON artifacts combine all optional
 // Rust features and do not identify feature ownership.
 //

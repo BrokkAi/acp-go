@@ -36,7 +36,43 @@ func synthWire(r *ir, name string, full bool, depth map[string]int) (string, err
 	case kindAny:
 		return `""`, nil
 
+	case kindRaw:
+		if full {
+			return `{"k": "v"}`, nil
+		}
+		return "{}", nil
+
 	case kindStruct:
+		if fl := td.Flatten; fl != nil && full {
+			// Exercise a tag value together with its lifted payload, which
+			// is encoded only alongside that value.
+			chosen := ""
+			for _, f := range td.Fields {
+				if f.Variant != "" {
+					chosen = f.Variant
+					break
+				}
+			}
+			if chosen == "" && len(fl.Known) > 0 {
+				chosen = fl.Known[0]
+			}
+			var fields []field
+			for _, f := range td.Fields {
+				if f.Variant == "" || f.Variant == chosen {
+					fields = append(fields, f)
+				}
+			}
+			parts, err := synthFieldParts(r, fields, full, withDepth(depth, name))
+			if err != nil {
+				return "", err
+			}
+			for i, f := range fields {
+				if f.JSONName == fl.TagJSON {
+					parts[i] = fmt.Sprintf("%q: %q", fl.TagJSON, chosen)
+				}
+			}
+			return "{" + strings.Join(parts, ", ") + "}", nil
+		}
 		return synthFields(r, td.Fields, full, withDepth(depth, name))
 
 	case kindTaggedUnion, kindUntaggedUnion:

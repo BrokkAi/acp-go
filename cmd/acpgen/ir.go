@@ -20,6 +20,7 @@ const (
 	kindUntaggedUnion
 	kindAny
 	kindAlias
+	kindRaw // arbitrary JSON preserved verbatim (json.RawMessage alias)
 )
 
 type field struct {
@@ -29,12 +30,27 @@ type field struct {
 	Required bool
 	Nullable bool // JSON null is distinct from an omitted optional field
 	Doc      string
+	// Lenient mirrors x-deserialize-default-on-error: a value that does not
+	// decode reads as not reported. Only defs with Lenient set honor it.
+	Lenient bool
+	// Variant names the flattened tag value this lifted payload field
+	// belongs to; it is decoded and encoded only alongside that value.
+	Variant string
+}
+
+// flattenInfo describes a tagged union flattened into its parent struct.
+type flattenInfo struct {
+	TagJSON  string   // wire key of the discriminator
+	TagGo    string   // Go field name of the discriminator
+	Enum     string   // synthesized open enum type
+	Known    []string // const tag values
+	ExtrasGo string   // Go field holding a custom variant's other fields
 }
 
 type variant struct {
 	GoName  string // Go payload field name on the union struct
 	Const   string // tag const value; "" when untagged or open
-	Open    bool   // unknown-tag catch-all preserving the raw payload
+	Open    bool   // unknown-tag or unmatched-shape catch-all preserving the raw payload
 	Default bool   // used when the tag key is absent on the wire
 	Payload string // def name for ref payloads; "" for inline or open payloads
 	Inline  []field
@@ -52,6 +68,33 @@ type typeDef struct {
 	Alias    string // alias target def name
 	Side     string // x-side annotation
 	Method   string // x-method annotation
+	// Extra holds types synthesized while classifying this def, such as the
+	// discriminator enum of a union flattened into a struct. They are
+	// emitted right after the def itself.
+	Extra []*typeDef
+	// Flatten is set on a struct carrying a flattened tagged union.
+	Flatten *flattenInfo
+	// Lenient structs get a decoder that honors their fields'
+	// x-deserialize-default-on-error hints (see lenientDefs).
+	Lenient bool
+}
+
+// lenientDefs are the state-update snapshots whose optional fields must read
+// as not reported when malformed, as Rust's DefaultOnError does: a client has
+// to recognize an idle transition even when its stopReason or background list
+// is malformed, or active work never completes. Structs with a flattened
+// union are lenient too. Honoring the hints on every def is tracked in #82.
+var lenientDefs = map[string]bool{
+	"IdleStateUpdate":           true,
+	"RunningStateUpdate":        true,
+	"RequiresActionStateUpdate": true,
+	"UnknownStateUpdate":        true,
+}
+
+// rustEnumNames gives the Rust type name of a flattened union's enum when
+// the tag-derived name is already a def (the schema does not carry it).
+var rustEnumNames = map[string]string{
+	"IdleStateUpdate.stopReason": "IdleStopReason",
 }
 
 type methodDesc struct {
@@ -104,8 +147,16 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 			return nil, err
 		}
 		td.Side, td.Method = def.Side, def.Method
-		r.Defs = append(r.Defs, td)
-		r.ByName[name] = td
+		if td.Kind == kindStruct && (lenientDefs[name] || td.Flatten != nil) {
+			td.Lenient = true
+		}
+		for _, out := range append([]*typeDef{td}, td.Extra...) {
+			if _, taken := r.ByName[out.Name]; taken {
+				return nil, fmt.Errorf("%s: generated type name is already taken", out.Name)
+			}
+			r.Defs = append(r.Defs, out)
+			r.ByName[out.Name] = out
+		}
 	}
 	if err := r.resolveRefs(); err != nil {
 		return nil, err
@@ -130,10 +181,26 @@ func classify(name string, def *rawSchema, root *rootSchema, preserveNull bool) 
 		if len(variants) == 0 {
 			variants = def.AnyOf
 		}
+		if flat, ok, err := classifyFlattenedUnion(name, def, variants, root, preserveNull); ok || err != nil {
+			return flat, err
+		}
 		return classifyUnion(name, def, variants, root, preserveNull)
+
+	case def.Properties == nil && def.Type == nil && len(def.AllOf) == 1 && def.AllOf[0].typeName() != "":
+		// A def that is exactly another def (e.g. InitializeProxyRequest is
+		// InitializeRequest under a different method) aliases it.
+		td.Kind, td.Alias = kindAlias, def.AllOf[0].typeName()
+		return td, nil
 
 	case def.Properties == nil && def.Type == nil && def.soleType() == "" &&
 		len(def.OneOf) == 0 && len(def.AnyOf) == 0 && len(def.AllOf) == 0:
+		if def.Method != "" {
+			// A typeless method payload (e.g. ProxySuccessorResponse, the
+			// wrapped request's result forwarded unchanged) is arbitrary
+			// JSON that must survive decoding verbatim.
+			td.Kind = kindRaw
+			return td, nil
+		}
 		return td, nil // description-only marker (e.g. ExtRequest)
 
 	case def.Properties != nil || (def.Type != nil && def.soleType() == "object"):
@@ -189,6 +256,126 @@ func classifyUnion(name string, def *rawSchema, variants []*rawSchema, root *roo
 		}
 	}
 	return td, nil
+}
+
+// classifyFlattenedUnion recognizes a struct with an internally tagged union
+// flattened into it (a Rust #[serde(flatten)] of a #[serde(tag)] enum), such
+// as IdleStateUpdate.stopReason. The def declares the tag property beside its
+// anyOf, and every variant constrains only that tag: a const for each known
+// variant (optionally merging a payload def via allOf), a plain string for
+// the open custom/future variant, and null for "not reported".
+//
+// The result is a plain struct. The tag becomes an optional field typed by a
+// synthesized open string enum, and each payload def's fields are lifted into
+// the struct as optional fields. The enum is named after the tag property, or
+// prefixed with the def name when a def of that name already exists.
+func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, root *rootSchema, preserveNull bool) (*typeDef, bool, error) {
+	tag := ""
+	for _, v := range variants {
+		if t, ok := unionTagProp(v); ok {
+			tag = t
+			break
+		}
+	}
+	if tag == "" || def.Properties[tag] == nil {
+		return nil, false, nil
+	}
+
+	enumName := goNameOf(tag)
+	if _, taken := root.Defs[enumName]; taken || enumName == name {
+		enumName = rustEnumNames[name+"."+tag]
+	}
+	if _, taken := root.Defs[enumName]; taken || enumName == "" {
+		return nil, true, fmt.Errorf("%s: no free name for the flattened %q enum; add its Rust name to rustEnumNames", name, tag)
+	}
+	tagDoc := def.Properties[tag].Description
+	enum := &typeDef{
+		Name: enumName, Kind: kindEnum, Base: "string",
+		Doc: fmt.Sprintf("%s is the %q discriminator flattened into %s. Unknown values decode unchanged.\n%s", enumName, tag, name, tagDoc),
+	}
+
+	var lifted []field
+	open := false
+	for _, v := range variants {
+		tp := v.Properties[tag]
+		if len(v.Properties) != 1 || tp == nil {
+			return nil, true, fmt.Errorf("%s: flattened %q variant must constrain only the tag", name, tag)
+		}
+		cv, isConst := tp.constString()
+		switch {
+		case isConst:
+			enum.Variants = append(enum.Variants, variant{Const: cv, GoName: pascal(cv), Doc: v.Description})
+			if len(v.AllOf) == 0 {
+				continue
+			}
+			target := ""
+			if len(v.AllOf) == 1 {
+				target = v.AllOf[0].typeName()
+			}
+			payload := root.Defs[target]
+			if payload == nil || payload.Properties == nil || len(payload.AnyOf) > 0 || len(payload.OneOf) > 0 {
+				return nil, true, fmt.Errorf("%s: flattened %q variant %q payload must be one object def", name, tag, cv)
+			}
+			for _, p := range sortedProps(payload.Properties) {
+				f, err := fieldFrom(p.key, p.value, root, preserveNull)
+				if err != nil {
+					return nil, true, fmt.Errorf("%s.%s: %w", target, p.key, err)
+				}
+				// Payload fields exist only alongside their variant, so they
+				// are optional on the flattened struct.
+				f.Doc = strings.TrimSpace(f.Doc + fmt.Sprintf("\nSent only with %s %q; encoding drops it otherwise.", tag, cv))
+				f.Variant = cv
+				lifted = append(lifted, f)
+			}
+		case tp.Const == nil && tp.soleType() == "string" && !tp.isNull():
+			if open {
+				return nil, true, fmt.Errorf("%s: flattened %q has more than one open variant", name, tag)
+			}
+			open = true
+		case tp.Const == nil && tp.soleType() == "null":
+			// "Not reported": the same wire state as an omitted tag.
+		default:
+			return nil, true, fmt.Errorf("%s: unsupported flattened %q variant", name, tag)
+		}
+	}
+
+	td := &typeDef{Name: name, Doc: def.Description, Kind: kindStruct, Extra: []*typeDef{enum}}
+	td.Flatten = &flattenInfo{TagJSON: tag, TagGo: goNameOf(tag), Enum: enumName, ExtrasGo: goNameOf(tag) + "Fields"}
+	for _, v := range enum.Variants {
+		td.Flatten.Known = append(td.Flatten.Known, v.Const)
+	}
+	required := map[string]bool{}
+	for _, k := range def.Required {
+		required[k] = true
+	}
+	for _, p := range sortedProps(def.Properties) {
+		if p.key == tag {
+			// Null selects the "not reported" variant, which omission also
+			// selects, so the tag is a plain optional field even where null
+			// is otherwise preserved.
+			td.Fields = append(td.Fields, field{
+				JSONName: tag, GoName: goNameOf(tag), GoType: enumName,
+				Required: required[tag], Doc: tagDoc, Lenient: p.value.DefaultOnError,
+			})
+			continue
+		}
+		f, err := fieldFrom(p.key, p.value, root, preserveNull)
+		if err != nil {
+			return nil, true, fmt.Errorf("%s.%s: %w", name, p.key, err)
+		}
+		f.Required = required[p.key]
+		td.Fields = append(td.Fields, f)
+	}
+	for _, f := range lifted {
+		for _, existing := range td.Fields {
+			if existing.JSONName == f.JSONName || existing.GoName == f.GoName || f.GoName == td.Flatten.ExtrasGo {
+				return nil, true, fmt.Errorf("%s: flattened variant field %q collides with a struct field", name, f.JSONName)
+			}
+		}
+		td.Fields = append(td.Fields, f)
+	}
+	sort.SliceStable(td.Fields, func(i, j int) bool { return td.Fields[i].JSONName < td.Fields[j].JSONName })
+	return td, true, nil
 }
 
 // carries reports whether the generated type encodes the given wire key as a
@@ -315,6 +502,23 @@ func classifyUnionShape(name string, def *rawSchema, variants []*rawSchema, root
 			}
 		}
 		nv := variant{GoName: goNameOf(v.Title), Payload: payload, Doc: v.Description}
+		if payload == "" && v.isEmpty() {
+			// An unconstrained arm (e.g. ErrorData's Other) accepts any
+			// value no other arm matches and preserves it verbatim. It must
+			// come last because it matches everything.
+			if v != variants[len(variants)-1] {
+				return nil, fmt.Errorf("%s: unconstrained variant must be the last one", name)
+			}
+			if nv.GoName != "Other" {
+				return nil, fmt.Errorf("%s: unconstrained variant is titled %q, want Other", name, v.Title)
+			}
+			if len(td.Fields) > 0 {
+				return nil, fmt.Errorf("%s: unconstrained variant beside shared fields is unsupported", name)
+			}
+			nv.Open = true
+			td.Variants = append(td.Variants, nv)
+			continue
+		}
 		if payload == "" {
 			if v.Properties == nil && v.soleType() != "object" {
 				return nil, fmt.Errorf("%s: untagged variant without $ref or object payload is unsupported", name)
@@ -382,6 +586,9 @@ func enumVariants(variants []*rawSchema) ([]constVariant, string, bool) {
 
 func allPrimitive(variants []*rawSchema) bool {
 	for _, v := range variants {
+		if v.isEmpty() {
+			continue // an unconstrained arm accepts any JSON value
+		}
 		switch v.soleType() {
 		case "string", "integer", "number", "boolean", "array", "null":
 		default:
@@ -519,7 +726,7 @@ func unionTagProp(v *rawSchema) (string, bool) {
 
 // fieldFrom maps one object property to a Go field.
 func fieldFrom(prop string, ps *rawSchema, root *rootSchema, preserveNull bool) (field, error) {
-	f := field{JSONName: prop, GoName: goNameOf(prop), Doc: ps.Description}
+	f := field{JSONName: prop, GoName: goNameOf(prop), Doc: ps.Description, Lenient: ps.DefaultOnError}
 	inner := ps.unwrap()
 	f.Nullable = preserveNull && ps.isNull()
 
@@ -741,7 +948,7 @@ func (r *ir) checkCollisions() error {
 				if !v.Open && v.Payload == "" {
 					generated[td.Name+v.GoName] = true
 				}
-				if td.Kind == kindTaggedUnion && v.Open {
+				if v.Open {
 					generated[td.Name+"Other"] = true
 				}
 			}
@@ -853,6 +1060,11 @@ func (r *ir) buildMethods(meta *metaFile) error {
 		for _, m := range meta.ProtocolMethods {
 			if m == method {
 				return "protocol", nil
+			}
+		}
+		for _, m := range meta.ProxyMethods {
+			if m == method {
+				return "proxy", nil
 			}
 		}
 		return "", fmt.Errorf("method %q not present in pinned meta.json", method)

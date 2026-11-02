@@ -24,7 +24,7 @@ type Elicitation interface {
 // reference SDK's non-interactive one-shot client.
 func CancelPermission() schema.RequestPermissionResponse {
 	return schema.RequestPermissionResponse{Outcome: schema.RequestPermissionOutcome{
-		Cancelled: &schema.RequestPermissionOutcomeCancelled{},
+		Cancelled: &schema.CancelledPermissionOutcome{},
 	}}
 }
 

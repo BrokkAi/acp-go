@@ -146,6 +146,8 @@ func emitTypes(r *ir, pin, packageName string) []byte {
 	b.WriteString(header(pin, "wire types"))
 	b.WriteString("package " + packageName + "\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n)\n\n")
 	b.WriteString("// Meta is the reserved _meta channel for extension data.\ntype Meta map[string]any\n\n")
+	// Shared helpers are written once per generated file.
+	probeHelpersEmitted, withoutKeyEmitted, unchangedEmitted = false, false, false
 	if r.PreserveNull {
 		emitNullable(&b)
 	}
@@ -180,6 +182,9 @@ func emitTypes(r *ir, pin, packageName string) []byte {
 		case kindAny:
 			fmt.Fprintf(&b, "type %s any\n\n", td.Name)
 
+		case kindRaw:
+			fmt.Fprintf(&b, "type %s = json.RawMessage\n\n", td.Name)
+
 		case kindTaggedUnion:
 			emitTaggedUnion(&b, r, td)
 
@@ -196,7 +201,12 @@ func emitStruct(b *strings.Builder, td *typeDef) {
 		writeDoc(b, "\t", f.Doc)
 		fmt.Fprintf(b, "\t%s\n", f.goDecl())
 	}
+	if fl := td.Flatten; fl != nil {
+		fmt.Fprintf(b, "\t// %s keeps the other fields of a custom or future %s, which are\n\t// re-encoded with it. It is ignored for the known values.\n", fl.ExtrasGo, fl.TagJSON)
+		fmt.Fprintf(b, "\t%s map[string]json.RawMessage `json:\"-\"`\n", fl.ExtrasGo)
+	}
 	b.WriteString("}\n\n")
+	emitLenientStruct(b, td)
 }
 
 // payloadType renders the Go type of a union variant payload field.
@@ -214,6 +224,11 @@ func payloadType(r *ir, td *typeDef, v variant) string {
 func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 	kindType := td.Name + "Kind"
 	shadow := unexport(td.Name) + "Shadow"
+	for _, v := range td.Variants {
+		if v.Const != "" && v.Payload != "" && capturesExtras(r, v.Payload, map[string]bool{}) {
+			emitWithoutKey(b)
+		}
+	}
 
 	fmt.Fprintf(b, "type %s string\n\n", kindType)
 	b.WriteString("const (\n")
@@ -237,16 +252,7 @@ func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 		fmt.Fprintf(b, "\t%s *%s `json:\"-\"`\n", v.GoName, payloadType(r, td, v))
 	}
 	b.WriteString("}\n\n")
-
-	// Open-variant payload: the raw wire object, preserved verbatim.
-	for _, v := range td.Variants {
-		if !v.Open {
-			continue
-		}
-		fmt.Fprintf(b, "// %s preserves an unrecognized %s payload verbatim.\n", td.Name+"Other", td.Name)
-		fmt.Fprintf(b, "type %sOther struct{ Raw json.RawMessage }\n\n", td.Name)
-		fmt.Fprintf(b, "func (v %sOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }\n\n", td.Name)
-	}
+	emitOpenPayload(b, td)
 
 	// Inline variant payload structs.
 	for _, v := range td.Variants {
@@ -301,6 +307,8 @@ func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 		switch {
 		case v.Open:
 			continue
+		case v.Const != "" && v.Payload != "" && capturesExtras(r, v.Payload, map[string]bool{}):
+			fmt.Fprintf(b, "\tcase %q:\n\t\tv.Kind = %s%s\n\t\tv.%s = new(%s)\n\t\treturn json.Unmarshal(withoutKey(data, %q), v.%s)\n", v.Const, kindType, pascal(v.Const), v.GoName, payloadType(r, td, v), td.TagJSON, v.GoName)
 		case v.Const != "":
 			fmt.Fprintf(b, "\tcase %q:\n\t\tv.Kind = %s%s\n\t\tv.%s = new(%s)\n\t\treturn json.Unmarshal(data, v.%s)\n", v.Const, kindType, pascal(v.Const), v.GoName, payloadType(r, td, v), v.GoName)
 		case v.Default:
@@ -313,6 +321,17 @@ func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 		fmt.Fprintf(b, "\tdefault:\n\t\treturn fmt.Errorf(\"%s: unknown %s tag %%q\", tag)\n\t}\n", td.Name, td.TagJSON)
 	}
 	fmt.Fprintf(b, "}\n\n")
+}
+
+// emitOpenPayload declares the catch-all payload of a union's open variant:
+// the raw wire value, preserved verbatim.
+func emitOpenPayload(b *strings.Builder, td *typeDef) {
+	if !hasOpenVariant(td) {
+		return
+	}
+	fmt.Fprintf(b, "// %s preserves an unrecognized %s payload verbatim.\n", td.Name+"Other", td.Name)
+	fmt.Fprintf(b, "type %sOther struct{ Raw json.RawMessage }\n\n", td.Name)
+	fmt.Fprintf(b, "func (v %sOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }\n\n", td.Name)
 }
 
 func hasOpenVariant(td *typeDef) bool {
@@ -336,7 +355,16 @@ func emitUntaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 	for _, v := range td.Variants {
 		fmt.Fprintf(b, "\t%s *%s `json:\"-\"`\n", v.GoName, payloadType(r, td, v))
 	}
+	if hasOpenVariant(td) {
+		// Like the open arm, a decoded typed variant re-encodes its exact
+		// wire bytes, unknown keys included, while it is left unchanged.
+		b.WriteString("\traw        json.RawMessage // wire bytes of the decoded variant\n\trawVariant string          // variant raw was decoded into\n")
+	}
 	b.WriteString("}\n\n")
+	emitOpenPayload(b, td)
+	if hasOpenVariant(td) {
+		emitUnchanged(b)
+	}
 
 	// Inline variant payload structs.
 	for _, v := range td.Variants {
@@ -365,7 +393,20 @@ func emitUntaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 		fmt.Fprintf(b, "\tif v.%s != nil {\n\t\tset++\n\t}\n", v.GoName)
 	}
 	fmt.Fprintf(b, "\tif set != 1 {\n\t\treturn nil, fmt.Errorf(\"%%s: exactly one variant must be set, have %%d\", \"%s\", set)\n\t}\n", td.Name)
+	if hasOpenVariant(td) {
+		b.WriteString("\tswitch v.rawVariant {\n")
+		for _, v := range td.Variants {
+			if !v.Open {
+				fmt.Fprintf(b, "\tcase %q:\n\t\tif v.%s != nil && unchangedSince(v.raw, v.%s) {\n\t\t\treturn v.raw, nil\n\t\t}\n", v.GoName, v.GoName, v.GoName)
+			}
+		}
+		b.WriteString("\t}\n")
+	}
 	for _, v := range td.Variants {
+		if v.Open {
+			fmt.Fprintf(b, "\tif v.%s != nil {\n\t\treturn v.%s.Raw, nil\n\t}\n", v.GoName, v.GoName)
+			continue
+		}
 		fmt.Fprintf(b, "\tif v.%s != nil {\n\t\tpayload, err := json.Marshal(v.%s)\n\t\tif err != nil {\n\t\treturn nil, err\n\t\t}\n", v.GoName, v.GoName)
 		if strings.HasPrefix(v.Payload, "[]") {
 			fmt.Fprintf(b, "\t\treturn payload, nil\n\t}\n")
@@ -380,6 +421,20 @@ func emitUntaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 	if len(td.Fields) > 0 {
 		fmt.Fprintf(b, "\tif err := json.Unmarshal(data, (*%s)(v)); err != nil {\n\t\treturn err\n\t}\n", shadow)
 	}
+	if hasOpenVariant(td) {
+		// With a catch-all, a variant whose shape probe matches but whose
+		// payload does not decode falls through to the next candidate, as
+		// an untagged serde enum does, and finally to the raw value.
+		for _, v := range td.Variants {
+			if v.Open {
+				continue // classification keeps the open variant last
+			}
+			fmt.Fprintf(b, "\tif %s {\n\t\tpayload := new(%s)\n\t\tif json.Unmarshal(data, payload) == nil {\n\t\t\tv.%s = payload\n\t\t\tv.raw, v.rawVariant = append(json.RawMessage(nil), data...), %q\n\t\t\treturn nil\n\t\t}\n\t}\n", untaggedProbe(r, v), payloadType(r, td, v), v.GoName, v.GoName)
+		}
+		fmt.Fprintf(b, "\tv.Other = &%sOther{Raw: append(json.RawMessage(nil), data...)}\n\treturn nil\n}\n\n", td.Name)
+		emitProbeHelpers(b)
+		return
+	}
 	for i, v := range td.Variants {
 		keyword := "if"
 		if i > 0 {
@@ -388,8 +443,11 @@ func emitUntaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 		fmt.Fprintf(b, "\t%s %s {\n\t\tv.%s = new(%s)\n\t\treturn json.Unmarshal(data, v.%s)\n\t", keyword, untaggedProbe(r, v), v.GoName, payloadType(r, td, v), v.GoName)
 	}
 	fmt.Fprintf(b, "}\n\treturn fmt.Errorf(\"%s: payload matches no variant\")\n}\n\n", td.Name)
+	emitProbeHelpers(b)
+}
 
-	// Probe helpers are shared across unions; emit once.
+// emitProbeHelpers writes the shape-probe helpers shared across unions, once.
+func emitProbeHelpers(b *strings.Builder) {
 	if !probeHelpersEmitted {
 		probeHelpersEmitted = true
 		b.WriteString(`
@@ -497,6 +555,7 @@ func emitMethods(r *ir, pin, packageName string) []byte {
 	b.WriteString("\tSideClient = \"client\"   // requests are served by the client\n")
 	b.WriteString("\tSideProtocol = \"protocol\" // connection-level notifications\n")
 	b.WriteString("\tSideBoth = \"both\" // either peer may send the request or notification\n")
+	b.WriteString("\tSideProxy = \"proxy\" // exchanged between a proxy-chain conductor and its proxies\n")
 	b.WriteString(")\n\n")
 
 	b.WriteString("const (\n")
@@ -547,6 +606,8 @@ func sideConst(side string) string {
 		return "SideClient"
 	case "both":
 		return "SideBoth"
+	case "proxy":
+		return "SideProxy"
 	default:
 		return "SideProtocol"
 	}
@@ -559,7 +620,7 @@ func emitParity(r *ir, pin, packageName string) []byte {
 	b.WriteString("var parityCases = []parityCase{\n")
 	for _, td := range r.Defs {
 		switch td.Kind {
-		case kindStruct, kindTaggedUnion, kindUntaggedUnion, kindNewtype, kindEnum, kindAny, kindAlias:
+		case kindStruct, kindTaggedUnion, kindUntaggedUnion, kindNewtype, kindEnum, kindAny, kindAlias, kindRaw:
 		default:
 			continue
 		}

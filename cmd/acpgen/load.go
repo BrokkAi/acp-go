@@ -24,6 +24,9 @@ type rawSchema struct {
 	Method       string                `json:"x-method"`
 	Discriminate json.RawMessage       `json:"discriminator"` // OpenAPI-style; informational only
 	Not          *rawSchema            `json:"not"`
+	// DefaultOnError marks a field whose malformed value Rust reads as
+	// absent (x-deserialize-default-on-error).
+	DefaultOnError bool `json:"x-deserialize-default-on-error"`
 }
 
 type rootSchema struct {
@@ -51,6 +54,10 @@ type metaFile struct {
 	AgentMethods    map[string]string `json:"agentMethods"`
 	ClientMethods   map[string]string `json:"clientMethods"`
 	ProtocolMethods map[string]string `json:"protocolMethods"`
+	// ProxyMethods lists the conductor/proxy methods of the proxy-chains
+	// extension (proxy/initialize, proxy/successor). They belong to neither
+	// the agent nor the client API surface.
+	ProxyMethods map[string]string `json:"proxyMethods"`
 }
 
 func loadMeta(path string) (*metaFile, error) {
@@ -93,6 +100,14 @@ func (s *rawSchema) unwrap() *rawSchema {
 		return t
 	}
 	return nil
+}
+
+// isEmpty reports whether the schema places no constraint on the value
+// (only a title or description), so it accepts any JSON value.
+func (s *rawSchema) isEmpty() bool {
+	return s.Ref == "" && s.Type == nil && s.Const == nil && s.Enum == nil &&
+		s.Properties == nil && s.Items == nil && s.Additional == nil &&
+		len(s.AllOf) == 0 && len(s.AnyOf) == 0 && len(s.OneOf) == 0 && s.Not == nil
 }
 
 // isNull reports whether the type list includes "null".
