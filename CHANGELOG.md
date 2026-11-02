@@ -139,8 +139,8 @@ series, minor releases may contain breaking API changes.
   `capabilities.session.fork`. `ForkSession` requires a source session ID and
   an absolute `cwd`, gates additional directories on
   `capabilities.session.additionalDirectories`, rejects inline MCP servers,
-  requires a non-blank forked session ID in the response, and forwards
-  `systemPrompt` unchanged. All checks fail before writing to the wire.
+  and requires a non-blank forked session ID in the response. All checks fail
+  before writing to the wire.
 - `v2/unstable.Handle`, `ProviderHandler`, and `ForkHandler` serve those
   methods on the agent side, and `v2/unstable.Advertise` announces the
   implemented capabilities in the initialize response. v1 `unstable` gains
@@ -265,6 +265,62 @@ series, minor releases may contain breaking API changes.
   that data from any error that is or wraps a `-32002` `*acp.RPCError`, and
   `v2.SchemaError` converts an `*acp.RPCError` to the typed draft-v2
   `schema.Error`.
+- Client-provided system prompts (#58), following the client-provided system
+  prompt RFD and the reference SDK's `unstable_session_system_prompt`:
+  - `unstable` (v1) and `v2/unstable` (draft v2) gain the `SystemPrompt` and
+    `SystemPromptMode` aliases, the `Append` and `Override` modes,
+    `NewSystemPrompt`, and `NewTextSystemPrompt`.
+  - Lifecycle facades that carry a system prompt: `NewSession`,
+    `LoadSession` (v1 only), and `ResumeSession`, alongside the existing
+    `ForkSession`. They take the complete unstable request (the reference
+    SDK's `_from` helpers), gate on `loadSession` or
+    `sessionCapabilities.resume` where needed, require an absolute `cwd` and
+    gated absolute additional directories, reject inline MCP servers, send
+    v1's required `mcpServers` as `[]`, and require a non-blank session ID in
+    the session/new response.
+  - Before writing, every lifecycle facade, including the `mcp` and `v2/mcp`
+    session helpers, rejects a `systemPrompt` the agent did not advertise
+    (`agentCapabilities.sessionCapabilities.systemPrompt` in v1,
+    `capabilities.session.systemPrompt` in v2), `override` without the nested
+    `mode.override`, a missing or unknown mode, empty content, and any
+    non-text content block. `ValidateSessionSystemPrompt` exposes the same
+    check.
+  - Agent side: `SystemPromptHandler` (`NewSessionWithSystemPrompt`, and in v2
+    `ResumeSessionWithSystemPrompt`), and in v1 `SystemPromptLoader`
+    (`LoadSessionWithSystemPrompt`) and `SystemPromptResumer`
+    (`ResumeSessionWithSystemPrompt`), receive the unstable lifecycle requests
+    with their `systemPrompt`, which the stable request types the runtimes
+    decode drop. `Install` serves `session/new`, `session/load`, and
+    `session/resume` (v2: `session/new` and `session/resume`) from them
+    through `Runtime.Overrides`, in place of the `Agent`'s own methods, and
+    the handlers reach the client through `ClientFromContext`. Params that do
+    not decode answer `-32602` in the deserialization shape `Handle` uses,
+    including a `systemPrompt` the reference SDK refuses to deserialize but
+    `encoding/json` would accept leniently (a missing or `null` `mode` or
+    `content`, or a text block without `text`), with the reference SDK's
+    error text for the first fault in document order within `systemPrompt`,
+    as serde reports it. That check runs before the full decode, so a prompt
+    fault wins over a bad sibling member earlier in the params.
+  - Before a handler runs, the `session/new`, `session/load`,
+    `session/resume`, and `session/fork` routes check a decoded
+    `systemPrompt` against the capability the runtime actually sent in this
+    connection's initialize response, and reject an unadvertised prompt,
+    `override` without `mode.override`, a missing or unknown mode, empty
+    content, and any non-text content block with the reference SDK's
+    `-32602` (`Invalid params`, with the reason as string data). Handlers no
+    longer re-derive the capability, so one can never accept a prompt that
+    was not advertised. The `agent` and `v2/agent` runtimes record the
+    encoded initialize response they sent for this check.
+  - `Install` announces the `systemPrompt` capability (`{}`, append only)
+    only when the handler receives the prompt on every lifecycle request the
+    agent advertises (v1: `loadSession` needs `SystemPromptLoader`, `resume`
+    `SystemPromptResumer`, `fork` `ForkHandler`; v2: `fork` needs
+    `ForkHandler`). A customize function may add `mode.override`; a
+    `systemPrompt` capability some advertised lifecycle request would drop
+    fails `initialize` instead of being sent. `Advertise` alone never
+    announces it.
+  - `mcp.NewSessionOptions` and `v2/mcp.NewSessionOptions` gain
+    `SystemPrompt`, so MCP servers and a system prompt can be combined.
 
 ### Changed
 
@@ -380,6 +436,27 @@ series, minor releases may contain breaking API changes.
   convert to its stable form instead of dropping it; `Observe` skips such a
   value, which only Go code can build (every content shape that decodes from
   the wire converts).
+- **Breaking (draft v2):** `v2/mcp.NewSession` and `v2/mcp.ResumeSession` now take the
+  unstable draft-v2 initialize response (from
+  `v2.Connection.InitializeExtended`) and send the unstable requests, like
+  `v2/mcp.ForkSession` and the v1 `mcp` package. This is how they can carry a
+  `systemPrompt`, which the stable draft-v2 types do not model.
+  `ResumeSession` takes `schema/v2/unstable.ResumeSessionRequest`, and
+  `NewSessionOptions.Servers`, `NewStdioServer`, and `NewHTTPServer` use the
+  unstable `McpServer`. As a result, both also accept the native `acp`
+  transport, gated on `capabilities.session.mcp.acp`, as the reference SDK's
+  `McpServer` does once MCP-over-ACP is enabled. The stable draft-v2 request
+  cannot carry `systemPrompt`, and the stable `acpv2.Initialization` drops
+  the `systemPrompt` capability that gates it, so no signature-compatible
+  change could send or check the prompt; a second, unstable-typed set of
+  helpers next to the old ones would be a compatibility path. Migrate by
+  initializing with `InitializeExtended` and passing its unstable response.
+- `unstable.ForkSession`, `v2/unstable.ForkSession`, `mcp.LoadSession`,
+  `mcp.ResumeSession`, `mcp.ForkSession`, `v2/mcp.ForkSession`, and the v1
+  and v2 attached-session helpers no longer forward a `systemPrompt`
+  unchecked. They apply the system prompt checks above before writing.
+  `v2/mcp.NewAttachedSession` and `ResumeAttachedSession` now share the
+  `NewSession` and `ResumeSession` checks.
 - v1 `unstable.Handle` follows the reference SDK's handler chain and error
   shapes, the same as `v2/unstable.Handle`: an unstable method the handler
   does not implement now goes to `next` instead of answering method-not-found

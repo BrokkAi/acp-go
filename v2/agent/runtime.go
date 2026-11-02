@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/initresult"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -95,6 +96,9 @@ type server struct {
 	initializing bool
 	caps         *schema.AgentCapabilities
 	auth         bool
+	// sent is the encoded initialize response, which handlers read through
+	// initresult.From.
+	sent json.RawMessage
 }
 
 func (s *server) handle(ctx context.Context, method string, raw json.RawMessage) (any, error) {
@@ -107,7 +111,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 	if err := s.gate(method); err != nil {
 		return nil, err
 	}
-	ctx = withClient(ctx, s.client)
+	ctx = initresult.With(withClient(ctx, s.client), s.sentInitialize())
 	if override, ok := s.overrides[method]; ok {
 		return override(ctx, method, raw)
 	}
@@ -257,11 +261,16 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 			return nil, errors.New("session.delete capability requires a SessionDeleter implementation")
 		}
 	}
+	sent, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("encode initialize response: %w", err)
+	}
 	s.client.initialize(request.Capabilities)
 	s.mu.Lock()
 	s.initialized = true
 	s.caps = response.Capabilities
 	s.auth = len(response.AuthMethods) > 0
+	s.sent = sent
 	s.mu.Unlock()
 	return result, nil
 }
@@ -275,6 +284,13 @@ func (s *server) notification(method string, raw json.RawMessage) error {
 		return err
 	}
 	return s.agent.CancelSession(notification)
+}
+
+// sentInitialize is the encoded initialize response sent on the connection.
+func (s *server) sentInitialize() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sent
 }
 
 func (s *server) isInitialized() bool {

@@ -40,6 +40,7 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/acpvalidate"
+	"github.com/BrokkAi/acp-go/internal/systemprompt"
 	schema "github.com/BrokkAi/acp-go/schema/unstable"
 )
 
@@ -47,16 +48,25 @@ import (
 type NewSessionOptions struct {
 	AdditionalDirectories []string
 	Servers               []schema.McpServer
+	// SystemPrompt is the optional client-provided system prompt. It needs
+	// sessionCapabilities.systemPrompt, and override mode needs
+	// sessionCapabilities.systemPrompt.mode.override; see
+	// github.com/BrokkAi/acp-go/unstable.ValidateSessionSystemPrompt.
+	SystemPrompt *schema.SystemPrompt
 }
 
 // NewSession creates a session whose MCP servers may use any unstable
-// transport, including native MCP-over-ACP.
+// transport, including native MCP-over-ACP, optionally with a client-provided
+// system prompt.
 func NewSession(ctx context.Context, connection *acp.Connection, initialization schema.InitializeResponse, directory string, options NewSessionOptions) (acp.Session, error) {
 	var session acp.Session
 	if err := validatePaths(initialization, directory, options.AdditionalDirectories); err != nil {
 		return session, err
 	}
 	if err := validateServers(initialization, options.Servers); err != nil {
+		return session, err
+	}
+	if err := systemprompt.V1Client(initialization, options.SystemPrompt); err != nil {
 		return session, err
 	}
 	servers := options.Servers
@@ -68,6 +78,7 @@ func NewSession(ctx context.Context, connection *acp.Connection, initialization 
 		Cwd:                   directory,
 		AdditionalDirectories: options.AdditionalDirectories,
 		MCPServers:            servers,
+		SystemPrompt:          options.SystemPrompt,
 	}
 	if err := connection.Call(ctx, schema.SessionNewMethodName, request, &session); err != nil {
 		return session, err
@@ -79,7 +90,8 @@ func NewSession(ctx context.Context, connection *acp.Connection, initialization 
 }
 
 // LoadSession loads a session with the unstable MCP server transports. The
-// agent must advertise loadSession.
+// agent must advertise loadSession. request.SystemPrompt gets the same checks
+// as NewSessionOptions.SystemPrompt.
 func LoadSession(ctx context.Context, connection *acp.Connection, initialization schema.InitializeResponse, request schema.LoadSessionRequest) (schema.LoadSessionResponse, error) {
 	var result schema.LoadSessionResponse
 	if initialization.AgentCapabilities == nil || initialization.AgentCapabilities.LoadSession == nil || !*initialization.AgentCapabilities.LoadSession {
@@ -94,6 +106,9 @@ func LoadSession(ctx context.Context, connection *acp.Connection, initialization
 	if err := validateServers(initialization, request.MCPServers); err != nil {
 		return result, err
 	}
+	if err := systemprompt.V1Client(initialization, request.SystemPrompt); err != nil {
+		return result, err
+	}
 	if request.MCPServers == nil {
 		// mcpServers is required in v1, so send an empty array, not null.
 		request.MCPServers = []schema.McpServer{}
@@ -102,6 +117,7 @@ func LoadSession(ctx context.Context, connection *acp.Connection, initialization
 }
 
 // ResumeSession resumes a session with the unstable MCP server transports.
+// request.SystemPrompt gets the same checks as NewSessionOptions.SystemPrompt.
 func ResumeSession(ctx context.Context, connection *acp.Connection, initialization schema.InitializeResponse, request schema.ResumeSessionRequest) (schema.ResumeSessionResponse, error) {
 	var result schema.ResumeSessionResponse
 	if err := requireResume(initialization); err != nil {
@@ -116,10 +132,14 @@ func ResumeSession(ctx context.Context, connection *acp.Connection, initializati
 	if err := validateServers(initialization, request.MCPServers); err != nil {
 		return result, err
 	}
+	if err := systemprompt.V1Client(initialization, request.SystemPrompt); err != nil {
+		return result, err
+	}
 	return result, connection.Call(ctx, schema.SessionResumeMethodName, request, &result)
 }
 
 // ForkSession forks a session with the unstable MCP server transports.
+// request.SystemPrompt gets the same checks as NewSessionOptions.SystemPrompt.
 func ForkSession(ctx context.Context, connection *acp.Connection, initialization schema.InitializeResponse, request schema.ForkSessionRequest) (schema.ForkSessionResponse, error) {
 	var result schema.ForkSessionResponse
 	if err := requireFork(initialization); err != nil {
@@ -132,6 +152,9 @@ func ForkSession(ctx context.Context, connection *acp.Connection, initialization
 		return result, err
 	}
 	if err := validateServers(initialization, request.MCPServers); err != nil {
+		return result, err
+	}
+	if err := systemprompt.V1Client(initialization, request.SystemPrompt); err != nil {
 		return result, err
 	}
 	if err := connection.Call(ctx, schema.SessionForkMethodName, request, &result); err != nil {

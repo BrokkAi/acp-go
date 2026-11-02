@@ -3,6 +3,18 @@
 // mirrors the Rust SDK's separately enabled unstable_mcp_over_acp feature:
 // importing this package is the explicit Go opt-in.
 //
+// The session helpers (NewSession, ResumeSession, and ForkSession) send the
+// unstable draft-v2 requests, whose McpServer union adds the native acp
+// transport and which can carry a client-provided system prompt. They gate on
+// the unstable initialize response, which
+// github.com/BrokkAi/acp-go/v2.Connection.InitializeExtended decodes:
+//
+//	var initialization unstable.InitializeResponse // schema/v2/unstable
+//	_, err := connection.InitializeExtended(ctx, capabilities, info, &initialization)
+//	session, err := mcp.NewSession(ctx, connection, initialization, directory, mcp.NewSessionOptions{
+//		Servers: []unstable.McpServer{mcp.NewStdioServer("docs", "/usr/local/bin/docs-mcp", nil, nil)},
+//	})
+//
 // The package shares a standard-library MCP server framework with
 // github.com/BrokkAi/acp-go/mcp: Server, Service, RequestContext, ToolRegistry,
 // and NewToolServer are the same types in both, so a server defined once
@@ -18,9 +30,11 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/BrokkAi/acp-go/internal/acpvalidate"
-	schema "github.com/BrokkAi/acp-go/schema/v2"
+	"github.com/BrokkAi/acp-go/internal/v2session"
+	schema "github.com/BrokkAi/acp-go/schema/v2/unstable"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
 )
 
@@ -28,6 +42,11 @@ import (
 type NewSessionOptions struct {
 	AdditionalDirectories []string
 	Servers               []schema.McpServer
+	// SystemPrompt is the optional client-provided system prompt. It needs
+	// capabilities.session.systemPrompt, and override mode needs
+	// capabilities.session.systemPrompt.mode.override; see
+	// github.com/BrokkAi/acp-go/v2/unstable.ValidateSessionSystemPrompt.
+	SystemPrompt *schema.SystemPrompt
 }
 
 func NewStdioServer(name, command string, args []string, env []schema.EnvVariable) schema.McpServer {
@@ -40,21 +59,22 @@ func NewHTTPServer(name, url string, headers []schema.HttpHeader) schema.McpServ
 	return schema.McpServer{HTTP: &schema.McpServerHttp{Name: name, URL: url, Headers: headers}}
 }
 
-func NewSession(ctx context.Context, connection *acpv2.Connection, initialization acpv2.Initialization, directory string, options NewSessionOptions) (acpv2.Session, error) {
+// NewSession sends session/new with MCP servers and an optional system
+// prompt. It applies the github.com/BrokkAi/acp-go/v2/unstable.NewSession
+// checks (the baseline capabilities.session surface, an absolute cwd, gated
+// absolute additional directories, and the systemPrompt rules) plus the
+// transport checks: each server needs its advertised capabilities.session.mcp
+// transport and a name plus its command, URL, or server ID.
+func NewSession(ctx context.Context, connection *acpv2.Connection, initialization schema.InitializeResponse, directory string, options NewSessionOptions) (acpv2.Session, error) {
 	var session acpv2.Session
-	if err := validateSessionCapabilities(initialization); err != nil {
-		return session, err
-	}
-	if err := validatePaths(initialization, directory, options.AdditionalDirectories); err != nil {
-		return session, err
-	}
-	if err := validateServers(initialization, options.Servers); err != nil {
-		return session, err
-	}
 	request := schema.NewSessionRequest{
 		Cwd:                   schema.AbsolutePath(directory),
 		AdditionalDirectories: paths(options.AdditionalDirectories),
 		MCPServers:            options.Servers,
+		SystemPrompt:          options.SystemPrompt,
+	}
+	if err := validateNewSession(initialization, request); err != nil {
+		return session, err
 	}
 	if err := connection.Call(ctx, schema.SessionNewMethodName, request, &session); err != nil {
 		return session, err
@@ -65,20 +85,13 @@ func NewSession(ctx context.Context, connection *acpv2.Connection, initializatio
 	return session, nil
 }
 
-func ResumeSession(ctx context.Context, connection *acpv2.Connection, initialization acpv2.Initialization, request schema.ResumeSessionRequest) (schema.ResumeSessionResponse, error) {
+// ResumeSession sends session/resume with MCP servers, with the
+// github.com/BrokkAi/acp-go/v2/unstable.ResumeSession checks (including the
+// systemPrompt rules) and the NewSession transport checks.
+func ResumeSession(ctx context.Context, connection *acpv2.Connection, initialization schema.InitializeResponse, request schema.ResumeSessionRequest) (schema.ResumeSessionResponse, error) {
 	var result schema.ResumeSessionResponse
-	if err := validateSessionCapabilities(initialization); err != nil {
+	if err := v2session.ValidateResumeSessionRequest(initialization, request); err != nil {
 		return result, err
-	}
-	directories := make([]string, len(request.AdditionalDirectories))
-	for i, directory := range request.AdditionalDirectories {
-		directories[i] = string(directory)
-	}
-	if err := validatePaths(initialization, string(request.Cwd), directories); err != nil {
-		return result, err
-	}
-	if request.SessionID == "" {
-		return result, fmt.Errorf("session ID is required")
 	}
 	if err := validateServers(initialization, request.MCPServers); err != nil {
 		return result, err
@@ -86,32 +99,18 @@ func ResumeSession(ctx context.Context, connection *acpv2.Connection, initializa
 	return result, connection.Call(ctx, schema.SessionResumeMethodName, request, &result)
 }
 
-func validateSessionCapabilities(initialization acpv2.Initialization) error {
-	if initialization.Capabilities == nil || initialization.Capabilities.Session == nil {
-		return fmt.Errorf("agent did not advertise the ACP v2 session method surface")
-	}
-	return nil
-}
-
-func validatePaths(initialization acpv2.Initialization, directory string, additional []string) error {
-	if err := acpvalidate.AbsolutePath("ACP path", directory); err != nil {
+// validateNewSession applies the session/new checks shared by NewSession and
+// NewAttachedSession.
+func validateNewSession(initialization schema.InitializeResponse, request schema.NewSessionRequest) error {
+	if err := v2session.ValidateNewSessionRequest(initialization, request); err != nil {
 		return err
 	}
-	if len(additional) > 0 {
-		session := initialization.Capabilities.Session
-		if session == nil || session.AdditionalDirectories == nil {
-			return fmt.Errorf("agent did not advertise additionalDirectories support")
-		}
-	}
-	for _, path := range additional {
-		if err := acpvalidate.AbsolutePath("ACP path", path); err != nil {
-			return err
-		}
-	}
-	return nil
+	return validateServers(initialization, request.MCPServers)
 }
 
-func validateServers(initialization acpv2.Initialization, servers []schema.McpServer) error {
+// validateServers requires each server's advertised capabilities.session.mcp
+// transport, including the native acp transport, and its identifying fields.
+func validateServers(initialization schema.InitializeResponse, servers []schema.McpServer) error {
 	var capabilities *schema.McpCapabilities
 	if initialization.Capabilities != nil && initialization.Capabilities.Session != nil {
 		capabilities = initialization.Capabilities.Session.MCP
@@ -134,6 +133,13 @@ func validateServers(initialization acpv2.Initialization, servers []schema.McpSe
 			}
 			if server.HTTP.Name == "" || server.HTTP.URL == "" {
 				return fmt.Errorf("HTTP MCP server %d requires a name and URL", i)
+			}
+		case server.ACP != nil:
+			if capabilities == nil || capabilities.ACP == nil {
+				return fmt.Errorf("agent did not advertise native MCP-over-ACP server support (server %d)", i)
+			}
+			if server.ACP.Name == "" || strings.TrimSpace(string(server.ACP.ServerID)) == "" {
+				return fmt.Errorf("acp MCP server %d requires a name and server ID", i)
 			}
 		default:
 			return fmt.Errorf("MCP server %d has no supported transport variant", i)

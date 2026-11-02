@@ -23,7 +23,10 @@ type ProviderHandler interface {
 // ForkHandler serves the agent side of session/fork. Advertise announces
 // capabilities.session.fork for it. The returned response must carry the new
 // session's non-blank ID; Handle answers -32603 instead of sending a response
-// without one.
+// without one. A systemPrompt on the request is checked as on the other
+// lifecycle requests before ForkSession runs (see SystemPromptHandler), so
+// one the connection's initialize response did not advertise never reaches
+// it.
 type ForkHandler interface {
 	ForkSession(context.Context, schema.ForkSessionRequest) (schema.ForkSessionResponse, error)
 }
@@ -57,7 +60,8 @@ var routes = map[string]unstabledispatch.Binding{
 	schema.ProvidersListMethodName:    unstabledispatch.Route(ProviderHandler.ListProviders, nil),
 	schema.ProvidersSetMethodName:     unstabledispatch.Route(ProviderHandler.SetProvider, nil),
 	schema.ProvidersDisableMethodName: unstabledispatch.Route(ProviderHandler.DisableProvider, nil),
-	schema.SessionForkMethodName:      unstabledispatch.Route(ForkHandler.ForkSession, checkForkResponse),
+	schema.SessionForkMethodName: systemPromptRoute(ForkHandler.ForkSession,
+		func(request schema.ForkSessionRequest) *SystemPrompt { return request.SystemPrompt }, checkForkResponse),
 	schema.SessionArchiveMethodName:   unstabledispatch.Route(ArchiveHandler.ArchiveSession, nil),
 	schema.SessionUnarchiveMethodName: unstabledispatch.Route(ArchiveHandler.UnarchiveSession, nil),
 	schema.SessionStatusMethodName:    unstabledispatch.Route(StatusHandler.SessionStatus, nil),
@@ -82,7 +86,10 @@ func checkForkResponse(response schema.ForkSessionResponse) error {
 //
 // Advertise never announces capabilities.session.archive: an agent that does
 // must also serve the archived session/list filter, which only Install wires
-// up. Install announces it for an ArchiveHandler.
+// up. Install announces it for an ArchiveHandler. Advertise never announces
+// capabilities.session.systemPrompt either, because the stable session/new
+// and session/resume the runtime dispatches drop the prompt; Install
+// announces it for a SystemPromptHandler.
 //
 // The session entries are added only when the agent advertised the baseline
 // session capabilities, which the runtime requires anyway; Advertise never
@@ -91,9 +98,11 @@ func Advertise(handler any, customize ...func(*schema.InitializeResponse) error)
 	return advertise(handler, false, customize)
 }
 
-// advertise is Advertise; archive also announces the archive capability,
-// which only Install, which serves the archived filter, may do.
-func advertise(handler any, archive bool, customize []func(*schema.InitializeResponse) error) func(stable.InitializeResponse) (any, error) {
+// advertise is Advertise; install also announces the archive and systemPrompt
+// capabilities, which only Install, which serves the archived filter and the
+// system prompt through runtime overrides, may do, and then refuses a
+// systemPrompt capability the handler does not serve.
+func advertise(handler any, install bool, customize []func(*schema.InitializeResponse) error) func(stable.InitializeResponse) (any, error) {
 	return func(response stable.InitializeResponse) (any, error) {
 		encoded, err := json.Marshal(response)
 		if err != nil {
@@ -116,9 +125,17 @@ func advertise(handler any, archive bool, customize []func(*schema.InitializeRes
 				extended.Capabilities.Session.Fork = &schema.SessionForkCapabilities{}
 			}
 		}
-		advertiseSessionHandlers(handler, archive, &extended)
+		advertiseSessionHandlers(handler, install, &extended)
+		if install {
+			advertiseSystemPrompt(handler, &extended)
+		}
 		for _, apply := range customize {
 			if err := apply(&extended); err != nil {
+				return nil, err
+			}
+		}
+		if install {
+			if err := checkSystemPromptServed(handler, extended); err != nil {
 				return nil, err
 			}
 		}

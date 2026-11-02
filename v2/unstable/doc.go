@@ -5,13 +5,23 @@ typed facades over ACP's optional draft-v2 methods. Nothing here is reachable
 from the stable v2 facade.
 
 The client facades cover agent provider configuration (ListProviders,
-SetProvider, DisableProvider) and session fork (ForkSession, the counterpart of
-the reference SDK's v2::ForkSessionBuilder). Each checks its advertised
-capability and request invariants before writing to the wire. Forks that carry
-MCP servers go through github.com/BrokkAi/acp-go/v2/mcp.ForkSession instead.
-Session archive (ArchiveSession, UnarchiveSession, and ListSessions with the
-archived filter), status (SessionStatus), and title (SetSessionTitle) follow
-the same rule.
+SetProvider, DisableProvider), session fork (ForkSession, the counterpart of
+the reference SDK's v2::ForkSessionBuilder), session archive (ArchiveSession,
+UnarchiveSession, and ListSessions with the archived filter), status
+(SessionStatus), and title (SetSessionTitle), and the session lifecycle
+requests that carry a client-provided system prompt (NewSession,
+ResumeSession, and ForkSession, with NewSystemPrompt and NewTextSystemPrompt).
+Each checks its advertised capability and request invariants before writing
+to the wire. Requests that carry MCP servers go through
+github.com/BrokkAi/acp-go/v2/mcp instead.
+
+Agents that advertise capabilities.session.systemPrompt serve session/new and
+session/resume with the prompt through a SystemPromptHandler, which Install
+routes to with runtime overrides (session/fork through ForkHandler). The
+routes check each supplied prompt before the handler runs, against the
+capability the connection's initialize response announced, and answer -32602
+in the reference SDK's shape. Install announces the capability only for such
+a handler.
 
 Capability gating reads the unstable draft-v2 initialize response, which is the
 only place the optional capability fields are published. The stable
