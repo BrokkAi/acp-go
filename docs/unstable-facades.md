@@ -2,10 +2,22 @@
 
 ACP's optional features live in the generated `schema/unstable` and
 `schema/v2/unstable` packages, which already expose every request, response,
-and notification type. `github.com/BrokkAi/acp-go/unstable` (v1) and
+and notification type from Rust schema crate 1.15.1's unstable artifacts (the
+crate the reference Rust SDK `agent-client-protocol` 5.0.0 pins).
+`github.com/BrokkAi/acp-go/unstable` (v1) and
 `github.com/BrokkAi/acp-go/v2/unstable` (draft v2) add narrow typed facades on
 top where a capability check or a composite invariant earns its keep, and never
-re-export them through the stable `acp` or `v2` facades.
+re-export them through the stable `acp` or `v2` facades. `v2/unstable` has no
+facades at present.
+
+Next Edit Suggestions (`nes/*`, `document/did*`, and their capabilities) were
+removed from the upstream unstable schema in crate 1.15, so acp-go no longer
+generates or wraps them.
+
+Several unstable surfaces in the 1.15.1 pin are generated but have no facade
+yet: client-provided system prompts (#58), subagents (#60), session
+archive/status/title (#71), auth status (#72), and proxy chains
+(`proxy/initialize`, `proxy/successor`, registered with `SideProxy`; #69).
 
 ## Why a separate import
 
@@ -27,11 +39,9 @@ providers, err := unstable.ListProviders(ctx, connection, initialization)
 |---|---|---|
 | `ListProviders`, `SetProvider`, `DisableProvider` | `agentCapabilities.providers` | Requires a non-blank provider ID before writing. |
 | `ForkSession` | `sessionCapabilities.fork` | Requires a session ID, an absolute `cwd`, and absolute additional directories; rejects inline MCP servers so MCP stays behind its own import; requires a non-blank forked session ID in the response. |
-| `StartNes`, `SuggestNes`, `AcceptNes`, `RejectNes`, `CloseNes` | `agentCapabilities.nes` | Requests: start/suggest/close; notifications: accept/reject. Requires non-blank session and suggestion IDs, and an absolute document URI. Implemented for v1 and draft v2. |
 | `MessageClient` | — | Consumer side of the request-scoped `mcp/message` binding: requires a server ID, request ID, and inner MCP method, rejects duplicate active IDs, routes request-scoped notifications to the owning call, and cancels through the outer ACP request. Implemented for v1 and draft v2. |
 | `MessageRouter` | — | Provider side of the request-scoped binding: server-ID registry and dispatch, request-scoped notifications through `MessageRequest.Notify`, `Unregister` cancellation, and the binding's outer error codes (`-32602`, `-32800`, `-33001`, `-33002`). Implemented for v1 and draft v2. |
 | `Handle` | — | Agent-side dispatch: routes providers/* and session/fork to optional `ProviderHandler`/`ForkHandler` implementations, answers method-not-found when a handler is missing, and delegates every other method to the next handler. |
-| `HandleNesNotifications` | — | Composes the agent side of `nes/accept`/`nes/reject` (notifications) with another `acp.Notifications` handler. |
 | `Projection` | — | Client-side: folds optional session updates into ordered per-session state (see below). `Projection.Notifications` adapts `session/update` notifications. |
 
 ## Session updates: projection, not request facades
@@ -51,6 +61,10 @@ rules:
   `DrainNotices` consumes.
 - `usage_update` keeps the latest end-turn token usage (used, size, cost).
 
+Notices and compaction are stable types since schema crate 1.11, so the stable
+`schema` and `schema/v2` packages generate them too. The projection still reads
+the unstable bindings; stable helpers are tracked in #57.
+
 MCP-over-ACP for the v1 surface landed as `github.com/BrokkAi/acp-go/mcp`,
 mirroring `v2/mcp`: session create, resume, and fork helpers that
 accept the unstable server transports, including the native `acp` variant.
@@ -58,7 +72,7 @@ accept the unstable server transports, including the native `acp` variant.
 ## MCP-over-ACP methods: a request-scoped message mover
 
 The native MCP-over-ACP *methods* are still open from #10. The pinned schemas
-(`schema-v1.24.1` and `schema-v2.0.0-alpha.7`) model the request-scoped
+(`schema-v1.29.1` and `schema-v2.0.0-alpha.13`) model the request-scoped
 binding that upstream shipped in
 [agentclientprotocol/agent-client-protocol#2223](https://github.com/agentclientprotocol/agent-client-protocol/pull/2223):
 `mcp/connect` and `mcp/disconnect` are gone, and each `mcp/message` request

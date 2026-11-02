@@ -4,11 +4,12 @@
 the reference Rust SDK workspace have no Go equivalent, which are worth porting,
 and which are not. This document records that evaluation.
 
-It was checked against the same baseline as [ROADMAP.md](../ROADMAP.md): Rust
-`agent-client-protocol` 2.2.0. The schema baseline has since moved to
-`agent-client-protocol-schema` 1.10.2, which the SDK has not adopted yet. For
-each crate we read the workspace `Cargo.toml` and its public documentation,
-then compared the surface with what `acp-go` already ships.
+It was checked against Rust `agent-client-protocol` 2.2.0. The baseline in
+[ROADMAP.md](../ROADMAP.md) has since moved to `agent-client-protocol` 5.0.0
+and schema crate 1.15.1; the decisions below still hold, and the conductor
+section notes the one wire-shape change. For each crate we read the workspace
+`Cargo.toml` and its public documentation, then compared the surface with what
+`acp-go` already ships.
 
 ## Decision rule
 
@@ -91,6 +92,12 @@ registries), the Rust `SuccessorMessage` lives in that crate's own
 `schema/proxy_protocol.rs`, and the reference design document is explicitly
 historical. A Go conductor would hand-model a shape the pin-and-regenerate
 discipline cannot keep in sync.
+
+Schema crate 1.15 changed the wire-shape part of that reasoning: the unstable
+artifacts now publish the proxy-chain methods as `proxy/initialize` and
+`proxy/successor`, generated in `schema/unstable` and `schema/v2/unstable`
+with `SideProxy`. Moving `proxyrouter` to them is tracked in #69. The conductor
+is still an application without a Go consumer, so the decision stands.
 
 `acp-go` already ships the producer side: `proxyrouter` lets an application write
 a Go proxy that the reference conductor can orchestrate. If a concrete Go

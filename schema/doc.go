@@ -25,7 +25,7 @@
 //     with the type named by the Methods registry.
 //
 // This package is the stable surface only. ACP's optional ("unstable")
-// features, including LLM providers, session fork, MCP-over-ACP, NES, and
-// document events, live in the opt-in schema/unstable package and are not
-// re-exported here.
+// features, including LLM providers, session fork, MCP-over-ACP, client
+// system prompts, subagents, and proxy chains, live in the opt-in
+// schema/unstable package and are not re-exported here.
 package schema

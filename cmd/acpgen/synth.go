@@ -36,6 +36,12 @@ func synthWire(r *ir, name string, full bool, depth map[string]int) (string, err
 	case kindAny:
 		return `""`, nil
 
+	case kindRaw:
+		if full {
+			return `{"k": "v"}`, nil
+		}
+		return "{}", nil
+
 	case kindStruct:
 		return synthFields(r, td.Fields, full, withDepth(depth, name))
 

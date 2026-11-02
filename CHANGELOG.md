@@ -16,6 +16,40 @@ series, minor releases may contain breaking API changes.
   object cannot carry a member twice.
 - `RPCError.SchemaError` converts to the typed v1 `schema.Error`, dropping
   `Extra`, as an explicit boundary like Rust's `into_acp_error`.
+- Stable v1 (`schema`) and draft v2 (`schema/v2`) generate session notices
+  (`Notice`, `NoticeSeverity`, the `notice` session update) and compaction
+  (`CompactionId`, `CompactionStatus`, `CompactionUpdate`,
+  `CompactionSummaryChunk` and their session-update variants). v1 also gains
+  `ClientSessionCapabilities.Notices` and `.Compaction`.
+- Draft v2 generates background work (`BackgroundWork` with terminal and
+  tool-call variants, the `background` snapshot on the idle, running, and
+  requires-action state updates, and on the unstable unknown state update), the `tool_call/cancel` and
+  `terminal/cancel` methods with their request, response, and capability types,
+  `TerminalUpdate.Size`/`.Capabilities`, `ToolCallUpdate.Capabilities`,
+  `ToolCallStatusPaused`, `ErrorCodeUnsupportedProtocolVersion` (`-32022`), the
+  defined error data (`ErrorData`, `UnsupportedProtocolVersionErrorData`,
+  `SessionNotFoundErrorData`), `ErrorStopReason`, `StopReasonError`, and
+  `_meta` on `DiffPatch`, `Icon`, `ToolCallPermissionSubject`, and
+  `CancelledPermissionOutcome`.
+- The unstable packages generate client-provided system prompts
+  (`SystemPrompt`, `SystemPromptMode`, `SessionSystemPrompt*Capabilities`, and
+  `systemPrompt` on the session lifecycle requests), the subagent additions
+  (`ErrorStopReason`, `SubagentUpdate.Cwd`/`.AdditionalDirectories`,
+  `SessionMessage.SenderMessageID`/`.RecipientMessageID`, v2
+  `BackgroundSubagent`), `auth/status` and `auth/status_update`,
+  `session/archive`, `session/unarchive`, `session/status`, and
+  `session/set_title`, and proxy chains (`proxy/initialize`, `proxy/successor`,
+  `InitializeProxyRequest`/`Response`, `ProxySuccessor*`, and the `Proxy*`
+  envelopes). These are types only; facades follow in their own issues.
+- Method registries gain `SideProxy` for the proxy-chain methods.
+- `cmd/acpgen` models the 1.15.1 schema shapes: the `proxyMethods` meta group
+  and `x-side: "proxy"`; a tagged union flattened into its parent object
+  (`IdleStateUpdate.stopReason`), generated as an open string enum plus the
+  variant payload's fields on the parent; untyped "any other value" union arms,
+  preserved verbatim in an `Other` variant (`ErrorData`) or as `any`
+  (`ElicitationContentValue`); defs that are exactly another def, generated as
+  aliases (`InitializeProxyRequest = InitializeRequest`); and typeless method
+  payloads, generated as `json.RawMessage` aliases (`ProxySuccessorResponse`).
 
 ### Changed
 
@@ -63,6 +97,40 @@ series, minor releases may contain breaking API changes.
     successful run. A `SetupError` keeps its phase and wraps it.
 - `examples/minimal-client` closes the agent's stdin and waits up to a second
   before killing it.
+- Schema pins move from ACP v1 `schema-v1.24.1` / draft v2
+  `schema-v2.0.0-alpha.7` to `schema-v1.29.1` / `schema-v2.0.0-alpha.13` and
+  their `-unstable` artifacts: exactly Rust schema crate
+  `agent-client-protocol-schema` 1.15.1, which the reference Rust SDK
+  `agent-client-protocol` 5.0.0 pins. The docs now name 5.0.0 as the
+  behavioral reference.
+- Breaking (draft v2, both v2 packages):
+  - The top-level `StopReason` def is gone upstream; `IdleStateUpdate` now
+    flattens a stop-reason union. `StopReason` and its constants are
+    regenerated from that union with the same names, the type stays an open
+    string (custom and future reasons decode unchanged), and the `error`
+    variant's details arrive in the new `IdleStateUpdate.Error`.
+  - `AvailableCommand` is a union discriminated by `type`: the `command`
+    variant is `Command{Name, Description, Input, Meta}` and other kinds are
+    preserved in `Other`.
+  - `Error.Data` is `*ErrorData` instead of `json.RawMessage`. Data that does
+    not match a defined shape, including primitives, stays raw in
+    `ErrorData.Other`.
+  - `AuthCapabilities` is renamed `ClientAuthCapabilities`;
+    `RequestPermissionOutcomeCancelled` is replaced by the named
+    `CancelledPermissionOutcome`; `ProtocolLevelNotification` is removed.
+  - `ElicitationSchema.Type` and `.Properties` are required, so `Type` is a
+    value instead of a pointer and `Properties` is always encoded (use an
+    empty map, not nil, for a schema without properties).
+  - `ResourceLink.Size` is `Nullable[uint64]` and `TerminalExitStatus.ExitCode`
+    is `Nullable[int64]`.
+- Breaking (v1 unstable): `IdleStateUpdate.StopReason` is the new open
+  `IdleStateUpdateStopReason` (its union adds `error` with the new
+  `IdleStateUpdate.Error`; the stable v1 `StopReason` is unchanged), and
+  `SessionMessageChunk` drops `SenderSessionID` and `RecipientSessionID`.
+- The `x-deserialize-default-on-null` hints that replace
+  `x-deserialize-default-on-error` on several v1 request fields need no Go
+  change: `cmd/acpgen` does not read these hints, `null` already decodes as
+  empty, and malformed values still fail to decode.
 
 ### Fixed
 
@@ -83,6 +151,17 @@ series, minor releases may contain breaking API changes.
 - The `RPCError` documentation claimed it preserved extension data while it
   dropped unknown members. It now documents the omitted, `null`, and value
   forms of `data`, which were already preserved and are now tested.
+
+### Removed
+
+- Next Edit Suggestions, removed from the upstream unstable schema: every
+  `nes/*` and `document/did*` method, the `Nes*`, `Did*DocumentNotification`,
+  `Position`, `Range`, `PositionEncodingKind`, `TextDocumentContentChangeEvent`,
+  `TextDocumentSyncKind`, and `WorkspaceFolder` types, the `nes` and
+  `positionEncoding(s)` capabilities, the `unstable.StartNes`, `SuggestNes`,
+  `AcceptNes`, `RejectNes`, `CloseNes`, `NesHandler`, and
+  `HandleNesNotifications` facades with their `Handle` cases, and the same
+  facades in `v2/unstable`, which now has no facades.
 
 ## 0.12.1 - 2026-10-05
 

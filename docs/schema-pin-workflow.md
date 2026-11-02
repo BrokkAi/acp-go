@@ -8,10 +8,16 @@ generator commands; this page is the review checklist that runs around them.
 
 The reference Rust SDK releases `agent-client-protocol` with a different
 `agent-client-protocol-schema = "=X.Y.Z"` pin, or that schema crate publishes a
-new version. [ROADMAP.md](../ROADMAP.md) records the current baseline (schema
-crate 1.10.2 → ACP v1 `schema-v1.24.1`, draft v2
-`schema-v2.0.0-alpha.7`). The 1.10.2 pin moved on the schema-crate release
-trigger while the Rust SDK core 2.2.0 still pinned `=1.9.1`.
+new version. [ROADMAP.md](../ROADMAP.md) records the current baseline: Rust
+`agent-client-protocol` 5.0.0 pins schema crate `=1.15.1` → ACP v1
+`schema-v1.29.1`, draft v2 `schema-v2.0.0-alpha.13`, and their `-unstable`
+artifacts.
+
+The release assets the downloader fetches are the same files the schema crate
+embeds; to double-check a pin, compare them with `git show
+v<crate-version>:schema/v1/schema.json` (and `meta.json`, `schema.unstable.json`,
+`meta.unstable.json`, and the `schema/v2/` set) in the
+[schema repository](https://github.com/agentclientprotocol/agent-client-protocol).
 
 Do not follow the ACP schema repository `main` on its own; move on a released
 schema crate or when the Rust SDK moves its exact pin.
@@ -51,6 +57,12 @@ schema crate or when the Rust SDK moves its exact pin.
    - required/optional field changes, including pointer and `Nullable`
      differences between v1 and v2;
    - JSON field names, integer widths, and defaults;
+   - `x-deserialize-*` hints (default-on-error, default-on-null, skip invalid
+     items), which `cmd/acpgen` does not read: decide whether Go's strict
+     decoding is still acceptable for each affected field;
+   - new `x-side` values or `meta.json` method groups (such as 1.15's
+     `proxyMethods`): generation fails on a method outside the groups
+     `cmd/acpgen` models, so teach it the group and its side constant;
    - `parity_gen_test.go` and `golden_test.go` updates, and any new goldens.
 
    Preserve the guardrails: open-world enums and unknown tags must keep

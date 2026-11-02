@@ -6,13 +6,12 @@ Protocol, with v1 and draft-v2 behavior aligned to the
 
 ## Reference baseline
 
-The behavioral reference is Rust `agent-client-protocol` **2.2.0**. The schema
-baseline moved ahead of it: Rust `agent-client-protocol-schema` **1.10.2**
-published ACP v1 **`schema-v1.24.1`** and draft ACP v2
-**`schema-v2.0.0-alpha.7`**, and our pinned artifacts are byte-for-byte
-identical to that schema-crate release. The SDK's latest release still pins
-`=1.9.1`; the pin workflow allows the schema-crate release trigger, and the
-newer pin carries the released request-scoped MCP-over-ACP binding.
+The behavioral reference is Rust `agent-client-protocol` **5.0.0**, which pins
+`agent-client-protocol-schema` **`=1.15.1`**. That schema crate publishes ACP
+v1 **`schema-v1.29.1`** and draft ACP v2 **`schema-v2.0.0-alpha.13`**, and our
+pinned stable and unstable artifacts are byte-for-byte identical to it. The
+generated types cover the whole 1.15.1 surface; the 5.0.0 behavior built on
+the newer types is tracked under "Schema crate 1.15.1 follow-ups" below.
 
 ## Status
 
@@ -95,15 +94,19 @@ only remaining work.
   - validate the selected initialize schema,
   - preserve the complete initial single or batch frame without canonicalization,
   - reject future versions rather than downgrading.
-- Unstable schema surfaces from the exact Rust 1.10.2 unstable artifacts:
+- Unstable schema surfaces from the exact Rust schema crate 1.15.1 unstable
+  artifacts:
   - v1 and v2 generated bindings in explicit import-only packages,
   - LLM providers,
   - plan operations,
-  - session fork, compaction, and notices,
-  - NES,
+  - session fork,
   - MCP-over-ACP (session options and the request-scoped `mcp/message` mover),
   - end-turn token usage,
-  - bidirectional `mcp/message` request/notification registry metadata.
+  - bidirectional `mcp/message` request/notification registry metadata,
+  - generated types, without facades yet, for client-provided system prompts,
+    subagents, auth status, session archive/status/title, and proxy chains
+    (`proxy/initialize` and `proxy/successor`, registered as `SideProxy`).
+- Session notices and compaction are stable types in v1 and draft v2.
 - Optional credential-backed v2 integration coverage: the draft-v2 runner is
   exercised against a real adapter when it advertises v2, and the CI integration
   job runs the v1 and v2 tests together.
@@ -122,10 +125,12 @@ only remaining work.
 ### 1. Optional typed facades for unstable methods
 
 The typed facade surface is delivered: client facades and agent dispatch for
-providers, session fork, and NES, the session-update projection helper, and the
-MCP session options all live in
+providers and session fork, the session-update projection helper, and the MCP
+session options all live in
 [docs/unstable-facades.md](docs/unstable-facades.md)'s packages
-(`unstable`, `v2/unstable`, `mcp`, `v2/mcp`).
+(`unstable`, `mcp`, `v2/mcp`). `v2/unstable` held only the Next Edit
+Suggestions facades, which left with NES's removal from the upstream unstable
+schema; it is kept as the import boundary for future draft-v2 facades.
 
 The native MCP-over-ACP binding is delivered (#39): `mcp` and `v2/mcp` expose
 the standard-library message mover decided above, with `MessageClient` on the
@@ -144,9 +149,21 @@ per crate. Every port is done: the test harness (`acptest`), the trace viewer
 
 Two crates are recorded as won't port: the `agent-client-protocol-rmcp` bridge,
 which needs a third-party MCP SDK, and the proxy-chain conductor, which is an
-application with no Go consumer and whose `_proxy/*` wire shape the pinned
-schema does not cover. Every port stays standard-library-only and behind its own
-package or command.
+application with no Go consumer. The pinned unstable schema now models the
+proxy-chain wire shape as `proxy/initialize` and `proxy/successor`; moving
+`proxyrouter` off the old `_proxy/*` names is tracked in #69. Every port stays
+standard-library-only and behind its own package or command.
+
+### 3. Schema crate 1.15.1 follow-ups
+
+The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
+them is tracked separately: stable notice and compaction helpers (#57),
+client-provided system prompts (#58), v2 error and custom stop reasons (#59),
+subagents (#60), v2 providers and `session/fork` (#61), `-32022` version
+negotiation (#62), v2 metadata patch helpers (#67), the proxy-chain method
+rename (#69), v2 background work and `tool_call/cancel`/`terminal/cancel`
+(#70), unstable session archive/status/title (#71), and unstable auth status
+(#72).
 
 ## Guardrails
 
