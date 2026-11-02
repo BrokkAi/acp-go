@@ -55,7 +55,9 @@ func (s *SessionHandle) Prompt(ctx context.Context, prompt string) (MessageID, e
 
 // PromptContent submits a prompt and returns the ID of the user message the
 // agent inserted into the conversation. Output and completion remain
-// independent session updates.
+// independent session updates. With a SessionTracker it first begins new
+// tracked work, assuming the prompt starts new foreground work; see
+// ActiveWork, and bound WaitForIdle with ctx.
 func (s *SessionHandle) PromptContent(ctx context.Context, prompt []Content) (MessageID, error) {
 	s.beginWork()
 	return s.connection.PromptContent(
@@ -81,6 +83,9 @@ func (s *SessionHandle) ActiveWork() (*ActiveWork, error) {
 	return s.tracker.Work(s.sessionID), nil
 }
 
+// WaitForIdle waits for the session's tracked work to complete. Tracking
+// assumes each prompt starts new foreground work (see ActiveWork), so a wait
+// can last until ctx ends; bound it with ctx.
 func (s *SessionHandle) WaitForIdle(ctx context.Context) (WorkResult, error) {
 	work, err := s.ActiveWork()
 	if err != nil {
@@ -106,10 +111,17 @@ func (s *SessionHandle) CancelActiveWork(ctx context.Context) error {
 // cancellation, which per the v2 prompt lifecycle covers stops the user or
 // Client chose. Any other idle, including error, a custom or unknown reason,
 // or none, returns the work's result with an error wrapping
-// ErrWorkNotCancelled (and the result's *WorkError for error). So does work
-// that had already completed before the cancellation was sent. When no
-// foreground work is active the Agent sends no idle update, so bound the wait
-// with ctx.
+// ErrWorkNotCancelled (and the result's *WorkError for error).
+//
+// The result is that of the tracked work, the work begun for the latest
+// prompt sent through this handle. If that work had already completed before
+// the cancellation was sent, CancelActiveWorkAndWait returns its earlier
+// result at once: a nil error when that work had itself ended cancelled, and
+// ErrWorkNotCancelled otherwise. Neither confirms that this cancellation took
+// effect; check ActiveWork's Done first when that matters. When no foreground
+// work is active the Agent sends no idle update, and work that never reported
+// an active state stays incomplete (see ActiveWork), so bound the wait with
+// ctx.
 func (s *SessionHandle) CancelActiveWorkAndWait(ctx context.Context) (WorkResult, error) {
 	if err := s.CancelActiveWork(ctx); err != nil {
 		return WorkResult{}, err

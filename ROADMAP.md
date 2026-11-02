@@ -187,10 +187,10 @@ standard-library-only and behind its own package or command.
 
 The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
 them is tracked separately: stable notice and compaction helpers (#57),
-client-provided system prompts (#58), subagents (#60), `-32022` version negotiation (#62), the proxy-chain method
-rename (#69), v2 background work and `tool_call/cancel`/`terminal/cancel`
-(#70), unstable session archive/status/title (#71), and unstable auth status
-(#72).
+client-provided system prompts (#58), subagents (#60), `-32022` version
+negotiation (#62), the proxy-chain method rename (#69), v2 background work and
+`tool_call/cancel`/`terminal/cancel` (#70), unstable session
+archive/status/title (#71), and unstable auth status (#72).
 
 ## Guardrails
 

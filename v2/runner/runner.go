@@ -103,10 +103,10 @@ func (e *AgentExitError) Unwrap() error { return e.Err }
 // process group at once. endAgent returns the exit error of an agent that failed on its own,
 // whether during the run (crashed) or after its stdin closed.
 func endAgent(ctx context.Context, process *osrun.Agent, runErr, crashed error) error {
-	var workFailed *acpv2.WorkError
-	if errors.As(runErr, &workFailed) {
-		// The agent reported a failed turn over a working connection; the
-		// run itself completed.
+	if _, ok := runErr.(*acpv2.WorkError); ok {
+		// The agent reported a failed turn over a working connection and the
+		// session closed; the run itself completed. A WorkError joined with
+		// a later failure, such as session/close, is a failed run.
 		runErr = nil
 	}
 	if runErr == nil && crashed == nil {
@@ -117,11 +117,17 @@ func endAgent(ctx context.Context, process *osrun.Agent, runErr, crashed error) 
 }
 
 // withAgentExit reports an agent's failed exit in place of the run error,
-// keeping a setup failure's phase.
+// keeping a setup failure's phase. A failure the agent reported for its turn
+// is not replaced: the *acpv2.WorkError, and any error joined with it, is
+// joined with the exit so errors.As finds each.
 func withAgentExit(runErr error, exit *AgentExitError) error {
 	if setup, ok := runErr.(*SetupError); ok {
 		setup.Err = exit
 		return setup
+	}
+	var workFailed *acpv2.WorkError
+	if errors.As(runErr, &workFailed) {
+		return errors.Join(runErr, exit)
 	}
 	return exit
 }
@@ -141,7 +147,9 @@ func (e *SetupError) Unwrap() error { return e.Err }
 // stop reason, Execute closes the session as usual and returns the result,
 // including any projected text, together with an *acpv2.WorkError carrying
 // the reported JSON-RPC error. Every other stop reason, including cancelled,
-// custom, and unknown ones, returns a nil error.
+// custom, and unknown ones, returns a nil error. If closing the session or
+// the agent's exit then fails too, the *acpv2.WorkError is joined with that
+// failure (an *AgentExitError for the exit), so errors.As finds each.
 func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runErr error) {
 	log := r.Log
 	if log == nil {
@@ -289,6 +297,9 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	}
 	phase = "session/close"
 	if err := connection.CloseSession(ctx, initialization, session.SessionID); err != nil {
+		if workErr != nil {
+			return result, errors.Join(workErr, err)
+		}
 		return result, err
 	}
 	return result, workErr

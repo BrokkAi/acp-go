@@ -48,6 +48,13 @@ func (r WorkResult) Err() error {
 // list all end the foreground work. The result is fixed at that idle update;
 // later updates, including a repeated idle snapshot, are not a new completion
 // and do not change it.
+//
+// Tracking assumes each prompt starts new foreground work. The v2 prompt
+// lifecycle lets a Client prompt in any state, and an Agent may instead insert
+// a prompt sent during active work into the running turn, or hold it until
+// that turn ends. A prompt that steers the current turn, or that the Agent
+// never starts work for, may not be followed by a new active state, so the
+// ActiveWork begun for it can stay incomplete. Bound every wait with ctx.
 type ActiveWork struct {
 	mu             sync.RWMutex
 	observedActive bool
@@ -237,7 +244,9 @@ func (t *SessionTracker) Work(sessionID SessionID) *ActiveWork {
 }
 
 // BeginWork resets the session's work projection before submitting a new
-// prompt. The session's entity projection is kept.
+// prompt. The session's entity projection is kept. It assumes the prompt
+// starts new foreground work; see ActiveWork for prompts sent during active
+// work, and bound waits with ctx.
 func (t *SessionTracker) BeginWork(sessionID SessionID) *ActiveWork {
 	t.mu.Lock()
 	defer t.mu.Unlock()
