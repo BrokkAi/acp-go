@@ -14,11 +14,11 @@ import (
 	"time"
 )
 
-func pipeClient(t *testing.T, h Handler, n Notifications) (*Connection, net.Conn) {
+func pipeClient(t *testing.T, h Handler, n Notifications, options ...ConnectOption) (*Connection, net.Conn) {
 	t.Helper()
 	local, peer := net.Pipe()
 	_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
-	c := Connect(local, local, h, n)
+	c := Connect(local, local, h, n, options...)
 	t.Cleanup(func() { _ = peer.Close(); _ = c.Close() })
 	return c, peer
 }
@@ -30,11 +30,11 @@ func TestBidirectionalCallsAndNotificationOrder(t *testing.T) {
 		}
 		return map[string]string{"content": "data"}, nil
 	}, func(method string, p json.RawMessage) error {
-		var value string
+		var value []string
 		if err := json.Unmarshal(p, &value); err != nil {
 			return err
 		}
-		messages.WriteString(value)
+		messages.WriteString(strings.Join(value, ""))
 		return nil
 	})
 	server := make(chan error, 1)
@@ -57,7 +57,7 @@ func TestBidirectionalCallsAndNotificationOrder(t *testing.T) {
 			return
 		}
 		for _, s := range []string{"one", "two", "three"} {
-			b, _ := json.Marshal(s)
+			b, _ := json.Marshal([]string{s})
 			_ = e.Encode(packet{Version: "2.0", Method: "session/update", Params: b})
 		}
 		_ = e.Encode(packet{Version: "2.0", ID: prompt.ID, Result: json.RawMessage(`{"stopReason":"end_turn"}`)})
@@ -168,21 +168,7 @@ func TestCancelRequestRejectsInvalidIDs(t *testing.T) {
 	}
 }
 
-func TestInvalidFrameAndBlockedWriter(t *testing.T) {
-	t.Run("invalid envelope", func(t *testing.T) {
-		// Valid JSON that is not a JSON-RPC 2.0 message still closes the
-		// connection; answering it in place is tracked separately (#73).
-		c, peer := pipeClient(t, nil, nil)
-		_, _ = io.WriteString(peer, `{"jsonrpc":"1.0","method":"x"}`+"\n")
-		select {
-		case <-c.Done():
-			if c.Err() == nil {
-				t.Fatal("missing failure")
-			}
-		case <-time.After(time.Second):
-			t.Fatal("invalid frame accepted")
-		}
-	})
+func TestBlockedWriter(t *testing.T) {
 	t.Run("blocked write", func(t *testing.T) {
 		c, _ := pipeClient(t, nil, nil)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
@@ -407,34 +393,49 @@ func TestReplacementAfterDeliveredResponse(t *testing.T) {
 	}
 }
 
-func TestIncomingRequestConcurrencyLimit(t *testing.T) {
-	started := make(chan struct{}, 32)
+func TestManyConcurrentIncomingRequestsAreAllServed(t *testing.T) {
+	// The reference SDK puts no limit on concurrent incoming requests, so a
+	// peer that pipelines many of them is served instead of disconnected.
+	const count = 100
+	started := make(chan struct{}, count)
+	release := make(chan struct{})
 	c, peer := pipeClient(t, func(ctx context.Context, _ string, _ json.RawMessage) (any, error) {
 		started <- struct{}{}
-		<-ctx.Done()
-		return nil, ctx.Err()
+		select {
+		case <-release:
+			return map[string]bool{"ok": true}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}, nil)
 	encoder := json.NewEncoder(peer)
-	for i := 0; i < 32; i++ {
+	for i := range count {
 		if err := encoder.Encode(packet{Version: "2.0", ID: json.RawMessage(fmt.Sprint(i)), Method: "hold"}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	for range count {
 		select {
 		case <-started:
 		case <-time.After(2 * time.Second):
-			t.Fatal("handler did not start")
+			t.Fatalf("handler did not start; connection error %v", c.Err())
 		}
 	}
-	if err := encoder.Encode(packet{Version: "2.0", ID: json.RawMessage("32"), Method: "overflow"}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-c.Done():
-		if err := c.Err(); err == nil || !strings.Contains(err.Error(), "too many simultaneous") {
-			t.Fatalf("unexpected error: %v", err)
+	close(release)
+	decoder := json.NewDecoder(peer)
+	seen := make(map[string]bool)
+	for range count {
+		var response packet
+		if err := decoder.Decode(&response); err != nil {
+			t.Fatal(err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("concurrency limit was not enforced")
+		if response.Error != nil || string(response.Result) != `{"ok":true}` {
+			t.Fatalf("response = %+v", response)
+		}
+		seen[string(response.ID)] = true
+	}
+	if len(seen) != count {
+		t.Fatalf("answered %d distinct requests, want %d", len(seen), count)
 	}
 }
 

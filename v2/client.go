@@ -40,15 +40,12 @@ type Connection struct {
 	initialization Initialization
 }
 
-func Connect(in io.ReadCloser, out io.WriteCloser, onRequest acp.Handler, onNotification acp.Notifications) *Connection {
-	return &Connection{Connection: acp.Connect(in, out, onRequest, onNotification)}
-}
-
-// ConnectObserving is Connect with a request observer that sees each incoming
-// request in wire order before its handler starts, such as
-// SessionTracker.TrackerRequests.
-func ConnectObserving(in io.ReadCloser, out io.WriteCloser, onRequest acp.Handler, onNotification acp.Notifications, observe acp.RequestObserver) *Connection {
-	return &Connection{Connection: acp.ConnectObserving(in, out, onRequest, onNotification, observe)}
+// Connect starts a v2 connection. It always applies
+// acp.WithProtocolVersion(Version), after any options given, so a request with
+// a null id is answered with -32600 and id null, which v2 requires.
+func Connect(in io.ReadCloser, out io.WriteCloser, onRequest acp.Handler, onNotification acp.Notifications, options ...acp.ConnectOption) *Connection {
+	options = append(options[:len(options):len(options)], acp.WithProtocolVersion(uint16(Version)))
+	return &Connection{Connection: acp.Connect(in, out, onRequest, onNotification, options...)}
 }
 
 func (c *Connection) beginInitialize() error {

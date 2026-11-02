@@ -44,7 +44,7 @@ func (r *Runtime) Serve(ctx context.Context, in io.ReadCloser, out io.WriteClose
 	}
 	client := &clientConnection{connectionReady: make(chan struct{})}
 	state := &server{agent: r.Agent, client: client, extensions: r.Extensions, initializeResult: r.InitializeResult}
-	connection := acp.Connect(in, out, state.handle, state.notification)
+	connection := acp.Connect(in, out, state.handle, state.notification, acp.WithProtocolVersion(uint16(version)))
 	client.attach(connection)
 	defer connection.Close()
 

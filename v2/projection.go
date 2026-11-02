@@ -70,7 +70,7 @@ func (w *ActiveWork) Wait(ctx context.Context) (WorkResult, error) {
 // SessionTracker owns, per session, an UpdateProjection of the session's
 // entities and an ActiveWork projection of the current foreground work.
 // Incoming traffic remains application-owned; install TrackerNotifications
-// (and TrackerRequests through ConnectObserving, to apply permission
+// (and TrackerRequests through acp.WithRequestObserver, to apply permission
 // requests' tool calls in receive order) when the connection is created,
 // before session setup or replay can begin.
 type SessionTracker struct {
@@ -105,9 +105,9 @@ func (t *SessionTracker) TrackerNotifications(next acp.Notifications) acp.Notifi
 	}
 }
 
-// TrackerRequests returns a request observer for ConnectObserving. It applies
-// the toolCall of each session/request_permission tool_call subject to the
-// session projection, like a tool_call_update, on the connection's read loop:
+// TrackerRequests returns a request observer for acp.WithRequestObserver. It
+// applies the toolCall of each session/request_permission tool_call subject to
+// the session projection, like a tool_call_update, on the connection's read loop:
 // in receive order relative to session/update notifications and before the
 // permission handler runs, as the spec requires. A request whose params do not
 // decode is left to its handler. The optional next observer runs afterwards.

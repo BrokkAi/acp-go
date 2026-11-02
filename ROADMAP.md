@@ -77,6 +77,16 @@ only remaining work.
   - the HTTP transport answers an array `POST` with `400` and the same
     JSON-RPC body without creating a connection; its client treats an array
     from the server as malformed.
+- A connection answers instead of tearing down, as Rust 5.0 does (#73):
+  - valid JSON that is not a JSON-RPC message gets `-32600` with `id: null`,
+    and a malformed response-shaped value is dropped,
+  - a null request id runs on v1 and version-neutral connections and gets
+    `-32600` with `id: null` on v2 (`acp.WithProtocolVersion`, set by
+    `v2.Connect` and the draft-v2 agent runtime); `agentrouter` keeping on
+    reading after a null-id first frame is part of #62,
+  - handler panics are recovered and answered with `-32603`, notification
+    handler errors are reported rather than fatal, and incoming requests are
+    not limited.
 - Rust-shaped v2 session command surface:
   - reusable session-update projection storing messages, thoughts, tool
     calls, terminals, compactions, session info, and usage with

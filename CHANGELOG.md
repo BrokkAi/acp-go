@@ -118,9 +118,10 @@ series, minor releases may contain breaking API changes.
     so a full replay rebuilds rather than merges) manage its lifetime, and
     `SessionHandle.Close` forgets the closed session. `ActiveWork` keeps
     only the Agent text it reports.
-  - `acp.ConnectObserving` and `acpv2.ConnectObserving` take an optional
-    `acp.RequestObserver` that sees each incoming request in wire order, on
-    the read loop, before its handler starts.
+  - `acp.WithRequestObserver`, a `ConnectOption` for `acp.Connect` and
+    `acpv2.Connect` (#73), sets an optional `acp.RequestObserver` that sees
+    each incoming request in wire order, on the read loop, before its handler
+    starts. A panic in it is recovered and reported like a handler panic.
 - Method registries gain `SideProxy` for the proxy-chain methods.
 - `cmd/acpgen` models the 1.15.1 schema shapes: the `proxyMethods` meta group
   and `x-side: "proxy"`; a tagged union flattened into its parent object
@@ -158,6 +159,15 @@ series, minor releases may contain breaking API changes.
   same fork checks plus the per-transport capability checks of `NewSession` and
   `ResumeSession`, including the native `acp` transport, gated on
   `capabilities.session.mcp.acp`.
+- `acp.Connect` takes optional `acp.ConnectOption`s (#73).
+  `acp.WithProtocolVersion` records the protocol version a version-neutral
+  connection serves, which decides how a null request id is handled.
+  `acp.WithErrorHandler` receives the failures the connection absorbs instead
+  of closing: notification handler errors and `*acp.HandlerPanic` values
+  (method, panic value, stack) recovered from handlers. `v2.Connect`,
+  `acptest.Endpoint.Connect`, and the draft HTTP transport's `acphttp.Dial`
+  and `Client.Dial` pass options through, and `v2.Connect` always sets
+  protocol version 2.
 
 ### Changed
 
@@ -190,6 +200,65 @@ series, minor releases may contain breaking API changes.
 - v1 `unstable.ForkSession` now requires
   `sessionCapabilities.additionalDirectories` before sending additional
   directories, as the protocol requires.
+- **Breaking:** `acp.Connect`, `v2.Connect`, `acptest.Endpoint.Connect`,
+  `acphttp.Dial`, and `acphttp.Client.Dial` gain a trailing variadic
+  `...acp.ConnectOption` parameter (#73). Calls compile unchanged, but code
+  that stores one of these functions in a variable or field of the old
+  function type must update that type.
+- **Breaking:** one bad message from a peer, or one failing handler, no
+  longer closes an `acp.Connection` and fails its other in-flight requests,
+  matching the reference Rust SDK 5.0 (#73).
+  - Valid JSON that is not a JSON-RPC message, as the Rust
+    `RawJsonRpcMessage` deserializer judges it, gets
+    `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}`
+    and the connection keeps reading. This covers a non-object value, a wrong
+    or missing `jsonrpc`, a non-string `method`, `params` that is not an
+    object, array, or null, an id that is not null, a string, or an int64
+    integer (`1.5`, `1e3`, `-0`, `2^63`), and an object with `method` plus
+    `result` or `error`. Member names match exactly, so `"Method"` is not a
+    method. Previously the connection closed.
+  - A malformed value shaped like a response (no `method`, with `result` or
+    `error`) is dropped, as Rust's `frame_entry` does: no answer, no pending
+    call completed. This covers both `result` and `error`, a missing or
+    invalid id, a wrong `jsonrpc`, and an error object `RPCError` rejects.
+    Previously the connection closed. A repeated response for the same id is
+    ignored instead of closing the connection. A repeated member of a
+    response's error object, such as a second `code`, keeps its last value, as
+    Rust reads the whole message as a `serde_json` value first; `RPCError`
+    decoding on its own still rejects it.
+  - A request with a null id runs normally on a version-neutral or v1
+    connection, as JSON-RPC and Rust's v1 connections allow. On a connection
+    with protocol version 2, including every `v2.Connect` connection, it gets
+    `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"ACP protocol v2 request ids must be a string or an integer, not null"}}`
+    without running a handler, and the draft-v2 agent runtime sets version 2.
+    Previously either closed the connection. `agentrouter` still answers a
+    null-id first frame and exits; keeping it reading is part of #62.
+  - A request handler panic is recovered. The reference SDK does not catch
+    panics; acp-go answers as Rust answers a request whose handler dropped
+    its responder without responding, which is the closest Rust wire
+    equivalent:
+    ``{"code":-32603,"message":"Internal error","data":"request handler dropped its responder for `<method>` without responding"}``,
+    or `{"code":-32800,"message":"Request cancelled"}` when the request was
+    already cancelled. A panicking notification handler is recovered too. The
+    panic and its stack go to the `WithErrorHandler` hook, or to the standard
+    logger without one; neither reaches the peer. A panic in the hook itself
+    is recovered and logged. A request whose handler panics after input
+    closed (`InputClosed`) is not answered, as Rust sends nothing for a
+    dropped responder while shutting down and as the MCP bindings leave a
+    request unanswered after EOF. Previously a handler panic crashed the
+    process.
+  - A cancelled incoming request is answered with the message
+    `Request cancelled`, Rust's text for `-32800`, instead of
+    `request cancelled`.
+  - An error returned by a `Notifications` function goes to the
+    `WithErrorHandler` hook, or is dropped, instead of closing the
+    connection, as Rust logs and ignores it. A malformed `session/cancel` or a
+    failing v2 `CancelSession` no longer disconnects the client.
+  - The limit of 32 concurrent incoming requests is removed: Rust has no such
+    limit, and exceeding it closed the connection. Every incoming request runs
+    in its own goroutine.
+  - Invalid UTF-8, an oversized frame, and transport failures still close the
+    connection.
 - The v1 and draft v2 agent runtimes now send their initialization lifecycle
   refusals in the reference Rust SDK's wire shape: code `-32600`, message
   `Invalid request`, and the explanation as a JSON string in `data`. A request
@@ -317,7 +386,7 @@ series, minor releases may contain breaking API changes.
   connection closed, the agent router exited, and the proxy router answered
   `-32600` and exited. Invalid UTF-8 still closes the connection, because the
   reference SDK cannot read it as a line either. Valid JSON that is not a
-  JSON-RPC message still closes it; that is tracked in #73.
+  JSON-RPC message is answered or dropped too; see the #73 entry below.
 - Validity follows `serde_json`, which the reference SDK parses with, rather
   than `encoding/json`. A lone UTF-16 surrogate escape such as `"\ud800"`, a
   number whose float64 evaluation overflows (including values just below

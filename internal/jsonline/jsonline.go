@@ -6,7 +6,9 @@
 // "id": null and the line as data. A JSON array is a batch, which acp-go does
 // not support on any protocol version, matching the ACP v2 transports rule: it
 // gets one -32600 error with "id": null, and none of its entries run. Either
-// way the connection keeps reading.
+// way the connection keeps reading. The package also holds the exact -32600
+// errors for a valid JSON value that is not a JSON-RPC message and for a
+// protocol v2 request with a null id.
 //
 // Validity follows serde_json, which the reference SDK parses with: besides the
 // JSON grammar, a string may not hold a lone UTF-16 surrogate escape, a number
@@ -257,6 +259,26 @@ func hexValue(digits []byte) uint16 {
 // answers a batch array, without a trailing newline.
 func BatchRejection() []byte { return []byte(batchRejection) }
 
+// invalidRequest is the exact wire response, without a trailing newline, that
+// the reference SDK sends for a valid JSON value that is not a JSON-RPC
+// message and is not shaped like a response: Error::invalid_request() with no
+// data, sent as an uncorrelated error response.
+const invalidRequest = `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}`
+
+// nullV2RequestID is the exact wire response, without a trailing newline,
+// that the reference SDK sends for a protocol v2 request whose id is null
+// (raw_id::null_v2_request_id). The id cannot be echoed, so it is null.
+const nullV2RequestID = `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"ACP protocol v2 request ids must be a string or an integer, not null"}}`
+
+// InvalidRequest returns a fresh copy of the JSON-RPC error response that
+// answers a valid JSON value that is not a JSON-RPC message, without a
+// trailing newline.
+func InvalidRequest() []byte { return []byte(invalidRequest) }
+
+// NullV2RequestID returns a fresh copy of the JSON-RPC error response that
+// answers a protocol v2 request with a null id, without a trailing newline.
+func NullV2RequestID() []byte { return []byte(nullV2RequestID) }
+
 // ParseError returns the JSON-RPC error response that answers line, a valid
 // UTF-8 value that is not valid JSON, without a trailing newline. It matches
 // the reference SDK byte for byte: Error::parse_error() with data
@@ -264,16 +286,16 @@ func BatchRejection() []byte { return []byte(batchRejection) }
 func ParseError(line []byte) []byte {
 	var b bytes.Buffer
 	b.WriteString(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error","data":{"line":`)
-	b.Write(quote(line))
+	b.Write(Quote(line))
 	b.WriteString(`}}}`)
 	return b.Bytes()
 }
 
-// quote encodes s as a JSON string exactly as serde_json does: only '"', '\\',
-// and control characters are escaped, using \b \t \n \f \r where they exist
-// and lowercase \u00XX otherwise. Everything else, including '<', '>', '&',
+// Quote encodes s, valid UTF-8, as a JSON string exactly as serde_json does:
+// only '"', '\\', and control characters are escaped, using \b \t \n \f \r
+// where they exist and lowercase \u00XX otherwise. Everything else, including '<', '>', '&',
 // U+2028, and U+2029, is written as is.
-func quote(s []byte) []byte {
+func Quote(s []byte) []byte {
 	const hex = "0123456789abcdef"
 	out := make([]byte, 0, len(s)+2)
 	out = append(out, '"')
