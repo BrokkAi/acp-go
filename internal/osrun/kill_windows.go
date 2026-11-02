@@ -3,16 +3,23 @@
 package osrun
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"strconv"
 	"syscall"
+	"time"
 )
 
 func processGroup() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
 }
+
+// terminate has no gentler step on Windows, which has no SIGTERM: like the Rust
+// SDK, an agent that ignored stdin EOF is killed at once, here by the caller
+// killing its process tree.
+func terminate(context.Context, *exec.Cmd, <-chan struct{}, time.Duration) {}
 
 // Kill terminates the command and its descendants. Windows has no process
 // groups to signal, so taskkill walks the tree; the direct kill covers a

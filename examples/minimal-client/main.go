@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/schema"
@@ -43,8 +44,19 @@ func main() {
 		panic(err)
 	}
 	defer func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		// connection.Close has closed the agent's stdin, which asks it to exit.
+		// Give it a second, as the SDK runners do, before killing it.
+		exited := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(exited)
+		}()
+		select {
+		case <-exited:
+		case <-time.After(time.Second):
+			_ = cmd.Process.Kill()
+			<-exited
+		}
 	}()
 
 	connection := acp.Connect(stdout, stdin, nil, acp.SessionUpdates(func(update acp.Update) error {
