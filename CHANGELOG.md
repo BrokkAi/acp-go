@@ -191,13 +191,6 @@ series, minor releases may contain breaking API changes.
   acp-go agents cannot answer in place until #73. The HTTP client fails an
   `initialize` whose response body is not valid JSON.
 
-### Removed
-
-- **Breaking:** `Connection.CallBatch` and `BatchCall`, and all inbound batch
-  processing (grouped response arrays, response-batch routing, and the agent
-  router's batched-initialize validation). Send each message individually
-  (#68).
-
 ### Fixed
 
 - The v1 and draft v2 agent runtimes could call `Agent.Initialize` twice when
@@ -220,6 +213,10 @@ series, minor releases may contain breaking API changes.
 
 ### Removed
 
+- **Breaking:** `Connection.CallBatch` and `BatchCall`, and all inbound batch
+  processing (grouped response arrays, response-batch routing, and the agent
+  router's batched-initialize validation). Send each message individually
+  (#68).
 - Next Edit Suggestions, removed from the upstream unstable schema: every
   `nes/*` and `document/did*` method, the `Nes*`, `Did*DocumentNotification`,
   `Position`, `Range`, `PositionEncodingKind`, `TextDocumentContentChangeEvent`,
