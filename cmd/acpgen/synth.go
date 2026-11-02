@@ -34,6 +34,9 @@ func synthWire(r *ir, name string, full bool, depth map[string]int) (string, err
 		return "0", nil
 
 	case kindAny:
+		if td.AnySynth != "" {
+			return td.AnySynth, nil
+		}
 		return `""`, nil
 
 	case kindRaw:
@@ -94,40 +97,45 @@ func synthWire(r *ir, name string, full bool, depth map[string]int) (string, err
 		if chosen == nil {
 			return "null", nil
 		}
-		parts, err := synthFieldParts(r, td.Fields, full, withDepth(depth, name))
-		if err != nil {
-			return "", err
-		}
-		if chosen.Const != "" {
-			parts = append(parts, fmt.Sprintf("%q: %q", td.TagJSON, chosen.Const))
-		}
-		switch {
-		case chosen.Open:
-			return "null", nil
-		case strings.HasPrefix(chosen.Payload, "[]"):
-			item, err := synthWire(r, strings.TrimPrefix(chosen.Payload, "[]"), full, withDepth(depth, name))
-			if err != nil {
-				return "", err
-			}
-			return "[" + item + "]", nil
-		case chosen.Payload != "":
-			payload, err := synthWire(r, chosen.Payload, full, withDepth(depth, name))
-			if err != nil {
-				return "", err
-			}
-			parts = append(parts, objectParts(payload)...)
-		default:
-			inline, err := synthFieldParts(r, chosen.Inline, full, withDepth(depth, name))
-			if err != nil {
-				return "", err
-			}
-			parts = append(parts, inline...)
-		}
-		return "{" + strings.Join(parts, ", ") + "}", nil
+		return synthVariant(r, td, chosen, full, withDepth(depth, name))
 
 	default:
 		return "", fmt.Errorf("%s: cannot synthesize kind %d", name, td.Kind)
 	}
+}
+
+// synthVariant renders a union value holding the chosen variant.
+func synthVariant(r *ir, td *typeDef, chosen *variant, full bool, depth map[string]int) (string, error) {
+	parts, err := synthFieldParts(r, td.Fields, full, depth)
+	if err != nil {
+		return "", err
+	}
+	if chosen.Const != "" {
+		parts = append(parts, fmt.Sprintf("%q: %q", td.TagJSON, chosen.Const))
+	}
+	switch {
+	case chosen.Open:
+		return "null", nil
+	case strings.HasPrefix(chosen.Payload, "[]"):
+		item, err := synthWire(r, strings.TrimPrefix(chosen.Payload, "[]"), full, depth)
+		if err != nil {
+			return "", err
+		}
+		return "[" + item + "]", nil
+	case chosen.Payload != "":
+		payload, err := synthWire(r, chosen.Payload, full, depth)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, objectParts(payload)...)
+	default:
+		inline, err := synthFieldParts(r, chosen.Inline, full, depth)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, inline...)
+	}
+	return "{" + strings.Join(parts, ", ") + "}", nil
 }
 
 // synthFields renders an object with required fields (or all fields when
@@ -181,6 +189,8 @@ func synthValue(r *ir, f field, full bool, depth map[string]int) (string, error)
 		return synthValue(r, f, full, depth)
 	case typ == "string":
 		return `""`, nil
+	case (strings.HasPrefix(typ, "int") || strings.HasPrefix(typ, "uint")) && f.NonZero:
+		return "1", nil
 	case strings.HasPrefix(typ, "int") || strings.HasPrefix(typ, "uint"):
 		return "0", nil
 	case typ == "float64":

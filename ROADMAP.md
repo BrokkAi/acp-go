@@ -150,8 +150,12 @@ only remaining work.
   artifacts and review the generated API diff before either pin moves.
 - Semantic validation at the typed facade boundaries
   (`docs/validation-boundaries.md`): absolute paths, required identifiers,
-  media types, and URIs are checked before a request reaches the wire, with the
-  generated types left permissive so unknown tags and raw `_meta` keep decoding.
+  media types, and URIs are checked before a request reaches the wire, while
+  unknown tags and raw `_meta` keep decoding.
+- Rust-parity decoding (#82): the generated decoders honor the schema's
+  `x-deserialize-*` hints and enforce required fields and union tags, checked
+  per pin against outcomes captured from the Rust schema crate
+  (`docs/schema-pin-workflow.md`).
 
 ## Remaining Rust-parity gaps
 
@@ -217,4 +221,6 @@ Unstable session archive/status/title (#71) and client-provided system prompts
 - Capability-gated methods and session-update variants must fail before
   writing to the wire.
 - Generated files must remain byte-deterministic for both pinned artifacts.
+- Generated decoders must accept and reject what the pinned Rust schema crate
+  does; each package's `TestDeserializeHints` checks it.
 - The module version is independent of the negotiated wire version.

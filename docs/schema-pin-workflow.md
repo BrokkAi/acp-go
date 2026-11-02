@@ -45,6 +45,7 @@ schema crate or when the Rust SDK moves its exact pin.
      -out schema/v2/unstable -package unstable
    go run ./cmd/acpgen -schema schema/v2/unstable/schema.json \
      -meta schema/v2/unstable/meta.json -out schema/v2/unstable -package unstable
+   python3 scripts/capture_hint_fixtures.py   # recapture the Rust decode outcomes
    ```
 
 2. **Review the generated API diff.** This is the gate, not a formality. Read
@@ -71,18 +72,21 @@ schema crate or when the Rust SDK moves its exact pin.
      v2 metadata patch helpers. A listed field that is missing, required, or
      not nullable fails generation;
    - JSON field names, integer widths, and defaults;
-   - `x-deserialize-*` hints (default-on-error, default-on-null, skip invalid
-     items). `cmd/acpgen` honors default-on-error only on the defs in
-     `lenientDefs` (`cmd/acpgen/ir.go`): the state-update snapshots,
-     `SessionStatusResponse`, and `SessionInfo`. It decodes every other field
-     strictly and never skips invalid items. That is a known divergence from
-     Rust, tracked in #82: a malformed value fails the whole message instead
-     of reading as not reported. Record newly affected fields on #82, and extend `lenientDefs`
-     where a malformed field would break a protocol MUST;
+   - `x-deserialize-*` hints and required fields. The generated decoders
+     follow them on every field (see [Decode rules](#decode-rules)), so the
+     diff shows changed decoding wherever a hint or a `required` list
+     changed. A decode rule the schema cannot express belongs in the tables
+     in `cmd/acpgen/ir.go` (see [Decode rules](#decode-rules)), and a new
+     hint the generator does not know is a generator change. Generation
+     fails when the method payloads without required fields stop matching
+     `defaultOnNullPayloads`, the Rust crate's `default_on_null!` inventory;
    - new `x-side` values or `meta.json` method groups (such as 1.15's
      `proxyMethods`): generation fails on a method outside the groups
      `cmd/acpgen` models, so teach it the group and its side constant;
-   - `parity_gen_test.go` and `golden_test.go` updates, and any new goldens.
+   - `parity_gen_test.go` and `golden_test.go` updates, and any new goldens;
+   - `hints_gen_test.go` and `testdata/hints_rust.json`: recapture the Rust
+     outcomes (see [Decode rules](#decode-rules)) and review the fixture diff
+     next to the generated code.
 
    Preserve the guardrails: open-world enums and unknown tags must keep
    decoding, raw `_meta` payloads must round-trip, and nothing may convert v1
@@ -95,8 +99,113 @@ schema crate or when the Rust SDK moves its exact pin.
 4. **Validate.** Run the default suite from `CONTRIBUTING.md`
    (`go test -race ./...`, `go vet ./...`, `python3 scripts/licenses.py`,
    `python3 -m unittest discover -s scripts -p '*_test.py'`) plus
-   `go test -race ./schema/`. Regeneration is deterministic: re-running the
-   generator must leave a clean tree.
+   `go test -race ./schema/...`. Before that, recapture the Rust decode
+   outcomes with `python3 scripts/capture_hint_fixtures.py` (it needs
+   cargo). Regeneration is deterministic: re-running the generator must leave
+   a clean tree, and so must re-running the capture.
 
 5. **Commit together.** Land the artifact pins, the regenerated files, the
-   changelog entry, and any API-diff notes in one reviewed change.
+   recaptured fixtures, the changelog entry, and any API-diff notes in one
+   reviewed change.
+
+## Decode rules
+
+The generated decoders accept and reject the same inputs as the pinned Rust
+schema crate and produce the same values. The reference SDK parses a message
+into a `serde_json::Value` and decodes the payload from it; the generated
+decoders follow serde's derives and the schema's hints, which record each
+field's serde adapters:
+
+- `x-deserialize-default-on-error` (`serde_with::DefaultOnError`): a value
+  that does not decode reads as the field's default. For an optional field
+  that is "not reported", and `null` reads the same way. A `Nullable` patch
+  field (`DefaultOnError<MaybeUndefined<_>>`) keeps an explicit `null` as
+  null; only a malformed value reads as unset (Rust's
+  `MaybeUndefined::Undefined`). A required list or map defaults to an empty
+  one. A required field must still be present.
+- `x-deserialize-skip-invalid-items` (`serde_with::VecSkipError`): list items
+  that do not decode are dropped and the others kept. A value that is not a
+  list fails, unless default-on-error also applies.
+- `x-deserialize-default-on-null` (`serde_with::DefaultOnNull`): `null` reads
+  as the default.
+
+Everything else decodes as serde does:
+
+- A required field must be present. `null` is accepted only where the schema
+  admits it (an `Option` in Rust), for list items and map values too. Wire
+  keys match exactly, and a duplicate key keeps its last value, as in
+  `serde_json::Value`.
+- Enums read as serde reads unit variants: a string, or the one-key map form
+  `{"variant": null}` (a non-null value or more keys fail). A closed enum
+  (one without a catch-all member: most v1 enums, and `ElicitationSchemaType`
+  in both versions) rejects a value it does not name; v1 `ToolKind` reads one
+  as `other` (`#[serde(other)]`). An open enum keeps any string, and the map
+  form only for a variant it names. `null` is never an enum value.
+- A union of primitives (an untagged Rust enum such as
+  `SessionConfigSelectOptions` or `ElicitationContentValue`) accepts only a
+  value one of its arms decodes; the Go value stays `any`.
+- A tagged union routes on its tag; whatever its tagged variants do not decode
+  (a missing, invalid, or unknown tag, or a payload that does not decode) goes
+  to its untagged variants in schema order. The open variant takes a string
+  tag that names no variant, and only with the fields (and scope) its schema
+  arm requires; a tag-less variant takes any value its payload decodes.
+- A struct also decodes from a JSON array, positionally in Rust field
+  declaration order (the schema's property order): a missing element leaves
+  an optional field unset and fails a required one, and extra elements fail.
+  A tagged union decodes from an array whose first element is the tag and
+  whose rest is the payload. A Rust struct with a flattened field decodes only
+  from an object: unions with shared fields, structs carrying a flattened
+  union (`IdleStateUpdate`), and the plain structs in `mapOnlyStructs` (v1
+  `ToolCallUpdate` and `WaitForTerminalExitResponse`, and `McpError`); v2
+  `ToolCallUpdate` flattens nothing and reads from an array.
+- Where serde decodes from buffered content (inside a default-on-error field,
+  a skip-invalid list item, a tagged union's payload, a union with untagged
+  variants or shared fields, or the flattened `IdleStateUpdate.stopReason`),
+  a non-negative integer tag selects the tagged variant at that index, as
+  serde's variant identifiers do. Elsewhere, such as a top-level v1
+  `ContentBlock` or a plain `SessionNotification.update`, a numeric tag fails.
+  The decoders carry this context as a `buffered` flag.
+- A flattened union is a Rust flattened `Option`: a stop reason that does not
+  decode reads as not reported.
+- A struct without required fields decodes from top-level `null` as its zero
+  value. That matches Rust on the wire: the generator requires the method
+  payloads without required fields to be exactly the crate's
+  `default_on_null!` payloads (`defaultOnNullPayloads`), the only ones Rust
+  reads from `null`; other structs never arrive as a top-level `null`.
+
+The rules the schema cannot express are tables in `cmd/acpgen/ir.go`, each
+checked at generation:
+
+- `nonZeroFields`: integers Rust decodes as `NonZero` (v2
+  `ToolCallLocation.line`).
+- `flattenReservedKeys`: keys Rust keeps out of a custom stop reason.
+- `enumFallbacks`: closed enums with a `#[serde(other)]` member.
+- `mapOnlyStructs`: plain structs with a `#[serde(flatten)]` field in Rust,
+  per protocol version; an entry that is not a plain struct fails generation.
+- `stringTagUnions`: unions whose hand-written Rust `Deserialize` requires a
+  string tag (v2 `SetSessionConfigOptionRequest`).
+- `defaultOnNullPayloads`: the `default_on_null!` inventory.
+
+Each package's generated `hints_gen_test.go` derives decode cases from the
+schema: valid, missing, `null`, and malformed values for every hinted field;
+missing and `null` for every required field; `null` items and values for
+every list and map; an unknown value and the map forms for every enum field,
+an object for every union-of-primitives field, and an integer tag for every
+tagged-union field;
+the array form of every struct (short, long, and empty) and tagged union;
+and missing, `null`, non-string, empty, custom, integer, and bare known and
+custom tags for every tagged union. `scripts/capture_hint_fixtures.py` runs
+them through `scripts/hintprobe`, a probe built on the pinned crate that
+decodes through `serde_json::Value` as the SDK does, and writes the outcomes
+to `testdata/hints_rust.json`. `TestDeserializeHints` requires the Go
+decoders to accept and reject the same inputs and, for accepted ones, to
+produce the same value: it decodes the Rust re-encoding with the Go type and
+compares the two Go values field by field. A field one side leaves unset
+equals the other only when the other holds that field's default (the
+schema's, or one Rust omits when encoding, `rustOmittedDefaults`), an empty
+list equals an absent one, and a `Nullable` null equals omission except on
+patch fields, at any depth. A stale or missing fixture fails the test.
+
+The generated cases find no remaining accept/reject or value differences.
+Decode errors use serde's wording ("invalid type: sequence, expected a
+map") and never name Go types, but their text is not compared with Rust's.

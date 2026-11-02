@@ -30,9 +30,27 @@ type field struct {
 	Required bool
 	Nullable bool // JSON null is distinct from an omitted optional field
 	Doc      string
-	// Lenient mirrors x-deserialize-default-on-error: a value that does not
-	// decode reads as not reported. Only defs with Lenient set honor it.
-	Lenient bool
+	// DefaultOnError mirrors x-deserialize-default-on-error: a value that
+	// does not decode, null included, reads as the field's default.
+	DefaultOnError bool
+	// SkipInvalid mirrors x-deserialize-skip-invalid-items: list items
+	// that do not decode are dropped and the others kept.
+	SkipInvalid bool
+	// DefaultOnNull mirrors x-deserialize-default-on-null: null reads as
+	// the field's default.
+	DefaultOnNull bool
+	// NullOK is set when the schema admits null for the value, as Rust's
+	// Option (or a type that accepts null itself) does. Null fails any
+	// other field, unless a hint reads it as the default.
+	NullOK bool
+	// ItemNullOK is set when the schema admits null for the items of a list
+	// or the values of a map. Null fails any other item or value.
+	ItemNullOK bool
+	// Default is the schema's default value of the field, as JSON, or "".
+	Default string
+	// NonZero marks an integer Rust decodes as NonZero, rejecting 0 (see
+	// nonZeroFields).
+	NonZero bool
 	// Variant names the flattened tag value this lifted payload field
 	// belongs to; it is decoded and encoded only alongside that value.
 	Variant string
@@ -51,10 +69,18 @@ type variant struct {
 	GoName  string // Go payload field name on the union struct
 	Const   string // tag const value; "" when untagged or open
 	Open    bool   // unknown-tag or unmatched-shape catch-all preserving the raw payload
-	Default bool   // used when the tag key is absent on the wire
-	Payload string // def name for ref payloads; "" for inline or open payloads
-	Inline  []field
-	Doc     string
+	Default bool   // untagged: decodes any object the tagged variants do not
+	Rank    int    // position in the schema, which orders untagged decoding
+	// SeqOrder lists the inline fields' wire keys in Rust declaration order.
+	SeqOrder []string
+	// OpenAnyOf lists defs one of which an open variant's value must also
+	// decode as.
+	OpenAnyOf []string
+	// OpenOneOf requires exactly one of OpenAnyOf to match (a oneOf).
+	OpenOneOf bool
+	Payload   string // def name for ref payloads; "" for inline or open payloads
+	Inline    []field
+	Doc       string
 }
 
 type typeDef struct {
@@ -74,31 +100,35 @@ type typeDef struct {
 	Extra []*typeDef
 	// Flatten is set on a struct carrying a flattened tagged union.
 	Flatten *flattenInfo
-	// Lenient structs get a decoder that honors their fields'
-	// x-deserialize-default-on-error hints (see lenientDefs).
-	Lenient bool
 	// Upsert structs get an ApplyUpdate method (see patchDefs).
 	Upsert bool
+	// AnySynth is the parity fixture value of a kindAny def: a value of its
+	// first arm, so the fixture also decodes in the Rust schema crate.
+	AnySynth string
+	// AnyArms are the arms of a kindAny def, tried in order to validate a
+	// value as Rust's untagged enum does.
+	AnyArms []anyArm
+	// OpenEnum is set on an enum with a catch-all member, which keeps any
+	// string. A closed enum rejects unknown values, as Rust does, unless
+	// Fallback names the member they read as (Rust's #[serde(other)]).
+	OpenEnum bool
+	Fallback string
+	// StringTag is set on a tagged union whose tag must be a string (see
+	// stringTagUnions).
+	StringTag bool
+	// SeqOrder lists a struct's wire keys in Rust declaration order, the
+	// order serde reads a struct from a JSON array.
+	SeqOrder []string
+	// ObjectOnly is set on a struct Rust reads only from an object (a
+	// flattened field; see mapOnlyStructs).
+	ObjectOnly bool
 }
 
-// lenientDefs are the defs whose optional fields must read as not reported
-// when malformed, as Rust's DefaultOnError does. The state-update snapshots
-// are lenient because a client has to recognize an idle transition even when
-// its stopReason or background list is malformed, or active work never
-// completes. Structs with a flattened
-// union are lenient too. SessionStatusResponse is lenient because the
-// session-status RFD requires a malformed draft-v2 state snapshot to read as
-// not reported rather than fail the whole response. SessionInfo is lenient so
-// that a malformed archived (and the other hinted fields) reads as not
-// reported instead of failing the whole session/list page. Honoring the hints
-// on every def is tracked in #82.
-var lenientDefs = map[string]bool{
-	"IdleStateUpdate":           true,
-	"RunningStateUpdate":        true,
-	"RequiresActionStateUpdate": true,
-	"UnknownStateUpdate":        true,
-	"SessionStatusResponse":     true,
-	"SessionInfo":               true,
+// anyArm is one arm of a union of primitives.
+type anyArm struct {
+	Kind       string // "string", "integer", "number", "boolean", "null", "array", or "any"
+	GoType     string // integer type, or the list item type
+	ItemNullOK bool   // a list item may be null
 }
 
 // patchDefs are the v2 updates whose optional fields are patches: omission
@@ -144,6 +174,185 @@ var v1PatchDefs = map[string][]string{
 // the tag-derived name is already a def (the schema does not carry it).
 var rustEnumNames = map[string]string{
 	"IdleStateUpdate.stopReason": "IdleStopReason",
+}
+
+// The x-deserialize-* hints cover the serde adapters of the Rust schema
+// crate. The tables below record the few decode rules the schema does not
+// express; everything else follows from the schema and its hints.
+
+// nonZeroFields are the integer fields Rust decodes as a NonZero integer,
+// which rejects 0, keyed by def and field, with the lowest protocol version
+// where they are. The schema records them only as "minimum": 1, which it
+// also writes for plain integers Rust does not range-check (v2
+// TerminalSize). A listed field that is not an integer with minimum 1 fails
+// generation.
+var nonZeroFields = map[string]int{
+	"ToolCallLocation.line": 2,
+}
+
+// flattenReservedKeys are wire keys Rust keeps out of a flattened union's
+// custom-variant fields, whether or not the pin models them as fields of the
+// parent (Rust's remove_idle_state_update_fields reserves usage even when
+// the end-turn token usage feature is off).
+var flattenReservedKeys = map[string][]string{
+	"IdleStateUpdate": {"usage"},
+}
+
+// enumFallbacks are closed enums with a #[serde(other)] member, keyed by def,
+// with the protocol version they apply to: an unknown value reads as that
+// member instead of failing. A listed enum that is closed in the pin but has
+// no such member fails generation.
+var enumFallbacks = map[string]struct {
+	protocol int
+	value    string
+}{
+	"ToolKind": {1, "other"}, // v1 tool_call.rs; v2's ToolKind is open
+}
+
+// mapOnlyStructs are the plain structs whose Rust type has a
+// #[serde(flatten)] field, keyed by def, with the protocol versions where it
+// does. serde reads such a struct only from a JSON object, while every other
+// struct also reads from a JSON array, positionally. The schema inlines
+// flattened fields, so it cannot tell the two apart. Unions with shared
+// fields and structs carrying a flattened union are flattened in Rust too
+// and never read from an array, so they are not listed. A listed def that is
+// not such a plain struct fails generation.
+var mapOnlyStructs = map[string][]int{
+	"McpError":                    {1, 2}, // #[serde(flatten)] data fields
+	"ToolCallUpdate":              {1},    // v1 tool_call.rs: #[serde(flatten)] fields
+	"WaitForTerminalExitResponse": {1},    // #[serde(flatten)] exit status
+}
+
+// defaultOnNullPayloads mirrors the Rust crate's default_on_null! inventory
+// (serde_util.rs): the method payloads that decode from null as their
+// default. The generated decoders read null as the zero value for every
+// struct without required fields, so the generator requires these to be
+// exactly the method payloads without required fields of each pin. A
+// mismatch means Rust and Go would differ on a null payload.
+var defaultOnNullPayloads = map[int]struct{ stable, unstable []string }{
+	1: {
+		stable: []string{"AuthenticateResponse", "CloseSessionResponse", "DeleteSessionResponse", "KillTerminalResponse",
+			"ListSessionsRequest", "LoadSessionResponse", "LogoutRequest", "LogoutResponse", "ReleaseTerminalResponse",
+			"ResumeSessionResponse", "SetSessionModeResponse", "WaitForTerminalExitResponse", "WriteTextFileResponse"},
+		unstable: []string{"ArchiveSessionResponse", "AuthStatusRequest", "DisableProviderResponse", "ListProvidersRequest",
+			"SetProviderResponse", "UnarchiveSessionResponse"},
+	},
+	2: {
+		stable: []string{"CancelTerminalResponse", "CancelToolCallResponse", "CloseSessionResponse", "DeleteSessionResponse",
+			"ListSessionsRequest", "LoginAuthResponse", "LogoutAuthRequest", "LogoutAuthResponse", "ResumeSessionResponse"},
+		unstable: []string{"ArchiveSessionResponse", "AuthStatusRequest", "DisableProviderResponse", "ListProvidersRequest",
+			"SetProviderResponse", "UnarchiveSessionResponse"},
+	},
+}
+
+// checkDefaultOnNull fails when the method payloads without required fields
+// differ from defaultOnNullPayloads.
+func (r *ir) checkDefaultOnNull(protocol int) error {
+	table, ok := defaultOnNullPayloads[protocol]
+	if !ok || !strings.HasPrefix(r.Pin, "schema-v") {
+		return nil // only released pins carry the Rust inventory
+	}
+	names := table.stable
+	if strings.Contains(r.Pin, "unstable") {
+		names = append(append([]string{}, names...), table.unstable...)
+	}
+	want := map[string]bool{}
+	for _, n := range names {
+		want[n] = true
+	}
+	for _, td := range r.Defs {
+		if td.Method == "" || td.Kind != kindStruct || len(td.Fields) == 0 {
+			continue
+		}
+		required := false
+		for _, f := range td.Fields {
+			required = required || f.Required
+		}
+		if required {
+			continue
+		}
+		if !want[td.Name] {
+			return fmt.Errorf("%s: a method payload without required fields is not in defaultOnNullPayloads", td.Name)
+		}
+		delete(want, td.Name)
+	}
+	missing := make([]string, 0, len(want))
+	for n := range want {
+		missing = append(missing, n)
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		return fmt.Errorf("defaultOnNullPayloads lists %v, which are not method payloads without required fields", missing)
+	}
+	return nil
+}
+
+// stringTagUnions are tagged unions whose Rust Deserialize is hand-written
+// and requires a string tag, keyed by def, with the protocol version: serde
+// would otherwise read an integer tag as a variant index from buffered
+// content (v2 SessionConfigOptionValue, flattened into
+// SetSessionConfigOptionRequest).
+var stringTagUnions = map[string]int{
+	"SetSessionConfigOptionRequest": 2,
+}
+
+// applyDecodeTables applies enumFallbacks and mapOnlyStructs to a def.
+func applyDecodeTables(td *typeDef, protocol int) error {
+	if fb, ok := enumFallbacks[td.Name]; ok && fb.protocol == protocol && td.Kind == kindEnum && !td.OpenEnum {
+		for _, v := range td.Variants {
+			if v.Const == fb.value {
+				td.Fallback = fb.value
+			}
+		}
+		if td.Fallback == "" {
+			return fmt.Errorf("%s: enum fallback %q is not a member", td.Name, fb.value)
+		}
+	}
+	for _, p := range mapOnlyStructs[td.Name] {
+		if p != protocol {
+			continue
+		}
+		if td.Kind != kindStruct || td.Flatten != nil || len(td.Fields) == 0 {
+			return fmt.Errorf("%s: mapOnlyStructs lists a def that is not a plain struct", td.Name)
+		}
+		td.ObjectOnly = true
+	}
+	if td.Flatten != nil {
+		td.ObjectOnly = true
+	}
+	if since, ok := stringTagUnions[td.Name]; ok && protocol >= since {
+		if td.Kind != kindTaggedUnion {
+			return fmt.Errorf("%s: string-tag union is not a tagged union", td.Name)
+		}
+		td.StringTag = true
+	}
+	return nil
+}
+
+// applyNonZeroFields marks the def's nonZeroFields.
+func applyNonZeroFields(td *typeDef, def *rawSchema, protocol int) error {
+	for key, since := range nonZeroFields {
+		name, prop, _ := strings.Cut(key, ".")
+		if name != td.Name || protocol < since {
+			continue
+		}
+		ps := def.Properties[prop]
+		found := false
+		for i := range td.Fields {
+			f := &td.Fields[i]
+			if f.JSONName != prop {
+				continue
+			}
+			if ps == nil || ps.Minimum == nil || *ps.Minimum != 1 || !strings.Contains(f.GoType, "int") {
+				return fmt.Errorf("%s: non-zero field is not an integer with minimum 1", key)
+			}
+			f.NonZero, found = true, true
+		}
+		if !found {
+			return fmt.Errorf("%s: non-zero field is not in the schema", key)
+		}
+	}
+	return nil
 }
 
 type methodDesc struct {
@@ -203,13 +412,16 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 				return nil, err
 			}
 		}
+		if err := applyNonZeroFields(td, def, meta.ProtocolVersion); err != nil {
+			return nil, err
+		}
+		if err := applyDecodeTables(td, meta.ProtocolVersion); err != nil {
+			return nil, err
+		}
 		for _, f := range td.Fields {
 			r.HasNullable = r.HasNullable || f.Nullable
 		}
 		td.Side, td.Method = def.Side, def.Method
-		if td.Kind == kindStruct && (lenientDefs[name] || td.Flatten != nil) {
-			td.Lenient = true
-		}
 		if preserveNull && td.Kind == kindStruct && patchDefs[name].upsert {
 			if err := checkUpsert(td); err != nil {
 				return nil, err
@@ -223,6 +435,9 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 			r.Defs = append(r.Defs, out)
 			r.ByName[out.Name] = out
 		}
+	}
+	if err := r.checkDefaultOnNull(meta.ProtocolVersion); err != nil {
+		return nil, err
 	}
 	if err := r.resolveRefs(); err != nil {
 		return nil, err
@@ -324,6 +539,7 @@ func classify(name string, def *rawSchema, root *rootSchema, preserveNull bool) 
 			return td, nil // {} marker type (e.g. LogoutCapabilities)
 		}
 		td.Kind = kindStruct
+		td.SeqOrder = def.propOrder()
 		required := map[string]bool{}
 		for _, k := range def.Required {
 			required[k] = true
@@ -411,7 +627,7 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 	}
 	tagDoc := def.Properties[tag].Description
 	enum := &typeDef{
-		Name: enumName, Kind: kindEnum, Base: "string",
+		Name: enumName, Kind: kindEnum, Base: "string", OpenEnum: true,
 		Doc: fmt.Sprintf("%s is the %q discriminator flattened into %s. Unknown values decode unchanged.\n%s", enumName, tag, name, tagDoc),
 	}
 
@@ -460,7 +676,7 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 		}
 	}
 
-	td := &typeDef{Name: name, Doc: def.Description, Kind: kindStruct, Extra: []*typeDef{enum}}
+	td := &typeDef{Name: name, Doc: def.Description, Kind: kindStruct, Extra: []*typeDef{enum}, SeqOrder: def.propOrder()}
 	td.Flatten = &flattenInfo{TagJSON: tag, TagGo: goNameOf(tag), Enum: enumName, ExtrasGo: goNameOf(tag) + "Fields"}
 	for _, v := range enum.Variants {
 		td.Flatten.Known = append(td.Flatten.Known, v.Const)
@@ -474,9 +690,12 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 			// Null selects the "not reported" variant, which omission also
 			// selects, so the tag is a plain optional field even where null
 			// is otherwise preserved.
+			if required[tag] {
+				return nil, true, fmt.Errorf("%s: a required flattened %q is not supported", name, tag)
+			}
 			td.Fields = append(td.Fields, field{
 				JSONName: tag, GoName: goNameOf(tag), GoType: enumName,
-				Required: required[tag], Doc: tagDoc, Lenient: p.value.DefaultOnError,
+				Doc: tagDoc, NullOK: true,
 			})
 			continue
 		}
@@ -559,6 +778,7 @@ func classifyUnionShape(name string, def *rawSchema, variants []*rawSchema, root
 		td.Kind, td.Base = kindEnum, base
 		for _, e := range enums {
 			if e.value == "" {
+				td.OpenEnum = true
 				continue // open tail: unknown values stay valid
 			}
 			name := goNameOf(e.title)
@@ -573,6 +793,20 @@ func classifyUnionShape(name string, def *rawSchema, variants []*rawSchema, root
 	// Union of bare primitives (string|int|bool|array|null): model as any.
 	if allPrimitive(variants) {
 		td.Kind = kindAny
+		td.AnySynth = `""`
+		for _, v := range variants {
+			arm, err := anyArmOf(v, root)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", name, err)
+			}
+			td.AnyArms = append(td.AnyArms, arm)
+		}
+		for _, v := range variants {
+			if t := v.soleType(); t != "" && t != "null" {
+				td.AnySynth = map[string]string{"string": `""`, "integer": "0", "number": "0.5", "boolean": "true", "array": "[]"}[t]
+				break
+			}
+		}
 		return td, nil
 	}
 
@@ -659,6 +893,7 @@ func classifyUnionShape(name string, def *rawSchema, variants []*rawSchema, root
 				f.Required = required[p.key]
 				nv.Inline = append(nv.Inline, f)
 			}
+			nv.SeqOrder = withoutName(v.propOrder(), "")
 		}
 		td.Variants = append(td.Variants, nv)
 	}
@@ -757,7 +992,7 @@ func taggedVariants(name string, variants []*rawSchema, root *rootSchema, preser
 		if title == "" && target != "" {
 			title = target
 		}
-		nv := variant{GoName: goNameOf(title), Default: true, Doc: v.Description}
+		nv := variant{GoName: goNameOf(title), Default: true, Rank: i, Doc: v.Description}
 		if target != "" {
 			if skippedDefs[target] {
 				return nil, fmt.Errorf("%s: variant references skipped def %s", name, target)
@@ -776,6 +1011,7 @@ func taggedVariants(name string, variants []*rawSchema, root *rootSchema, preser
 				f.Required = required[p.key]
 				nv.Inline = append(nv.Inline, f)
 			}
+			nv.SeqOrder = withoutName(v.propOrder(), "")
 		} else {
 			return nil, fmt.Errorf("%s: default variant without payload $ref", name)
 		}
@@ -796,7 +1032,41 @@ func taggedVariants(name string, variants []*rawSchema, root *rootSchema, preser
 		}
 		cv, hasConst := tp.constString()
 		if !hasConst {
-			list = append(list, variant{GoName: "Other", Open: true, Doc: v.Description})
+			open := variant{GoName: "Other", Open: true, Rank: i, Doc: v.Description}
+			// The open arm's other properties are checked, as Rust's
+			// Other types require them, and the value is kept verbatim.
+			required := map[string]bool{}
+			for _, k := range v.Required {
+				required[k] = true
+			}
+			for _, p := range sortedProps(props) {
+				if p.key == tag {
+					continue
+				}
+				f, err := fieldFrom(p.key, p.value, root, preserveNull)
+				if err != nil {
+					return nil, fmt.Errorf("%s open variant: %w", name, err)
+				}
+				f.Required = required[p.key]
+				open.Inline = append(open.Inline, f)
+			}
+			// An anyOf of refs on the open arm (an elicitation scope) must
+			// also match one of them.
+			arms := v.AnyOf
+			if len(v.OneOf) > 0 {
+				arms, open.OpenOneOf = v.OneOf, true
+			}
+			for _, arm := range arms {
+				target := arm.typeName()
+				if target == "" && len(arm.AllOf) == 1 {
+					target = arm.AllOf[0].typeName()
+				}
+				if target == "" {
+					return nil, fmt.Errorf("%s: open variant anyOf arm without $ref", name)
+				}
+				open.OpenAnyOf = append(open.OpenAnyOf, target)
+			}
+			list = append(list, open)
 			continue
 		}
 		if seenConst[cv] {
@@ -807,7 +1077,7 @@ func taggedVariants(name string, variants []*rawSchema, root *rootSchema, preser
 		if goName == "" {
 			goName = cv
 		}
-		nv := variant{GoName: goNameOf(goName), Const: cv, Doc: v.Description}
+		nv := variant{GoName: goNameOf(goName), Const: cv, Rank: i, Doc: v.Description}
 		if len(v.AllOf) == 1 && v.AllOf[0].typeName() != "" {
 			nv.Payload = v.AllOf[0].typeName()
 			if skippedDefs[nv.Payload] {
@@ -829,10 +1099,50 @@ func taggedVariants(name string, variants []*rawSchema, root *rootSchema, preser
 				f.Required = required[p.key]
 				nv.Inline = append(nv.Inline, f)
 			}
+			nv.SeqOrder = withoutName(v.propOrder(), tag)
 		}
 		list = append(list, nv)
 	}
 	return &taggedResult{tag: tag, list: list}, nil
+}
+
+// withoutName returns names without skip.
+func withoutName(names []string, skip string) []string {
+	var out []string
+	for _, n := range names {
+		if n != skip {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// anyArmOf classifies one arm of a union of primitives.
+func anyArmOf(v *rawSchema, root *rootSchema) (anyArm, error) {
+	if v.isEmpty() {
+		return anyArm{Kind: "any"}, nil
+	}
+	switch t := v.soleType(); t {
+	case "string", "number", "boolean", "null":
+		return anyArm{Kind: t}, nil
+	case "integer":
+		goType, err := integerGoType(v)
+		return anyArm{Kind: t, GoType: goType}, err
+	case "array":
+		if v.Items == nil {
+			return anyArm{Kind: "array", GoType: "any", ItemNullOK: true}, nil
+		}
+		item := v.Items.unwrap()
+		arm := anyArm{Kind: "array", ItemNullOK: admitsNull(v.Items, root, map[string]bool{})}
+		if target := item.typeName(); target != "" {
+			arm.GoType = target
+			return arm, nil
+		}
+		elem, err := primitiveGoType(item)
+		arm.GoType = elem
+		return arm, err
+	}
+	return anyArm{}, fmt.Errorf("unsupported arm of a union of primitives (type=%s)", string(v.Type))
 }
 
 // unionTagProp returns the property name carrying a const discriminator.
@@ -847,7 +1157,63 @@ func unionTagProp(v *rawSchema) (string, bool) {
 
 // fieldFrom maps one object property to a Go field.
 func fieldFrom(prop string, ps *rawSchema, root *rootSchema, preserveNull bool) (field, error) {
-	f := field{JSONName: prop, GoName: goNameOf(prop), Doc: ps.Description, Lenient: ps.DefaultOnError}
+	f, err := fieldType(prop, ps, root, preserveNull)
+	if err != nil {
+		return f, err
+	}
+	f.DefaultOnError, f.SkipInvalid, f.DefaultOnNull = ps.DefaultOnError, ps.SkipInvalidItems, ps.DefaultOnNull
+	f.Default = string(ps.Default)
+	f.NullOK = admitsNull(ps, root, map[string]bool{})
+	inner := ps.unwrap()
+	switch {
+	case strings.HasPrefix(f.GoType, "[]"):
+		f.ItemNullOK = admitsNull(inner.Items, root, map[string]bool{})
+	case strings.HasPrefix(f.GoType, "map[") || f.GoType == "Meta":
+		var val *rawSchema
+		if isTrue(inner.Additional) || inner.Additional == nil || json.Unmarshal(inner.Additional, &val) != nil || val == nil {
+			f.ItemNullOK = true // arbitrary JSON values
+		} else {
+			f.ItemNullOK = admitsNull(val, root, map[string]bool{})
+		}
+	}
+	if f.SkipInvalid && !strings.HasPrefix(f.GoType, "[]") {
+		return f, fmt.Errorf("x-deserialize-skip-invalid-items on %s, which is not a list", f.GoType)
+	}
+	return f, nil
+}
+
+// admitsNull reports whether the schema accepts JSON null: it lists the null
+// type, has a null (or unconstrained) arm, references a def that does, or
+// places no constraint at all. Rust decodes such a value with Option or with
+// a type that accepts null itself; every other value rejects null.
+func admitsNull(s *rawSchema, root *rootSchema, seen map[string]bool) bool {
+	if s == nil {
+		return false
+	}
+	if s.isNull() || s.soleType() == "null" || s.isEmpty() {
+		return true
+	}
+	if name := s.typeName(); name != "" {
+		if seen[name] {
+			return false
+		}
+		seen[name] = true
+		return admitsNull(root.Defs[name], root, seen)
+	}
+	for _, arm := range append(append([]*rawSchema{}, s.AnyOf...), s.OneOf...) {
+		if admitsNull(arm, root, seen) {
+			return true
+		}
+	}
+	if len(s.AllOf) == 1 && s.Type == nil && s.Properties == nil {
+		return admitsNull(s.AllOf[0], root, seen)
+	}
+	return false
+}
+
+// fieldType maps one object property to a Go field and its type.
+func fieldType(prop string, ps *rawSchema, root *rootSchema, preserveNull bool) (field, error) {
+	f := field{JSONName: prop, GoName: goNameOf(prop), Doc: ps.Description}
 	inner := ps.unwrap()
 	f.Nullable = preserveNull && ps.isNull()
 

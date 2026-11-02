@@ -41,7 +41,7 @@ func TestElicitationHostRoundTrip(t *testing.T) {
 				"mode": "form",
 				"message": "Who should review?",
 				"sessionId": "session",
-				"schema": {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+				"requestedSchema": {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
 			}`),
 		}
 		if err := encoder.Encode(request); err != nil {

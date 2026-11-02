@@ -99,7 +99,7 @@ func TestHandleClientHostDispatchesTypedMethods(t *testing.T) {
 				t.Fatal("permission request was not dispatched")
 			}
 		}},
-		{schema.ElicitationCreateMethodName, `{"mode":"url","sessionId":"s","message":"authenticate"}`, func(value any) {
+		{schema.ElicitationCreateMethodName, `{"mode":"url","sessionId":"s","message":"authenticate","elicitationId":"e","url":"https://example.com/auth"}`, func(value any) {
 			if value.(schema.CreateElicitationResponse).Accept == nil {
 				t.Fatal("elicitation was not dispatched")
 			}

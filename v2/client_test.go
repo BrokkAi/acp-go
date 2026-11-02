@@ -369,7 +369,9 @@ func TestV2PromptRejectsMissingUserMessageID(t *testing.T) {
 	if err == nil {
 		t.Fatalf("prompt accepted without a user message ID: %q", messageID)
 	}
-	if !strings.Contains(err.Error(), "user message ID") {
+	// The response decoder rejects the missing required field before the
+	// client checks for an empty ID.
+	if !strings.Contains(err.Error(), `missing field "messageId"`) {
 		t.Fatalf("prompt error = %v", err)
 	}
 }

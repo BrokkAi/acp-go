@@ -74,7 +74,6 @@ func TestFlattenedUnionBecomesStructAndOpenEnum(t *testing.T) {
 	if td.Flatten == nil || td.Flatten.ExtrasGo != "StopReasonFields" || td.Fields[1].Variant != "error" {
 		t.Fatalf("flatten = %+v, error field = %+v", td.Flatten, td.Fields[1])
 	}
-	td.Lenient = true
 	failure, err := classify("Failure", root.Defs["Failure"], root, true)
 	if err != nil {
 		t.Fatal(err)
@@ -84,8 +83,9 @@ func TestFlattenedUnionBecomesStructAndOpenEnum(t *testing.T) {
 	for _, want := range []string{
 		"StopReasonFields map[string]json.RawMessage `json:\"-\"`",
 		"if tag != \"error\" {\n\t\tdelete(obj, \"error\")",
-		"if json.Unmarshal(raw, &tag) == nil && tag != nil {",
-		"case \"_meta\", \"stopReason\":",
+		"if tag, ok := decodeTag(raw, true, idleStateUpdateTags); ok {",
+		"if v.decodeStopReasonVariant(raws) != nil {",
+		"case \"_meta\", \"stopReason\", \"usage\":",
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("generated source missing %q:\n%s", want, src)

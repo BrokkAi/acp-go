@@ -55,10 +55,10 @@ func TestUntaggedUnionSupportsInlineObjectVariants(t *testing.T) {
 	if failure.Inline[0].GoType != "Boom" {
 		t.Fatalf("error payload type = %q, want Boom", failure.Inline[0].GoType)
 	}
-	if probe := untaggedProbe(&ir{}, result); probe != `hasKeys(data, "result")` {
+	if probe := untaggedProbe(&ir{}, result); probe != `hasKeys(raws, "result")` {
 		t.Fatalf("result probe = %s", probe)
 	}
-	if probe := untaggedProbe(&ir{}, failure); probe != `hasKeys(data, "error")` {
+	if probe := untaggedProbe(&ir{}, failure); probe != `hasKeys(raws, "error")` {
 		t.Fatalf("error probe = %s", probe)
 	}
 
@@ -70,8 +70,8 @@ func TestUntaggedUnionSupportsInlineObjectVariants(t *testing.T) {
 	for _, want := range []string{
 		"type ReplyResult struct",
 		"type ReplyError struct",
-		`hasKeys(data, "result")`,
-		`hasKeys(data, "error")`,
+		`!object || hasKeys(raws, "result")`,
+		`!object || hasKeys(raws, "error")`,
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("generated source missing %q:\n%s", want, src)
@@ -135,7 +135,8 @@ func TestUntaggedUnionLiftsSharedProperties(t *testing.T) {
 		"`json:\"url\"`",
 		"`json:\"note,omitempty\"`",
 		"type urlModeShadow UrlMode",
-		"json.Unmarshal(data, (*urlModeShadow)(v))",
+		"if raw, ok := raws.get(\"url\"); ok {",
+		"return missingField(\"UrlMode\", \"url\")",
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("generated source missing %q:\n%s", want, src)

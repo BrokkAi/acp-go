@@ -4,7 +4,10 @@ package unstable
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 )
 
 // Meta is the reserved _meta channel for extension data.
@@ -102,6 +105,523 @@ func isJSONNull(value any) bool {
 	return err == nil && string(encoded) == "null"
 }
 
+// decoder is implemented by the generated structs and unions. buffered is
+// set where serde decodes from buffered content, which reads a non-negative
+// integer union tag as a variant index.
+type decoder interface {
+	decodeJSON(data []byte, buffered bool) error
+}
+
+// errNull reports a null where the schema does not admit one.
+var errNull = fmt.Errorf("null is not allowed here")
+
+// errSeq reports an array where only an object decodes.
+var errSeq = fmt.Errorf("invalid type: sequence, expected an object")
+
+func isNull(raw json.RawMessage) bool { return string(raw) == "null" }
+
+// jsonKind returns the first byte of a JSON value.
+func jsonKind(raw []byte) byte {
+	for _, c := range raw {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+		default:
+			return c
+		}
+	}
+	return 0
+}
+
+func isArray(data []byte) bool { return jsonKind(data) == '[' }
+
+func missingField(owner, key string) error {
+	return fmt.Errorf("%s: missing field %q", owner, key)
+}
+
+func seqTooShort(owner string, n, want int) error {
+	return fmt.Errorf("invalid length %d, expected struct %s with %d elements", n, owner, want)
+}
+
+// seqEmpty fails when a variant without fields gets elements.
+func seqEmpty(items []json.RawMessage) error {
+	if len(items) > 0 {
+		return fmt.Errorf("invalid length %d, expected 0 elements in sequence", len(items))
+	}
+	return nil
+}
+
+func seqTooLong(n int) error {
+	return fmt.Errorf("invalid length %d, expected fewer elements in array", n)
+}
+
+// rawObject holds the members of a JSON object in wire order. The values are
+// slices of the decoded document, not copies.
+type rawObject []rawMember
+
+type rawMember struct {
+	key []byte
+	raw json.RawMessage
+}
+
+// get returns the value of key; a duplicate key keeps its last value, as
+// the Rust SDK's serde_json::Value does.
+func (o rawObject) get(key string) (json.RawMessage, bool) {
+	for i := len(o) - 1; i >= 0; i-- {
+		if string(o[i].key) == key {
+			return o[i].raw, true
+		}
+	}
+	return nil, false
+}
+
+// hasKeys reports whether every key is present.
+func hasKeys(raws rawObject, keys ...string) bool {
+	for _, k := range keys {
+		if _, ok := raws.get(k); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// withoutKey returns raws without key, leaving raws unchanged.
+func withoutKey(raws rawObject, key string) rawObject {
+	out := make(rawObject, 0, len(raws))
+	for _, m := range raws {
+		if string(m.key) != key {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// objectData returns the wire bytes of an object, re-encoding raws when the
+// original bytes are not at hand.
+func objectData(data []byte, raws rawObject) json.RawMessage {
+	if data != nil {
+		return append(json.RawMessage(nil), data...)
+	}
+	obj := make(map[string]json.RawMessage, len(raws))
+	for _, m := range raws {
+		obj[string(m.key)] = m.raw
+	}
+	out, _ := json.Marshal(obj)
+	return out
+}
+
+// splitObject splits a JSON object into its members without copying them.
+// The document has already been validated by encoding/json (the decoders
+// only see values it handed to UnmarshalJSON, or slices of them), so the
+// scan only finds value boundaries; anything unexpected defers to
+// encoding/json for its error. null reads as no object, as in encoding/json.
+func splitObject(data []byte) (rawObject, error) {
+	i := skipSpace(data, 0)
+	if i < len(data) && data[i] == 'n' {
+		return nil, nil
+	}
+	if i >= len(data) || data[i] != '{' {
+		return nil, fmt.Errorf("invalid type: %s, expected a map", serdeKind(data))
+	}
+	var out rawObject
+	i = skipSpace(data, i+1)
+	if i < len(data) && data[i] == '}' {
+		return rawObject{}, nil
+	}
+	for i < len(data) {
+		end, ok := scanString(data, i)
+		if !ok {
+			break
+		}
+		key := data[i+1 : end-1]
+		if bytesIndex(key, '\\') >= 0 {
+			var unescaped string
+			if err := json.Unmarshal(data[i:end], &unescaped); err != nil {
+				return nil, err
+			}
+			key = []byte(unescaped)
+		}
+		i = skipSpace(data, end)
+		if i >= len(data) || data[i] != ':' {
+			break
+		}
+		start := skipSpace(data, i+1)
+		end, ok = scanValue(data, start)
+		if !ok {
+			break
+		}
+		out = append(out, rawMember{key: key, raw: data[start:end:end]})
+		i = skipSpace(data, end)
+		if i < len(data) && data[i] == ',' {
+			i = skipSpace(data, i+1)
+			continue
+		}
+		if i < len(data) && data[i] == '}' {
+			return out, nil
+		}
+		break
+	}
+	return nil, jsonError(data, new(map[string]json.RawMessage))
+}
+
+// splitArray splits a JSON array into its elements without copying them.
+func splitArray(data []byte) ([]json.RawMessage, error) {
+	i := skipSpace(data, 0)
+	if i < len(data) && data[i] == 'n' {
+		return nil, nil
+	}
+	if i >= len(data) || data[i] != '[' {
+		return nil, fmt.Errorf("invalid type: %s, expected a sequence", serdeKind(data))
+	}
+	out := []json.RawMessage{}
+	i = skipSpace(data, i+1)
+	if i < len(data) && data[i] == ']' {
+		return out, nil
+	}
+	for i < len(data) {
+		end, ok := scanValue(data, i)
+		if !ok {
+			break
+		}
+		out = append(out, data[i:end:end])
+		i = skipSpace(data, end)
+		if i < len(data) && data[i] == ',' {
+			i = skipSpace(data, i+1)
+			continue
+		}
+		if i < len(data) && data[i] == ']' {
+			return out, nil
+		}
+		break
+	}
+	return nil, jsonError(data, new([]json.RawMessage))
+}
+
+// jsonError reports a document the fast scan could not split; encoding/json
+// has validated it, so this means a bug in the scan.
+func jsonError(data []byte, _ any) error {
+	return fmt.Errorf("invalid JSON value %.40q", data)
+}
+
+func skipSpace(data []byte, i int) int {
+	for i < len(data) {
+		switch data[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+func bytesIndex(data []byte, c byte) int {
+	for i, d := range data {
+		if d == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// scanString returns the end of the string starting at data[i].
+func scanString(data []byte, i int) (int, bool) {
+	if i >= len(data) || data[i] != '"' {
+		return 0, false
+	}
+	for j := i + 1; j < len(data); j++ {
+		switch data[j] {
+		case '\\':
+			j++
+		case '"':
+			return j + 1, true
+		}
+	}
+	return 0, false
+}
+
+// scanValue returns the end of the value starting at data[i].
+func scanValue(data []byte, i int) (int, bool) {
+	if i >= len(data) {
+		return 0, false
+	}
+	switch data[i] {
+	case '"':
+		return scanString(data, i)
+	case '{', '[':
+		depth := 0
+		for j := i; j < len(data); j++ {
+			switch data[j] {
+			case '"':
+				end, ok := scanString(data, j)
+				if !ok {
+					return 0, false
+				}
+				j = end - 1
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return j + 1, true
+				}
+			}
+		}
+		return 0, false
+	}
+	j := i
+	for j < len(data) {
+		switch data[j] {
+		case ',', '}', ']', ' ', '\t', '\n', '\r':
+			return j, j > i
+		}
+		j++
+	}
+	return j, j > i
+}
+
+// arrayData re-encodes array elements.
+func arrayData(items []json.RawMessage) json.RawMessage {
+	if items == nil {
+		items = []json.RawMessage{}
+	}
+	out, _ := json.Marshal(items)
+	return out
+}
+
+// enumValue reads a unit-variant enum value: a string, or the one-key map
+// form {"variant": null} that serde also accepts.
+func enumValue(data []byte) (string, bool, error) {
+	switch jsonKind(data) {
+	case '"':
+		if end := len(data) - 1; end > 0 && data[end] == '"' && bytesIndex(data[1:end], '\\') < 0 {
+			return string(data[1:end]), false, nil
+		}
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return "", false, err
+		}
+		return s, false, nil
+	case '{':
+		members, err := splitObject(data)
+		if err != nil {
+			return "", false, err
+		}
+		if len(members) != 1 {
+			return "", false, fmt.Errorf("invalid value: map, expected map with a single key")
+		}
+		if !isNull(members[0].raw) {
+			return "", false, fmt.Errorf("invalid type: %s, expected unit", serdeKind(members[0].raw))
+		}
+		return string(members[0].key), true, nil
+	}
+	return "", false, fmt.Errorf("invalid type: %s, expected a variant", serdeKind(data))
+}
+
+// serdeKind names the kind of a JSON value the way serde's errors do.
+func serdeKind(data []byte) string {
+	switch c := jsonKind(data); {
+	case c == '{':
+		return "map"
+	case c == '[':
+		return "sequence"
+	case c == '"':
+		return "string"
+	case c == 't' || c == 'f':
+		return "boolean"
+	case c == 'n':
+		return "null"
+	case c == '-' || (c >= '0' && c <= '9'):
+		return "number"
+	}
+	return "value"
+}
+
+// decodeTag reads a union tag: a string or, from buffered content, a
+// non-negative integer naming the tagged variant at that index.
+func decodeTag(raw json.RawMessage, buffered bool, tags []string) (string, bool) {
+	switch c := jsonKind(raw); {
+	case c == '"':
+		if end := len(raw) - 1; end > 0 && raw[end] == '"' && bytesIndex(raw[1:end], '\\') < 0 {
+			return string(raw[1:end]), true
+		}
+		var tag string
+		return tag, json.Unmarshal(raw, &tag) == nil
+	case buffered && c >= '0' && c <= '9':
+		var index uint64
+		for _, d := range []byte(raw) {
+			if d < '0' || d > '9' {
+				return "", false
+			}
+			next := index*10 + uint64(d-'0')
+			if next/10 != index {
+				return "", false
+			}
+			index = next
+		}
+		if index < uint64(len(tags)) {
+			return tags[index], true
+		}
+	}
+	return "", false
+}
+
+// decodeValue decodes one value, failing on null unless the schema admits it.
+func decodeValue[T any](raw json.RawMessage, dst *T, nullOK, buffered bool) error {
+	if !nullOK && isNull(raw) {
+		return errNull
+	}
+	if d, ok := any(dst).(decoder); ok {
+		return d.decodeJSON(raw, buffered)
+	}
+	return typeError(json.Unmarshal(raw, dst), raw)
+}
+
+// typeError rewrites encoding/json's type errors the way serde words them,
+// without Go type names.
+func typeError(err error, raw []byte) error {
+	if err == nil {
+		return nil
+	}
+	var te *json.UnmarshalTypeError
+	if !errors.As(err, &te) {
+		return err
+	}
+	expected := "a value"
+	switch te.Type.Kind() {
+	case reflect.String:
+		expected = "a string"
+	case reflect.Bool:
+		expected = "a boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		expected = "an integer"
+	case reflect.Float32, reflect.Float64:
+		expected = "a number"
+	case reflect.Map, reflect.Struct:
+		expected = "a map"
+	case reflect.Slice, reflect.Array:
+		expected = "a sequence"
+	}
+	kind := serdeKind(raw)
+	if kind == "number" && strings.Contains(expected, "integer") {
+		return fmt.Errorf("invalid value: %s, expected %s", raw, expected)
+	}
+	return fmt.Errorf("invalid type: %s, expected %s", kind, expected)
+}
+
+// decodePtr decodes an optional struct or union.
+func decodePtr[T any, P interface {
+	*T
+	decoder
+}](raw json.RawMessage, dst **T, nullOK, buffered bool) error {
+	if isNull(raw) {
+		if !nullOK {
+			return errNull
+		}
+		*dst = nil
+		return nil
+	}
+	value := P(new(T))
+	if err := value.decodeJSON(raw, buffered); err != nil {
+		return err
+	}
+	*dst = (*T)(value)
+	return nil
+}
+
+// decodeChecked decodes a union of primitives after check accepts it.
+func decodeChecked[T any](raw json.RawMessage, dst *T, nullOK bool, check func(json.RawMessage) error) error {
+	if isNull(raw) && !nullOK {
+		return errNull
+	}
+	if !isNull(raw) {
+		if err := check(raw); err != nil {
+			return err
+		}
+	}
+	return typeError(json.Unmarshal(raw, dst), raw)
+}
+
+// decodeList decodes a list item by item. With skip set
+// (x-deserialize-skip-invalid-items), items that do not decode are dropped
+// and the others kept.
+func decodeList[T any](raw json.RawMessage, dst *[]T, nullOK, skip bool, item func(json.RawMessage, *T) error) error {
+	if isNull(raw) {
+		if !nullOK {
+			return errNull
+		}
+		*dst = nil
+		return nil
+	}
+	items, err := splitArray(raw)
+	if err != nil {
+		return err
+	}
+	out := make([]T, 0, len(items))
+	for i, raw := range items {
+		var value T
+		if err := item(raw, &value); err != nil {
+			if skip {
+				continue
+			}
+			return fmt.Errorf("item %d: %w", i, err)
+		}
+		out = append(out, value)
+	}
+	*dst = out
+	return nil
+}
+
+// decodeMap decodes an object whose values must each decode.
+func decodeMap[M ~map[string]V, V any](raw json.RawMessage, dst *M, nullOK bool, value func(json.RawMessage, *V) error) error {
+	if isNull(raw) {
+		if !nullOK {
+			return errNull
+		}
+		*dst = nil
+		return nil
+	}
+	entries, err := splitObject(raw)
+	if err != nil {
+		return err
+	}
+	out := make(M, len(entries))
+	for _, entry := range entries {
+		var v V
+		if err := value(entry.raw, &v); err != nil {
+			return fmt.Errorf("%q: %w", entry.key, err)
+		}
+		out[string(entry.key)] = v
+	}
+	*dst = out
+	return nil
+}
+
+// decodeNullable decodes a field that keeps null distinct from omission.
+func decodeNullable[T any](raw json.RawMessage, dst *Nullable[T], decode func(json.RawMessage, *T) error) error {
+	if isNull(raw) {
+		*dst = Nullable[T]{Set: true, Null: true}
+		return nil
+	}
+	var value T
+	if err := decode(raw, &value); err != nil {
+		return err
+	}
+	*dst = Nullable[T]{Set: true, Value: value}
+	return nil
+}
+
+// decodeNonZero decodes an integer Rust reads as NonZero, which rejects 0.
+func decodeNonZero[T ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~int8 | ~int16 | ~int32 | ~int64](raw json.RawMessage, dst *T) error {
+	if err := decodeValue(raw, dst, false, false); err != nil {
+		return err
+	}
+	if *dst == 0 {
+		return fmt.Errorf("invalid value: 0, expected a nonzero integer")
+	}
+	return nil
+}
+
 // An absolute filesystem path used by the protocol.
 // Uses the native syntax of the machine the Agent runs on, such as /home/user/project,
 // C:\Users\user\project, or \\server\share\project. It is not a URI.
@@ -123,6 +643,62 @@ type AgentAuthCapabilities struct {
 	// Optional. Omitted and null are equivalent and mean the agent does not advertise support.
 	// Supplying {} means the agent supports the auth/status method.
 	Status *AuthStatusCapabilities `json:"status,omitempty"`
+}
+
+func (v *AgentAuthCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AgentAuthCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AgentAuthCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AgentAuthCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("status"); ok {
+		if err := decodePtr(raw, &v.Status, true, true); err != nil {
+			v.Status = nil
+		}
+	}
+	return nil
+}
+
+func (v *AgentAuthCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AgentAuthCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Status, true, true); err != nil {
+			v.Status = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Capabilities supported by the agent.
@@ -156,6 +732,84 @@ type AgentCapabilities struct {
 	Session *SessionCapabilities `json:"session,omitempty"`
 }
 
+func (v *AgentCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AgentCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AgentCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AgentCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("auth"); ok {
+		if err := decodePtr(raw, &v.Auth, true, true); err != nil {
+			v.Auth = nil
+		}
+	}
+	if raw, ok := raws.get("providers"); ok {
+		if err := decodePtr(raw, &v.Providers, true, true); err != nil {
+			v.Providers = nil
+		}
+	}
+	if raw, ok := raws.get("session"); ok {
+		if err := decodePtr(raw, &v.Session, true, true); err != nil {
+			v.Session = nil
+		}
+	}
+	return nil
+}
+
+func (v *AgentCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AgentCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Session, true, true); err != nil {
+			v.Session = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodePtr(raw, &v.Auth, true, true); err != nil {
+			v.Auth = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodePtr(raw, &v.Providers, true, true); err != nil {
+			v.Providers = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // An agent message upsert.
 // Only messageId is required. content has patch semantics:
 // an omitted field leaves existing message content unchanged, null clears the
@@ -180,6 +834,85 @@ type AgentMessage struct {
 	Content Nullable[[]ContentBlock] `json:"content,omitzero"`
 	// A unique identifier for the message.
 	MessageID MessageId `json:"messageId"`
+}
+
+func (v *AgentMessage) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AgentMessage) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AgentMessage) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AgentMessage{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ContentBlock) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Content = Nullable[[]ContentBlock]{}
+		}
+	}
+	if raw, ok := raws.get("messageId"); ok {
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("AgentMessage.messageId: %w", err)
+		}
+	} else {
+		return missingField("AgentMessage", "messageId")
+	}
+	return nil
+}
+
+func (v *AgentMessage) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AgentMessage{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("AgentMessage.messageId: %w", err)
+		}
+	} else {
+		return seqTooShort("AgentMessage", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ContentBlock) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Content = Nullable[[]ContentBlock]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // ApplyUpdate applies a later update for the same entity to this stored AgentMessage state.
@@ -227,6 +960,85 @@ type AgentThought struct {
 	MessageID MessageId `json:"messageId"`
 }
 
+func (v *AgentThought) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AgentThought) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AgentThought) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AgentThought{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ContentBlock) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Content = Nullable[[]ContentBlock]{}
+		}
+	}
+	if raw, ok := raws.get("messageId"); ok {
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("AgentThought.messageId: %w", err)
+		}
+	} else {
+		return missingField("AgentThought", "messageId")
+	}
+	return nil
+}
+
+func (v *AgentThought) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AgentThought{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("AgentThought.messageId: %w", err)
+		}
+	} else {
+		return seqTooShort("AgentThought", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ContentBlock) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Content = Nullable[[]ContentBlock]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // ApplyUpdate applies a later update for the same entity to this stored AgentThought state.
 //
 // Omitted fields leave the stored value unchanged. Fields set to null are
@@ -266,6 +1078,100 @@ type Annotations struct {
 	Priority Nullable[float64] `json:"priority,omitzero"`
 }
 
+func (v *Annotations) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Annotations) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Annotations) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Annotations{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("audience"); ok {
+		if err := decodeNullable(raw, &v.Audience, func(raw json.RawMessage, dst *[]Role) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *Role) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Audience = Nullable[[]Role]{}
+		}
+	}
+	if raw, ok := raws.get("lastModified"); ok {
+		if err := decodeNullable(raw, &v.LastModified, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.LastModified = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("priority"); ok {
+		if err := decodeNullable(raw, &v.Priority, func(raw json.RawMessage, dst *float64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Priority = Nullable[float64]{}
+		}
+	}
+	return nil
+}
+
+func (v *Annotations) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Annotations{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Audience, func(raw json.RawMessage, dst *[]Role) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *Role) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Audience = Nullable[[]Role]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.LastModified, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.LastModified = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Priority, func(raw json.RawMessage, dst *float64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Priority = Nullable[float64]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Request parameters for archiving a session.
@@ -284,6 +1190,66 @@ type ArchiveSessionRequest struct {
 	SessionID SessionId `json:"sessionId"`
 }
 
+func (v *ArchiveSessionRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ArchiveSessionRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ArchiveSessionRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ArchiveSessionRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("ArchiveSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("ArchiveSessionRequest", "sessionId")
+	}
+	return nil
+}
+
+func (v *ArchiveSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ArchiveSessionRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("ArchiveSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("ArchiveSessionRequest", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Response from archiving a session.
@@ -293,6 +1259,51 @@ type ArchiveSessionResponse struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *ArchiveSessionResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ArchiveSessionResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ArchiveSessionResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ArchiveSessionResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *ArchiveSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ArchiveSessionResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Audio provided to or from an LLM.
@@ -309,6 +1320,92 @@ type AudioContent struct {
 	Data string `json:"data"`
 	// MIME type describing the encoded media payload.
 	MimeType MediaType `json:"mimeType"`
+}
+
+func (v *AudioContent) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AudioContent) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AudioContent) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AudioContent{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("annotations"); ok {
+		if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
+			v.Annotations = nil
+		}
+	}
+	if raw, ok := raws.get("data"); ok {
+		if err := decodeValue(raw, &v.Data, false, buffered); err != nil {
+			return fmt.Errorf("AudioContent.data: %w", err)
+		}
+	} else {
+		return missingField("AudioContent", "data")
+	}
+	if raw, ok := raws.get("mimeType"); ok {
+		if err := decodeValue(raw, &v.MimeType, false, buffered); err != nil {
+			return fmt.Errorf("AudioContent.mimeType: %w", err)
+		}
+	} else {
+		return missingField("AudioContent", "mimeType")
+	}
+	return nil
+}
+
+func (v *AudioContent) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AudioContent{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Data, false, buffered); err != nil {
+			return fmt.Errorf("AudioContent.data: %w", err)
+		}
+	} else {
+		return seqTooShort("AudioContent", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.MimeType, false, buffered); err != nil {
+			return fmt.Errorf("AudioContent.mimeType: %w", err)
+		}
+	} else {
+		return seqTooShort("AudioContent", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
+			v.Annotations = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -342,6 +1439,126 @@ type AuthAccount struct {
 	Organization Nullable[string] `json:"organization,omitzero"`
 }
 
+func (v *AuthAccount) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AuthAccount) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AuthAccount) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AuthAccount{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("active"); ok {
+		if err := decodeNullable(raw, &v.Active, func(raw json.RawMessage, dst *bool) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Active = Nullable[bool]{}
+		}
+	}
+	if raw, ok := raws.get("email"); ok {
+		if err := decodeNullable(raw, &v.Email, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Email = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("label"); ok {
+		if err := decodeValue(raw, &v.Label, false, buffered); err != nil {
+			return fmt.Errorf("AuthAccount.label: %w", err)
+		}
+	} else {
+		return missingField("AuthAccount", "label")
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeNullable(raw, &v.Name, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Name = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("organization"); ok {
+		if err := decodeNullable(raw, &v.Organization, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Organization = Nullable[string]{}
+		}
+	}
+	return nil
+}
+
+func (v *AuthAccount) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AuthAccount{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Label, false, buffered); err != nil {
+			return fmt.Errorf("AuthAccount.label: %w", err)
+		}
+	} else {
+		return seqTooShort("AuthAccount", 0, 6)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Active, func(raw json.RawMessage, dst *bool) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Active = Nullable[bool]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Name, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Name = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Email, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Email = Nullable[string]{}
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Organization, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Organization = Nullable[string]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 6 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Describes an available authentication method.
 // The type field acts as the discriminator in the serialized JSON form.
 type AuthMethodKind string
@@ -365,6 +1582,41 @@ type AuthMethod struct {
 type AuthMethodOther struct{ Raw json.RawMessage }
 
 func (v AuthMethodOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }
+
+// authMethodOtherFields checks the fields an open AuthMethod variant must carry.
+type authMethodOtherFields struct {
+	MethodID AuthMethodId `json:"methodId"`
+	Name     string       `json:"name"`
+}
+
+func (v *authMethodOtherFields) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *authMethodOtherFields) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *authMethodOtherFields) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = authMethodOtherFields{}
+	if raw, ok := raws.get("methodId"); ok {
+		if err := decodeValue(raw, &v.MethodID, false, buffered); err != nil {
+			return fmt.Errorf("authMethodOtherFields.methodId: %w", err)
+		}
+	} else {
+		return missingField("authMethodOtherFields", "methodId")
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("authMethodOtherFields.name: %w", err)
+		}
+	} else {
+		return missingField("authMethodOtherFields", "name")
+	}
+	return nil
+}
 
 func (v AuthMethod) MarshalJSON() ([]byte, error) {
 	obj := map[string]json.RawMessage{}
@@ -423,32 +1675,103 @@ func (v AuthMethod) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *AuthMethod) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var authMethodTags = []string{"terminal", "agent"}
+
+func (v *AuthMethod) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AuthMethod) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AuthMethod) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = AuthMethod{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("AuthMethod tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, authMethodTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "terminal":
+			payload := new(AuthMethodTerminal)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Terminal = AuthMethodKindTerminal, payload
+				return nil
+			}
+		case "agent":
+			payload := new(AuthMethodAgent)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Agent = AuthMethodKindAgent, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "terminal":
-		v.Kind = AuthMethodKindTerminal
-		v.Terminal = new(AuthMethodTerminal)
-		return json.Unmarshal(data, v.Terminal)
-	case "agent":
-		v.Kind = AuthMethodKindAgent
-		v.Agent = new(AuthMethodAgent)
-		return json.Unmarshal(data, v.Agent)
-	default:
+	if tagged && tag != "terminal" && tag != "agent" {
+		if e := new(authMethodOtherFields).decodeFields(data, raws, true); e != nil {
+			return fmt.Errorf("AuthMethod: data matches no variant: %w", e)
+		}
 		v.Kind = AuthMethodKind(tag)
-		v.Other = &AuthMethodOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &AuthMethodOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("AuthMethod: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("AuthMethod", "type")
+	}
+	return fmt.Errorf("AuthMethod: unknown type tag %s", raw)
+}
+
+func (v *AuthMethod) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AuthMethod{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, authMethodTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "terminal":
+			payload := new(AuthMethodTerminal)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Terminal = AuthMethodKindTerminal, payload
+				return nil
+			}
+		case "agent":
+			payload := new(AuthMethodAgent)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Agent = AuthMethodKindAgent, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("AuthMethod: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("AuthMethod", "type")
+	}
+	return fmt.Errorf("AuthMethod: unknown type tag %s", raw)
 }
 
 // Agent handles authentication itself through auth/login.
@@ -466,6 +1789,96 @@ type AuthMethodAgent struct {
 	MethodID AuthMethodId `json:"methodId"`
 	// Human-readable name of the authentication method.
 	Name string `json:"name"`
+}
+
+func (v *AuthMethodAgent) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AuthMethodAgent) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AuthMethodAgent) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AuthMethodAgent{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("methodId"); ok {
+		if err := decodeValue(raw, &v.MethodID, false, buffered); err != nil {
+			return fmt.Errorf("AuthMethodAgent.methodId: %w", err)
+		}
+	} else {
+		return missingField("AuthMethodAgent", "methodId")
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("AuthMethodAgent.name: %w", err)
+		}
+	} else {
+		return missingField("AuthMethodAgent", "name")
+	}
+	return nil
+}
+
+func (v *AuthMethodAgent) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AuthMethodAgent{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.MethodID, false, buffered); err != nil {
+			return fmt.Errorf("AuthMethodAgent.methodId: %w", err)
+		}
+	} else {
+		return seqTooShort("AuthMethodAgent", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("AuthMethodAgent.name: %w", err)
+		}
+	} else {
+		return seqTooShort("AuthMethodAgent", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Typed identifier used for auth method values on the wire.
@@ -498,6 +1911,134 @@ type AuthMethodTerminal struct {
 	Name string `json:"name"`
 }
 
+func (v *AuthMethodTerminal) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AuthMethodTerminal) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AuthMethodTerminal) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AuthMethodTerminal{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("args"); ok {
+		if isNull(raw) {
+			v.Args = nil
+		} else if err := decodeList(raw, &v.Args, false, false, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("AuthMethodTerminal.args: %w", err)
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("env"); ok {
+		if isNull(raw) {
+			v.Env = nil
+		} else if err := decodeList(raw, &v.Env, false, false, func(raw json.RawMessage, dst *EnvVariable) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("AuthMethodTerminal.env: %w", err)
+		}
+	}
+	if raw, ok := raws.get("methodId"); ok {
+		if err := decodeValue(raw, &v.MethodID, false, buffered); err != nil {
+			return fmt.Errorf("AuthMethodTerminal.methodId: %w", err)
+		}
+	} else {
+		return missingField("AuthMethodTerminal", "methodId")
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("AuthMethodTerminal.name: %w", err)
+		}
+	} else {
+		return missingField("AuthMethodTerminal", "name")
+	}
+	return nil
+}
+
+func (v *AuthMethodTerminal) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AuthMethodTerminal{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.MethodID, false, buffered); err != nil {
+			return fmt.Errorf("AuthMethodTerminal.methodId: %w", err)
+		}
+	} else {
+		return seqTooShort("AuthMethodTerminal", 0, 6)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("AuthMethodTerminal.name: %w", err)
+		}
+	} else {
+		return seqTooShort("AuthMethodTerminal", 1, 6)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if isNull(raw) {
+			v.Args = nil
+		} else if err := decodeList(raw, &v.Args, false, false, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("AuthMethodTerminal.args: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if isNull(raw) {
+			v.Env = nil
+		} else if err := decodeList(raw, &v.Env, false, false, func(raw json.RawMessage, dst *EnvVariable) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("AuthMethodTerminal.env: %w", err)
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 6 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // The agent's overall authentication state.
@@ -515,6 +2056,27 @@ const (
 	AuthStateUnknown AuthState = "unknown"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *AuthState) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("AuthState: %w", err)
+	}
+	switch AuthState(s) {
+	case AuthStateAuthenticated, AuthStateUnauthenticated, AuthStateNotRequired, AuthStateUnknown:
+		*v = AuthState(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("AuthState: unknown variant %q", s)
+		}
+		*v = AuthState(s)
+	}
+	return nil
+}
+
+func (v *AuthState) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Auth status capabilities supported by the agent.
@@ -525,6 +2087,51 @@ type AuthStatusCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *AuthStatusCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AuthStatusCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AuthStatusCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AuthStatusCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *AuthStatusCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AuthStatusCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -539,6 +2146,51 @@ type AuthStatusRequest struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *AuthStatusRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AuthStatusRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AuthStatusRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AuthStatusRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *AuthStatusRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AuthStatusRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -559,6 +2211,81 @@ type AuthStatusResponse struct {
 	// This is the only field clients should act on. Clients MUST treat values they
 	// do not recognize as unknown.
 	State AuthState `json:"state"`
+}
+
+func (v *AuthStatusResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AuthStatusResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AuthStatusResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AuthStatusResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("accounts"); ok {
+		if err := decodeList(raw, &v.Accounts, false, true, func(raw json.RawMessage, dst *AuthAccount) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Accounts = nil
+		}
+	}
+	if raw, ok := raws.get("state"); ok {
+		if err := decodeValue(raw, &v.State, false, buffered); err != nil {
+			return fmt.Errorf("AuthStatusResponse.state: %w", err)
+		}
+	} else {
+		return missingField("AuthStatusResponse", "state")
+	}
+	return nil
+}
+
+func (v *AuthStatusResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AuthStatusResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.State, false, buffered); err != nil {
+			return fmt.Errorf("AuthStatusResponse.state: %w", err)
+		}
+	} else {
+		return seqTooShort("AuthStatusResponse", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeList(raw, &v.Accounts, false, true, func(raw json.RawMessage, dst *AuthAccount) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Accounts = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -584,6 +2311,83 @@ type AuthStatusUpdateNotification struct {
 	State AuthState `json:"state"`
 }
 
+func (v *AuthStatusUpdateNotification) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *AuthStatusUpdateNotification) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AuthStatusUpdateNotification) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AuthStatusUpdateNotification{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("accounts"); ok {
+		if err := decodeList(raw, &v.Accounts, false, true, func(raw json.RawMessage, dst *AuthAccount) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Accounts = nil
+		}
+	}
+	if raw, ok := raws.get("state"); ok {
+		if err := decodeValue(raw, &v.State, false, buffered); err != nil {
+			return fmt.Errorf("AuthStatusUpdateNotification.state: %w", err)
+		}
+	} else {
+		return missingField("AuthStatusUpdateNotification", "state")
+	}
+	return nil
+}
+
+func (v *AuthStatusUpdateNotification) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AuthStatusUpdateNotification{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.State, false, buffered); err != nil {
+			return fmt.Errorf("AuthStatusUpdateNotification.state: %w", err)
+		}
+	} else {
+		return seqTooShort("AuthStatusUpdateNotification", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeList(raw, &v.Accounts, false, true, func(raw json.RawMessage, dst *AuthAccount) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Accounts = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // A command the agent advertises to the client.
 // The type field acts as the discriminator in the serialized JSON form.
 type AvailableCommandKind string
@@ -605,6 +2409,43 @@ type AvailableCommand struct {
 type AvailableCommandOther struct{ Raw json.RawMessage }
 
 func (v AvailableCommandOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }
+
+// availableCommandOtherFields checks the fields an open AvailableCommand variant must carry.
+type availableCommandOtherFields struct {
+	Description string `json:"description"`
+	Name        string `json:"name"`
+}
+
+func (v *availableCommandOtherFields) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *availableCommandOtherFields) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *availableCommandOtherFields) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = availableCommandOtherFields{}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeValue(raw, &v.Description, false, buffered); err != nil {
+			return fmt.Errorf("availableCommandOtherFields.description: %w", err)
+		}
+	} else {
+		return missingField("availableCommandOtherFields", "description")
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("availableCommandOtherFields.name: %w", err)
+		}
+	} else {
+		return missingField("availableCommandOtherFields", "name")
+	}
+	return nil
+}
 
 func (v AvailableCommand) MarshalJSON() ([]byte, error) {
 	obj := map[string]json.RawMessage{}
@@ -642,28 +2483,91 @@ func (v AvailableCommand) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *AvailableCommand) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var availableCommandTags = []string{"command"}
+
+func (v *AvailableCommand) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AvailableCommand) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AvailableCommand) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = AvailableCommand{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("AvailableCommand tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, availableCommandTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "command":
+			payload := new(Command)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Command = AvailableCommandKindCommand, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "command":
-		v.Kind = AvailableCommandKindCommand
-		v.Command = new(Command)
-		return json.Unmarshal(data, v.Command)
-	default:
+	if tagged && tag != "command" {
+		if e := new(availableCommandOtherFields).decodeFields(data, raws, true); e != nil {
+			return fmt.Errorf("AvailableCommand: data matches no variant: %w", e)
+		}
 		v.Kind = AvailableCommandKind(tag)
-		v.Other = &AvailableCommandOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &AvailableCommandOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("AvailableCommand: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("AvailableCommand", "type")
+	}
+	return fmt.Errorf("AvailableCommand: unknown type tag %s", raw)
+}
+
+func (v *AvailableCommand) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AvailableCommand{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, availableCommandTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "command":
+			payload := new(Command)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Command = AvailableCommandKindCommand, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("AvailableCommand: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("AvailableCommand", "type")
+	}
+	return fmt.Errorf("AvailableCommand: unknown type tag %s", raw)
 }
 
 // The input specification for a command.
@@ -723,28 +2627,88 @@ func (v AvailableCommandInput) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *AvailableCommandInput) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var availableCommandInputTags = []string{"text"}
+
+func (v *AvailableCommandInput) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AvailableCommandInput) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AvailableCommandInput) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = AvailableCommandInput{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("AvailableCommandInput tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, availableCommandInputTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "text":
+			payload := new(TextCommandInput)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Text = AvailableCommandInputKindText, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "text":
-		v.Kind = AvailableCommandInputKindText
-		v.Text = new(TextCommandInput)
-		return json.Unmarshal(data, v.Text)
-	default:
+	if tagged && tag != "text" {
 		v.Kind = AvailableCommandInputKind(tag)
-		v.Other = &AvailableCommandInputOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &AvailableCommandInputOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("AvailableCommandInput: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("AvailableCommandInput", "type")
+	}
+	return fmt.Errorf("AvailableCommandInput: unknown type tag %s", raw)
+}
+
+func (v *AvailableCommandInput) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AvailableCommandInput{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, availableCommandInputTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "text":
+			payload := new(TextCommandInput)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Text = AvailableCommandInputKindText, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("AvailableCommandInput: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("AvailableCommandInput", "type")
+	}
+	return fmt.Errorf("AvailableCommandInput: unknown type tag %s", raw)
 }
 
 // Available commands are ready or have changed
@@ -756,6 +2720,70 @@ type AvailableCommandsUpdate struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// Commands the agent can execute.
 	AvailableCommands []AvailableCommand `json:"availableCommands"`
+}
+
+func (v *AvailableCommandsUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *AvailableCommandsUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *AvailableCommandsUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = AvailableCommandsUpdate{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("availableCommands"); ok {
+		if err := decodeList(raw, &v.AvailableCommands, false, true, func(raw json.RawMessage, dst *AvailableCommand) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			return fmt.Errorf("AvailableCommandsUpdate.availableCommands: %w", err)
+		}
+	} else {
+		return missingField("AvailableCommandsUpdate", "availableCommands")
+	}
+	return nil
+}
+
+func (v *AvailableCommandsUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = AvailableCommandsUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeList(raw, &v.AvailableCommands, false, true, func(raw json.RawMessage, dst *AvailableCommand) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			return fmt.Errorf("AvailableCommandsUpdate.availableCommands: %w", err)
+		}
+	} else {
+		return seqTooShort("AvailableCommandsUpdate", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -771,6 +2799,66 @@ type BackgroundSubagent struct {
 	SessionID SessionId `json:"sessionId"`
 }
 
+func (v *BackgroundSubagent) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *BackgroundSubagent) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *BackgroundSubagent) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = BackgroundSubagent{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("BackgroundSubagent.sessionId: %w", err)
+		}
+	} else {
+		return missingField("BackgroundSubagent", "sessionId")
+	}
+	return nil
+}
+
+func (v *BackgroundSubagent) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = BackgroundSubagent{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("BackgroundSubagent.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("BackgroundSubagent", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // A listed terminal running in the background.
 type BackgroundTerminal struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -782,6 +2870,66 @@ type BackgroundTerminal struct {
 	TerminalID TerminalId `json:"terminalId"`
 }
 
+func (v *BackgroundTerminal) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *BackgroundTerminal) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *BackgroundTerminal) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = BackgroundTerminal{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("terminalId"); ok {
+		if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
+			return fmt.Errorf("BackgroundTerminal.terminalId: %w", err)
+		}
+	} else {
+		return missingField("BackgroundTerminal", "terminalId")
+	}
+	return nil
+}
+
+func (v *BackgroundTerminal) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = BackgroundTerminal{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
+			return fmt.Errorf("BackgroundTerminal.terminalId: %w", err)
+		}
+	} else {
+		return seqTooShort("BackgroundTerminal", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // A listed tool call whose work continues in the background.
 type BackgroundToolCall struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -791,6 +2939,66 @@ type BackgroundToolCall struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The ID of the listed tool call.
 	ToolCallID ToolCallId `json:"toolCallId"`
+}
+
+func (v *BackgroundToolCall) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *BackgroundToolCall) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *BackgroundToolCall) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = BackgroundToolCall{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("toolCallId"); ok {
+		if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
+			return fmt.Errorf("BackgroundToolCall.toolCallId: %w", err)
+		}
+	} else {
+		return missingField("BackgroundToolCall", "toolCallId")
+	}
+	return nil
+}
+
+func (v *BackgroundToolCall) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = BackgroundToolCall{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
+			return fmt.Errorf("BackgroundToolCall.toolCallId: %w", err)
+		}
+	} else {
+		return seqTooShort("BackgroundToolCall", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // One piece of work running independently of the session's foreground work.
@@ -901,36 +3109,112 @@ func (v BackgroundWork) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *BackgroundWork) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var backgroundWorkTags = []string{"terminal", "tool_call", "subagent"}
+
+func (v *BackgroundWork) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *BackgroundWork) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *BackgroundWork) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = BackgroundWork{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("BackgroundWork tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, backgroundWorkTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "terminal":
+			payload := new(BackgroundTerminal)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Terminal = BackgroundWorkKindTerminal, payload
+				return nil
+			}
+		case "tool_call":
+			payload := new(BackgroundToolCall)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.ToolCall = BackgroundWorkKindToolCall, payload
+				return nil
+			}
+		case "subagent":
+			payload := new(BackgroundSubagent)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Subagent = BackgroundWorkKindSubagent, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "terminal":
-		v.Kind = BackgroundWorkKindTerminal
-		v.Terminal = new(BackgroundTerminal)
-		return json.Unmarshal(data, v.Terminal)
-	case "tool_call":
-		v.Kind = BackgroundWorkKindToolCall
-		v.ToolCall = new(BackgroundToolCall)
-		return json.Unmarshal(data, v.ToolCall)
-	case "subagent":
-		v.Kind = BackgroundWorkKindSubagent
-		v.Subagent = new(BackgroundSubagent)
-		return json.Unmarshal(data, v.Subagent)
-	default:
+	if tagged && tag != "terminal" && tag != "tool_call" && tag != "subagent" {
 		v.Kind = BackgroundWorkKind(tag)
-		v.Other = &BackgroundWorkOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &BackgroundWorkOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("BackgroundWork: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("BackgroundWork", "type")
+	}
+	return fmt.Errorf("BackgroundWork: unknown type tag %s", raw)
+}
+
+func (v *BackgroundWork) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = BackgroundWork{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, backgroundWorkTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "terminal":
+			payload := new(BackgroundTerminal)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Terminal = BackgroundWorkKindTerminal, payload
+				return nil
+			}
+		case "tool_call":
+			payload := new(BackgroundToolCall)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.ToolCall = BackgroundWorkKindToolCall, payload
+				return nil
+			}
+		case "subagent":
+			payload := new(BackgroundSubagent)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Subagent = BackgroundWorkKindSubagent, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("BackgroundWork: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("BackgroundWork", "type")
+	}
+	return fmt.Errorf("BackgroundWork: unknown type tag %s", raw)
 }
 
 // Binary resource contents.
@@ -947,6 +3231,92 @@ type BlobResourceContents struct {
 	MimeType *MediaType `json:"mimeType,omitempty"`
 	// URI associated with this resource or media payload.
 	URI string `json:"uri"`
+}
+
+func (v *BlobResourceContents) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *BlobResourceContents) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *BlobResourceContents) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = BlobResourceContents{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("blob"); ok {
+		if err := decodeValue(raw, &v.Blob, false, buffered); err != nil {
+			return fmt.Errorf("BlobResourceContents.blob: %w", err)
+		}
+	} else {
+		return missingField("BlobResourceContents", "blob")
+	}
+	if raw, ok := raws.get("mimeType"); ok {
+		if err := decodeValue(raw, &v.MimeType, true, true); err != nil {
+			v.MimeType = nil
+		}
+	}
+	if raw, ok := raws.get("uri"); ok {
+		if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
+			return fmt.Errorf("BlobResourceContents.uri: %w", err)
+		}
+	} else {
+		return missingField("BlobResourceContents", "uri")
+	}
+	return nil
+}
+
+func (v *BlobResourceContents) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = BlobResourceContents{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Blob, false, buffered); err != nil {
+			return fmt.Errorf("BlobResourceContents.blob: %w", err)
+		}
+	} else {
+		return seqTooShort("BlobResourceContents", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
+			return fmt.Errorf("BlobResourceContents.uri: %w", err)
+		}
+	} else {
+		return seqTooShort("BlobResourceContents", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.MimeType, true, true); err != nil {
+			v.MimeType = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Schema for boolean properties in an elicitation form.
@@ -967,6 +3337,96 @@ type BooleanPropertySchema struct {
 	Title Nullable[string] `json:"title,omitzero"`
 }
 
+func (v *BooleanPropertySchema) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *BooleanPropertySchema) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *BooleanPropertySchema) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = BooleanPropertySchema{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("default"); ok {
+		if err := decodeNullable(raw, &v.Default, func(raw json.RawMessage, dst *bool) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Default = Nullable[bool]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	return nil
+}
+
+func (v *BooleanPropertySchema) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = BooleanPropertySchema{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Default, func(raw json.RawMessage, dst *bool) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Default = Nullable[bool]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Notification to cancel an ongoing request.
 // See protocol docs: Cancellation
 type CancelRequestNotification struct {
@@ -980,6 +3440,68 @@ type CancelRequestNotification struct {
 	RequestID RequestId `json:"requestId"`
 }
 
+func (v *CancelRequestNotification) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *CancelRequestNotification) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CancelRequestNotification) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CancelRequestNotification{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("requestId"); ok {
+		if err := decodeChecked(raw, &v.RequestID, false, validRequestId); err != nil {
+			return fmt.Errorf("CancelRequestNotification.requestId: %w", err)
+		}
+	} else {
+		return missingField("CancelRequestNotification", "requestId")
+	}
+	return nil
+}
+
+func (v *CancelRequestNotification) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CancelRequestNotification{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeChecked(raw, &v.RequestID, false, validRequestId); err != nil {
+			return fmt.Errorf("CancelRequestNotification.requestId: %w", err)
+		}
+	} else {
+		return seqTooShort("CancelRequestNotification", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Notification to cancel a session's foreground work and its prompts not yet inserted.
 // See protocol docs: Cancellation
 type CancelSessionNotification struct {
@@ -990,6 +3512,68 @@ type CancelSessionNotification struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The ID of the session to cancel operations for.
 	SessionID SessionId `json:"sessionId"`
+}
+
+func (v *CancelSessionNotification) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *CancelSessionNotification) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CancelSessionNotification) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CancelSessionNotification{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("CancelSessionNotification.sessionId: %w", err)
+		}
+	} else {
+		return missingField("CancelSessionNotification", "sessionId")
+	}
+	return nil
+}
+
+func (v *CancelSessionNotification) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CancelSessionNotification{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("CancelSessionNotification.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("CancelSessionNotification", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Request parameters for cancelling one terminal.
@@ -1013,6 +3597,81 @@ type CancelTerminalRequest struct {
 	TerminalID TerminalId `json:"terminalId"`
 }
 
+func (v *CancelTerminalRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *CancelTerminalRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CancelTerminalRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CancelTerminalRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("CancelTerminalRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("CancelTerminalRequest", "sessionId")
+	}
+	if raw, ok := raws.get("terminalId"); ok {
+		if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
+			return fmt.Errorf("CancelTerminalRequest.terminalId: %w", err)
+		}
+	} else {
+		return missingField("CancelTerminalRequest", "terminalId")
+	}
+	return nil
+}
+
+func (v *CancelTerminalRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CancelTerminalRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("CancelTerminalRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("CancelTerminalRequest", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
+			return fmt.Errorf("CancelTerminalRequest.terminalId: %w", err)
+		}
+	} else {
+		return seqTooShort("CancelTerminalRequest", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response from cancelling a terminal.
 type CancelTerminalResponse struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -1020,6 +3679,51 @@ type CancelTerminalResponse struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *CancelTerminalResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *CancelTerminalResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CancelTerminalResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CancelTerminalResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *CancelTerminalResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CancelTerminalResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Request parameters for cancelling one tool call.
@@ -1042,6 +3746,81 @@ type CancelToolCallRequest struct {
 	ToolCallID ToolCallId `json:"toolCallId"`
 }
 
+func (v *CancelToolCallRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *CancelToolCallRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CancelToolCallRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CancelToolCallRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("CancelToolCallRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("CancelToolCallRequest", "sessionId")
+	}
+	if raw, ok := raws.get("toolCallId"); ok {
+		if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
+			return fmt.Errorf("CancelToolCallRequest.toolCallId: %w", err)
+		}
+	} else {
+		return missingField("CancelToolCallRequest", "toolCallId")
+	}
+	return nil
+}
+
+func (v *CancelToolCallRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CancelToolCallRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("CancelToolCallRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("CancelToolCallRequest", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
+			return fmt.Errorf("CancelToolCallRequest.toolCallId: %w", err)
+		}
+	} else {
+		return seqTooShort("CancelToolCallRequest", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response from cancelling a tool call.
 type CancelToolCallResponse struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -1051,6 +3830,51 @@ type CancelToolCallResponse struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 }
 
+func (v *CancelToolCallResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *CancelToolCallResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CancelToolCallResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CancelToolCallResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *CancelToolCallResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CancelToolCallResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // The request was not approved and no option was selected.
 type CancelledPermissionOutcome struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -1058,6 +3882,53 @@ type CancelledPermissionOutcome struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *CancelledPermissionOutcome) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *CancelledPermissionOutcome) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CancelledPermissionOutcome) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CancelledPermissionOutcome{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *CancelledPermissionOutcome) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CancelledPermissionOutcome{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Authentication capabilities supported by the client.
@@ -1076,6 +3947,62 @@ type ClientAuthCapabilities struct {
 	// agent invocation in an interactive terminal. Supplying {} means the
 	// agent may include terminal entries in its authentication methods.
 	Terminal *TerminalAuthCapabilities `json:"terminal,omitempty"`
+}
+
+func (v *ClientAuthCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ClientAuthCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ClientAuthCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ClientAuthCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("terminal"); ok {
+		if err := decodePtr(raw, &v.Terminal, true, true); err != nil {
+			v.Terminal = nil
+		}
+	}
+	return nil
+}
+
+func (v *ClientAuthCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ClientAuthCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Terminal, true, true); err != nil {
+			v.Terminal = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Capabilities supported by the client.
@@ -1101,12 +4028,135 @@ type ClientCapabilities struct {
 	Elicitation *ElicitationCapabilities `json:"elicitation,omitempty"`
 }
 
+func (v *ClientCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ClientCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ClientCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ClientCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("auth"); ok {
+		if err := decodePtr(raw, &v.Auth, true, true); err != nil {
+			v.Auth = nil
+		}
+	}
+	if raw, ok := raws.get("elicitation"); ok {
+		if err := decodePtr(raw, &v.Elicitation, true, true); err != nil {
+			v.Elicitation = nil
+		}
+	}
+	return nil
+}
+
+func (v *ClientCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ClientCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Auth, true, true); err != nil {
+			v.Auth = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodePtr(raw, &v.Elicitation, true, true); err != nil {
+			v.Elicitation = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // A JSON-RPC notification object.
 type ClientNotification struct {
 	// The notification method name.
 	Method string `json:"method"`
 	// Method-specific notification parameters.
 	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (v *ClientNotification) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ClientNotification) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ClientNotification) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ClientNotification{}
+	if raw, ok := raws.get("method"); ok {
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ClientNotification.method: %w", err)
+		}
+	} else {
+		return missingField("ClientNotification", "method")
+	}
+	if raw, ok := raws.get("params"); ok {
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ClientNotification.params: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *ClientNotification) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ClientNotification{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ClientNotification.method: %w", err)
+		}
+	} else {
+		return seqTooShort("ClientNotification", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ClientNotification.params: %w", err)
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A JSON-RPC request object.
@@ -1117,6 +4167,77 @@ type ClientRequest struct {
 	Method string `json:"method"`
 	// Method-specific request parameters.
 	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (v *ClientRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ClientRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ClientRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ClientRequest{}
+	if raw, ok := raws.get("id"); ok {
+		if err := decodeChecked(raw, &v.ID, false, validRequestId); err != nil {
+			return fmt.Errorf("ClientRequest.id: %w", err)
+		}
+	} else {
+		return missingField("ClientRequest", "id")
+	}
+	if raw, ok := raws.get("method"); ok {
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ClientRequest.method: %w", err)
+		}
+	} else {
+		return missingField("ClientRequest", "method")
+	}
+	if raw, ok := raws.get("params"); ok {
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ClientRequest.params: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *ClientRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ClientRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeChecked(raw, &v.ID, false, validRequestId); err != nil {
+			return fmt.Errorf("ClientRequest.id: %w", err)
+		}
+	} else {
+		return seqTooShort("ClientRequest", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ClientRequest.method: %w", err)
+		}
+	} else {
+		return seqTooShort("ClientRequest", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ClientRequest.params: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Request parameters for closing an active session.
@@ -1142,6 +4263,66 @@ type CloseSessionRequest struct {
 	SessionID SessionId `json:"sessionId"`
 }
 
+func (v *CloseSessionRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *CloseSessionRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CloseSessionRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CloseSessionRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("CloseSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("CloseSessionRequest", "sessionId")
+	}
+	return nil
+}
+
+func (v *CloseSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CloseSessionRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("CloseSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("CloseSessionRequest", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response from closing a session.
 type CloseSessionResponse struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -1149,6 +4330,51 @@ type CloseSessionResponse struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *CloseSessionResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *CloseSessionResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CloseSessionResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CloseSessionResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *CloseSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CloseSessionResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A slash command the user can invoke by including it in a prompt.
@@ -1169,6 +4395,92 @@ type Command struct {
 	Name string `json:"name"`
 }
 
+func (v *Command) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Command) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Command) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Command{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeValue(raw, &v.Description, false, buffered); err != nil {
+			return fmt.Errorf("Command.description: %w", err)
+		}
+	} else {
+		return missingField("Command", "description")
+	}
+	if raw, ok := raws.get("input"); ok {
+		if err := decodePtr(raw, &v.Input, true, true); err != nil {
+			v.Input = nil
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("Command.name: %w", err)
+		}
+	} else {
+		return missingField("Command", "name")
+	}
+	return nil
+}
+
+func (v *Command) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Command{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("Command.name: %w", err)
+		}
+	} else {
+		return seqTooShort("Command", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Description, false, buffered); err != nil {
+			return fmt.Errorf("Command.description: %w", err)
+		}
+	} else {
+		return seqTooShort("Command", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodePtr(raw, &v.Input, true, true); err != nil {
+			v.Input = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Permission request details for a command.
 type CommandPermissionSubject struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -1184,6 +4496,103 @@ type CommandPermissionSubject struct {
 	TerminalID *TerminalId `json:"terminalId,omitempty"`
 	// The associated tool call, when known. Omitted and null are equivalent.
 	ToolCallID *ToolCallId `json:"toolCallId,omitempty"`
+}
+
+func (v *CommandPermissionSubject) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *CommandPermissionSubject) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CommandPermissionSubject) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CommandPermissionSubject{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("command"); ok {
+		if err := decodeValue(raw, &v.Command, false, buffered); err != nil {
+			return fmt.Errorf("CommandPermissionSubject.command: %w", err)
+		}
+	} else {
+		return missingField("CommandPermissionSubject", "command")
+	}
+	if raw, ok := raws.get("cwd"); ok {
+		if err := decodeValue(raw, &v.Cwd, false, buffered); err != nil {
+			return fmt.Errorf("CommandPermissionSubject.cwd: %w", err)
+		}
+	} else {
+		return missingField("CommandPermissionSubject", "cwd")
+	}
+	if raw, ok := raws.get("terminalId"); ok {
+		if err := decodeValue(raw, &v.TerminalID, true, true); err != nil {
+			v.TerminalID = nil
+		}
+	}
+	if raw, ok := raws.get("toolCallId"); ok {
+		if err := decodeValue(raw, &v.ToolCallID, true, true); err != nil {
+			v.ToolCallID = nil
+		}
+	}
+	return nil
+}
+
+func (v *CommandPermissionSubject) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CommandPermissionSubject{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Command, false, buffered); err != nil {
+			return fmt.Errorf("CommandPermissionSubject.command: %w", err)
+		}
+	} else {
+		return seqTooShort("CommandPermissionSubject", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Cwd, false, buffered); err != nil {
+			return fmt.Errorf("CommandPermissionSubject.cwd: %w", err)
+		}
+	} else {
+		return seqTooShort("CommandPermissionSubject", 1, 5)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.ToolCallID, true, true); err != nil {
+			v.ToolCallID = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeValue(raw, &v.TerminalID, true, true); err != nil {
+			v.TerminalID = nil
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Unique identifier for a context compaction within a session.
@@ -1203,6 +4612,27 @@ const (
 	CompactionStatusCancelled CompactionStatus = "cancelled"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *CompactionStatus) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("CompactionStatus: %w", err)
+	}
+	switch CompactionStatus(s) {
+	case CompactionStatusInProgress, CompactionStatusCompleted, CompactionStatusFailed, CompactionStatusCancelled:
+		*v = CompactionStatus(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("CompactionStatus: unknown variant %q", s)
+		}
+		*v = CompactionStatus(s)
+	}
+	return nil
+}
+
+func (v *CompactionStatus) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // A content block appended to a compaction's summary. A first-seen ID creates
 // an in-progress compaction. Chunks append in receive order.
 type CompactionSummaryChunk struct {
@@ -1216,6 +4646,81 @@ type CompactionSummaryChunk struct {
 	CompactionID CompactionId `json:"compactionId"`
 	// One content block to append.
 	Content ContentBlock `json:"content"`
+}
+
+func (v *CompactionSummaryChunk) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *CompactionSummaryChunk) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CompactionSummaryChunk) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CompactionSummaryChunk{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("compactionId"); ok {
+		if err := decodeValue(raw, &v.CompactionID, false, buffered); err != nil {
+			return fmt.Errorf("CompactionSummaryChunk.compactionId: %w", err)
+		}
+	} else {
+		return missingField("CompactionSummaryChunk", "compactionId")
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("CompactionSummaryChunk.content: %w", err)
+		}
+	} else {
+		return missingField("CompactionSummaryChunk", "content")
+	}
+	return nil
+}
+
+func (v *CompactionSummaryChunk) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CompactionSummaryChunk{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.CompactionID, false, buffered); err != nil {
+			return fmt.Errorf("CompactionSummaryChunk.compactionId: %w", err)
+		}
+	} else {
+		return seqTooShort("CompactionSummaryChunk", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("CompactionSummaryChunk.content: %w", err)
+		}
+	} else {
+		return seqTooShort("CompactionSummaryChunk", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A context compaction upsert. The first notification fixes the compaction's
@@ -1241,6 +4746,115 @@ type CompactionUpdate struct {
 	Status CompactionStatus `json:"status"`
 	// Complete replacement user-displayable summary content for the compaction.
 	Summary Nullable[[]ContentBlock] `json:"summary,omitzero"`
+}
+
+func (v *CompactionUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *CompactionUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CompactionUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CompactionUpdate{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("compactionId"); ok {
+		if err := decodeValue(raw, &v.CompactionID, false, buffered); err != nil {
+			return fmt.Errorf("CompactionUpdate.compactionId: %w", err)
+		}
+	} else {
+		return missingField("CompactionUpdate", "compactionId")
+	}
+	if raw, ok := raws.get("error"); ok {
+		if err := decodeNullable(raw, &v.Error, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Error = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("status"); ok {
+		if err := decodeValue(raw, &v.Status, false, buffered); err != nil {
+			return fmt.Errorf("CompactionUpdate.status: %w", err)
+		}
+	} else {
+		return missingField("CompactionUpdate", "status")
+	}
+	if raw, ok := raws.get("summary"); ok {
+		if err := decodeNullable(raw, &v.Summary, func(raw json.RawMessage, dst *[]ContentBlock) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Summary = Nullable[[]ContentBlock]{}
+		}
+	}
+	return nil
+}
+
+func (v *CompactionUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CompactionUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.CompactionID, false, buffered); err != nil {
+			return fmt.Errorf("CompactionUpdate.compactionId: %w", err)
+		}
+	} else {
+		return seqTooShort("CompactionUpdate", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Status, false, buffered); err != nil {
+			return fmt.Errorf("CompactionUpdate.status: %w", err)
+		}
+	} else {
+		return seqTooShort("CompactionUpdate", 1, 5)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Summary, func(raw json.RawMessage, dst *[]ContentBlock) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Summary = Nullable[[]ContentBlock]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Error, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Error = Nullable[string]{}
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // ApplyUpdate applies a later update for the same entity to this stored CompactionUpdate state.
@@ -1278,6 +4892,68 @@ type CompleteElicitationNotification struct {
 	ElicitationID ElicitationId `json:"elicitationId"`
 }
 
+func (v *CompleteElicitationNotification) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *CompleteElicitationNotification) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CompleteElicitationNotification) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = CompleteElicitationNotification{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("elicitationId"); ok {
+		if err := decodeValue(raw, &v.ElicitationID, false, buffered); err != nil {
+			return fmt.Errorf("CompleteElicitationNotification.elicitationId: %w", err)
+		}
+	} else {
+		return missingField("CompleteElicitationNotification", "elicitationId")
+	}
+	return nil
+}
+
+func (v *CompleteElicitationNotification) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = CompleteElicitationNotification{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ElicitationID, false, buffered); err != nil {
+			return fmt.Errorf("CompleteElicitationNotification.elicitationId: %w", err)
+		}
+	} else {
+		return seqTooShort("CompleteElicitationNotification", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Session configuration options have been updated.
 type ConfigOptionUpdate struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -1289,6 +4965,70 @@ type ConfigOptionUpdate struct {
 	ConfigOptions []SessionConfigOption `json:"configOptions"`
 }
 
+func (v *ConfigOptionUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ConfigOptionUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ConfigOptionUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ConfigOptionUpdate{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("configOptions"); ok {
+		if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			return fmt.Errorf("ConfigOptionUpdate.configOptions: %w", err)
+		}
+	} else {
+		return missingField("ConfigOptionUpdate", "configOptions")
+	}
+	return nil
+}
+
+func (v *ConfigOptionUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ConfigOptionUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			return fmt.Errorf("ConfigOptionUpdate.configOptions: %w", err)
+		}
+	} else {
+		return seqTooShort("ConfigOptionUpdate", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Standard content block (text, images, resources).
 type Content struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -1298,6 +5038,66 @@ type Content struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The actual content block.
 	Content ContentBlock `json:"content"`
+}
+
+func (v *Content) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Content) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Content) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Content{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("Content.content: %w", err)
+		}
+	} else {
+		return missingField("Content", "content")
+	}
+	return nil
+}
+
+func (v *Content) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Content{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("Content.content: %w", err)
+		}
+	} else {
+		return seqTooShort("Content", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Content blocks represent displayable information in the Agent Client Protocol.
@@ -1457,44 +5257,136 @@ func (v ContentBlock) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *ContentBlock) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var contentBlockTags = []string{"text", "image", "audio", "resource_link", "resource"}
+
+func (v *ContentBlock) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ContentBlock) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ContentBlock) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = ContentBlock{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("ContentBlock tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, contentBlockTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "text":
+			payload := new(TextContent)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Text = ContentBlockKindText, payload
+				return nil
+			}
+		case "image":
+			payload := new(ImageContent)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Image = ContentBlockKindImage, payload
+				return nil
+			}
+		case "audio":
+			payload := new(AudioContent)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Audio = ContentBlockKindAudio, payload
+				return nil
+			}
+		case "resource_link":
+			payload := new(ResourceLink)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.ResourceLink = ContentBlockKindResourceLink, payload
+				return nil
+			}
+		case "resource":
+			payload := new(EmbeddedResource)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Resource = ContentBlockKindResource, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "text":
-		v.Kind = ContentBlockKindText
-		v.Text = new(TextContent)
-		return json.Unmarshal(data, v.Text)
-	case "image":
-		v.Kind = ContentBlockKindImage
-		v.Image = new(ImageContent)
-		return json.Unmarshal(data, v.Image)
-	case "audio":
-		v.Kind = ContentBlockKindAudio
-		v.Audio = new(AudioContent)
-		return json.Unmarshal(data, v.Audio)
-	case "resource_link":
-		v.Kind = ContentBlockKindResourceLink
-		v.ResourceLink = new(ResourceLink)
-		return json.Unmarshal(data, v.ResourceLink)
-	case "resource":
-		v.Kind = ContentBlockKindResource
-		v.Resource = new(EmbeddedResource)
-		return json.Unmarshal(data, v.Resource)
-	default:
+	if tagged && tag != "text" && tag != "image" && tag != "audio" && tag != "resource_link" && tag != "resource" {
 		v.Kind = ContentBlockKind(tag)
-		v.Other = &ContentBlockOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &ContentBlockOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("ContentBlock: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("ContentBlock", "type")
+	}
+	return fmt.Errorf("ContentBlock: unknown type tag %s", raw)
+}
+
+func (v *ContentBlock) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ContentBlock{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, contentBlockTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "text":
+			payload := new(TextContent)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Text = ContentBlockKindText, payload
+				return nil
+			}
+		case "image":
+			payload := new(ImageContent)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Image = ContentBlockKindImage, payload
+				return nil
+			}
+		case "audio":
+			payload := new(AudioContent)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Audio = ContentBlockKindAudio, payload
+				return nil
+			}
+		case "resource_link":
+			payload := new(ResourceLink)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.ResourceLink = ContentBlockKindResourceLink, payload
+				return nil
+			}
+		case "resource":
+			payload := new(EmbeddedResource)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Resource = ContentBlockKindResource, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("ContentBlock: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("ContentBlock", "type")
+	}
+	return fmt.Errorf("ContentBlock: unknown type tag %s", raw)
 }
 
 // A streamed item of message content.
@@ -1513,6 +5405,81 @@ type ContentChunk struct {
 	MessageID MessageId `json:"messageId"`
 }
 
+func (v *ContentChunk) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ContentChunk) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ContentChunk) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ContentChunk{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("ContentChunk.content: %w", err)
+		}
+	} else {
+		return missingField("ContentChunk", "content")
+	}
+	if raw, ok := raws.get("messageId"); ok {
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("ContentChunk.messageId: %w", err)
+		}
+	} else {
+		return missingField("ContentChunk", "messageId")
+	}
+	return nil
+}
+
+func (v *ContentChunk) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ContentChunk{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("ContentChunk.messageId: %w", err)
+		}
+	} else {
+		return seqTooShort("ContentChunk", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("ContentChunk.content: %w", err)
+		}
+	} else {
+		return seqTooShort("ContentChunk", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Cost information for a session.
 type Cost struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -1525,6 +5492,81 @@ type Cost struct {
 	// Unit of amount: an ISO 4217 currency code (e.g., "USD", "EUR") for money, or another
 	// unit such as "credits".
 	Currency string `json:"currency"`
+}
+
+func (v *Cost) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Cost) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Cost) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Cost{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("amount"); ok {
+		if err := decodeValue(raw, &v.Amount, false, buffered); err != nil {
+			return fmt.Errorf("Cost.amount: %w", err)
+		}
+	} else {
+		return missingField("Cost", "amount")
+	}
+	if raw, ok := raws.get("currency"); ok {
+		if err := decodeValue(raw, &v.Currency, false, buffered); err != nil {
+			return fmt.Errorf("Cost.currency: %w", err)
+		}
+	} else {
+		return missingField("Cost", "currency")
+	}
+	return nil
+}
+
+func (v *Cost) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Cost{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Amount, false, buffered); err != nil {
+			return fmt.Errorf("Cost.amount: %w", err)
+		}
+	} else {
+		return seqTooShort("Cost", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Currency, false, buffered); err != nil {
+			return fmt.Errorf("Cost.currency: %w", err)
+		}
+	} else {
+		return seqTooShort("Cost", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Request from the agent to elicit structured user input.
@@ -1636,35 +5678,79 @@ func (v CreateElicitationRequest) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *CreateElicitationRequest) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var createElicitationRequestTags = []string{"form", "url"}
+
+func (v *CreateElicitationRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *CreateElicitationRequest) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CreateElicitationRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = CreateElicitationRequest{}
-	if err := json.Unmarshal(data, (*createElicitationRequestShadow)(v)); err != nil {
-		return err
-	}
-	var tag string
-	if raw, ok := raws["mode"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("CreateElicitationRequest tag: %w", err)
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	switch tag {
-	case "form":
-		v.Kind = CreateElicitationRequestKindForm
-		v.Form = new(ElicitationFormMode)
-		return json.Unmarshal(data, v.Form)
-	case "url":
-		v.Kind = CreateElicitationRequestKindUrl
-		v.URL = new(ElicitationUrlMode)
-		return json.Unmarshal(data, v.URL)
-	default:
+	if raw, ok := raws.get("message"); ok {
+		if err := decodeValue(raw, &v.Message, false, buffered); err != nil {
+			return fmt.Errorf("CreateElicitationRequest.message: %w", err)
+		}
+	} else {
+		return missingField("CreateElicitationRequest", "message")
+	}
+	buffered = true
+	raw, present := raws.get("mode")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, createElicitationRequestTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "form":
+			payload := new(ElicitationFormMode)
+			if err = payload.decodeJSON(objectData(data, raws), true); err == nil {
+				v.Kind, v.Form = CreateElicitationRequestKindForm, payload
+				return nil
+			}
+		case "url":
+			payload := new(ElicitationUrlMode)
+			if err = payload.decodeJSON(objectData(data, raws), true); err == nil {
+				v.Kind, v.URL = CreateElicitationRequestKindUrl, payload
+				return nil
+			}
+		}
+	}
+	if tagged && tag != "form" && tag != "url" {
+		matched := 0
+		if new(ElicitationSessionScope).decodeFields(data, raws, true) == nil {
+			matched++
+		}
+		if new(ElicitationRequestScope).decodeFields(data, raws, true) == nil {
+			matched++
+		}
+		if matched != 1 {
+			return fmt.Errorf("CreateElicitationRequest: data matches no variant")
+		}
 		v.Kind = CreateElicitationRequestKind(tag)
-		v.Other = &CreateElicitationRequestOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &CreateElicitationRequestOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("CreateElicitationRequest: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("CreateElicitationRequest", "mode")
+	}
+	return fmt.Errorf("CreateElicitationRequest: unknown mode tag %s", raw)
 }
 
 // Response from the client to an elicitation request.
@@ -1791,39 +5877,70 @@ func (v CreateElicitationResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
+var createElicitationResponseTags = []string{"accept", "decline", "cancel"}
+
 func (v *CreateElicitationResponse) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+	return v.decodeJSON(data, false)
+}
+
+func (v *CreateElicitationResponse) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *CreateElicitationResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = CreateElicitationResponse{}
-	if err := json.Unmarshal(data, (*createElicitationResponseShadow)(v)); err != nil {
-		return err
-	}
-	var tag string
-	if raw, ok := raws["action"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("CreateElicitationResponse tag: %w", err)
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	switch tag {
-	case "accept":
-		v.Kind = CreateElicitationResponseKindAccept
-		v.Accept = new(ElicitationAcceptAction)
-		return json.Unmarshal(data, v.Accept)
-	case "decline":
-		v.Kind = CreateElicitationResponseKindDecline
-		v.Decline = new(CreateElicitationResponseDecline)
-		return json.Unmarshal(data, v.Decline)
-	case "cancel":
-		v.Kind = CreateElicitationResponseKindCancel
-		v.Cancel = new(CreateElicitationResponseCancel)
-		return json.Unmarshal(data, v.Cancel)
-	default:
+	buffered = true
+	raw, present := raws.get("action")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, createElicitationResponseTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "accept":
+			payload := new(ElicitationAcceptAction)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Accept = CreateElicitationResponseKindAccept, payload
+				return nil
+			}
+		case "decline":
+			payload := new(CreateElicitationResponseDecline)
+			if err = nil; err == nil {
+				v.Kind, v.Decline = CreateElicitationResponseKindDecline, payload
+				return nil
+			}
+		case "cancel":
+			payload := new(CreateElicitationResponseCancel)
+			if err = nil; err == nil {
+				v.Kind, v.Cancel = CreateElicitationResponseKindCancel, payload
+				return nil
+			}
+		}
+	}
+	if tagged && tag != "accept" && tag != "decline" && tag != "cancel" {
 		v.Kind = CreateElicitationResponseKind(tag)
-		v.Other = &CreateElicitationResponseOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &CreateElicitationResponseOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("CreateElicitationResponse: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("CreateElicitationResponse", "action")
+	}
+	return fmt.Errorf("CreateElicitationResponse: unknown action tag %s", raw)
 }
 
 // Request parameters for deleting an existing session from session/list.
@@ -1838,6 +5955,66 @@ type DeleteSessionRequest struct {
 	SessionID SessionId `json:"sessionId"`
 }
 
+func (v *DeleteSessionRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *DeleteSessionRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *DeleteSessionRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = DeleteSessionRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("DeleteSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("DeleteSessionRequest", "sessionId")
+	}
+	return nil
+}
+
+func (v *DeleteSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = DeleteSessionRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("DeleteSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("DeleteSessionRequest", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response from deleting a session.
 type DeleteSessionResponse struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -1845,6 +6022,51 @@ type DeleteSessionResponse struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *DeleteSessionResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *DeleteSessionResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *DeleteSessionResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = DeleteSessionResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *DeleteSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = DeleteSessionResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // File changes produced by a tool call.
@@ -1866,6 +6088,81 @@ type Diff struct {
 	// Agents SHOULD provide patch text whenever feasible. Omitted and null are
 	// equivalent and mean no renderable patch text was provided.
 	Patch *DiffPatch `json:"patch,omitempty"`
+}
+
+func (v *Diff) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Diff) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Diff) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Diff{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("changes"); ok {
+		if err := decodeList(raw, &v.Changes, false, true, func(raw json.RawMessage, dst *DiffChange) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			return fmt.Errorf("Diff.changes: %w", err)
+		}
+	} else {
+		return missingField("Diff", "changes")
+	}
+	if raw, ok := raws.get("patch"); ok {
+		if err := decodePtr(raw, &v.Patch, true, true); err != nil {
+			v.Patch = nil
+		}
+	}
+	return nil
+}
+
+func (v *Diff) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Diff{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeList(raw, &v.Changes, false, true, func(raw json.RawMessage, dst *DiffChange) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			return fmt.Errorf("Diff.changes: %w", err)
+		}
+	} else {
+		return seqTooShort("Diff", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodePtr(raw, &v.Patch, true, true); err != nil {
+			v.Patch = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // One file-level change described by a Diff.
@@ -2040,47 +6337,90 @@ func (v DiffChange) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *DiffChange) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var diffChangeTags = []string{"add", "delete", "modify", "move", "copy"}
+
+func (v *DiffChange) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *DiffChange) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *DiffChange) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = DiffChange{}
-	if err := json.Unmarshal(data, (*diffChangeShadow)(v)); err != nil {
-		return err
-	}
-	var tag string
-	if raw, ok := raws["operation"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("DiffChange tag: %w", err)
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	switch tag {
-	case "add":
-		v.Kind = DiffChangeKindAdd
-		v.Add = new(DiffPathChange)
-		return json.Unmarshal(data, v.Add)
-	case "delete":
-		v.Kind = DiffChangeKindDelete
-		v.Delete = new(DiffPathChange)
-		return json.Unmarshal(data, v.Delete)
-	case "modify":
-		v.Kind = DiffChangeKindModify
-		v.Modify = new(DiffPathChange)
-		return json.Unmarshal(data, v.Modify)
-	case "move":
-		v.Kind = DiffChangeKindMove
-		v.Move = new(DiffPathPairChange)
-		return json.Unmarshal(data, v.Move)
-	case "copy":
-		v.Kind = DiffChangeKindCopy
-		v.Copy = new(DiffPathPairChange)
-		return json.Unmarshal(data, v.Copy)
-	default:
+	if raw, ok := raws.get("fileType"); ok {
+		if err := decodeValue(raw, &v.FileType, true, true); err != nil {
+			v.FileType = nil
+		}
+	}
+	if raw, ok := raws.get("mimeType"); ok {
+		if err := decodeValue(raw, &v.MimeType, true, true); err != nil {
+			v.MimeType = nil
+		}
+	}
+	buffered = true
+	raw, present := raws.get("operation")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, diffChangeTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "add":
+			payload := new(DiffPathChange)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Add = DiffChangeKindAdd, payload
+				return nil
+			}
+		case "delete":
+			payload := new(DiffPathChange)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Delete = DiffChangeKindDelete, payload
+				return nil
+			}
+		case "modify":
+			payload := new(DiffPathChange)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Modify = DiffChangeKindModify, payload
+				return nil
+			}
+		case "move":
+			payload := new(DiffPathPairChange)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Move = DiffChangeKindMove, payload
+				return nil
+			}
+		case "copy":
+			payload := new(DiffPathPairChange)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Copy = DiffChangeKindCopy, payload
+				return nil
+			}
+		}
+	}
+	if tagged && tag != "add" && tag != "delete" && tag != "modify" && tag != "move" && tag != "copy" {
 		v.Kind = DiffChangeKind(tag)
-		v.Other = &DiffChangeOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &DiffChangeOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("DiffChange: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("DiffChange", "operation")
+	}
+	return fmt.Errorf("DiffChange: unknown operation tag %s", raw)
 }
 
 // Kind of file content represented by a diff change.
@@ -2097,6 +6437,27 @@ const (
 	DiffFileTypeSymlink DiffFileType = "symlink"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *DiffFileType) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("DiffFileType: %w", err)
+	}
+	switch DiffFileType(s) {
+	case DiffFileTypeText, DiffFileTypeBinary, DiffFileTypeDirectory, DiffFileTypeSymlink:
+		*v = DiffFileType(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("DiffFileType: unknown variant %q", s)
+		}
+		*v = DiffFileType(s)
+	}
+	return nil
+}
+
+func (v *DiffFileType) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // Renderable patch text and its format.
 type DiffPatch struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -2108,6 +6469,81 @@ type DiffPatch struct {
 	Format DiffPatchFormat `json:"format"`
 	// Patch text in the format named by format.
 	Text string `json:"text"`
+}
+
+func (v *DiffPatch) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *DiffPatch) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *DiffPatch) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = DiffPatch{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("format"); ok {
+		if err := decodeValue(raw, &v.Format, false, buffered); err != nil {
+			return fmt.Errorf("DiffPatch.format: %w", err)
+		}
+	} else {
+		return missingField("DiffPatch", "format")
+	}
+	if raw, ok := raws.get("text"); ok {
+		if err := decodeValue(raw, &v.Text, false, buffered); err != nil {
+			return fmt.Errorf("DiffPatch.text: %w", err)
+		}
+	} else {
+		return missingField("DiffPatch", "text")
+	}
+	return nil
+}
+
+func (v *DiffPatch) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = DiffPatch{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Format, false, buffered); err != nil {
+			return fmt.Errorf("DiffPatch.format: %w", err)
+		}
+	} else {
+		return seqTooShort("DiffPatch", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Text, false, buffered); err != nil {
+			return fmt.Errorf("DiffPatch.text: %w", err)
+		}
+	} else {
+		return seqTooShort("DiffPatch", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Text patch format used by DiffPatch.
@@ -2127,10 +6563,76 @@ const (
 	DiffPatchFormatGitPatch DiffPatchFormat = "git_patch"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *DiffPatchFormat) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("DiffPatchFormat: %w", err)
+	}
+	switch DiffPatchFormat(s) {
+	case DiffPatchFormatGitPatch:
+		*v = DiffPatchFormat(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("DiffPatchFormat: unknown variant %q", s)
+		}
+		*v = DiffPatchFormat(s)
+	}
+	return nil
+}
+
+func (v *DiffPatchFormat) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // Operation metadata for add, delete, and modify changes.
 type DiffPathChange struct {
 	// Absolute path for the operation.
 	Path AbsolutePath `json:"path"`
+}
+
+func (v *DiffPathChange) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *DiffPathChange) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *DiffPathChange) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = DiffPathChange{}
+	if raw, ok := raws.get("path"); ok {
+		if err := decodeValue(raw, &v.Path, false, buffered); err != nil {
+			return fmt.Errorf("DiffPathChange.path: %w", err)
+		}
+	} else {
+		return missingField("DiffPathChange", "path")
+	}
+	return nil
+}
+
+func (v *DiffPathChange) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = DiffPathChange{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Path, false, buffered); err != nil {
+			return fmt.Errorf("DiffPathChange.path: %w", err)
+		}
+	} else {
+		return seqTooShort("DiffPathChange", 0, 1)
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Operation metadata for move and copy changes.
@@ -2139,6 +6641,66 @@ type DiffPathPairChange struct {
 	OldPath AbsolutePath `json:"oldPath"`
 	// Absolute path after the operation.
 	Path AbsolutePath `json:"path"`
+}
+
+func (v *DiffPathPairChange) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *DiffPathPairChange) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *DiffPathPairChange) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = DiffPathPairChange{}
+	if raw, ok := raws.get("oldPath"); ok {
+		if err := decodeValue(raw, &v.OldPath, false, buffered); err != nil {
+			return fmt.Errorf("DiffPathPairChange.oldPath: %w", err)
+		}
+	} else {
+		return missingField("DiffPathPairChange", "oldPath")
+	}
+	if raw, ok := raws.get("path"); ok {
+		if err := decodeValue(raw, &v.Path, false, buffered); err != nil {
+			return fmt.Errorf("DiffPathPairChange.path: %w", err)
+		}
+	} else {
+		return missingField("DiffPathPairChange", "path")
+	}
+	return nil
+}
+
+func (v *DiffPathPairChange) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = DiffPathPairChange{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.OldPath, false, buffered); err != nil {
+			return fmt.Errorf("DiffPathPairChange.oldPath: %w", err)
+		}
+	} else {
+		return seqTooShort("DiffPathPairChange", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Path, false, buffered); err != nil {
+			return fmt.Errorf("DiffPathPairChange.path: %w", err)
+		}
+	} else {
+		return seqTooShort("DiffPathPairChange", 1, 2)
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -2154,6 +6716,66 @@ type DisableProviderRequest struct {
 	ProviderID ProviderId `json:"providerId"`
 }
 
+func (v *DisableProviderRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *DisableProviderRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *DisableProviderRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = DisableProviderRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("providerId"); ok {
+		if err := decodeValue(raw, &v.ProviderID, false, buffered); err != nil {
+			return fmt.Errorf("DisableProviderRequest.providerId: %w", err)
+		}
+	} else {
+		return missingField("DisableProviderRequest", "providerId")
+	}
+	return nil
+}
+
+func (v *DisableProviderRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = DisableProviderRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ProviderID, false, buffered); err != nil {
+			return fmt.Errorf("DisableProviderRequest.providerId: %w", err)
+		}
+	} else {
+		return seqTooShort("DisableProviderRequest", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Response to providers/disable.
@@ -2165,11 +6787,105 @@ type DisableProviderResponse struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 }
 
+func (v *DisableProviderResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *DisableProviderResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *DisableProviderResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = DisableProviderResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *DisableProviderResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = DisableProviderResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // The user accepted the elicitation and provided content.
 type ElicitationAcceptAction struct {
 	// The user-provided content, if any, as an object matching the requested schema.
 	// Omitted and null are equivalent and mean no content is provided.
 	Content Nullable[map[string]ElicitationContentValue] `json:"content,omitzero"`
+}
+
+func (v *ElicitationAcceptAction) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ElicitationAcceptAction) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ElicitationAcceptAction) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ElicitationAcceptAction{}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *map[string]ElicitationContentValue) error {
+			return decodeMap(raw, dst, false, func(raw json.RawMessage, dst *ElicitationContentValue) error {
+				return decodeChecked(raw, dst, true, validElicitationContentValue)
+			})
+		}); err != nil {
+			return fmt.Errorf("ElicitationAcceptAction.content: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *ElicitationAcceptAction) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ElicitationAcceptAction{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *map[string]ElicitationContentValue) error {
+			return decodeMap(raw, dst, false, func(raw json.RawMessage, dst *ElicitationContentValue) error {
+				return decodeChecked(raw, dst, true, validElicitationContentValue)
+			})
+		}); err != nil {
+			return fmt.Errorf("ElicitationAcceptAction.content: %w", err)
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Elicitation capabilities supported by the client.
@@ -2189,8 +6905,100 @@ type ElicitationCapabilities struct {
 	URL *ElicitationUrlCapabilities `json:"url,omitempty"`
 }
 
+func (v *ElicitationCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ElicitationCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ElicitationCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ElicitationCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("form"); ok {
+		if err := decodePtr(raw, &v.Form, true, true); err != nil {
+			v.Form = nil
+		}
+	}
+	if raw, ok := raws.get("url"); ok {
+		if err := decodePtr(raw, &v.URL, true, true); err != nil {
+			v.URL = nil
+		}
+	}
+	return nil
+}
+
+func (v *ElicitationCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ElicitationCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Form, true, true); err != nil {
+			v.Form = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodePtr(raw, &v.URL, true, true); err != nil {
+			v.URL = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Allowed wire representations for ElicitationContentValue.
 type ElicitationContentValue any
+
+// validElicitationContentValue reports whether raw matches an arm of ElicitationContentValue.
+func validElicitationContentValue(raw json.RawMessage) error {
+	if jsonKind(raw) == '"' {
+		return nil
+	}
+	if !isNull(raw) && json.Unmarshal(raw, new(int64)) == nil {
+		return nil
+	}
+	if jsonKind(raw) == '-' || (jsonKind(raw) >= '0' && jsonKind(raw) <= '9') {
+		return nil
+	}
+	if string(raw) == "true" || string(raw) == "false" {
+		return nil
+	}
+	if decodeList(raw, new([]string), false, false, func(raw json.RawMessage, dst *string) error {
+		return decodeValue(raw, dst, false, true)
+	}) == nil {
+		return nil
+	}
+	if true {
+		return nil
+	}
+	return fmt.Errorf("ElicitationContentValue: data did not match any variant")
+}
 
 // Form-based elicitation capabilities.
 // Supplying {} means the client supports form-based elicitation.
@@ -2200,6 +7008,53 @@ type ElicitationFormCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *ElicitationFormCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *ElicitationFormCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ElicitationFormCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ElicitationFormCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *ElicitationFormCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ElicitationFormCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Form-based elicitation mode where the client renders a form from the provided schema.
@@ -2263,43 +7118,51 @@ func (v ElicitationFormMode) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *ElicitationFormMode) UnmarshalJSON(data []byte) error {
-	*v = ElicitationFormMode{}
-	if err := json.Unmarshal(data, (*elicitationFormModeShadow)(v)); err != nil {
-		return err
-	}
-	if hasKeys(data, "sessionId") {
-		v.Session = new(ElicitationSessionScope)
-		return json.Unmarshal(data, v.Session)
-	} else if hasKeys(data, "requestId") {
-		v.Request = new(ElicitationRequestScope)
-		return json.Unmarshal(data, v.Request)
-	}
-	return fmt.Errorf("ElicitationFormMode: payload matches no variant")
-}
+func (v *ElicitationFormMode) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
 
-func hasKeys(data []byte, keys ...string) bool {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return false
+func (v *ElicitationFormMode) decodeJSON(data []byte, buffered bool) error {
+	*v = ElicitationFormMode{}
+	raws, err := splitObject(data)
+	object := err == nil && raws != nil
+	if !object {
+		return fmt.Errorf("ElicitationFormMode: expected an object")
 	}
-	for _, k := range keys {
-		if _, ok := obj[k]; !ok {
-			return false
+	if raw, ok := raws.get("requestedSchema"); ok {
+		if err := decodeValue(raw, &v.RequestedSchema, false, buffered); err != nil {
+			return fmt.Errorf("ElicitationFormMode.requestedSchema: %w", err)
+		}
+	} else {
+		return missingField("ElicitationFormMode", "requestedSchema")
+	}
+	err = nil
+	if !object || hasKeys(raws, "sessionId") {
+		payload := new(ElicitationSessionScope)
+		if err = func() error {
+			if object {
+				return payload.decodeFields(data, raws, true)
+			}
+			return payload.decodeJSON(data, true)
+		}(); err == nil {
+			v.Session = payload
+			return nil
 		}
 	}
-	return true
-}
-
-func arrayHasKeys(data []byte, keys ...string) bool {
-	var items []json.RawMessage
-	if err := json.Unmarshal(data, &items); err != nil {
-		return false
+	if !object || hasKeys(raws, "requestId") {
+		payload := new(ElicitationRequestScope)
+		if err = func() error {
+			if object {
+				return payload.decodeFields(data, raws, true)
+			}
+			return payload.decodeJSON(data, true)
+		}(); err == nil {
+			v.Request = payload
+			return nil
+		}
 	}
-	if len(items) == 0 {
-		return true // an empty array fits the first variant
+	if err != nil {
+		return fmt.Errorf("ElicitationFormMode: payload matches no variant: %w", err)
 	}
-	return hasKeys(items[0], keys...)
+	return fmt.Errorf("ElicitationFormMode: payload matches no variant")
 }
 
 // Unique identifier for an elicitation.
@@ -2457,44 +7320,138 @@ func (v ElicitationPropertySchema) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
+var elicitationPropertySchemaTags = []string{"string", "number", "integer", "boolean", "array"}
+
 func (v *ElicitationPropertySchema) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+	return v.decodeJSON(data, false)
+}
+
+func (v *ElicitationPropertySchema) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ElicitationPropertySchema) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = ElicitationPropertySchema{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("ElicitationPropertySchema tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, elicitationPropertySchemaTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "string":
+			payload := new(StringPropertySchema)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.String = ElicitationPropertySchemaKindString, payload
+				return nil
+			}
+		case "number":
+			payload := new(NumberPropertySchema)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Number = ElicitationPropertySchemaKindNumber, payload
+				return nil
+			}
+		case "integer":
+			payload := new(IntegerPropertySchema)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Integer = ElicitationPropertySchemaKindInteger, payload
+				return nil
+			}
+		case "boolean":
+			payload := new(BooleanPropertySchema)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Boolean = ElicitationPropertySchemaKindBoolean, payload
+				return nil
+			}
+		case "array":
+			payload := new(MultiSelectPropertySchema)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Array = ElicitationPropertySchemaKindArray, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "string":
-		v.Kind = ElicitationPropertySchemaKindString
-		v.String = new(StringPropertySchema)
-		return json.Unmarshal(data, v.String)
-	case "number":
-		v.Kind = ElicitationPropertySchemaKindNumber
-		v.Number = new(NumberPropertySchema)
-		return json.Unmarshal(data, v.Number)
-	case "integer":
-		v.Kind = ElicitationPropertySchemaKindInteger
-		v.Integer = new(IntegerPropertySchema)
-		return json.Unmarshal(data, v.Integer)
-	case "boolean":
-		v.Kind = ElicitationPropertySchemaKindBoolean
-		v.Boolean = new(BooleanPropertySchema)
-		return json.Unmarshal(data, v.Boolean)
-	case "array":
-		v.Kind = ElicitationPropertySchemaKindArray
-		v.Array = new(MultiSelectPropertySchema)
-		return json.Unmarshal(data, v.Array)
-	default:
+	if tagged && tag != "string" && tag != "number" && tag != "integer" && tag != "boolean" && tag != "array" {
 		v.Kind = ElicitationPropertySchemaKind(tag)
-		v.Other = &ElicitationPropertySchemaOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &ElicitationPropertySchemaOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("ElicitationPropertySchema: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("ElicitationPropertySchema", "type")
+	}
+	return fmt.Errorf("ElicitationPropertySchema: unknown type tag %s", raw)
+}
+
+func (v *ElicitationPropertySchema) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ElicitationPropertySchema{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, elicitationPropertySchemaTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "string":
+			payload := new(StringPropertySchema)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.String = ElicitationPropertySchemaKindString, payload
+				return nil
+			}
+		case "number":
+			payload := new(NumberPropertySchema)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Number = ElicitationPropertySchemaKindNumber, payload
+				return nil
+			}
+		case "integer":
+			payload := new(IntegerPropertySchema)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Integer = ElicitationPropertySchemaKindInteger, payload
+				return nil
+			}
+		case "boolean":
+			payload := new(BooleanPropertySchema)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Boolean = ElicitationPropertySchemaKindBoolean, payload
+				return nil
+			}
+		case "array":
+			payload := new(MultiSelectPropertySchema)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Array = ElicitationPropertySchemaKindArray, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("ElicitationPropertySchema: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("ElicitationPropertySchema", "type")
+	}
+	return fmt.Errorf("ElicitationPropertySchema: unknown type tag %s", raw)
 }
 
 // Request-scoped elicitation, tied to a specific JSON-RPC request outside of a session
@@ -2502,6 +7459,51 @@ func (v *ElicitationPropertySchema) UnmarshalJSON(data []byte) error {
 type ElicitationRequestScope struct {
 	// The pending Client-to-Agent request this elicitation is tied to.
 	RequestID RequestId `json:"requestId"`
+}
+
+func (v *ElicitationRequestScope) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ElicitationRequestScope) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ElicitationRequestScope) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ElicitationRequestScope{}
+	if raw, ok := raws.get("requestId"); ok {
+		if err := decodeChecked(raw, &v.RequestID, false, validRequestId); err != nil {
+			return fmt.Errorf("ElicitationRequestScope.requestId: %w", err)
+		}
+	} else {
+		return missingField("ElicitationRequestScope", "requestId")
+	}
+	return nil
+}
+
+func (v *ElicitationRequestScope) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ElicitationRequestScope{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeChecked(raw, &v.RequestID, false, validRequestId); err != nil {
+			return fmt.Errorf("ElicitationRequestScope.requestId: %w", err)
+		}
+	} else {
+		return seqTooShort("ElicitationRequestScope", 0, 1)
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Type-safe elicitation schema for requesting structured user input.
@@ -2528,6 +7530,134 @@ type ElicitationSchema struct {
 	Type ElicitationSchemaType `json:"type"`
 }
 
+func (v *ElicitationSchema) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ElicitationSchema) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ElicitationSchema) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ElicitationSchema{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("properties"); ok {
+		if err := decodeMap(raw, &v.Properties, false, func(raw json.RawMessage, dst *ElicitationPropertySchema) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ElicitationSchema.properties: %w", err)
+		}
+	} else {
+		return missingField("ElicitationSchema", "properties")
+	}
+	if raw, ok := raws.get("required"); ok {
+		if err := decodeNullable(raw, &v.Required, func(raw json.RawMessage, dst *[]string) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, buffered)
+			})
+		}); err != nil {
+			return fmt.Errorf("ElicitationSchema.required: %w", err)
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("type"); ok {
+		if err := decodeValue(raw, &v.Type, false, buffered); err != nil {
+			return fmt.Errorf("ElicitationSchema.type: %w", err)
+		}
+	} else {
+		return missingField("ElicitationSchema", "type")
+	}
+	return nil
+}
+
+func (v *ElicitationSchema) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ElicitationSchema{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Type, false, buffered); err != nil {
+			return fmt.Errorf("ElicitationSchema.type: %w", err)
+		}
+	} else {
+		return seqTooShort("ElicitationSchema", 0, 6)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeMap(raw, &v.Properties, false, func(raw json.RawMessage, dst *ElicitationPropertySchema) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ElicitationSchema.properties: %w", err)
+		}
+	} else {
+		return seqTooShort("ElicitationSchema", 2, 6)
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Required, func(raw json.RawMessage, dst *[]string) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, buffered)
+			})
+		}); err != nil {
+			return fmt.Errorf("ElicitationSchema.required: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 6 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Type discriminator for elicitation schemas.
 type ElicitationSchemaType string
 
@@ -2535,6 +7665,25 @@ const (
 	// Object schema type.
 	ElicitationSchemaTypeObject ElicitationSchemaType = "object"
 )
+
+// UnmarshalJSON reads a member as a string or in the map form
+// {"variant": null}, and rejects any other value, as Rust's closed enum does.
+func (v *ElicitationSchemaType) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("ElicitationSchemaType: %w", err)
+	}
+	switch ElicitationSchemaType(s) {
+	case ElicitationSchemaTypeObject:
+		*v = ElicitationSchemaType(s)
+	default:
+		return fmt.Errorf("ElicitationSchemaType: unknown variant %q", s)
+	}
+	_ = mapForm
+	return nil
+}
+
+func (v *ElicitationSchemaType) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
 
 // Session-scoped elicitation, optionally tied to a specific tool call.
 // When toolCallId is set, the elicitation is tied to a specific tool call.
@@ -2549,6 +7698,62 @@ type ElicitationSessionScope struct {
 	ToolCallID *ToolCallId `json:"toolCallId,omitempty"`
 }
 
+func (v *ElicitationSessionScope) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ElicitationSessionScope) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ElicitationSessionScope) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ElicitationSessionScope{}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("ElicitationSessionScope.sessionId: %w", err)
+		}
+	} else {
+		return missingField("ElicitationSessionScope", "sessionId")
+	}
+	if raw, ok := raws.get("toolCallId"); ok {
+		if err := decodeValue(raw, &v.ToolCallID, true, true); err != nil {
+			v.ToolCallID = nil
+		}
+	}
+	return nil
+}
+
+func (v *ElicitationSessionScope) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ElicitationSessionScope{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("ElicitationSessionScope.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("ElicitationSessionScope", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.ToolCallID, true, true); err != nil {
+			v.ToolCallID = nil
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // URL-based elicitation capabilities.
 // Supplying {} means the client supports URL-based elicitation.
 type ElicitationUrlCapabilities struct {
@@ -2557,6 +7762,53 @@ type ElicitationUrlCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *ElicitationUrlCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *ElicitationUrlCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ElicitationUrlCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ElicitationUrlCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *ElicitationUrlCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ElicitationUrlCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // URL-based elicitation mode where the client directs the user to a URL.
@@ -2622,17 +7874,56 @@ func (v ElicitationUrlMode) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *ElicitationUrlMode) UnmarshalJSON(data []byte) error {
+func (v *ElicitationUrlMode) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ElicitationUrlMode) decodeJSON(data []byte, buffered bool) error {
 	*v = ElicitationUrlMode{}
-	if err := json.Unmarshal(data, (*elicitationUrlModeShadow)(v)); err != nil {
-		return err
+	raws, err := splitObject(data)
+	object := err == nil && raws != nil
+	if !object {
+		return fmt.Errorf("ElicitationUrlMode: expected an object")
 	}
-	if hasKeys(data, "sessionId") {
-		v.Session = new(ElicitationSessionScope)
-		return json.Unmarshal(data, v.Session)
-	} else if hasKeys(data, "requestId") {
-		v.Request = new(ElicitationRequestScope)
-		return json.Unmarshal(data, v.Request)
+	if raw, ok := raws.get("elicitationId"); ok {
+		if err := decodeValue(raw, &v.ElicitationID, false, buffered); err != nil {
+			return fmt.Errorf("ElicitationUrlMode.elicitationId: %w", err)
+		}
+	} else {
+		return missingField("ElicitationUrlMode", "elicitationId")
+	}
+	if raw, ok := raws.get("url"); ok {
+		if err := decodeValue(raw, &v.URL, false, buffered); err != nil {
+			return fmt.Errorf("ElicitationUrlMode.url: %w", err)
+		}
+	} else {
+		return missingField("ElicitationUrlMode", "url")
+	}
+	err = nil
+	if !object || hasKeys(raws, "sessionId") {
+		payload := new(ElicitationSessionScope)
+		if err = func() error {
+			if object {
+				return payload.decodeFields(data, raws, true)
+			}
+			return payload.decodeJSON(data, true)
+		}(); err == nil {
+			v.Session = payload
+			return nil
+		}
+	}
+	if !object || hasKeys(raws, "requestId") {
+		payload := new(ElicitationRequestScope)
+		if err = func() error {
+			if object {
+				return payload.decodeFields(data, raws, true)
+			}
+			return payload.decodeJSON(data, true)
+		}(); err == nil {
+			v.Request = payload
+			return nil
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("ElicitationUrlMode: payload matches no variant: %w", err)
 	}
 	return fmt.Errorf("ElicitationUrlMode: payload matches no variant")
 }
@@ -2649,6 +7940,77 @@ type EmbeddedResource struct {
 	Annotations *Annotations `json:"annotations,omitempty"`
 	// Embedded resource payload, either text or binary data.
 	Resource EmbeddedResourceResource `json:"resource"`
+}
+
+func (v *EmbeddedResource) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *EmbeddedResource) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *EmbeddedResource) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = EmbeddedResource{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("annotations"); ok {
+		if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
+			v.Annotations = nil
+		}
+	}
+	if raw, ok := raws.get("resource"); ok {
+		if err := decodeValue(raw, &v.Resource, false, buffered); err != nil {
+			return fmt.Errorf("EmbeddedResource.resource: %w", err)
+		}
+	} else {
+		return missingField("EmbeddedResource", "resource")
+	}
+	return nil
+}
+
+func (v *EmbeddedResource) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = EmbeddedResource{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Resource, false, buffered); err != nil {
+			return fmt.Errorf("EmbeddedResource.resource: %w", err)
+		}
+	} else {
+		return seqTooShort("EmbeddedResource", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
+			v.Annotations = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Resource content that can be embedded in a message.
@@ -2700,14 +8062,39 @@ func (v EmbeddedResourceResource) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *EmbeddedResourceResource) UnmarshalJSON(data []byte) error {
+func (v *EmbeddedResourceResource) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *EmbeddedResourceResource) decodeJSON(data []byte, buffered bool) error {
 	*v = EmbeddedResourceResource{}
-	if hasKeys(data, "text", "uri") {
-		v.TextResourceContents = new(TextResourceContents)
-		return json.Unmarshal(data, v.TextResourceContents)
-	} else if hasKeys(data, "blob", "uri") {
-		v.BlobResourceContents = new(BlobResourceContents)
-		return json.Unmarshal(data, v.BlobResourceContents)
+	raws, err := splitObject(data)
+	object := err == nil && raws != nil
+	err = nil
+	if !object || hasKeys(raws, "text", "uri") {
+		payload := new(TextResourceContents)
+		if err = func() error {
+			if object {
+				return payload.decodeFields(data, raws, true)
+			}
+			return payload.decodeJSON(data, true)
+		}(); err == nil {
+			v.TextResourceContents = payload
+			return nil
+		}
+	}
+	if !object || hasKeys(raws, "blob", "uri") {
+		payload := new(BlobResourceContents)
+		if err = func() error {
+			if object {
+				return payload.decodeFields(data, raws, true)
+			}
+			return payload.decodeJSON(data, true)
+		}(); err == nil {
+			v.BlobResourceContents = payload
+			return nil
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("EmbeddedResourceResource: payload matches no variant: %w", err)
 	}
 	return fmt.Errorf("EmbeddedResourceResource: payload matches no variant")
 }
@@ -2728,6 +8115,96 @@ type EnumOption struct {
 	Title string `json:"title"`
 }
 
+func (v *EnumOption) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *EnumOption) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *EnumOption) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = EnumOption{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("const"); ok {
+		if err := decodeValue(raw, &v.Const, false, buffered); err != nil {
+			return fmt.Errorf("EnumOption.const: %w", err)
+		}
+	} else {
+		return missingField("EnumOption", "const")
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+			return fmt.Errorf("EnumOption.title: %w", err)
+		}
+	} else {
+		return missingField("EnumOption", "title")
+	}
+	return nil
+}
+
+func (v *EnumOption) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = EnumOption{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Const, false, buffered); err != nil {
+			return fmt.Errorf("EnumOption.const: %w", err)
+		}
+	} else {
+		return seqTooShort("EnumOption", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+			return fmt.Errorf("EnumOption.title: %w", err)
+		}
+	} else {
+		return seqTooShort("EnumOption", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // An environment variable to set when launching a process.
 type EnvVariable struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -2739,6 +8216,81 @@ type EnvVariable struct {
 	Name string `json:"name"`
 	// The value to set for the environment variable.
 	Value string `json:"value"`
+}
+
+func (v *EnvVariable) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *EnvVariable) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *EnvVariable) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = EnvVariable{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("EnvVariable.name: %w", err)
+		}
+	} else {
+		return missingField("EnvVariable", "name")
+	}
+	if raw, ok := raws.get("value"); ok {
+		if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+			return fmt.Errorf("EnvVariable.value: %w", err)
+		}
+	} else {
+		return missingField("EnvVariable", "value")
+	}
+	return nil
+}
+
+func (v *EnvVariable) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = EnvVariable{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("EnvVariable.name: %w", err)
+		}
+	} else {
+		return seqTooShort("EnvVariable", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+			return fmt.Errorf("EnvVariable.value: %w", err)
+		}
+	} else {
+		return seqTooShort("EnvVariable", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // JSON-RPC error object.
@@ -2758,6 +8310,77 @@ type Error struct {
 	// A string providing a short description of the error.
 	// The message should be limited to a concise single sentence.
 	Message string `json:"message"`
+}
+
+func (v *Error) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Error) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Error) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Error{}
+	if raw, ok := raws.get("code"); ok {
+		if err := decodeValue(raw, &v.Code, false, buffered); err != nil {
+			return fmt.Errorf("Error.code: %w", err)
+		}
+	} else {
+		return missingField("Error", "code")
+	}
+	if raw, ok := raws.get("data"); ok {
+		if err := decodePtr(raw, &v.Data, true, true); err != nil {
+			v.Data = nil
+		}
+	}
+	if raw, ok := raws.get("message"); ok {
+		if err := decodeValue(raw, &v.Message, false, buffered); err != nil {
+			return fmt.Errorf("Error.message: %w", err)
+		}
+	} else {
+		return missingField("Error", "message")
+	}
+	return nil
+}
+
+func (v *Error) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Error{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Code, false, buffered); err != nil {
+			return fmt.Errorf("Error.code: %w", err)
+		}
+	} else {
+		return seqTooShort("Error", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Message, false, buffered); err != nil {
+			return fmt.Errorf("Error.message: %w", err)
+		}
+	} else {
+		return seqTooShort("Error", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodePtr(raw, &v.Data, true, true); err != nil {
+			v.Data = nil
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Predefined error codes for common JSON-RPC and ACP-specific errors.
@@ -2878,19 +8501,34 @@ func (v ErrorData) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *ErrorData) UnmarshalJSON(data []byte) error {
+func (v *ErrorData) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ErrorData) decodeJSON(data []byte, buffered bool) error {
 	*v = ErrorData{}
-	if hasKeys(data, "requested", "supported") {
+	raws, err := splitObject(data)
+	object := err == nil && raws != nil
+	err = nil
+	if !object || hasKeys(raws, "requested", "supported") {
 		payload := new(UnsupportedProtocolVersionErrorData)
-		if json.Unmarshal(data, payload) == nil {
+		if err = func() error {
+			if object {
+				return payload.decodeFields(data, raws, true)
+			}
+			return payload.decodeJSON(data, true)
+		}(); err == nil {
 			v.UnsupportedProtocolVersion = payload
 			v.raw, v.rawVariant = append(json.RawMessage(nil), data...), "UnsupportedProtocolVersion"
 			return nil
 		}
 	}
-	if hasKeys(data, "sessionId") {
+	if !object || hasKeys(raws, "sessionId") {
 		payload := new(SessionNotFoundErrorData)
-		if json.Unmarshal(data, payload) == nil {
+		if err = func() error {
+			if object {
+				return payload.decodeFields(data, raws, true)
+			}
+			return payload.decodeJSON(data, true)
+		}(); err == nil {
 			v.SessionNotFound = payload
 			v.raw, v.rawVariant = append(json.RawMessage(nil), data...), "SessionNotFound"
 			return nil
@@ -2906,6 +8544,47 @@ type ErrorStopReason struct {
 	// Optional. Omitted and null are equivalent and mean the agent is not reporting failure details.
 	// Agents SHOULD include it.
 	Error *Error `json:"error,omitempty"`
+}
+
+func (v *ErrorStopReason) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ErrorStopReason) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ErrorStopReason) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ErrorStopReason{}
+	if raw, ok := raws.get("error"); ok {
+		if err := decodePtr(raw, &v.Error, true, true); err != nil {
+			v.Error = nil
+		}
+	}
+	return nil
+}
+
+func (v *ErrorStopReason) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ErrorStopReason{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Error, true, true); err != nil {
+			v.Error = nil
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Allows either side to send an arbitrary notification that is not part of the ACP spec.
@@ -2963,6 +8642,130 @@ type ForkSessionRequest struct {
 	SystemPrompt *SystemPrompt `json:"systemPrompt,omitempty"`
 }
 
+func (v *ForkSessionRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ForkSessionRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ForkSessionRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ForkSessionRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("additionalDirectories"); ok {
+		if isNull(raw) {
+			v.AdditionalDirectories = nil
+		} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ForkSessionRequest.additionalDirectories: %w", err)
+		}
+	}
+	if raw, ok := raws.get("cwd"); ok {
+		if err := decodeValue(raw, &v.Cwd, false, buffered); err != nil {
+			return fmt.Errorf("ForkSessionRequest.cwd: %w", err)
+		}
+	} else {
+		return missingField("ForkSessionRequest", "cwd")
+	}
+	if raw, ok := raws.get("mcpServers"); ok {
+		if isNull(raw) {
+			v.MCPServers = nil
+		} else if err := decodeList(raw, &v.MCPServers, false, false, func(raw json.RawMessage, dst *McpServer) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ForkSessionRequest.mcpServers: %w", err)
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("ForkSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("ForkSessionRequest", "sessionId")
+	}
+	if raw, ok := raws.get("systemPrompt"); ok {
+		if err := decodePtr(raw, &v.SystemPrompt, true, buffered); err != nil {
+			return fmt.Errorf("ForkSessionRequest.systemPrompt: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *ForkSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ForkSessionRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("ForkSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("ForkSessionRequest", 0, 6)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Cwd, false, buffered); err != nil {
+			return fmt.Errorf("ForkSessionRequest.cwd: %w", err)
+		}
+	} else {
+		return seqTooShort("ForkSessionRequest", 1, 6)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if isNull(raw) {
+			v.AdditionalDirectories = nil
+		} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ForkSessionRequest.additionalDirectories: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if isNull(raw) {
+			v.MCPServers = nil
+		} else if err := decodeList(raw, &v.MCPServers, false, false, func(raw json.RawMessage, dst *McpServer) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ForkSessionRequest.mcpServers: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodePtr(raw, &v.SystemPrompt, true, buffered); err != nil {
+			return fmt.Errorf("ForkSessionRequest.systemPrompt: %w", err)
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 6 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Response from forking an existing session.
@@ -2986,6 +8789,96 @@ type ForkSessionResponse struct {
 	SessionID SessionId `json:"sessionId"`
 }
 
+func (v *ForkSessionResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ForkSessionResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ForkSessionResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ForkSessionResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("availableCommands"); ok {
+		if err := decodeList(raw, &v.AvailableCommands, false, true, func(raw json.RawMessage, dst *AvailableCommand) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.AvailableCommands = nil
+		}
+	}
+	if raw, ok := raws.get("configOptions"); ok {
+		if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ConfigOptions = nil
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("ForkSessionResponse.sessionId: %w", err)
+		}
+	} else {
+		return missingField("ForkSessionResponse", "sessionId")
+	}
+	return nil
+}
+
+func (v *ForkSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ForkSessionResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("ForkSessionResponse.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("ForkSessionResponse", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ConfigOptions = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeList(raw, &v.AvailableCommands, false, true, func(raw json.RawMessage, dst *AvailableCommand) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.AvailableCommands = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // An HTTP header to set when making requests to the MCP server.
 type HttpHeader struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -2997,6 +8890,81 @@ type HttpHeader struct {
 	Name string `json:"name"`
 	// The value to set for the HTTP header.
 	Value string `json:"value"`
+}
+
+func (v *HttpHeader) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *HttpHeader) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *HttpHeader) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = HttpHeader{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("HttpHeader.name: %w", err)
+		}
+	} else {
+		return missingField("HttpHeader", "name")
+	}
+	if raw, ok := raws.get("value"); ok {
+		if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+			return fmt.Errorf("HttpHeader.value: %w", err)
+		}
+	} else {
+		return missingField("HttpHeader", "value")
+	}
+	return nil
+}
+
+func (v *HttpHeader) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = HttpHeader{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("HttpHeader.name: %w", err)
+		}
+	} else {
+		return seqTooShort("HttpHeader", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+			return fmt.Errorf("HttpHeader.value: %w", err)
+		}
+	} else {
+		return seqTooShort("HttpHeader", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // An optionally-sized icon that can be displayed in a user interface.
@@ -3024,6 +8992,107 @@ type Icon struct {
 	Theme *IconTheme `json:"theme,omitempty"`
 }
 
+func (v *Icon) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Icon) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Icon) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Icon{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("mimeType"); ok {
+		if err := decodeValue(raw, &v.MimeType, true, true); err != nil {
+			v.MimeType = nil
+		}
+	}
+	if raw, ok := raws.get("sizes"); ok {
+		if err := decodeNullable(raw, &v.Sizes, func(raw json.RawMessage, dst *[]string) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Sizes = Nullable[[]string]{}
+		}
+	}
+	if raw, ok := raws.get("src"); ok {
+		if err := decodeValue(raw, &v.Src, false, buffered); err != nil {
+			return fmt.Errorf("Icon.src: %w", err)
+		}
+	} else {
+		return missingField("Icon", "src")
+	}
+	if raw, ok := raws.get("theme"); ok {
+		if err := decodeValue(raw, &v.Theme, true, true); err != nil {
+			v.Theme = nil
+		}
+	}
+	return nil
+}
+
+func (v *Icon) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Icon{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Src, false, buffered); err != nil {
+			return fmt.Errorf("Icon.src: %w", err)
+		}
+	} else {
+		return seqTooShort("Icon", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.MimeType, true, true); err != nil {
+			v.MimeType = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Sizes, func(raw json.RawMessage, dst *[]string) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Sizes = Nullable[[]string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeValue(raw, &v.Theme, true, true); err != nil {
+			v.Theme = nil
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Theme an icon is designed for.
 type IconTheme string
 
@@ -3033,6 +9102,27 @@ const (
 	// Icon designed for dark backgrounds.
 	IconThemeDark IconTheme = "dark"
 )
+
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *IconTheme) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("IconTheme: %w", err)
+	}
+	switch IconTheme(s) {
+	case IconThemeLight, IconThemeDark:
+		*v = IconTheme(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("IconTheme: unknown variant %q", s)
+		}
+		*v = IconTheme(s)
+	}
+	return nil
+}
+
+func (v *IconTheme) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
 
 // No foreground work is active. Background activity may continue.
 // Agents SHOULD include a stopReason when the idle transition ends foreground
@@ -3105,39 +9195,58 @@ func (v IdleStateUpdate) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *IdleStateUpdate) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+func (v *IdleStateUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *IdleStateUpdate) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *IdleStateUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = IdleStateUpdate{}
-	if raw, ok := raws["_meta"]; ok {
-		var value Nullable[Meta]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Meta = value
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	if raw, ok := raws["background"]; ok {
-		var value Nullable[[]BackgroundWork]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Background = value
+	if raw, ok := raws.get("background"); ok {
+		if err := decodeNullable(raw, &v.Background, func(raw json.RawMessage, dst *[]BackgroundWork) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *BackgroundWork) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Background = Nullable[[]BackgroundWork]{}
 		}
 	}
-	if raw, ok := raws["usage"]; ok {
-		var value *Usage
-		if json.Unmarshal(raw, &value) == nil {
-			v.Usage = value
+	if raw, ok := raws.get("usage"); ok {
+		if err := decodePtr(raw, &v.Usage, true, true); err != nil {
+			v.Usage = nil
 		}
 	}
-	if raw, ok := raws["stopReason"]; ok {
-		var tag *string
-		if json.Unmarshal(raw, &tag) == nil && tag != nil {
-			v.StopReason = (*StopReason)(tag)
+	if raw, ok := raws.get("stopReason"); ok {
+		if tag, ok := decodeTag(raw, true, idleStateUpdateTags); ok {
+			value := StopReason(tag)
+			v.StopReason = &value
+			if v.decodeStopReasonVariant(raws) != nil {
+				// The flattened Option reads a variant that does not decode as not reported.
+				v.StopReason = nil
+				v.Error = nil
+				v.StopReasonFields = nil
+			}
 		}
 	}
-	if v.StopReason == nil {
-		return nil
-	}
+	return nil
+}
+
+var idleStateUpdateTags = []string{"end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled", "error"}
+
+// decodeStopReasonVariant decodes the fields of the flattened stopReason variant.
+func (v *IdleStateUpdate) decodeStopReasonVariant(raws rawObject) error {
 	switch *v.StopReason {
 	case "end_turn":
 	case "max_tokens":
@@ -3145,15 +9254,14 @@ func (v *IdleStateUpdate) UnmarshalJSON(data []byte) error {
 	case "refusal":
 	case "cancelled":
 	case "error":
-		if raw, ok := raws["error"]; ok {
-			var value *Error
-			if json.Unmarshal(raw, &value) == nil {
-				v.Error = value
+		if raw, ok := raws.get("error"); ok {
+			if err := decodePtr(raw, &v.Error, true, true); err != nil {
+				v.Error = nil
 			}
 		}
 	default:
-		for key, raw := range raws {
-			switch key {
+		for _, m := range raws {
+			switch key, raw := string(m.key), m.raw; key {
 			case "_meta", "background", "stopReason", "usage":
 			default:
 				if v.StopReasonFields == nil {
@@ -3200,6 +9308,27 @@ const (
 	StopReasonError StopReason = "error"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *StopReason) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("StopReason: %w", err)
+	}
+	switch StopReason(s) {
+	case StopReasonEndTurn, StopReasonMaxTokens, StopReasonMaxTurnRequests, StopReasonRefusal, StopReasonCancelled, StopReasonError:
+		*v = StopReason(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("StopReason: unknown variant %q", s)
+		}
+		*v = StopReason(s)
+	}
+	return nil
+}
+
+func (v *StopReason) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // An image provided to or from an LLM.
 type ImageContent struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -3217,6 +9346,107 @@ type ImageContent struct {
 	// URI associated with this resource or media payload.
 	// Omitted and null are equivalent and mean no URI is associated with the image.
 	URI Nullable[string] `json:"uri,omitzero"`
+}
+
+func (v *ImageContent) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ImageContent) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ImageContent) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ImageContent{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("annotations"); ok {
+		if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
+			v.Annotations = nil
+		}
+	}
+	if raw, ok := raws.get("data"); ok {
+		if err := decodeValue(raw, &v.Data, false, buffered); err != nil {
+			return fmt.Errorf("ImageContent.data: %w", err)
+		}
+	} else {
+		return missingField("ImageContent", "data")
+	}
+	if raw, ok := raws.get("mimeType"); ok {
+		if err := decodeValue(raw, &v.MimeType, false, buffered); err != nil {
+			return fmt.Errorf("ImageContent.mimeType: %w", err)
+		}
+	} else {
+		return missingField("ImageContent", "mimeType")
+	}
+	if raw, ok := raws.get("uri"); ok {
+		if err := decodeNullable(raw, &v.URI, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.URI = Nullable[string]{}
+		}
+	}
+	return nil
+}
+
+func (v *ImageContent) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ImageContent{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Data, false, buffered); err != nil {
+			return fmt.Errorf("ImageContent.data: %w", err)
+		}
+	} else {
+		return seqTooShort("ImageContent", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.MimeType, false, buffered); err != nil {
+			return fmt.Errorf("ImageContent.mimeType: %w", err)
+		}
+	} else {
+		return seqTooShort("ImageContent", 1, 5)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.URI, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.URI = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
+			v.Annotations = nil
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Metadata about the implementation of the client or agent.
@@ -3239,6 +9469,96 @@ type Implementation struct {
 	// Version of the implementation. Can be displayed to the user or used
 	// for debugging or metrics purposes. (e.g. "1.0.0").
 	Version string `json:"version"`
+}
+
+func (v *Implementation) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Implementation) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Implementation) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Implementation{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("Implementation.name: %w", err)
+		}
+	} else {
+		return missingField("Implementation", "name")
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("version"); ok {
+		if err := decodeValue(raw, &v.Version, false, buffered); err != nil {
+			return fmt.Errorf("Implementation.version: %w", err)
+		}
+	} else {
+		return missingField("Implementation", "version")
+	}
+	return nil
+}
+
+func (v *Implementation) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Implementation{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("Implementation.name: %w", err)
+		}
+	} else {
+		return seqTooShort("Implementation", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.Version, false, buffered); err != nil {
+			return fmt.Errorf("Implementation.version: %w", err)
+		}
+	} else {
+		return seqTooShort("Implementation", 2, 4)
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -3278,6 +9598,92 @@ type InitializeRequest struct {
 	ProtocolVersion ProtocolVersion `json:"protocolVersion"`
 }
 
+func (v *InitializeRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *InitializeRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *InitializeRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = InitializeRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("capabilities"); ok {
+		if err := decodePtr(raw, &v.Capabilities, false, true); err != nil {
+			v.Capabilities = nil
+		}
+	}
+	if raw, ok := raws.get("info"); ok {
+		if err := decodeValue(raw, &v.Info, false, buffered); err != nil {
+			return fmt.Errorf("InitializeRequest.info: %w", err)
+		}
+	} else {
+		return missingField("InitializeRequest", "info")
+	}
+	if raw, ok := raws.get("protocolVersion"); ok {
+		if err := decodeValue(raw, &v.ProtocolVersion, false, buffered); err != nil {
+			return fmt.Errorf("InitializeRequest.protocolVersion: %w", err)
+		}
+	} else {
+		return missingField("InitializeRequest", "protocolVersion")
+	}
+	return nil
+}
+
+func (v *InitializeRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = InitializeRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ProtocolVersion, false, buffered); err != nil {
+			return fmt.Errorf("InitializeRequest.protocolVersion: %w", err)
+		}
+	} else {
+		return seqTooShort("InitializeRequest", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Info, false, buffered); err != nil {
+			return fmt.Errorf("InitializeRequest.info: %w", err)
+		}
+	} else {
+		return seqTooShort("InitializeRequest", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodePtr(raw, &v.Capabilities, false, true); err != nil {
+			v.Capabilities = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response to the initialize method.
 // Contains the negotiated protocol version and agent capabilities.
 // See protocol docs: Initialization
@@ -3304,6 +9710,107 @@ type InitializeResponse struct {
 	ProtocolVersion ProtocolVersion `json:"protocolVersion"`
 }
 
+func (v *InitializeResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *InitializeResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *InitializeResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = InitializeResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("authMethods"); ok {
+		if err := decodeList(raw, &v.AuthMethods, false, true, func(raw json.RawMessage, dst *AuthMethod) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.AuthMethods = nil
+		}
+	}
+	if raw, ok := raws.get("capabilities"); ok {
+		if err := decodePtr(raw, &v.Capabilities, false, true); err != nil {
+			v.Capabilities = nil
+		}
+	}
+	if raw, ok := raws.get("info"); ok {
+		if err := decodeValue(raw, &v.Info, false, buffered); err != nil {
+			return fmt.Errorf("InitializeResponse.info: %w", err)
+		}
+	} else {
+		return missingField("InitializeResponse", "info")
+	}
+	if raw, ok := raws.get("protocolVersion"); ok {
+		if err := decodeValue(raw, &v.ProtocolVersion, false, buffered); err != nil {
+			return fmt.Errorf("InitializeResponse.protocolVersion: %w", err)
+		}
+	} else {
+		return missingField("InitializeResponse", "protocolVersion")
+	}
+	return nil
+}
+
+func (v *InitializeResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = InitializeResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ProtocolVersion, false, buffered); err != nil {
+			return fmt.Errorf("InitializeResponse.protocolVersion: %w", err)
+		}
+	} else {
+		return seqTooShort("InitializeResponse", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Info, false, buffered); err != nil {
+			return fmt.Errorf("InitializeResponse.info: %w", err)
+		}
+	} else {
+		return seqTooShort("InitializeResponse", 1, 5)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodePtr(raw, &v.Capabilities, false, true); err != nil {
+			v.Capabilities = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeList(raw, &v.AuthMethods, false, true, func(raw json.RawMessage, dst *AuthMethod) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.AuthMethods = nil
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Schema for integer properties in an elicitation form.
 type IntegerPropertySchema struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -3328,6 +9835,126 @@ type IntegerPropertySchema struct {
 	Title Nullable[string] `json:"title,omitzero"`
 }
 
+func (v *IntegerPropertySchema) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *IntegerPropertySchema) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *IntegerPropertySchema) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = IntegerPropertySchema{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("default"); ok {
+		if err := decodeNullable(raw, &v.Default, func(raw json.RawMessage, dst *int64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Default = Nullable[int64]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("maximum"); ok {
+		if err := decodeNullable(raw, &v.Maximum, func(raw json.RawMessage, dst *int64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("IntegerPropertySchema.maximum: %w", err)
+		}
+	}
+	if raw, ok := raws.get("minimum"); ok {
+		if err := decodeNullable(raw, &v.Minimum, func(raw json.RawMessage, dst *int64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("IntegerPropertySchema.minimum: %w", err)
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	return nil
+}
+
+func (v *IntegerPropertySchema) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = IntegerPropertySchema{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Minimum, func(raw json.RawMessage, dst *int64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("IntegerPropertySchema.minimum: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Maximum, func(raw json.RawMessage, dst *int64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("IntegerPropertySchema.maximum: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Default, func(raw json.RawMessage, dst *int64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Default = Nullable[int64]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 6 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Request parameters for providers/list.
@@ -3337,6 +9964,51 @@ type ListProvidersRequest struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *ListProvidersRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ListProvidersRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ListProvidersRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ListProvidersRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *ListProvidersRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ListProvidersRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -3350,6 +10022,70 @@ type ListProvidersResponse struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// Configurable providers with current routing info suitable for UI display.
 	Providers []ProviderInfo `json:"providers"`
+}
+
+func (v *ListProvidersResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ListProvidersResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ListProvidersResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ListProvidersResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("providers"); ok {
+		if err := decodeList(raw, &v.Providers, false, false, func(raw json.RawMessage, dst *ProviderInfo) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ListProvidersResponse.providers: %w", err)
+		}
+	} else {
+		return missingField("ListProvidersResponse", "providers")
+	}
+	return nil
+}
+
+func (v *ListProvidersResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ListProvidersResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeList(raw, &v.Providers, false, false, func(raw json.RawMessage, dst *ProviderInfo) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ListProvidersResponse.providers: %w", err)
+		}
+	} else {
+		return seqTooShort("ListProvidersResponse", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Request parameters for listing existing sessions.
@@ -3376,6 +10112,84 @@ type ListSessionsRequest struct {
 	Cwd *AbsolutePath `json:"cwd,omitempty"`
 }
 
+func (v *ListSessionsRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ListSessionsRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ListSessionsRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ListSessionsRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("archived"); ok {
+		if err := decodeValue(raw, &v.Archived, true, buffered); err != nil {
+			return fmt.Errorf("ListSessionsRequest.archived: %w", err)
+		}
+	}
+	if raw, ok := raws.get("cursor"); ok {
+		if err := decodeValue(raw, &v.Cursor, true, buffered); err != nil {
+			return fmt.Errorf("ListSessionsRequest.cursor: %w", err)
+		}
+	}
+	if raw, ok := raws.get("cwd"); ok {
+		if err := decodeValue(raw, &v.Cwd, true, buffered); err != nil {
+			return fmt.Errorf("ListSessionsRequest.cwd: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *ListSessionsRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ListSessionsRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Cwd, true, buffered); err != nil {
+			return fmt.Errorf("ListSessionsRequest.cwd: %w", err)
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Cursor, true, buffered); err != nil {
+			return fmt.Errorf("ListSessionsRequest.cursor: %w", err)
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.Archived, true, buffered); err != nil {
+			return fmt.Errorf("ListSessionsRequest.archived: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response from listing sessions.
 type ListSessionsResponse struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -3389,6 +10203,81 @@ type ListSessionsResponse struct {
 	NextCursor *SessionListCursor `json:"nextCursor,omitempty"`
 	// Array of session information objects.
 	Sessions []SessionInfo `json:"sessions"`
+}
+
+func (v *ListSessionsResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ListSessionsResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ListSessionsResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ListSessionsResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("nextCursor"); ok {
+		if err := decodeValue(raw, &v.NextCursor, true, buffered); err != nil {
+			return fmt.Errorf("ListSessionsResponse.nextCursor: %w", err)
+		}
+	}
+	if raw, ok := raws.get("sessions"); ok {
+		if err := decodeList(raw, &v.Sessions, false, true, func(raw json.RawMessage, dst *SessionInfo) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Sessions = []SessionInfo{}
+		}
+	} else {
+		return missingField("ListSessionsResponse", "sessions")
+	}
+	return nil
+}
+
+func (v *ListSessionsResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ListSessionsResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeList(raw, &v.Sessions, false, true, func(raw json.RawMessage, dst *SessionInfo) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Sessions = []SessionInfo{}
+		}
+	} else {
+		return seqTooShort("ListSessionsResponse", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.NextCursor, true, buffered); err != nil {
+			return fmt.Errorf("ListSessionsResponse.nextCursor: %w", err)
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -3412,6 +10301,27 @@ const (
 	LlmProtocolBedrock LlmProtocol = "bedrock"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *LlmProtocol) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("LlmProtocol: %w", err)
+	}
+	switch LlmProtocol(s) {
+	case LlmProtocolAnthropic, LlmProtocolOpenai, LlmProtocolAzure, LlmProtocolVertex, LlmProtocolBedrock:
+		*v = LlmProtocol(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("LlmProtocol: unknown variant %q", s)
+		}
+		*v = LlmProtocol(s)
+	}
+	return nil
+}
+
+func (v *LlmProtocol) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // Request parameters for the auth/login method.
 // Specifies which authentication method to use.
 // Agents MUST support this method when their initialize response included
@@ -3428,6 +10338,66 @@ type LoginAuthRequest struct {
 	MethodID AuthMethodId `json:"methodId"`
 }
 
+func (v *LoginAuthRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *LoginAuthRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *LoginAuthRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = LoginAuthRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("methodId"); ok {
+		if err := decodeValue(raw, &v.MethodID, false, buffered); err != nil {
+			return fmt.Errorf("LoginAuthRequest.methodId: %w", err)
+		}
+	} else {
+		return missingField("LoginAuthRequest", "methodId")
+	}
+	return nil
+}
+
+func (v *LoginAuthRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = LoginAuthRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.MethodID, false, buffered); err != nil {
+			return fmt.Errorf("LoginAuthRequest.methodId: %w", err)
+		}
+	} else {
+		return seqTooShort("LoginAuthRequest", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response to the auth/login method.
 type LoginAuthResponse struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -3435,6 +10405,51 @@ type LoginAuthResponse struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *LoginAuthResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *LoginAuthResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *LoginAuthResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = LoginAuthResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *LoginAuthResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = LoginAuthResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Request parameters for the auth/logout method.
@@ -3450,6 +10465,51 @@ type LogoutAuthRequest struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 }
 
+func (v *LogoutAuthRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *LogoutAuthRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *LogoutAuthRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = LogoutAuthRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *LogoutAuthRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = LogoutAuthRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response to the auth/logout method.
 type LogoutAuthResponse struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -3457,6 +10517,51 @@ type LogoutAuthResponse struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *LogoutAuthResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *LogoutAuthResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *LogoutAuthResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = LogoutAuthResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *LogoutAuthResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = LogoutAuthResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -3469,6 +10574,51 @@ type McpAcpCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *McpAcpCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *McpAcpCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *McpAcpCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = McpAcpCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *McpAcpCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = McpAcpCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // MCP capabilities supported by the agent for session lifecycle requests.
@@ -3494,6 +10644,84 @@ type McpCapabilities struct {
 	Stdio *McpStdioCapabilities `json:"stdio,omitempty"`
 }
 
+func (v *McpCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *McpCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *McpCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = McpCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("acp"); ok {
+		if err := decodePtr(raw, &v.ACP, true, true); err != nil {
+			v.ACP = nil
+		}
+	}
+	if raw, ok := raws.get("http"); ok {
+		if err := decodePtr(raw, &v.HTTP, true, true); err != nil {
+			v.HTTP = nil
+		}
+	}
+	if raw, ok := raws.get("stdio"); ok {
+		if err := decodePtr(raw, &v.Stdio, true, true); err != nil {
+			v.Stdio = nil
+		}
+	}
+	return nil
+}
+
+func (v *McpCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = McpCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Stdio, true, true); err != nil {
+			v.Stdio = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodePtr(raw, &v.HTTP, true, true); err != nil {
+			v.HTTP = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodePtr(raw, &v.ACP, true, true); err != nil {
+			v.ACP = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // An inner MCP error, distinct from an outer ACP binding or runtime error.
 // code and message are required and non-null. data is optional.
@@ -3507,6 +10735,40 @@ type McpError struct {
 	Message string `json:"message"`
 }
 
+func (v *McpError) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *McpError) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *McpError) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = McpError{}
+	if raw, ok := raws.get("code"); ok {
+		if err := decodeValue(raw, &v.Code, false, buffered); err != nil {
+			return fmt.Errorf("McpError.code: %w", err)
+		}
+	} else {
+		return missingField("McpError", "code")
+	}
+	if raw, ok := raws.get("data"); ok {
+		if err := decodeValue(raw, &v.Data, true, buffered); err != nil {
+			return fmt.Errorf("McpError.data: %w", err)
+		}
+	}
+	if raw, ok := raws.get("message"); ok {
+		if err := decodeValue(raw, &v.Message, false, buffered); err != nil {
+			return fmt.Errorf("McpError.message: %w", err)
+		}
+	} else {
+		return missingField("McpError", "message")
+	}
+	return nil
+}
+
 // Capabilities for HTTP MCP server transports.
 // Supplying {} means the agent supports HTTP MCP server transports.
 type McpHttpCapabilities struct {
@@ -3515,6 +10777,51 @@ type McpHttpCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *McpHttpCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *McpHttpCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *McpHttpCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = McpHttpCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *McpHttpCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = McpHttpCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -3629,36 +10936,112 @@ func (v McpServer) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *McpServer) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var mcpServerTags = []string{"http", "acp", "stdio"}
+
+func (v *McpServer) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *McpServer) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *McpServer) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = McpServer{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("McpServer tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, mcpServerTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "http":
+			payload := new(McpServerHttp)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.HTTP = McpServerKindHttp, payload
+				return nil
+			}
+		case "acp":
+			payload := new(McpServerAcp)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.ACP = McpServerKindAcp, payload
+				return nil
+			}
+		case "stdio":
+			payload := new(McpServerStdio)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Stdio = McpServerKindStdio, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "http":
-		v.Kind = McpServerKindHttp
-		v.HTTP = new(McpServerHttp)
-		return json.Unmarshal(data, v.HTTP)
-	case "acp":
-		v.Kind = McpServerKindAcp
-		v.ACP = new(McpServerAcp)
-		return json.Unmarshal(data, v.ACP)
-	case "stdio":
-		v.Kind = McpServerKindStdio
-		v.Stdio = new(McpServerStdio)
-		return json.Unmarshal(data, v.Stdio)
-	default:
+	if tagged && tag != "http" && tag != "acp" && tag != "stdio" {
 		v.Kind = McpServerKind(tag)
-		v.Other = &McpServerOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &McpServerOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("McpServer: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("McpServer", "type")
+	}
+	return fmt.Errorf("McpServer: unknown type tag %s", raw)
+}
+
+func (v *McpServer) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = McpServer{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, mcpServerTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "http":
+			payload := new(McpServerHttp)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.HTTP = McpServerKindHttp, payload
+				return nil
+			}
+		case "acp":
+			payload := new(McpServerAcp)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.ACP = McpServerKindAcp, payload
+				return nil
+			}
+		case "stdio":
+			payload := new(McpServerStdio)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Stdio = McpServerKindStdio, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("McpServer: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("McpServer", "type")
+	}
+	return fmt.Errorf("McpServer: unknown type tag %s", raw)
 }
 
 // UNSTABLE
@@ -3678,6 +11061,81 @@ type McpServerAcp struct {
 	// Providers MUST NOT reuse an ID for multiple ACP-transport MCP servers that are visible
 	// on the same ACP connection.
 	ServerID McpServerAcpId `json:"serverId"`
+}
+
+func (v *McpServerAcp) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *McpServerAcp) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *McpServerAcp) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = McpServerAcp{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("McpServerAcp.name: %w", err)
+		}
+	} else {
+		return missingField("McpServerAcp", "name")
+	}
+	if raw, ok := raws.get("serverId"); ok {
+		if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
+			return fmt.Errorf("McpServerAcp.serverId: %w", err)
+		}
+	} else {
+		return missingField("McpServerAcp", "serverId")
+	}
+	return nil
+}
+
+func (v *McpServerAcp) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = McpServerAcp{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("McpServerAcp.name: %w", err)
+		}
+	} else {
+		return seqTooShort("McpServerAcp", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
+			return fmt.Errorf("McpServerAcp.serverId: %w", err)
+		}
+	} else {
+		return seqTooShort("McpServerAcp", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -3703,6 +11161,100 @@ type McpServerHttp struct {
 	URL string `json:"url"`
 }
 
+func (v *McpServerHttp) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *McpServerHttp) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *McpServerHttp) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = McpServerHttp{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("headers"); ok {
+		if isNull(raw) {
+			v.Headers = nil
+		} else if err := decodeList(raw, &v.Headers, false, false, func(raw json.RawMessage, dst *HttpHeader) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("McpServerHttp.headers: %w", err)
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("McpServerHttp.name: %w", err)
+		}
+	} else {
+		return missingField("McpServerHttp", "name")
+	}
+	if raw, ok := raws.get("url"); ok {
+		if err := decodeValue(raw, &v.URL, false, buffered); err != nil {
+			return fmt.Errorf("McpServerHttp.url: %w", err)
+		}
+	} else {
+		return missingField("McpServerHttp", "url")
+	}
+	return nil
+}
+
+func (v *McpServerHttp) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = McpServerHttp{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("McpServerHttp.name: %w", err)
+		}
+	} else {
+		return seqTooShort("McpServerHttp", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.URL, false, buffered); err != nil {
+			return fmt.Errorf("McpServerHttp.url: %w", err)
+		}
+	} else {
+		return seqTooShort("McpServerHttp", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if isNull(raw) {
+			v.Headers = nil
+		} else if err := decodeList(raw, &v.Headers, false, false, func(raw json.RawMessage, dst *HttpHeader) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("McpServerHttp.headers: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Stdio transport configuration for MCP.
 type McpServerStdio struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -3721,6 +11273,119 @@ type McpServerStdio struct {
 	Name string `json:"name"`
 }
 
+func (v *McpServerStdio) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *McpServerStdio) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *McpServerStdio) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = McpServerStdio{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("args"); ok {
+		if isNull(raw) {
+			v.Args = nil
+		} else if err := decodeList(raw, &v.Args, false, false, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("McpServerStdio.args: %w", err)
+		}
+	}
+	if raw, ok := raws.get("command"); ok {
+		if err := decodeValue(raw, &v.Command, false, buffered); err != nil {
+			return fmt.Errorf("McpServerStdio.command: %w", err)
+		}
+	} else {
+		return missingField("McpServerStdio", "command")
+	}
+	if raw, ok := raws.get("env"); ok {
+		if isNull(raw) {
+			v.Env = nil
+		} else if err := decodeList(raw, &v.Env, false, false, func(raw json.RawMessage, dst *EnvVariable) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("McpServerStdio.env: %w", err)
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("McpServerStdio.name: %w", err)
+		}
+	} else {
+		return missingField("McpServerStdio", "name")
+	}
+	return nil
+}
+
+func (v *McpServerStdio) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = McpServerStdio{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("McpServerStdio.name: %w", err)
+		}
+	} else {
+		return seqTooShort("McpServerStdio", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Command, false, buffered); err != nil {
+			return fmt.Errorf("McpServerStdio.command: %w", err)
+		}
+	} else {
+		return seqTooShort("McpServerStdio", 1, 5)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if isNull(raw) {
+			v.Args = nil
+		} else if err := decodeList(raw, &v.Args, false, false, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("McpServerStdio.args: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if isNull(raw) {
+			v.Env = nil
+		} else if err := decodeList(raw, &v.Env, false, false, func(raw json.RawMessage, dst *EnvVariable) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("McpServerStdio.env: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Capabilities for stdio MCP server transports.
 // Supplying {} means the agent supports stdio MCP server transports.
 type McpStdioCapabilities struct {
@@ -3729,6 +11394,51 @@ type McpStdioCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *McpStdioCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *McpStdioCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *McpStdioCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = McpStdioCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *McpStdioCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = McpStdioCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // An Internet media type identifying the format of protocol content.
@@ -3760,6 +11470,111 @@ type MessageMcpNotification struct {
 	ServerID McpServerAcpId `json:"serverId"`
 }
 
+func (v *MessageMcpNotification) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *MessageMcpNotification) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *MessageMcpNotification) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = MessageMcpNotification{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("method"); ok {
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpNotification.method: %w", err)
+		}
+	} else {
+		return missingField("MessageMcpNotification", "method")
+	}
+	if raw, ok := raws.get("params"); ok {
+		if err := decodeNullable(raw, &v.Params, func(raw json.RawMessage, dst *map[string]any) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("MessageMcpNotification.params: %w", err)
+		}
+	}
+	if raw, ok := raws.get("requestId"); ok {
+		if err := decodeValue(raw, &v.RequestID, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpNotification.requestId: %w", err)
+		}
+	} else {
+		return missingField("MessageMcpNotification", "requestId")
+	}
+	if raw, ok := raws.get("serverId"); ok {
+		if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpNotification.serverId: %w", err)
+		}
+	} else {
+		return missingField("MessageMcpNotification", "serverId")
+	}
+	return nil
+}
+
+func (v *MessageMcpNotification) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = MessageMcpNotification{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpNotification.serverId: %w", err)
+		}
+	} else {
+		return seqTooShort("MessageMcpNotification", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.RequestID, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpNotification.requestId: %w", err)
+		}
+	} else {
+		return seqTooShort("MessageMcpNotification", 1, 5)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpNotification.method: %w", err)
+		}
+	} else {
+		return seqTooShort("MessageMcpNotification", 2, 5)
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Params, func(raw json.RawMessage, dst *map[string]any) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("MessageMcpNotification.params: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // Request parameters for mcp/message, sent from consumer to provider.
 type MessageMcpRequest struct {
@@ -3777,6 +11592,111 @@ type MessageMcpRequest struct {
 	RequestID McpRequestId `json:"requestId"`
 	// The declared ACP MCP server receiving this request.
 	ServerID McpServerAcpId `json:"serverId"`
+}
+
+func (v *MessageMcpRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *MessageMcpRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *MessageMcpRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = MessageMcpRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("method"); ok {
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpRequest.method: %w", err)
+		}
+	} else {
+		return missingField("MessageMcpRequest", "method")
+	}
+	if raw, ok := raws.get("params"); ok {
+		if err := decodeNullable(raw, &v.Params, func(raw json.RawMessage, dst *map[string]any) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("MessageMcpRequest.params: %w", err)
+		}
+	}
+	if raw, ok := raws.get("requestId"); ok {
+		if err := decodeValue(raw, &v.RequestID, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpRequest.requestId: %w", err)
+		}
+	} else {
+		return missingField("MessageMcpRequest", "requestId")
+	}
+	if raw, ok := raws.get("serverId"); ok {
+		if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpRequest.serverId: %w", err)
+		}
+	} else {
+		return missingField("MessageMcpRequest", "serverId")
+	}
+	return nil
+}
+
+func (v *MessageMcpRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = MessageMcpRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpRequest.serverId: %w", err)
+		}
+	} else {
+		return seqTooShort("MessageMcpRequest", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.RequestID, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpRequest.requestId: %w", err)
+		}
+	} else {
+		return seqTooShort("MessageMcpRequest", 1, 5)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpRequest.method: %w", err)
+		}
+	} else {
+		return seqTooShort("MessageMcpRequest", 2, 5)
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Params, func(raw json.RawMessage, dst *map[string]any) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("MessageMcpRequest.params: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -3805,6 +11725,66 @@ type MessageMcpResponseResult struct {
 	Result json.RawMessage `json:"result"`
 }
 
+func (v *MessageMcpResponseResult) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *MessageMcpResponseResult) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *MessageMcpResponseResult) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = MessageMcpResponseResult{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("result"); ok {
+		if err := decodeValue(raw, &v.Result, true, buffered); err != nil {
+			return fmt.Errorf("MessageMcpResponseResult.result: %w", err)
+		}
+	} else {
+		return missingField("MessageMcpResponseResult", "result")
+	}
+	return nil
+}
+
+func (v *MessageMcpResponseResult) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = MessageMcpResponseResult{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Result, true, buffered); err != nil {
+			return fmt.Errorf("MessageMcpResponseResult.result: %w", err)
+		}
+	} else {
+		return seqTooShort("MessageMcpResponseResult", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 type MessageMcpResponseError struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Omitted and null are equivalent and mean no metadata.
@@ -3814,6 +11794,66 @@ type MessageMcpResponseError struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// Required, non-null MCP error object.
 	Error McpError `json:"error"`
+}
+
+func (v *MessageMcpResponseError) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *MessageMcpResponseError) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *MessageMcpResponseError) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = MessageMcpResponseError{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("error"); ok {
+		if err := decodeValue(raw, &v.Error, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpResponseError.error: %w", err)
+		}
+	} else {
+		return missingField("MessageMcpResponseError", "error")
+	}
+	return nil
+}
+
+func (v *MessageMcpResponseError) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = MessageMcpResponseError{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Error, false, buffered); err != nil {
+			return fmt.Errorf("MessageMcpResponseError.error: %w", err)
+		}
+	} else {
+		return seqTooShort("MessageMcpResponseError", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 func (v MessageMcpResponse) MarshalJSON() ([]byte, error) {
@@ -3857,14 +11897,29 @@ func (v MessageMcpResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *MessageMcpResponse) UnmarshalJSON(data []byte) error {
+func (v *MessageMcpResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *MessageMcpResponse) decodeJSON(data []byte, buffered bool) error {
 	*v = MessageMcpResponse{}
-	if hasKeys(data, "result") {
-		v.Result = new(MessageMcpResponseResult)
-		return json.Unmarshal(data, v.Result)
-	} else if hasKeys(data, "error") {
-		v.Error = new(MessageMcpResponseError)
-		return json.Unmarshal(data, v.Error)
+	raws, err := splitObject(data)
+	object := err == nil && raws != nil
+	err = nil
+	if !object || hasKeys(raws, "result") {
+		payload := new(MessageMcpResponseResult)
+		if err = json.Unmarshal(data, payload); err == nil {
+			v.Result = payload
+			return nil
+		}
+	}
+	if !object || hasKeys(raws, "error") {
+		payload := new(MessageMcpResponseError)
+		if err = json.Unmarshal(data, payload); err == nil {
+			v.Error = payload
+			return nil
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("MessageMcpResponse: payload matches no variant: %w", err)
 	}
 	return fmt.Errorf("MessageMcpResponse: payload matches no variant")
 }
@@ -3943,31 +11998,102 @@ func (v MultiSelectItems) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *MultiSelectItems) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var multiSelectItemsTags = []string{"string"}
+
+func (v *MultiSelectItems) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *MultiSelectItems) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *MultiSelectItems) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = MultiSelectItems{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("MultiSelectItems tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, multiSelectItemsTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "string":
+			payload := new(StringMultiSelectItems)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.String = MultiSelectItemsKindString, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "":
-		v.Titled = new(TitledMultiSelectItems)
-		return json.Unmarshal(data, v.Titled)
-	case "string":
-		v.Kind = MultiSelectItemsKindString
-		v.String = new(StringMultiSelectItems)
-		return json.Unmarshal(data, v.String)
-	default:
+	if tagged && tag != "string" {
 		v.Kind = MultiSelectItemsKind(tag)
-		v.Other = &MultiSelectItemsOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &MultiSelectItemsOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	payloadTitled := new(TitledMultiSelectItems)
+	if e := payloadTitled.decodeFields(data, raws, true); e == nil {
+		v.Titled = payloadTitled
+		return nil
+	} else if err == nil {
+		err = e
+	}
+	if err != nil {
+		return fmt.Errorf("MultiSelectItems: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("MultiSelectItems", "type")
+	}
+	return fmt.Errorf("MultiSelectItems: unknown type tag %s", raw)
+}
+
+func (v *MultiSelectItems) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = MultiSelectItems{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, multiSelectItemsTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "string":
+			payload := new(StringMultiSelectItems)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.String = MultiSelectItemsKindString, payload
+				return nil
+			}
+		}
+	}
+	payloadTitled := new(TitledMultiSelectItems)
+	if e := payloadTitled.decodeSeq(items, true); e == nil {
+		v.Titled = payloadTitled
+		return nil
+	} else if err == nil {
+		err = e
+	}
+	if err != nil {
+		return fmt.Errorf("MultiSelectItems: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("MultiSelectItems", "type")
+	}
+	return fmt.Errorf("MultiSelectItems: unknown type tag %s", raw)
 }
 
 // Schema for multi-select (array) properties in an elicitation form.
@@ -3996,6 +12122,147 @@ type MultiSelectPropertySchema struct {
 	Title Nullable[string] `json:"title,omitzero"`
 }
 
+func (v *MultiSelectPropertySchema) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *MultiSelectPropertySchema) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *MultiSelectPropertySchema) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = MultiSelectPropertySchema{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("default"); ok {
+		if err := decodeNullable(raw, &v.Default, func(raw json.RawMessage, dst *[]string) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Default = Nullable[[]string]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("items"); ok {
+		if err := decodeValue(raw, &v.Items, false, buffered); err != nil {
+			return fmt.Errorf("MultiSelectPropertySchema.items: %w", err)
+		}
+	} else {
+		return missingField("MultiSelectPropertySchema", "items")
+	}
+	if raw, ok := raws.get("maxItems"); ok {
+		if err := decodeNullable(raw, &v.MaxItems, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("MultiSelectPropertySchema.maxItems: %w", err)
+		}
+	}
+	if raw, ok := raws.get("minItems"); ok {
+		if err := decodeNullable(raw, &v.MinItems, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("MultiSelectPropertySchema.minItems: %w", err)
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	return nil
+}
+
+func (v *MultiSelectPropertySchema) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = MultiSelectPropertySchema{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.MinItems, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("MultiSelectPropertySchema.minItems: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.MaxItems, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("MultiSelectPropertySchema.maxItems: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeValue(raw, &v.Items, false, buffered); err != nil {
+			return fmt.Errorf("MultiSelectPropertySchema.items: %w", err)
+		}
+	} else {
+		return seqTooShort("MultiSelectPropertySchema", 4, 7)
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Default, func(raw json.RawMessage, dst *[]string) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Default = Nullable[[]string]{}
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 7 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Request parameters for creating a new session.
 // See protocol docs: Creating a Session
 type NewSessionRequest struct {
@@ -4020,6 +12287,115 @@ type NewSessionRequest struct {
 	// own default instructions. Clients MUST only send this when the Agent
 	// advertises session.systemPrompt.
 	SystemPrompt *SystemPrompt `json:"systemPrompt,omitempty"`
+}
+
+func (v *NewSessionRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *NewSessionRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *NewSessionRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = NewSessionRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("additionalDirectories"); ok {
+		if isNull(raw) {
+			v.AdditionalDirectories = nil
+		} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("NewSessionRequest.additionalDirectories: %w", err)
+		}
+	}
+	if raw, ok := raws.get("cwd"); ok {
+		if err := decodeValue(raw, &v.Cwd, false, buffered); err != nil {
+			return fmt.Errorf("NewSessionRequest.cwd: %w", err)
+		}
+	} else {
+		return missingField("NewSessionRequest", "cwd")
+	}
+	if raw, ok := raws.get("mcpServers"); ok {
+		if isNull(raw) {
+			v.MCPServers = nil
+		} else if err := decodeList(raw, &v.MCPServers, false, false, func(raw json.RawMessage, dst *McpServer) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("NewSessionRequest.mcpServers: %w", err)
+		}
+	}
+	if raw, ok := raws.get("systemPrompt"); ok {
+		if err := decodePtr(raw, &v.SystemPrompt, true, buffered); err != nil {
+			return fmt.Errorf("NewSessionRequest.systemPrompt: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *NewSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = NewSessionRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Cwd, false, buffered); err != nil {
+			return fmt.Errorf("NewSessionRequest.cwd: %w", err)
+		}
+	} else {
+		return seqTooShort("NewSessionRequest", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if isNull(raw) {
+			v.AdditionalDirectories = nil
+		} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("NewSessionRequest.additionalDirectories: %w", err)
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if isNull(raw) {
+			v.MCPServers = nil
+		} else if err := decodeList(raw, &v.MCPServers, false, false, func(raw json.RawMessage, dst *McpServer) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("NewSessionRequest.mcpServers: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodePtr(raw, &v.SystemPrompt, true, buffered); err != nil {
+			return fmt.Errorf("NewSessionRequest.systemPrompt: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Response from creating a new session.
@@ -4048,6 +12424,96 @@ type NewSessionResponse struct {
 	SessionID SessionId `json:"sessionId"`
 }
 
+func (v *NewSessionResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *NewSessionResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *NewSessionResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = NewSessionResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("availableCommands"); ok {
+		if err := decodeList(raw, &v.AvailableCommands, false, true, func(raw json.RawMessage, dst *AvailableCommand) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.AvailableCommands = nil
+		}
+	}
+	if raw, ok := raws.get("configOptions"); ok {
+		if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ConfigOptions = nil
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("NewSessionResponse.sessionId: %w", err)
+		}
+	} else {
+		return missingField("NewSessionResponse", "sessionId")
+	}
+	return nil
+}
+
+func (v *NewSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = NewSessionResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("NewSessionResponse.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("NewSessionResponse", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ConfigOptions = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeList(raw, &v.AvailableCommands, false, true, func(raw json.RawMessage, dst *AvailableCommand) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.AvailableCommands = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Fire-and-forget information for the user.
 // Notices are live events rather than session history. Agents must not rely on
 // a notice being received, displayed, or seen by the user.
@@ -4068,6 +12534,96 @@ type Notice struct {
 	Title string `json:"title"`
 }
 
+func (v *Notice) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Notice) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Notice) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Notice{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("severity"); ok {
+		if err := decodeValue(raw, &v.Severity, false, buffered); err != nil {
+			return fmt.Errorf("Notice.severity: %w", err)
+		}
+	} else {
+		return missingField("Notice", "severity")
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+			return fmt.Errorf("Notice.title: %w", err)
+		}
+	} else {
+		return missingField("Notice", "title")
+	}
+	return nil
+}
+
+func (v *Notice) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Notice{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Severity, false, buffered); err != nil {
+			return fmt.Errorf("Notice.severity: %w", err)
+		}
+	} else {
+		return seqTooShort("Notice", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+			return fmt.Errorf("Notice.title: %w", err)
+		}
+	} else {
+		return seqTooShort("Notice", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Severity hint for a session notice.
 type NoticeSeverity string
 
@@ -4079,6 +12635,27 @@ const (
 	// Error notice.
 	NoticeSeverityError NoticeSeverity = "error"
 )
+
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *NoticeSeverity) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("NoticeSeverity: %w", err)
+	}
+	switch NoticeSeverity(s) {
+	case NoticeSeverityInfo, NoticeSeverityWarning, NoticeSeverityError:
+		*v = NoticeSeverity(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("NoticeSeverity: unknown variant %q", s)
+		}
+		*v = NoticeSeverity(s)
+	}
+	return nil
+}
+
+func (v *NoticeSeverity) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
 
 // Schema for number (floating-point) properties in an elicitation form.
 type NumberPropertySchema struct {
@@ -4104,6 +12681,126 @@ type NumberPropertySchema struct {
 	Title Nullable[string] `json:"title,omitzero"`
 }
 
+func (v *NumberPropertySchema) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *NumberPropertySchema) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *NumberPropertySchema) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = NumberPropertySchema{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("default"); ok {
+		if err := decodeNullable(raw, &v.Default, func(raw json.RawMessage, dst *float64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Default = Nullable[float64]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("maximum"); ok {
+		if err := decodeNullable(raw, &v.Maximum, func(raw json.RawMessage, dst *float64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("NumberPropertySchema.maximum: %w", err)
+		}
+	}
+	if raw, ok := raws.get("minimum"); ok {
+		if err := decodeNullable(raw, &v.Minimum, func(raw json.RawMessage, dst *float64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("NumberPropertySchema.minimum: %w", err)
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	return nil
+}
+
+func (v *NumberPropertySchema) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = NumberPropertySchema{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Minimum, func(raw json.RawMessage, dst *float64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("NumberPropertySchema.minimum: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Maximum, func(raw json.RawMessage, dst *float64) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("NumberPropertySchema.maximum: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Default, func(raw json.RawMessage, dst *float64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Default = Nullable[float64]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 6 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // An option presented to the user when requesting permission.
 type PermissionOption struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -4117,6 +12814,96 @@ type PermissionOption struct {
 	Name string `json:"name"`
 	// Identifier for this permission option. MUST be unique within the request.
 	OptionID PermissionOptionId `json:"optionId"`
+}
+
+func (v *PermissionOption) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PermissionOption) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PermissionOption) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PermissionOption{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("kind"); ok {
+		if err := decodeValue(raw, &v.Kind, false, buffered); err != nil {
+			return fmt.Errorf("PermissionOption.kind: %w", err)
+		}
+	} else {
+		return missingField("PermissionOption", "kind")
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("PermissionOption.name: %w", err)
+		}
+	} else {
+		return missingField("PermissionOption", "name")
+	}
+	if raw, ok := raws.get("optionId"); ok {
+		if err := decodeValue(raw, &v.OptionID, false, buffered); err != nil {
+			return fmt.Errorf("PermissionOption.optionId: %w", err)
+		}
+	} else {
+		return missingField("PermissionOption", "optionId")
+	}
+	return nil
+}
+
+func (v *PermissionOption) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PermissionOption{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.OptionID, false, buffered); err != nil {
+			return fmt.Errorf("PermissionOption.optionId: %w", err)
+		}
+	} else {
+		return seqTooShort("PermissionOption", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("PermissionOption.name: %w", err)
+		}
+	} else {
+		return seqTooShort("PermissionOption", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.Kind, false, buffered); err != nil {
+			return fmt.Errorf("PermissionOption.kind: %w", err)
+		}
+	} else {
+		return seqTooShort("PermissionOption", 2, 4)
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Unique identifier for a permission option.
@@ -4137,6 +12924,27 @@ const (
 	PermissionOptionKindRejectAlways PermissionOptionKind = "reject_always"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *PermissionOptionKind) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("PermissionOptionKind: %w", err)
+	}
+	switch PermissionOptionKind(s) {
+	case PermissionOptionKindAllowOnce, PermissionOptionKindAllowAlways, PermissionOptionKindRejectOnce, PermissionOptionKindRejectAlways:
+		*v = PermissionOptionKind(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("PermissionOptionKind: unknown variant %q", s)
+		}
+		*v = PermissionOptionKind(s)
+	}
+	return nil
+}
+
+func (v *PermissionOptionKind) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // A single entry in the execution plan.
 // Represents a task or goal that the assistant intends to accomplish
 // as part of fulfilling the user's request.
@@ -4156,6 +12964,96 @@ type PlanEntry struct {
 	Status PlanEntryStatus `json:"status"`
 }
 
+func (v *PlanEntry) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PlanEntry) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PlanEntry) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PlanEntry{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("PlanEntry.content: %w", err)
+		}
+	} else {
+		return missingField("PlanEntry", "content")
+	}
+	if raw, ok := raws.get("priority"); ok {
+		if err := decodeValue(raw, &v.Priority, false, buffered); err != nil {
+			return fmt.Errorf("PlanEntry.priority: %w", err)
+		}
+	} else {
+		return missingField("PlanEntry", "priority")
+	}
+	if raw, ok := raws.get("status"); ok {
+		if err := decodeValue(raw, &v.Status, false, buffered); err != nil {
+			return fmt.Errorf("PlanEntry.status: %w", err)
+		}
+	} else {
+		return missingField("PlanEntry", "status")
+	}
+	return nil
+}
+
+func (v *PlanEntry) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PlanEntry{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("PlanEntry.content: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanEntry", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Priority, false, buffered); err != nil {
+			return fmt.Errorf("PlanEntry.priority: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanEntry", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.Status, false, buffered); err != nil {
+			return fmt.Errorf("PlanEntry.status: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanEntry", 2, 4)
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Priority levels for plan entries.
 // Used to indicate the relative importance or urgency of different
 // tasks in the execution plan.
@@ -4170,6 +13068,27 @@ const (
 	// Low priority task - nice to have but not essential.
 	PlanEntryPriorityLow PlanEntryPriority = "low"
 )
+
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *PlanEntryPriority) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("PlanEntryPriority: %w", err)
+	}
+	switch PlanEntryPriority(s) {
+	case PlanEntryPriorityHigh, PlanEntryPriorityMedium, PlanEntryPriorityLow:
+		*v = PlanEntryPriority(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("PlanEntryPriority: unknown variant %q", s)
+		}
+		*v = PlanEntryPriority(s)
+	}
+	return nil
+}
+
+func (v *PlanEntryPriority) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
 
 // Status of a plan entry in the execution flow.
 // Tracks the lifecycle of each task from planning through completion.
@@ -4187,6 +13106,27 @@ const (
 	PlanEntryStatusCancelled PlanEntryStatus = "cancelled"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *PlanEntryStatus) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("PlanEntryStatus: %w", err)
+	}
+	switch PlanEntryStatus(s) {
+	case PlanEntryStatusPending, PlanEntryStatusInProgress, PlanEntryStatusCompleted, PlanEntryStatusCancelled:
+		*v = PlanEntryStatus(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("PlanEntryStatus: unknown variant %q", s)
+		}
+		*v = PlanEntryStatus(s)
+	}
+	return nil
+}
+
+func (v *PlanEntryStatus) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // A plan represented by a file URI.
@@ -4200,6 +13140,81 @@ type PlanFile struct {
 	PlanID PlanId `json:"planId"`
 	// The URI of the file containing the plan.
 	URI string `json:"uri"`
+}
+
+func (v *PlanFile) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PlanFile) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PlanFile) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PlanFile{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("planId"); ok {
+		if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+			return fmt.Errorf("PlanFile.planId: %w", err)
+		}
+	} else {
+		return missingField("PlanFile", "planId")
+	}
+	if raw, ok := raws.get("uri"); ok {
+		if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
+			return fmt.Errorf("PlanFile.uri: %w", err)
+		}
+	} else {
+		return missingField("PlanFile", "uri")
+	}
+	return nil
+}
+
+func (v *PlanFile) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PlanFile{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+			return fmt.Errorf("PlanFile.planId: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanFile", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
+			return fmt.Errorf("PlanFile.uri: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanFile", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Unique identifier for a plan within a session.
@@ -4220,6 +13235,85 @@ type PlanItems struct {
 	PlanID PlanId `json:"planId"`
 }
 
+func (v *PlanItems) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PlanItems) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PlanItems) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PlanItems{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("entries"); ok {
+		if err := decodeList(raw, &v.Entries, false, true, func(raw json.RawMessage, dst *PlanEntry) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			return fmt.Errorf("PlanItems.entries: %w", err)
+		}
+	} else {
+		return missingField("PlanItems", "entries")
+	}
+	if raw, ok := raws.get("planId"); ok {
+		if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+			return fmt.Errorf("PlanItems.planId: %w", err)
+		}
+	} else {
+		return missingField("PlanItems", "planId")
+	}
+	return nil
+}
+
+func (v *PlanItems) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PlanItems{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+			return fmt.Errorf("PlanItems.planId: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanItems", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeList(raw, &v.Entries, false, true, func(raw json.RawMessage, dst *PlanEntry) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			return fmt.Errorf("PlanItems.entries: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanItems", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // A plan represented as raw markdown content.
@@ -4235,6 +13329,81 @@ type PlanMarkdown struct {
 	PlanID PlanId `json:"planId"`
 }
 
+func (v *PlanMarkdown) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PlanMarkdown) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PlanMarkdown) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PlanMarkdown{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("PlanMarkdown.content: %w", err)
+		}
+	} else {
+		return missingField("PlanMarkdown", "content")
+	}
+	if raw, ok := raws.get("planId"); ok {
+		if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+			return fmt.Errorf("PlanMarkdown.planId: %w", err)
+		}
+	} else {
+		return missingField("PlanMarkdown", "planId")
+	}
+	return nil
+}
+
+func (v *PlanMarkdown) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PlanMarkdown{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+			return fmt.Errorf("PlanMarkdown.planId: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanMarkdown", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("PlanMarkdown.content: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanMarkdown", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Removal notice for a plan identified by ID.
@@ -4248,6 +13417,66 @@ type PlanRemoved struct {
 	PlanID PlanId `json:"planId"`
 }
 
+func (v *PlanRemoved) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PlanRemoved) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PlanRemoved) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PlanRemoved{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("planId"); ok {
+		if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+			return fmt.Errorf("PlanRemoved.planId: %w", err)
+		}
+	} else {
+		return missingField("PlanRemoved", "planId")
+	}
+	return nil
+}
+
+func (v *PlanRemoved) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PlanRemoved{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+			return fmt.Errorf("PlanRemoved.planId: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanRemoved", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // A content update for a plan identified by ID.
 type PlanUpdate struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -4257,6 +13486,66 @@ type PlanUpdate struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The updated plan content.
 	Plan PlanUpdateContent `json:"plan"`
+}
+
+func (v *PlanUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PlanUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PlanUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PlanUpdate{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("plan"); ok {
+		if err := decodeValue(raw, &v.Plan, false, buffered); err != nil {
+			return fmt.Errorf("PlanUpdate.plan: %w", err)
+		}
+	} else {
+		return missingField("PlanUpdate", "plan")
+	}
+	return nil
+}
+
+func (v *PlanUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PlanUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Plan, false, buffered); err != nil {
+			return fmt.Errorf("PlanUpdate.plan: %w", err)
+		}
+	} else {
+		return seqTooShort("PlanUpdate", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Updated content for a plan.
@@ -4283,6 +13572,35 @@ type PlanUpdateContent struct {
 type PlanUpdateContentOther struct{ Raw json.RawMessage }
 
 func (v PlanUpdateContentOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }
+
+// planUpdateContentOtherFields checks the fields an open PlanUpdateContent variant must carry.
+type planUpdateContentOtherFields struct {
+	PlanID PlanId `json:"planId"`
+}
+
+func (v *planUpdateContentOtherFields) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *planUpdateContentOtherFields) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *planUpdateContentOtherFields) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = planUpdateContentOtherFields{}
+	if raw, ok := raws.get("planId"); ok {
+		if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+			return fmt.Errorf("planUpdateContentOtherFields.planId: %w", err)
+		}
+	} else {
+		return missingField("planUpdateContentOtherFields", "planId")
+	}
+	return nil
+}
 
 func (v PlanUpdateContent) MarshalJSON() ([]byte, error) {
 	obj := map[string]json.RawMessage{}
@@ -4362,36 +13680,115 @@ func (v PlanUpdateContent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *PlanUpdateContent) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var planUpdateContentTags = []string{"items", "file", "markdown"}
+
+func (v *PlanUpdateContent) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PlanUpdateContent) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PlanUpdateContent) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = PlanUpdateContent{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("PlanUpdateContent tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, planUpdateContentTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "items":
+			payload := new(PlanItems)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Items = PlanUpdateContentKindItems, payload
+				return nil
+			}
+		case "file":
+			payload := new(PlanFile)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.File = PlanUpdateContentKindFile, payload
+				return nil
+			}
+		case "markdown":
+			payload := new(PlanMarkdown)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Markdown = PlanUpdateContentKindMarkdown, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "items":
-		v.Kind = PlanUpdateContentKindItems
-		v.Items = new(PlanItems)
-		return json.Unmarshal(data, v.Items)
-	case "file":
-		v.Kind = PlanUpdateContentKindFile
-		v.File = new(PlanFile)
-		return json.Unmarshal(data, v.File)
-	case "markdown":
-		v.Kind = PlanUpdateContentKindMarkdown
-		v.Markdown = new(PlanMarkdown)
-		return json.Unmarshal(data, v.Markdown)
-	default:
+	if tagged && tag != "items" && tag != "file" && tag != "markdown" {
+		if e := new(planUpdateContentOtherFields).decodeFields(data, raws, true); e != nil {
+			return fmt.Errorf("PlanUpdateContent: data matches no variant: %w", e)
+		}
 		v.Kind = PlanUpdateContentKind(tag)
-		v.Other = &PlanUpdateContentOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &PlanUpdateContentOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("PlanUpdateContent: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("PlanUpdateContent", "type")
+	}
+	return fmt.Errorf("PlanUpdateContent: unknown type tag %s", raw)
+}
+
+func (v *PlanUpdateContent) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PlanUpdateContent{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, planUpdateContentTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "items":
+			payload := new(PlanItems)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Items = PlanUpdateContentKindItems, payload
+				return nil
+			}
+		case "file":
+			payload := new(PlanFile)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.File = PlanUpdateContentKindFile, payload
+				return nil
+			}
+		case "markdown":
+			payload := new(PlanMarkdown)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Markdown = PlanUpdateContentKindMarkdown, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("PlanUpdateContent: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("PlanUpdateContent", "type")
+	}
+	return fmt.Errorf("PlanUpdateContent: unknown type tag %s", raw)
 }
 
 // Capabilities for audio content in prompt requests.
@@ -4402,6 +13799,51 @@ type PromptAudioCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *PromptAudioCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PromptAudioCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PromptAudioCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PromptAudioCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *PromptAudioCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PromptAudioCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Prompt capabilities supported by the agent in session/prompt requests.
@@ -4434,6 +13876,84 @@ type PromptCapabilities struct {
 	Image *PromptImageCapabilities `json:"image,omitempty"`
 }
 
+func (v *PromptCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PromptCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PromptCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PromptCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("audio"); ok {
+		if err := decodePtr(raw, &v.Audio, true, true); err != nil {
+			v.Audio = nil
+		}
+	}
+	if raw, ok := raws.get("embeddedContext"); ok {
+		if err := decodePtr(raw, &v.EmbeddedContext, true, true); err != nil {
+			v.EmbeddedContext = nil
+		}
+	}
+	if raw, ok := raws.get("image"); ok {
+		if err := decodePtr(raw, &v.Image, true, true); err != nil {
+			v.Image = nil
+		}
+	}
+	return nil
+}
+
+func (v *PromptCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PromptCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Image, true, true); err != nil {
+			v.Image = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodePtr(raw, &v.Audio, true, true); err != nil {
+			v.Audio = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodePtr(raw, &v.EmbeddedContext, true, true); err != nil {
+			v.EmbeddedContext = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Capabilities for embedded context in prompt requests.
 // Supplying {} means the agent supports embedded context in prompts.
 type PromptEmbeddedContextCapabilities struct {
@@ -4444,6 +13964,53 @@ type PromptEmbeddedContextCapabilities struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 }
 
+func (v *PromptEmbeddedContextCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *PromptEmbeddedContextCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PromptEmbeddedContextCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PromptEmbeddedContextCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *PromptEmbeddedContextCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PromptEmbeddedContextCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Capabilities for image content in prompt requests.
 // Supplying {} means the agent supports image content in prompts.
 type PromptImageCapabilities struct {
@@ -4452,6 +14019,51 @@ type PromptImageCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *PromptImageCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PromptImageCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PromptImageCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PromptImageCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *PromptImageCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PromptImageCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Request parameters for sending a user prompt to the agent.
@@ -4479,6 +14091,85 @@ type PromptRequest struct {
 	SessionID SessionId `json:"sessionId"`
 }
 
+func (v *PromptRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PromptRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PromptRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PromptRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("prompt"); ok {
+		if err := decodeList(raw, &v.Prompt, false, false, func(raw json.RawMessage, dst *ContentBlock) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("PromptRequest.prompt: %w", err)
+		}
+	} else {
+		return missingField("PromptRequest", "prompt")
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("PromptRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("PromptRequest", "sessionId")
+	}
+	return nil
+}
+
+func (v *PromptRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PromptRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("PromptRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("PromptRequest", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeList(raw, &v.Prompt, false, false, func(raw json.RawMessage, dst *ContentBlock) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("PromptRequest.prompt: %w", err)
+		}
+	} else {
+		return seqTooShort("PromptRequest", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response acknowledging that a user prompt was inserted into the ACP conversation.
 // This response does not indicate that the prompt was merely received or held, nor that the
 // agent has finished processing it.
@@ -4500,6 +14191,66 @@ type PromptResponse struct {
 	MessageID MessageId `json:"messageId"`
 }
 
+func (v *PromptResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *PromptResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *PromptResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = PromptResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("messageId"); ok {
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("PromptResponse.messageId: %w", err)
+		}
+	} else {
+		return missingField("PromptResponse", "messageId")
+	}
+	return nil
+}
+
+func (v *PromptResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = PromptResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("PromptResponse.messageId: %w", err)
+		}
+	} else {
+		return seqTooShort("PromptResponse", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Protocol version identifier.
 // This version is only bumped for breaking changes.
 // Non-breaking changes should be introduced via capabilities.
@@ -4518,6 +14269,81 @@ type ProviderCurrentConfig struct {
 	APIType LlmProtocol `json:"apiType"`
 	// Base URL currently used by this provider.
 	BaseURL string `json:"baseUrl"`
+}
+
+func (v *ProviderCurrentConfig) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ProviderCurrentConfig) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ProviderCurrentConfig) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ProviderCurrentConfig{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("apiType"); ok {
+		if err := decodeValue(raw, &v.APIType, false, buffered); err != nil {
+			return fmt.Errorf("ProviderCurrentConfig.apiType: %w", err)
+		}
+	} else {
+		return missingField("ProviderCurrentConfig", "apiType")
+	}
+	if raw, ok := raws.get("baseUrl"); ok {
+		if err := decodeValue(raw, &v.BaseURL, false, buffered); err != nil {
+			return fmt.Errorf("ProviderCurrentConfig.baseUrl: %w", err)
+		}
+	} else {
+		return missingField("ProviderCurrentConfig", "baseUrl")
+	}
+	return nil
+}
+
+func (v *ProviderCurrentConfig) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ProviderCurrentConfig{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.APIType, false, buffered); err != nil {
+			return fmt.Errorf("ProviderCurrentConfig.apiType: %w", err)
+		}
+	} else {
+		return seqTooShort("ProviderCurrentConfig", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.BaseURL, false, buffered); err != nil {
+			return fmt.Errorf("ProviderCurrentConfig.baseUrl: %w", err)
+		}
+	} else {
+		return seqTooShort("ProviderCurrentConfig", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -4546,6 +14372,111 @@ type ProviderInfo struct {
 	Supported []LlmProtocol `json:"supported"`
 }
 
+func (v *ProviderInfo) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ProviderInfo) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ProviderInfo) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ProviderInfo{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("current"); ok {
+		if err := decodePtr(raw, &v.Current, true, buffered); err != nil {
+			return fmt.Errorf("ProviderInfo.current: %w", err)
+		}
+	}
+	if raw, ok := raws.get("providerId"); ok {
+		if err := decodeValue(raw, &v.ProviderID, false, buffered); err != nil {
+			return fmt.Errorf("ProviderInfo.providerId: %w", err)
+		}
+	} else {
+		return missingField("ProviderInfo", "providerId")
+	}
+	if raw, ok := raws.get("required"); ok {
+		if err := decodeValue(raw, &v.Required, false, buffered); err != nil {
+			return fmt.Errorf("ProviderInfo.required: %w", err)
+		}
+	} else {
+		return missingField("ProviderInfo", "required")
+	}
+	if raw, ok := raws.get("supported"); ok {
+		if err := decodeList(raw, &v.Supported, false, true, func(raw json.RawMessage, dst *LlmProtocol) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Supported = []LlmProtocol{}
+		}
+	} else {
+		return missingField("ProviderInfo", "supported")
+	}
+	return nil
+}
+
+func (v *ProviderInfo) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ProviderInfo{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ProviderID, false, buffered); err != nil {
+			return fmt.Errorf("ProviderInfo.providerId: %w", err)
+		}
+	} else {
+		return seqTooShort("ProviderInfo", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeList(raw, &v.Supported, false, true, func(raw json.RawMessage, dst *LlmProtocol) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Supported = []LlmProtocol{}
+		}
+	} else {
+		return seqTooShort("ProviderInfo", 1, 5)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.Required, false, buffered); err != nil {
+			return fmt.Errorf("ProviderInfo.required: %w", err)
+		}
+	} else {
+		return seqTooShort("ProviderInfo", 2, 5)
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodePtr(raw, &v.Current, true, buffered); err != nil {
+			return fmt.Errorf("ProviderInfo.current: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Provider configuration capabilities supported by the agent.
@@ -4558,12 +14489,113 @@ type ProvidersCapabilities struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 }
 
+func (v *ProvidersCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ProvidersCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ProvidersCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ProvidersCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *ProvidersCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ProvidersCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // A JSON-RPC notification object.
 type ProxyNotification struct {
 	// The notification method name.
 	Method string `json:"method"`
 	// Method-specific notification parameters.
 	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (v *ProxyNotification) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ProxyNotification) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ProxyNotification) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ProxyNotification{}
+	if raw, ok := raws.get("method"); ok {
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ProxyNotification.method: %w", err)
+		}
+	} else {
+		return missingField("ProxyNotification", "method")
+	}
+	if raw, ok := raws.get("params"); ok {
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ProxyNotification.params: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *ProxyNotification) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ProxyNotification{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ProxyNotification.method: %w", err)
+		}
+	} else {
+		return seqTooShort("ProxyNotification", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ProxyNotification.params: %w", err)
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A JSON-RPC request object.
@@ -4574,6 +14606,77 @@ type ProxyRequest struct {
 	Method string `json:"method"`
 	// Method-specific request parameters.
 	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (v *ProxyRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ProxyRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ProxyRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ProxyRequest{}
+	if raw, ok := raws.get("id"); ok {
+		if err := decodeChecked(raw, &v.ID, false, validRequestId); err != nil {
+			return fmt.Errorf("ProxyRequest.id: %w", err)
+		}
+	} else {
+		return missingField("ProxyRequest", "id")
+	}
+	if raw, ok := raws.get("method"); ok {
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ProxyRequest.method: %w", err)
+		}
+	} else {
+		return missingField("ProxyRequest", "method")
+	}
+	if raw, ok := raws.get("params"); ok {
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ProxyRequest.params: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *ProxyRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ProxyRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeChecked(raw, &v.ID, false, validRequestId); err != nil {
+			return fmt.Errorf("ProxyRequest.id: %w", err)
+		}
+	} else {
+		return seqTooShort("ProxyRequest", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ProxyRequest.method: %w", err)
+		}
+	} else {
+		return seqTooShort("ProxyRequest", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ProxyRequest.params: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A JSON-RPC response object.
@@ -4591,6 +14694,66 @@ type ProxyResponseResult struct {
 	Result json.RawMessage `json:"result"`
 }
 
+func (v *ProxyResponseResult) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ProxyResponseResult) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ProxyResponseResult) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ProxyResponseResult{}
+	if raw, ok := raws.get("id"); ok {
+		if err := decodeChecked(raw, &v.ID, false, validRequestId); err != nil {
+			return fmt.Errorf("ProxyResponseResult.id: %w", err)
+		}
+	} else {
+		return missingField("ProxyResponseResult", "id")
+	}
+	if raw, ok := raws.get("result"); ok {
+		if err := decodeValue(raw, &v.Result, true, buffered); err != nil {
+			return fmt.Errorf("ProxyResponseResult.result: %w", err)
+		}
+	} else {
+		return missingField("ProxyResponseResult", "result")
+	}
+	return nil
+}
+
+func (v *ProxyResponseResult) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ProxyResponseResult{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeChecked(raw, &v.ID, false, validRequestId); err != nil {
+			return fmt.Errorf("ProxyResponseResult.id: %w", err)
+		}
+	} else {
+		return seqTooShort("ProxyResponseResult", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Result, true, buffered); err != nil {
+			return fmt.Errorf("ProxyResponseResult.result: %w", err)
+		}
+	} else {
+		return seqTooShort("ProxyResponseResult", 1, 2)
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 type ProxyResponseError struct {
 	// Method-specific error data.
 	Error Error `json:"error"`
@@ -4598,6 +14761,66 @@ type ProxyResponseError struct {
 	// Required. null only when the request's id could not be determined, such as
 	// for a parse error or an invalid request.
 	ID json.RawMessage `json:"id"`
+}
+
+func (v *ProxyResponseError) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ProxyResponseError) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ProxyResponseError) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ProxyResponseError{}
+	if raw, ok := raws.get("error"); ok {
+		if err := decodeValue(raw, &v.Error, false, buffered); err != nil {
+			return fmt.Errorf("ProxyResponseError.error: %w", err)
+		}
+	} else {
+		return missingField("ProxyResponseError", "error")
+	}
+	if raw, ok := raws.get("id"); ok {
+		if err := decodeValue(raw, &v.ID, true, buffered); err != nil {
+			return fmt.Errorf("ProxyResponseError.id: %w", err)
+		}
+	} else {
+		return missingField("ProxyResponseError", "id")
+	}
+	return nil
+}
+
+func (v *ProxyResponseError) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ProxyResponseError{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ID, true, buffered); err != nil {
+			return fmt.Errorf("ProxyResponseError.id: %w", err)
+		}
+	} else {
+		return seqTooShort("ProxyResponseError", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Error, false, buffered); err != nil {
+			return fmt.Errorf("ProxyResponseError.error: %w", err)
+		}
+	} else {
+		return seqTooShort("ProxyResponseError", 1, 2)
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 func (v ProxyResponse) MarshalJSON() ([]byte, error) {
@@ -4641,14 +14864,29 @@ func (v ProxyResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *ProxyResponse) UnmarshalJSON(data []byte) error {
+func (v *ProxyResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ProxyResponse) decodeJSON(data []byte, buffered bool) error {
 	*v = ProxyResponse{}
-	if hasKeys(data, "id", "result") {
-		v.Result = new(ProxyResponseResult)
-		return json.Unmarshal(data, v.Result)
-	} else if hasKeys(data, "error", "id") {
-		v.Error = new(ProxyResponseError)
-		return json.Unmarshal(data, v.Error)
+	raws, err := splitObject(data)
+	object := err == nil && raws != nil
+	err = nil
+	if !object || hasKeys(raws, "id", "result") {
+		payload := new(ProxyResponseResult)
+		if err = json.Unmarshal(data, payload); err == nil {
+			v.Result = payload
+			return nil
+		}
+	}
+	if !object || hasKeys(raws, "error", "id") {
+		payload := new(ProxyResponseError)
+		if err = json.Unmarshal(data, payload); err == nil {
+			v.Error = payload
+			return nil
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("ProxyResponse: payload matches no variant: %w", err)
 	}
 	return fmt.Errorf("ProxyResponse: payload matches no variant")
 }
@@ -4676,6 +14914,79 @@ type ProxySuccessorNotification struct {
 	// When present, it MUST be a JSON object or array, as JSON-RPC requires.
 	// The wrapped notification's own _meta stays inside these params.
 	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (v *ProxySuccessorNotification) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *ProxySuccessorNotification) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ProxySuccessorNotification) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ProxySuccessorNotification{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("method"); ok {
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ProxySuccessorNotification.method: %w", err)
+		}
+	} else {
+		return missingField("ProxySuccessorNotification", "method")
+	}
+	if raw, ok := raws.get("params"); ok {
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ProxySuccessorNotification.params: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *ProxySuccessorNotification) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ProxySuccessorNotification{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ProxySuccessorNotification.method: %w", err)
+		}
+	} else {
+		return seqTooShort("ProxySuccessorNotification", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ProxySuccessorNotification.params: %w", err)
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -4706,6 +15017,77 @@ type ProxySuccessorRequest struct {
 	// When present, it MUST be a JSON object or array, as JSON-RPC requires.
 	// The wrapped request's own _meta stays inside these params.
 	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (v *ProxySuccessorRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ProxySuccessorRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ProxySuccessorRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ProxySuccessorRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("method"); ok {
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ProxySuccessorRequest.method: %w", err)
+		}
+	} else {
+		return missingField("ProxySuccessorRequest", "method")
+	}
+	if raw, ok := raws.get("params"); ok {
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ProxySuccessorRequest.params: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *ProxySuccessorRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ProxySuccessorRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
+			return fmt.Errorf("ProxySuccessorRequest.method: %w", err)
+		}
+	} else {
+		return seqTooShort("ProxySuccessorRequest", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			return fmt.Errorf("ProxySuccessorRequest.params: %w", err)
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -4771,28 +15153,88 @@ func (v ReplayFrom) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *ReplayFrom) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var replayFromTags = []string{"start"}
+
+func (v *ReplayFrom) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ReplayFrom) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ReplayFrom) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = ReplayFrom{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("ReplayFrom tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, replayFromTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "start":
+			payload := new(ReplayFromStart)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Start = ReplayFromKindStart, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "start":
-		v.Kind = ReplayFromKindStart
-		v.Start = new(ReplayFromStart)
-		return json.Unmarshal(data, v.Start)
-	default:
+	if tagged && tag != "start" {
 		v.Kind = ReplayFromKind(tag)
-		v.Other = &ReplayFromOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &ReplayFromOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("ReplayFrom: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("ReplayFrom", "type")
+	}
+	return fmt.Errorf("ReplayFrom: unknown type tag %s", raw)
+}
+
+func (v *ReplayFrom) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ReplayFrom{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, replayFromTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "start":
+			payload := new(ReplayFromStart)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Start = ReplayFromKindStart, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("ReplayFrom: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("ReplayFrom", "type")
+	}
+	return fmt.Errorf("ReplayFrom: unknown type tag %s", raw)
 }
 
 // Inclusive replay cursor requesting replay from the start of retained conversation history.
@@ -4804,11 +15246,67 @@ type ReplayFromStart struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 }
 
+func (v *ReplayFromStart) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ReplayFromStart) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ReplayFromStart) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ReplayFromStart{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *ReplayFromStart) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ReplayFromStart{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // A JSON-RPC request ID: a string or an integer. Unlike base JSON-RPC, it MUST NOT be null.
 // The receiver MUST reply with the same value in the response. Each side chooses IDs for its own
 // requests, so the same ID can be in use in both directions. A sender MUST NOT reuse an ID while
 // a request with it is still awaiting a response.
 type RequestId any
+
+// validRequestId reports whether raw matches an arm of RequestId.
+func validRequestId(raw json.RawMessage) error {
+	if !isNull(raw) && json.Unmarshal(raw, new(int64)) == nil {
+		return nil
+	}
+	if jsonKind(raw) == '"' {
+		return nil
+	}
+	return fmt.Errorf("RequestId: data did not match any variant")
+}
 
 // The outcome of a permission request.
 type RequestPermissionOutcomeKind string
@@ -4890,32 +15388,100 @@ func (v RequestPermissionOutcome) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *RequestPermissionOutcome) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var requestPermissionOutcomeTags = []string{"cancelled", "selected"}
+
+func (v *RequestPermissionOutcome) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *RequestPermissionOutcome) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *RequestPermissionOutcome) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = RequestPermissionOutcome{}
-	var tag string
-	if raw, ok := raws["outcome"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("RequestPermissionOutcome tag: %w", err)
+	buffered = true
+	raw, present := raws.get("outcome")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, requestPermissionOutcomeTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "cancelled":
+			payload := new(CancelledPermissionOutcome)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Cancelled = RequestPermissionOutcomeKindCancelled, payload
+				return nil
+			}
+		case "selected":
+			payload := new(SelectedPermissionOutcome)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Selected = RequestPermissionOutcomeKindSelected, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "cancelled":
-		v.Kind = RequestPermissionOutcomeKindCancelled
-		v.Cancelled = new(CancelledPermissionOutcome)
-		return json.Unmarshal(data, v.Cancelled)
-	case "selected":
-		v.Kind = RequestPermissionOutcomeKindSelected
-		v.Selected = new(SelectedPermissionOutcome)
-		return json.Unmarshal(data, v.Selected)
-	default:
+	if tagged && tag != "cancelled" && tag != "selected" {
 		v.Kind = RequestPermissionOutcomeKind(tag)
-		v.Other = &RequestPermissionOutcomeOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &RequestPermissionOutcomeOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("RequestPermissionOutcome: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("RequestPermissionOutcome", "outcome")
+	}
+	return fmt.Errorf("RequestPermissionOutcome: unknown outcome tag %s", raw)
+}
+
+func (v *RequestPermissionOutcome) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = RequestPermissionOutcome{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, requestPermissionOutcomeTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "cancelled":
+			payload := new(CancelledPermissionOutcome)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Cancelled = RequestPermissionOutcomeKindCancelled, payload
+				return nil
+			}
+		case "selected":
+			payload := new(SelectedPermissionOutcome)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Selected = RequestPermissionOutcomeKindSelected, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("RequestPermissionOutcome: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("RequestPermissionOutcome", "outcome")
+	}
+	return fmt.Errorf("RequestPermissionOutcome: unknown outcome tag %s", raw)
 }
 
 // Request for user permission to proceed with an operation.
@@ -4946,6 +15512,126 @@ type RequestPermissionRequest struct {
 	Title string `json:"title"`
 }
 
+func (v *RequestPermissionRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *RequestPermissionRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *RequestPermissionRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = RequestPermissionRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("options"); ok {
+		if err := decodeList(raw, &v.Options, false, false, func(raw json.RawMessage, dst *PermissionOption) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("RequestPermissionRequest.options: %w", err)
+		}
+	} else {
+		return missingField("RequestPermissionRequest", "options")
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("RequestPermissionRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("RequestPermissionRequest", "sessionId")
+	}
+	if raw, ok := raws.get("subject"); ok {
+		if err := decodePtr(raw, &v.Subject, true, buffered); err != nil {
+			return fmt.Errorf("RequestPermissionRequest.subject: %w", err)
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+			return fmt.Errorf("RequestPermissionRequest.title: %w", err)
+		}
+	} else {
+		return missingField("RequestPermissionRequest", "title")
+	}
+	return nil
+}
+
+func (v *RequestPermissionRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = RequestPermissionRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("RequestPermissionRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("RequestPermissionRequest", 0, 6)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+			return fmt.Errorf("RequestPermissionRequest.title: %w", err)
+		}
+	} else {
+		return seqTooShort("RequestPermissionRequest", 1, 6)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodePtr(raw, &v.Subject, true, buffered); err != nil {
+			return fmt.Errorf("RequestPermissionRequest.subject: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeList(raw, &v.Options, false, false, func(raw json.RawMessage, dst *PermissionOption) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("RequestPermissionRequest.options: %w", err)
+		}
+	} else {
+		return seqTooShort("RequestPermissionRequest", 4, 6)
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 6 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response to a permission request.
 type RequestPermissionResponse struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -4955,6 +15641,68 @@ type RequestPermissionResponse struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The user's decision on the permission request.
 	Outcome RequestPermissionOutcome `json:"outcome"`
+}
+
+func (v *RequestPermissionResponse) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *RequestPermissionResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *RequestPermissionResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = RequestPermissionResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("outcome"); ok {
+		if err := decodeValue(raw, &v.Outcome, false, buffered); err != nil {
+			return fmt.Errorf("RequestPermissionResponse.outcome: %w", err)
+		}
+	} else {
+		return missingField("RequestPermissionResponse", "outcome")
+	}
+	return nil
+}
+
+func (v *RequestPermissionResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = RequestPermissionResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Outcome, false, buffered); err != nil {
+			return fmt.Errorf("RequestPermissionResponse.outcome: %w", err)
+		}
+	} else {
+		return seqTooShort("RequestPermissionResponse", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // The operation requiring permission.
@@ -5037,32 +15785,100 @@ func (v RequestPermissionSubject) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *RequestPermissionSubject) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var requestPermissionSubjectTags = []string{"tool_call", "command"}
+
+func (v *RequestPermissionSubject) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *RequestPermissionSubject) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *RequestPermissionSubject) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = RequestPermissionSubject{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("RequestPermissionSubject tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, requestPermissionSubjectTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "tool_call":
+			payload := new(ToolCallPermissionSubject)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.ToolCall = RequestPermissionSubjectKindToolCall, payload
+				return nil
+			}
+		case "command":
+			payload := new(CommandPermissionSubject)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Command = RequestPermissionSubjectKindCommand, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "tool_call":
-		v.Kind = RequestPermissionSubjectKindToolCall
-		v.ToolCall = new(ToolCallPermissionSubject)
-		return json.Unmarshal(data, v.ToolCall)
-	case "command":
-		v.Kind = RequestPermissionSubjectKindCommand
-		v.Command = new(CommandPermissionSubject)
-		return json.Unmarshal(data, v.Command)
-	default:
+	if tagged && tag != "tool_call" && tag != "command" {
 		v.Kind = RequestPermissionSubjectKind(tag)
-		v.Other = &RequestPermissionSubjectOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &RequestPermissionSubjectOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("RequestPermissionSubject: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("RequestPermissionSubject", "type")
+	}
+	return fmt.Errorf("RequestPermissionSubject: unknown type tag %s", raw)
+}
+
+func (v *RequestPermissionSubject) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = RequestPermissionSubject{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, requestPermissionSubjectTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "tool_call":
+			payload := new(ToolCallPermissionSubject)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.ToolCall = RequestPermissionSubjectKindToolCall, payload
+				return nil
+			}
+		case "command":
+			payload := new(CommandPermissionSubject)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Command = RequestPermissionSubjectKindCommand, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("RequestPermissionSubject: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("RequestPermissionSubject", "type")
+	}
+	return fmt.Errorf("RequestPermissionSubject: unknown type tag %s", raw)
 }
 
 // The foreground workflow as a whole is blocked on user action.
@@ -5088,22 +15904,67 @@ type RequiresActionStateUpdate struct {
 }
 
 func (v *RequiresActionStateUpdate) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+	return v.decodeJSON(data, false)
+}
+
+func (v *RequiresActionStateUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *RequiresActionStateUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = RequiresActionStateUpdate{}
-	if raw, ok := raws["_meta"]; ok {
-		var value Nullable[Meta]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Meta = value
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	if raw, ok := raws["background"]; ok {
-		var value Nullable[[]BackgroundWork]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Background = value
+	if raw, ok := raws.get("background"); ok {
+		if err := decodeNullable(raw, &v.Background, func(raw json.RawMessage, dst *[]BackgroundWork) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *BackgroundWork) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Background = Nullable[[]BackgroundWork]{}
 		}
+	}
+	return nil
+}
+
+func (v *RequiresActionStateUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = RequiresActionStateUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Background, func(raw json.RawMessage, dst *[]BackgroundWork) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *BackgroundWork) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Background = Nullable[[]BackgroundWork]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
 	}
 	return nil
 }
@@ -5137,6 +15998,167 @@ type ResourceLink struct {
 	Title Nullable[string] `json:"title,omitzero"`
 	// URI associated with this resource or media payload.
 	URI string `json:"uri"`
+}
+
+func (v *ResourceLink) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ResourceLink) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ResourceLink) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ResourceLink{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("annotations"); ok {
+		if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
+			v.Annotations = nil
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("icons"); ok {
+		if err := decodeNullable(raw, &v.Icons, func(raw json.RawMessage, dst *[]Icon) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *Icon) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Icons = Nullable[[]Icon]{}
+		}
+	}
+	if raw, ok := raws.get("mimeType"); ok {
+		if err := decodeValue(raw, &v.MimeType, true, true); err != nil {
+			v.MimeType = nil
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("ResourceLink.name: %w", err)
+		}
+	} else {
+		return missingField("ResourceLink", "name")
+	}
+	if raw, ok := raws.get("size"); ok {
+		if err := decodeNullable(raw, &v.Size, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Size = Nullable[uint64]{}
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("uri"); ok {
+		if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
+			return fmt.Errorf("ResourceLink.uri: %w", err)
+		}
+	} else {
+		return missingField("ResourceLink", "uri")
+	}
+	return nil
+}
+
+func (v *ResourceLink) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ResourceLink{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("ResourceLink.name: %w", err)
+		}
+	} else {
+		return seqTooShort("ResourceLink", 0, 9)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
+			return fmt.Errorf("ResourceLink.uri: %w", err)
+		}
+	} else {
+		return seqTooShort("ResourceLink", 1, 9)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Icons, func(raw json.RawMessage, dst *[]Icon) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *Icon) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Icons = Nullable[[]Icon]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeValue(raw, &v.MimeType, true, true); err != nil {
+			v.MimeType = nil
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodeNullable(raw, &v.Size, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Size = Nullable[uint64]{}
+		}
+	}
+	if len(items) > 7 {
+		raw := items[7]
+		if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
+			v.Annotations = nil
+		}
+	}
+	if len(items) > 8 {
+		raw := items[8]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 9 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Request parameters for resuming an existing session.
@@ -5185,6 +16207,141 @@ type ResumeSessionRequest struct {
 	SystemPrompt *SystemPrompt `json:"systemPrompt,omitempty"`
 }
 
+func (v *ResumeSessionRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ResumeSessionRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ResumeSessionRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ResumeSessionRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("additionalDirectories"); ok {
+		if isNull(raw) {
+			v.AdditionalDirectories = nil
+		} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.additionalDirectories: %w", err)
+		}
+	}
+	if raw, ok := raws.get("cwd"); ok {
+		if err := decodeValue(raw, &v.Cwd, false, buffered); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.cwd: %w", err)
+		}
+	} else {
+		return missingField("ResumeSessionRequest", "cwd")
+	}
+	if raw, ok := raws.get("mcpServers"); ok {
+		if isNull(raw) {
+			v.MCPServers = nil
+		} else if err := decodeList(raw, &v.MCPServers, false, false, func(raw json.RawMessage, dst *McpServer) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.mcpServers: %w", err)
+		}
+	}
+	if raw, ok := raws.get("replayFrom"); ok {
+		if err := decodePtr(raw, &v.ReplayFrom, true, buffered); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.replayFrom: %w", err)
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("ResumeSessionRequest", "sessionId")
+	}
+	if raw, ok := raws.get("systemPrompt"); ok {
+		if err := decodePtr(raw, &v.SystemPrompt, true, buffered); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.systemPrompt: %w", err)
+		}
+	}
+	return nil
+}
+
+func (v *ResumeSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ResumeSessionRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("ResumeSessionRequest", 0, 7)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Cwd, false, buffered); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.cwd: %w", err)
+		}
+	} else {
+		return seqTooShort("ResumeSessionRequest", 1, 7)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if isNull(raw) {
+			v.AdditionalDirectories = nil
+		} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.additionalDirectories: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if isNull(raw) {
+			v.MCPServers = nil
+		} else if err := decodeList(raw, &v.MCPServers, false, false, func(raw json.RawMessage, dst *McpServer) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.mcpServers: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodePtr(raw, &v.ReplayFrom, true, buffered); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.replayFrom: %w", err)
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodePtr(raw, &v.SystemPrompt, true, buffered); err != nil {
+			return fmt.Errorf("ResumeSessionRequest.systemPrompt: %w", err)
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 7 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Response from resuming an existing session.
 // The agent MUST send a current state_update after any requested history
 // replay and before this response, even without replay. The update reports
@@ -5208,6 +16365,81 @@ type ResumeSessionResponse struct {
 	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
 }
 
+func (v *ResumeSessionResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ResumeSessionResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ResumeSessionResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ResumeSessionResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("availableCommands"); ok {
+		if err := decodeList(raw, &v.AvailableCommands, false, true, func(raw json.RawMessage, dst *AvailableCommand) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.AvailableCommands = nil
+		}
+	}
+	if raw, ok := raws.get("configOptions"); ok {
+		if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ConfigOptions = nil
+		}
+	}
+	return nil
+}
+
+func (v *ResumeSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ResumeSessionResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ConfigOptions = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeList(raw, &v.AvailableCommands, false, true, func(raw json.RawMessage, dst *AvailableCommand) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.AvailableCommands = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // The sender or recipient of messages and data in a conversation.
 type Role string
 
@@ -5217,6 +16449,27 @@ const (
 	// The user side of a conversation.
 	RoleUser Role = "user"
 )
+
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *Role) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("Role: %w", err)
+	}
+	switch Role(s) {
+	case RoleAssistant, RoleUser:
+		*v = Role(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("Role: unknown variant %q", s)
+		}
+		*v = Role(s)
+	}
+	return nil
+}
+
+func (v *Role) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
 
 // Foreground work is in progress.
 type RunningStateUpdate struct {
@@ -5234,23 +16487,66 @@ type RunningStateUpdate struct {
 	Background Nullable[[]BackgroundWork] `json:"background,omitzero"`
 }
 
-func (v *RunningStateUpdate) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+func (v *RunningStateUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *RunningStateUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *RunningStateUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = RunningStateUpdate{}
-	if raw, ok := raws["_meta"]; ok {
-		var value Nullable[Meta]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Meta = value
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	if raw, ok := raws["background"]; ok {
-		var value Nullable[[]BackgroundWork]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Background = value
+	if raw, ok := raws.get("background"); ok {
+		if err := decodeNullable(raw, &v.Background, func(raw json.RawMessage, dst *[]BackgroundWork) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *BackgroundWork) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Background = Nullable[[]BackgroundWork]{}
 		}
+	}
+	return nil
+}
+
+func (v *RunningStateUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = RunningStateUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Background, func(raw json.RawMessage, dst *[]BackgroundWork) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *BackgroundWork) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Background = Nullable[[]BackgroundWork]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
 	}
 	return nil
 }
@@ -5266,6 +16562,68 @@ type SelectedPermissionOutcome struct {
 	OptionID PermissionOptionId `json:"optionId"`
 }
 
+func (v *SelectedPermissionOutcome) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SelectedPermissionOutcome) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SelectedPermissionOutcome) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SelectedPermissionOutcome{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("optionId"); ok {
+		if err := decodeValue(raw, &v.OptionID, false, buffered); err != nil {
+			return fmt.Errorf("SelectedPermissionOutcome.optionId: %w", err)
+		}
+	} else {
+		return missingField("SelectedPermissionOutcome", "optionId")
+	}
+	return nil
+}
+
+func (v *SelectedPermissionOutcome) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SelectedPermissionOutcome{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.OptionID, false, buffered); err != nil {
+			return fmt.Errorf("SelectedPermissionOutcome.optionId: %w", err)
+		}
+	} else {
+		return seqTooShort("SelectedPermissionOutcome", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Capabilities for additional session directories support.
 // Supplying {} means the agent supports the additionalDirectories field on
 // supported session lifecycle requests. Agents may return
@@ -5279,6 +16637,53 @@ type SessionAdditionalDirectoriesCapabilities struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 }
 
+func (v *SessionAdditionalDirectoriesCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SessionAdditionalDirectoriesCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionAdditionalDirectoriesCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionAdditionalDirectoriesCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *SessionAdditionalDirectoriesCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionAdditionalDirectoriesCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Capabilities for session/archive and session/unarchive.
@@ -5290,6 +16695,53 @@ type SessionArchiveCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *SessionArchiveCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SessionArchiveCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionArchiveCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionArchiveCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *SessionArchiveCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionArchiveCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -5308,6 +16760,27 @@ const (
 	SessionArchiveFilterOnly SessionArchiveFilter = "only"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *SessionArchiveFilter) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("SessionArchiveFilter: %w", err)
+	}
+	switch SessionArchiveFilter(s) {
+	case SessionArchiveFilterExclude, SessionArchiveFilterInclude, SessionArchiveFilterOnly:
+		*v = SessionArchiveFilter(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("SessionArchiveFilter: unknown variant %q", s)
+		}
+		*v = SessionArchiveFilter(s)
+	}
+	return nil
+}
+
+func (v *SessionArchiveFilter) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Capability to cancel work in a subagent session without ending that session.
@@ -5318,6 +16791,53 @@ type SessionCancelCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *SessionCancelCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SessionCancelCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionCancelCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionCancelCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *SessionCancelCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionCancelCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Session capabilities supported by the agent.
@@ -5389,10 +16909,199 @@ type SessionCapabilities struct {
 	Title *SessionTitleCapabilities `json:"title,omitempty"`
 }
 
+func (v *SessionCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("additionalDirectories"); ok {
+		if err := decodePtr(raw, &v.AdditionalDirectories, true, true); err != nil {
+			v.AdditionalDirectories = nil
+		}
+	}
+	if raw, ok := raws.get("archive"); ok {
+		if err := decodePtr(raw, &v.Archive, true, true); err != nil {
+			v.Archive = nil
+		}
+	}
+	if raw, ok := raws.get("delete"); ok {
+		if err := decodePtr(raw, &v.Delete, true, true); err != nil {
+			v.Delete = nil
+		}
+	}
+	if raw, ok := raws.get("fork"); ok {
+		if err := decodePtr(raw, &v.Fork, true, true); err != nil {
+			v.Fork = nil
+		}
+	}
+	if raw, ok := raws.get("mcp"); ok {
+		if err := decodePtr(raw, &v.MCP, true, true); err != nil {
+			v.MCP = nil
+		}
+	}
+	if raw, ok := raws.get("prompt"); ok {
+		if err := decodePtr(raw, &v.Prompt, true, true); err != nil {
+			v.Prompt = nil
+		}
+	}
+	if raw, ok := raws.get("status"); ok {
+		if err := decodePtr(raw, &v.Status, true, true); err != nil {
+			v.Status = nil
+		}
+	}
+	if raw, ok := raws.get("systemPrompt"); ok {
+		if err := decodePtr(raw, &v.SystemPrompt, true, true); err != nil {
+			v.SystemPrompt = nil
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodePtr(raw, &v.Title, true, true); err != nil {
+			v.Title = nil
+		}
+	}
+	return nil
+}
+
+func (v *SessionCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Prompt, true, true); err != nil {
+			v.Prompt = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodePtr(raw, &v.MCP, true, true); err != nil {
+			v.MCP = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodePtr(raw, &v.Delete, true, true); err != nil {
+			v.Delete = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodePtr(raw, &v.AdditionalDirectories, true, true); err != nil {
+			v.AdditionalDirectories = nil
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodePtr(raw, &v.SystemPrompt, true, true); err != nil {
+			v.SystemPrompt = nil
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodePtr(raw, &v.Fork, true, true); err != nil {
+			v.Fork = nil
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodePtr(raw, &v.Archive, true, true); err != nil {
+			v.Archive = nil
+		}
+	}
+	if len(items) > 7 {
+		raw := items[7]
+		if err := decodePtr(raw, &v.Status, true, true); err != nil {
+			v.Status = nil
+		}
+	}
+	if len(items) > 8 {
+		raw := items[8]
+		if err := decodePtr(raw, &v.Title, true, true); err != nil {
+			v.Title = nil
+		}
+	}
+	if len(items) > 9 {
+		raw := items[9]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 10 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // A boolean on/off toggle session configuration option payload.
 type SessionConfigBoolean struct {
 	// The current value of the boolean option.
 	CurrentValue bool `json:"currentValue"`
+}
+
+func (v *SessionConfigBoolean) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionConfigBoolean) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionConfigBoolean) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionConfigBoolean{}
+	if raw, ok := raws.get("currentValue"); ok {
+		if err := decodeValue(raw, &v.CurrentValue, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigBoolean.currentValue: %w", err)
+		}
+	} else {
+		return missingField("SessionConfigBoolean", "currentValue")
+	}
+	return nil
+}
+
+func (v *SessionConfigBoolean) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionConfigBoolean{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.CurrentValue, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigBoolean.currentValue: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionConfigBoolean", 0, 1)
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Unique identifier for a session configuration option value group.
@@ -5506,35 +17215,88 @@ func (v SessionConfigOption) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *SessionConfigOption) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var sessionConfigOptionTags = []string{"select", "boolean"}
+
+func (v *SessionConfigOption) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionConfigOption) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionConfigOption) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = SessionConfigOption{}
-	if err := json.Unmarshal(data, (*sessionConfigOptionShadow)(v)); err != nil {
-		return err
-	}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("SessionConfigOption tag: %w", err)
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	switch tag {
-	case "select":
-		v.Kind = SessionConfigOptionKindSelect
-		v.Select = new(SessionConfigSelect)
-		return json.Unmarshal(data, v.Select)
-	case "boolean":
-		v.Kind = SessionConfigOptionKindBoolean
-		v.Boolean = new(SessionConfigBoolean)
-		return json.Unmarshal(data, v.Boolean)
-	default:
+	if raw, ok := raws.get("category"); ok {
+		if err := decodeValue(raw, &v.Category, true, true); err != nil {
+			v.Category = nil
+		}
+	}
+	if raw, ok := raws.get("configId"); ok {
+		if err := decodeValue(raw, &v.ConfigID, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigOption.configId: %w", err)
+		}
+	} else {
+		return missingField("SessionConfigOption", "configId")
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigOption.name: %w", err)
+		}
+	} else {
+		return missingField("SessionConfigOption", "name")
+	}
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, sessionConfigOptionTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "select":
+			payload := new(SessionConfigSelect)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Select = SessionConfigOptionKindSelect, payload
+				return nil
+			}
+		case "boolean":
+			payload := new(SessionConfigBoolean)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Boolean = SessionConfigOptionKindBoolean, payload
+				return nil
+			}
+		}
+	}
+	if tagged && tag != "select" && tag != "boolean" {
 		v.Kind = SessionConfigOptionKind(tag)
-		v.Other = &SessionConfigOptionOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &SessionConfigOptionOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("SessionConfigOption: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("SessionConfigOption", "type")
+	}
+	return fmt.Errorf("SessionConfigOption: unknown type tag %s", raw)
 }
 
 // Semantic category for a session configuration option.
@@ -5557,6 +17319,29 @@ const (
 	SessionConfigOptionCategoryThoughtLevel SessionConfigOptionCategory = "thought_level"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *SessionConfigOptionCategory) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("SessionConfigOptionCategory: %w", err)
+	}
+	switch SessionConfigOptionCategory(s) {
+	case SessionConfigOptionCategoryMode, SessionConfigOptionCategoryModel, SessionConfigOptionCategoryModelConfig, SessionConfigOptionCategoryThoughtLevel:
+		*v = SessionConfigOptionCategory(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("SessionConfigOptionCategory: unknown variant %q", s)
+		}
+		*v = SessionConfigOptionCategory(s)
+	}
+	return nil
+}
+
+func (v *SessionConfigOptionCategory) decodeJSON(data []byte, _ bool) error {
+	return v.UnmarshalJSON(data)
+}
+
 // A single-value selector (dropdown) session configuration option payload.
 type SessionConfigSelect struct {
 	// The currently selected value. MUST be one of the values in options.
@@ -5564,6 +17349,66 @@ type SessionConfigSelect struct {
 	// The set of selectable options. MUST contain at least one value, and each value MUST be
 	// unique within the option, including across groups.
 	Options SessionConfigSelectOptions `json:"options"`
+}
+
+func (v *SessionConfigSelect) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionConfigSelect) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionConfigSelect) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionConfigSelect{}
+	if raw, ok := raws.get("currentValue"); ok {
+		if err := decodeValue(raw, &v.CurrentValue, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigSelect.currentValue: %w", err)
+		}
+	} else {
+		return missingField("SessionConfigSelect", "currentValue")
+	}
+	if raw, ok := raws.get("options"); ok {
+		if err := decodeChecked(raw, &v.Options, false, validSessionConfigSelectOptions); err != nil {
+			return fmt.Errorf("SessionConfigSelect.options: %w", err)
+		}
+	} else {
+		return missingField("SessionConfigSelect", "options")
+	}
+	return nil
+}
+
+func (v *SessionConfigSelect) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionConfigSelect{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.CurrentValue, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigSelect.currentValue: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionConfigSelect", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeChecked(raw, &v.Options, false, validSessionConfigSelectOptions); err != nil {
+			return fmt.Errorf("SessionConfigSelect.options: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionConfigSelect", 1, 2)
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A group of possible values for a session configuration option.
@@ -5579,6 +17424,100 @@ type SessionConfigSelectGroup struct {
 	Name string `json:"name"`
 	// The set of option values in this group. MUST contain at least one value.
 	Options []SessionConfigSelectOption `json:"options"`
+}
+
+func (v *SessionConfigSelectGroup) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionConfigSelectGroup) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionConfigSelectGroup) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionConfigSelectGroup{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("groupId"); ok {
+		if err := decodeValue(raw, &v.GroupID, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigSelectGroup.groupId: %w", err)
+		}
+	} else {
+		return missingField("SessionConfigSelectGroup", "groupId")
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigSelectGroup.name: %w", err)
+		}
+	} else {
+		return missingField("SessionConfigSelectGroup", "name")
+	}
+	if raw, ok := raws.get("options"); ok {
+		if err := decodeList(raw, &v.Options, false, true, func(raw json.RawMessage, dst *SessionConfigSelectOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Options = []SessionConfigSelectOption{}
+		}
+	} else {
+		return missingField("SessionConfigSelectGroup", "options")
+	}
+	return nil
+}
+
+func (v *SessionConfigSelectGroup) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionConfigSelectGroup{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.GroupID, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigSelectGroup.groupId: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionConfigSelectGroup", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigSelectGroup.name: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionConfigSelectGroup", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeList(raw, &v.Options, false, true, func(raw json.RawMessage, dst *SessionConfigSelectOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Options = []SessionConfigSelectOption{}
+		}
+	} else {
+		return seqTooShort("SessionConfigSelectGroup", 2, 4)
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A possible value for a session configuration option.
@@ -5597,8 +17536,115 @@ type SessionConfigSelectOption struct {
 	Value SessionConfigValueId `json:"value"`
 }
 
+func (v *SessionConfigSelectOption) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SessionConfigSelectOption) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionConfigSelectOption) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionConfigSelectOption{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigSelectOption.name: %w", err)
+		}
+	} else {
+		return missingField("SessionConfigSelectOption", "name")
+	}
+	if raw, ok := raws.get("value"); ok {
+		if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigSelectOption.value: %w", err)
+		}
+	} else {
+		return missingField("SessionConfigSelectOption", "value")
+	}
+	return nil
+}
+
+func (v *SessionConfigSelectOption) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionConfigSelectOption{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigSelectOption.value: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionConfigSelectOption", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+			return fmt.Errorf("SessionConfigSelectOption.name: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionConfigSelectOption", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Possible values for a session configuration option.
 type SessionConfigSelectOptions any
+
+// validSessionConfigSelectOptions reports whether raw matches an arm of SessionConfigSelectOptions.
+func validSessionConfigSelectOptions(raw json.RawMessage) error {
+	if decodeList(raw, new([]SessionConfigSelectOption), false, false, func(raw json.RawMessage, dst *SessionConfigSelectOption) error {
+		return decodeValue(raw, dst, false, true)
+	}) == nil {
+		return nil
+	}
+	if decodeList(raw, new([]SessionConfigSelectGroup), false, false, func(raw json.RawMessage, dst *SessionConfigSelectGroup) error {
+		return decodeValue(raw, dst, false, true)
+	}) == nil {
+		return nil
+	}
+	return fmt.Errorf("SessionConfigSelectOptions: data did not match any variant")
+}
 
 // Unique identifier for a session configuration option value.
 type SessionConfigValueId string
@@ -5613,6 +17659,53 @@ type SessionDeleteCapabilities struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 }
 
+func (v *SessionDeleteCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SessionDeleteCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionDeleteCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionDeleteCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *SessionDeleteCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionDeleteCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Capabilities for the session/fork method.
@@ -5623,6 +17716,51 @@ type SessionForkCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *SessionForkCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionForkCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionForkCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionForkCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *SessionForkCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionForkCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A unique identifier for a conversation session between a client and agent.
@@ -5661,56 +17799,141 @@ type SessionInfo struct {
 	UpdatedAt Nullable[string] `json:"updatedAt,omitzero"`
 }
 
-func (v *SessionInfo) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+func (v *SessionInfo) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionInfo) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionInfo) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = SessionInfo{}
-	if raw, ok := raws["_meta"]; ok {
-		var value Nullable[Meta]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Meta = value
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	if raw, ok := raws["additionalDirectories"]; ok {
-		var value []AbsolutePath
-		if err := json.Unmarshal(raw, &value); err != nil {
+	if raw, ok := raws.get("additionalDirectories"); ok {
+		if isNull(raw) {
+			v.AdditionalDirectories = nil
+		} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
 			return fmt.Errorf("SessionInfo.additionalDirectories: %w", err)
 		}
-		v.AdditionalDirectories = value
 	}
-	if raw, ok := raws["archived"]; ok {
-		var value Nullable[bool]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Archived = value
+	if raw, ok := raws.get("archived"); ok {
+		if err := decodeNullable(raw, &v.Archived, func(raw json.RawMessage, dst *bool) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Archived = Nullable[bool]{}
 		}
 	}
-	if raw, ok := raws["cwd"]; ok {
-		var value AbsolutePath
-		if err := json.Unmarshal(raw, &value); err != nil {
+	if raw, ok := raws.get("cwd"); ok {
+		if err := decodeValue(raw, &v.Cwd, false, buffered); err != nil {
 			return fmt.Errorf("SessionInfo.cwd: %w", err)
 		}
-		v.Cwd = value
+	} else {
+		return missingField("SessionInfo", "cwd")
 	}
-	if raw, ok := raws["sessionId"]; ok {
-		var value SessionId
-		if err := json.Unmarshal(raw, &value); err != nil {
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 			return fmt.Errorf("SessionInfo.sessionId: %w", err)
 		}
-		v.SessionID = value
+	} else {
+		return missingField("SessionInfo", "sessionId")
 	}
-	if raw, ok := raws["title"]; ok {
-		var value Nullable[string]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Title = value
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
 		}
 	}
-	if raw, ok := raws["updatedAt"]; ok {
-		var value Nullable[string]
-		if json.Unmarshal(raw, &value) == nil {
-			v.UpdatedAt = value
+	if raw, ok := raws.get("updatedAt"); ok {
+		if err := decodeNullable(raw, &v.UpdatedAt, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.UpdatedAt = Nullable[string]{}
 		}
+	}
+	return nil
+}
+
+func (v *SessionInfo) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionInfo{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("SessionInfo.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionInfo", 0, 7)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Cwd, false, buffered); err != nil {
+			return fmt.Errorf("SessionInfo.cwd: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionInfo", 1, 7)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if isNull(raw) {
+			v.AdditionalDirectories = nil
+		} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("SessionInfo.additionalDirectories: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.UpdatedAt, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.UpdatedAt = Nullable[string]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Archived, func(raw json.RawMessage, dst *bool) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Archived = Nullable[bool]{}
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 7 {
+		return seqTooLong(len(items))
 	}
 	return nil
 }
@@ -5734,6 +17957,81 @@ type SessionInfoUpdate struct {
 	Title Nullable[string] `json:"title,omitzero"`
 	// RFC 3339 timestamp of last activity. Set to null to clear.
 	UpdatedAt Nullable[string] `json:"updatedAt,omitzero"`
+}
+
+func (v *SessionInfoUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionInfoUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionInfoUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionInfoUpdate{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("updatedAt"); ok {
+		if err := decodeNullable(raw, &v.UpdatedAt, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.UpdatedAt = Nullable[string]{}
+		}
+	}
+	return nil
+}
+
+func (v *SessionInfoUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionInfoUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.UpdatedAt, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.UpdatedAt = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // ApplyUpdate applies a later update for the same entity to this stored SessionInfoUpdate state.
@@ -5795,6 +18093,145 @@ type SessionMessage struct {
 	SenderSessionID Nullable[SessionId] `json:"senderSessionId,omitzero"`
 }
 
+func (v *SessionMessage) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionMessage) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionMessage) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionMessage{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ContentBlock) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Content = Nullable[[]ContentBlock]{}
+		}
+	}
+	if raw, ok := raws.get("messageId"); ok {
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("SessionMessage.messageId: %w", err)
+		}
+	} else {
+		return missingField("SessionMessage", "messageId")
+	}
+	if raw, ok := raws.get("recipientMessageId"); ok {
+		if err := decodeNullable(raw, &v.RecipientMessageID, func(raw json.RawMessage, dst *MessageId) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.RecipientMessageID = Nullable[MessageId]{}
+		}
+	}
+	if raw, ok := raws.get("recipientSessionId"); ok {
+		if err := decodeNullable(raw, &v.RecipientSessionID, func(raw json.RawMessage, dst *SessionId) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.RecipientSessionID = Nullable[SessionId]{}
+		}
+	}
+	if raw, ok := raws.get("senderMessageId"); ok {
+		if err := decodeNullable(raw, &v.SenderMessageID, func(raw json.RawMessage, dst *MessageId) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.SenderMessageID = Nullable[MessageId]{}
+		}
+	}
+	if raw, ok := raws.get("senderSessionId"); ok {
+		if err := decodeNullable(raw, &v.SenderSessionID, func(raw json.RawMessage, dst *SessionId) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.SenderSessionID = Nullable[SessionId]{}
+		}
+	}
+	return nil
+}
+
+func (v *SessionMessage) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionMessage{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("SessionMessage.messageId: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionMessage", 0, 7)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.SenderSessionID, func(raw json.RawMessage, dst *SessionId) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.SenderSessionID = Nullable[SessionId]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.RecipientSessionID, func(raw json.RawMessage, dst *SessionId) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.RecipientSessionID = Nullable[SessionId]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.SenderMessageID, func(raw json.RawMessage, dst *MessageId) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.SenderMessageID = Nullable[MessageId]{}
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.RecipientMessageID, func(raw json.RawMessage, dst *MessageId) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.RecipientMessageID = Nullable[MessageId]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ContentBlock) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Content = Nullable[[]ContentBlock]{}
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 7 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // ApplyUpdate applies a later update for the same entity to this stored SessionMessage state.
 //
 // Omitted fields leave the stored value unchanged. Fields set to null are
@@ -5844,6 +18281,81 @@ type SessionMessageChunk struct {
 	MessageID MessageId `json:"messageId"`
 }
 
+func (v *SessionMessageChunk) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionMessageChunk) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionMessageChunk) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionMessageChunk{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("SessionMessageChunk.content: %w", err)
+		}
+	} else {
+		return missingField("SessionMessageChunk", "content")
+	}
+	if raw, ok := raws.get("messageId"); ok {
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("SessionMessageChunk.messageId: %w", err)
+		}
+	} else {
+		return missingField("SessionMessageChunk", "messageId")
+	}
+	return nil
+}
+
+func (v *SessionMessageChunk) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionMessageChunk{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("SessionMessageChunk.messageId: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionMessageChunk", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("SessionMessageChunk.content: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionMessageChunk", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Data for the -32002 (Resource not found) error when a session-scoped request names a
 // session that does not exist or is not active.
 // See protocol docs: Unknown Sessions
@@ -5855,6 +18367,66 @@ type SessionNotFoundErrorData struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The session ID from the request.
 	SessionID SessionId `json:"sessionId"`
+}
+
+func (v *SessionNotFoundErrorData) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionNotFoundErrorData) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionNotFoundErrorData) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionNotFoundErrorData{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("SessionNotFoundErrorData.sessionId: %w", err)
+		}
+	} else {
+		return missingField("SessionNotFoundErrorData", "sessionId")
+	}
+	return nil
+}
+
+func (v *SessionNotFoundErrorData) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionNotFoundErrorData{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("SessionNotFoundErrorData.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionNotFoundErrorData", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -5874,6 +18446,27 @@ const (
 	SessionStatusSaved SessionStatus = "saved"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *SessionStatus) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("SessionStatus: %w", err)
+	}
+	switch SessionStatus(s) {
+	case SessionStatusOpen, SessionStatusSaved:
+		*v = SessionStatus(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("SessionStatus: unknown variant %q", s)
+		}
+		*v = SessionStatus(s)
+	}
+	return nil
+}
+
+func (v *SessionStatus) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Capabilities for the session/status method.
@@ -5884,6 +18477,53 @@ type SessionStatusCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *SessionStatusCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SessionStatusCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionStatusCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionStatusCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *SessionStatusCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionStatusCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -5901,6 +18541,66 @@ type SessionStatusRequest struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The ID of the session to check.
 	SessionID SessionId `json:"sessionId"`
+}
+
+func (v *SessionStatusRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionStatusRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionStatusRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionStatusRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("SessionStatusRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("SessionStatusRequest", "sessionId")
+	}
+	return nil
+}
+
+func (v *SessionStatusRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionStatusRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("SessionStatusRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionStatusRequest", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -5926,30 +18626,73 @@ type SessionStatusResponse struct {
 	Status SessionStatus `json:"status"`
 }
 
-func (v *SessionStatusResponse) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+func (v *SessionStatusResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionStatusResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionStatusResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = SessionStatusResponse{}
-	if raw, ok := raws["_meta"]; ok {
-		var value Nullable[Meta]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Meta = value
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	if raw, ok := raws["state"]; ok {
-		var value *StateUpdate
-		if json.Unmarshal(raw, &value) == nil {
-			v.State = value
+	if raw, ok := raws.get("state"); ok {
+		if err := decodePtr(raw, &v.State, true, true); err != nil {
+			v.State = nil
 		}
 	}
-	if raw, ok := raws["status"]; ok {
-		var value SessionStatus
-		if err := json.Unmarshal(raw, &value); err != nil {
+	if raw, ok := raws.get("status"); ok {
+		if err := decodeValue(raw, &v.Status, false, buffered); err != nil {
 			return fmt.Errorf("SessionStatusResponse.status: %w", err)
 		}
-		v.Status = value
+	} else {
+		return missingField("SessionStatusResponse", "status")
+	}
+	return nil
+}
+
+func (v *SessionStatusResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionStatusResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Status, false, buffered); err != nil {
+			return fmt.Errorf("SessionStatusResponse.status: %w", err)
+		}
+	} else {
+		return seqTooShort("SessionStatusResponse", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodePtr(raw, &v.State, true, true); err != nil {
+			v.State = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
 	}
 	return nil
 }
@@ -5970,6 +18713,64 @@ type SessionSystemPromptCapabilities struct {
 	Mode *SessionSystemPromptModeCapabilities `json:"mode,omitempty"`
 }
 
+func (v *SessionSystemPromptCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SessionSystemPromptCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionSystemPromptCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionSystemPromptCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("mode"); ok {
+		if err := decodePtr(raw, &v.Mode, true, true); err != nil {
+			v.Mode = nil
+		}
+	}
+	return nil
+}
+
+func (v *SessionSystemPromptCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionSystemPromptCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Mode, true, true); err != nil {
+			v.Mode = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // System prompt delivery modes the agent supports in addition to append.
@@ -5988,6 +18789,64 @@ type SessionSystemPromptModeCapabilities struct {
 	Override *SessionSystemPromptOverrideCapabilities `json:"override,omitempty"`
 }
 
+func (v *SessionSystemPromptModeCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SessionSystemPromptModeCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionSystemPromptModeCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionSystemPromptModeCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("override"); ok {
+		if err := decodePtr(raw, &v.Override, true, true); err != nil {
+			v.Override = nil
+		}
+	}
+	return nil
+}
+
+func (v *SessionSystemPromptModeCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionSystemPromptModeCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Override, true, true); err != nil {
+			v.Override = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Capabilities for the override system prompt mode.
@@ -5999,6 +18858,53 @@ type SessionSystemPromptOverrideCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *SessionSystemPromptOverrideCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SessionSystemPromptOverrideCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionSystemPromptOverrideCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionSystemPromptOverrideCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *SessionSystemPromptOverrideCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionSystemPromptOverrideCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -6014,24 +18920,54 @@ type SessionTitleCapabilities struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 }
 
+func (v *SessionTitleCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionTitleCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionTitleCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SessionTitleCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *SessionTitleCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionTitleCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Different types of updates that can be sent while a session exists.
 // These updates report messages, progress, and other session activity.
 // See protocol docs: Agent Reports Output
-// withoutKey drops a union discriminator before its payload is decoded, so
-// payloads that keep unknown keys do not keep the discriminator too.
-func withoutKey(data []byte, key string) []byte {
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(data, &obj) != nil {
-		return data
-	}
-	delete(obj, key)
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return data
-	}
-	return out
-}
-
 type SessionUpdateKind string
 
 const (
@@ -6594,116 +19530,352 @@ func (v SessionUpdate) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *SessionUpdate) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var sessionUpdateTags = []string{"user_message_chunk", "user_message", "agent_message_chunk", "agent_message", "agent_thought_chunk", "agent_thought", "state_update", "tool_call_content_chunk", "tool_call_update", "terminal_update", "terminal_output_chunk", "plan_update", "plan_removed", "available_commands_update", "config_option_update", "session_info_update", "usage_update", "notice", "compaction_update", "compaction_summary_chunk", "subagent_update", "session_message", "session_message_chunk"}
+
+func (v *SessionUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SessionUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SessionUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = SessionUpdate{}
-	var tag string
-	if raw, ok := raws["sessionUpdate"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("SessionUpdate tag: %w", err)
+	buffered = true
+	raw, present := raws.get("sessionUpdate")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, sessionUpdateTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "user_message_chunk":
+			payload := new(ContentChunk)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.UserMessageChunk = SessionUpdateKindUserMessageChunk, payload
+				return nil
+			}
+		case "user_message":
+			payload := new(UserMessage)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.UserMessage = SessionUpdateKindUserMessage, payload
+				return nil
+			}
+		case "agent_message_chunk":
+			payload := new(ContentChunk)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.AgentMessageChunk = SessionUpdateKindAgentMessageChunk, payload
+				return nil
+			}
+		case "agent_message":
+			payload := new(AgentMessage)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.AgentMessage = SessionUpdateKindAgentMessage, payload
+				return nil
+			}
+		case "agent_thought_chunk":
+			payload := new(ContentChunk)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.AgentThoughtChunk = SessionUpdateKindAgentThoughtChunk, payload
+				return nil
+			}
+		case "agent_thought":
+			payload := new(AgentThought)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.AgentThought = SessionUpdateKindAgentThought, payload
+				return nil
+			}
+		case "state_update":
+			payload := new(StateUpdate)
+			if err = payload.decodeFields(nil, withoutKey(raws, "sessionUpdate"), true); err == nil {
+				v.Kind, v.StateUpdate = SessionUpdateKindStateUpdate, payload
+				return nil
+			}
+		case "tool_call_content_chunk":
+			payload := new(ToolCallContentChunk)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.ToolCallContentChunk = SessionUpdateKindToolCallContentChunk, payload
+				return nil
+			}
+		case "tool_call_update":
+			payload := new(ToolCallUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.ToolCallUpdate = SessionUpdateKindToolCallUpdate, payload
+				return nil
+			}
+		case "terminal_update":
+			payload := new(TerminalUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.TerminalUpdate = SessionUpdateKindTerminalUpdate, payload
+				return nil
+			}
+		case "terminal_output_chunk":
+			payload := new(TerminalOutputChunk)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.TerminalOutputChunk = SessionUpdateKindTerminalOutputChunk, payload
+				return nil
+			}
+		case "plan_update":
+			payload := new(PlanUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.PlanUpdate = SessionUpdateKindPlanUpdate, payload
+				return nil
+			}
+		case "plan_removed":
+			payload := new(PlanRemoved)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.PlanRemoved = SessionUpdateKindPlanRemoved, payload
+				return nil
+			}
+		case "available_commands_update":
+			payload := new(AvailableCommandsUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.AvailableCommandsUpdate = SessionUpdateKindAvailableCommandsUpdate, payload
+				return nil
+			}
+		case "config_option_update":
+			payload := new(ConfigOptionUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.ConfigOptionUpdate = SessionUpdateKindConfigOptionUpdate, payload
+				return nil
+			}
+		case "session_info_update":
+			payload := new(SessionInfoUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.SessionInfoUpdate = SessionUpdateKindSessionInfoUpdate, payload
+				return nil
+			}
+		case "usage_update":
+			payload := new(UsageUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.UsageUpdate = SessionUpdateKindUsageUpdate, payload
+				return nil
+			}
+		case "notice":
+			payload := new(Notice)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Notice = SessionUpdateKindNotice, payload
+				return nil
+			}
+		case "compaction_update":
+			payload := new(CompactionUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.CompactionUpdate = SessionUpdateKindCompactionUpdate, payload
+				return nil
+			}
+		case "compaction_summary_chunk":
+			payload := new(CompactionSummaryChunk)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.CompactionSummaryChunk = SessionUpdateKindCompactionSummaryChunk, payload
+				return nil
+			}
+		case "subagent_update":
+			payload := new(SubagentUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.SubagentUpdate = SessionUpdateKindSubagentUpdate, payload
+				return nil
+			}
+		case "session_message":
+			payload := new(SessionMessage)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.SessionMessage = SessionUpdateKindSessionMessage, payload
+				return nil
+			}
+		case "session_message_chunk":
+			payload := new(SessionMessageChunk)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.SessionMessageChunk = SessionUpdateKindSessionMessageChunk, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "user_message_chunk":
-		v.Kind = SessionUpdateKindUserMessageChunk
-		v.UserMessageChunk = new(ContentChunk)
-		return json.Unmarshal(data, v.UserMessageChunk)
-	case "user_message":
-		v.Kind = SessionUpdateKindUserMessage
-		v.UserMessage = new(UserMessage)
-		return json.Unmarshal(data, v.UserMessage)
-	case "agent_message_chunk":
-		v.Kind = SessionUpdateKindAgentMessageChunk
-		v.AgentMessageChunk = new(ContentChunk)
-		return json.Unmarshal(data, v.AgentMessageChunk)
-	case "agent_message":
-		v.Kind = SessionUpdateKindAgentMessage
-		v.AgentMessage = new(AgentMessage)
-		return json.Unmarshal(data, v.AgentMessage)
-	case "agent_thought_chunk":
-		v.Kind = SessionUpdateKindAgentThoughtChunk
-		v.AgentThoughtChunk = new(ContentChunk)
-		return json.Unmarshal(data, v.AgentThoughtChunk)
-	case "agent_thought":
-		v.Kind = SessionUpdateKindAgentThought
-		v.AgentThought = new(AgentThought)
-		return json.Unmarshal(data, v.AgentThought)
-	case "state_update":
-		v.Kind = SessionUpdateKindStateUpdate
-		v.StateUpdate = new(StateUpdate)
-		return json.Unmarshal(withoutKey(data, "sessionUpdate"), v.StateUpdate)
-	case "tool_call_content_chunk":
-		v.Kind = SessionUpdateKindToolCallContentChunk
-		v.ToolCallContentChunk = new(ToolCallContentChunk)
-		return json.Unmarshal(data, v.ToolCallContentChunk)
-	case "tool_call_update":
-		v.Kind = SessionUpdateKindToolCallUpdate
-		v.ToolCallUpdate = new(ToolCallUpdate)
-		return json.Unmarshal(data, v.ToolCallUpdate)
-	case "terminal_update":
-		v.Kind = SessionUpdateKindTerminalUpdate
-		v.TerminalUpdate = new(TerminalUpdate)
-		return json.Unmarshal(data, v.TerminalUpdate)
-	case "terminal_output_chunk":
-		v.Kind = SessionUpdateKindTerminalOutputChunk
-		v.TerminalOutputChunk = new(TerminalOutputChunk)
-		return json.Unmarshal(data, v.TerminalOutputChunk)
-	case "plan_update":
-		v.Kind = SessionUpdateKindPlanUpdate
-		v.PlanUpdate = new(PlanUpdate)
-		return json.Unmarshal(data, v.PlanUpdate)
-	case "plan_removed":
-		v.Kind = SessionUpdateKindPlanRemoved
-		v.PlanRemoved = new(PlanRemoved)
-		return json.Unmarshal(data, v.PlanRemoved)
-	case "available_commands_update":
-		v.Kind = SessionUpdateKindAvailableCommandsUpdate
-		v.AvailableCommandsUpdate = new(AvailableCommandsUpdate)
-		return json.Unmarshal(data, v.AvailableCommandsUpdate)
-	case "config_option_update":
-		v.Kind = SessionUpdateKindConfigOptionUpdate
-		v.ConfigOptionUpdate = new(ConfigOptionUpdate)
-		return json.Unmarshal(data, v.ConfigOptionUpdate)
-	case "session_info_update":
-		v.Kind = SessionUpdateKindSessionInfoUpdate
-		v.SessionInfoUpdate = new(SessionInfoUpdate)
-		return json.Unmarshal(data, v.SessionInfoUpdate)
-	case "usage_update":
-		v.Kind = SessionUpdateKindUsageUpdate
-		v.UsageUpdate = new(UsageUpdate)
-		return json.Unmarshal(data, v.UsageUpdate)
-	case "notice":
-		v.Kind = SessionUpdateKindNotice
-		v.Notice = new(Notice)
-		return json.Unmarshal(data, v.Notice)
-	case "compaction_update":
-		v.Kind = SessionUpdateKindCompactionUpdate
-		v.CompactionUpdate = new(CompactionUpdate)
-		return json.Unmarshal(data, v.CompactionUpdate)
-	case "compaction_summary_chunk":
-		v.Kind = SessionUpdateKindCompactionSummaryChunk
-		v.CompactionSummaryChunk = new(CompactionSummaryChunk)
-		return json.Unmarshal(data, v.CompactionSummaryChunk)
-	case "subagent_update":
-		v.Kind = SessionUpdateKindSubagentUpdate
-		v.SubagentUpdate = new(SubagentUpdate)
-		return json.Unmarshal(data, v.SubagentUpdate)
-	case "session_message":
-		v.Kind = SessionUpdateKindSessionMessage
-		v.SessionMessage = new(SessionMessage)
-		return json.Unmarshal(data, v.SessionMessage)
-	case "session_message_chunk":
-		v.Kind = SessionUpdateKindSessionMessageChunk
-		v.SessionMessageChunk = new(SessionMessageChunk)
-		return json.Unmarshal(data, v.SessionMessageChunk)
-	default:
+	if tagged && tag != "user_message_chunk" && tag != "user_message" && tag != "agent_message_chunk" && tag != "agent_message" && tag != "agent_thought_chunk" && tag != "agent_thought" && tag != "state_update" && tag != "tool_call_content_chunk" && tag != "tool_call_update" && tag != "terminal_update" && tag != "terminal_output_chunk" && tag != "plan_update" && tag != "plan_removed" && tag != "available_commands_update" && tag != "config_option_update" && tag != "session_info_update" && tag != "usage_update" && tag != "notice" && tag != "compaction_update" && tag != "compaction_summary_chunk" && tag != "subagent_update" && tag != "session_message" && tag != "session_message_chunk" {
 		v.Kind = SessionUpdateKind(tag)
-		v.Other = &SessionUpdateOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &SessionUpdateOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("SessionUpdate: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("SessionUpdate", "sessionUpdate")
+	}
+	return fmt.Errorf("SessionUpdate: unknown sessionUpdate tag %s", raw)
+}
+
+func (v *SessionUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SessionUpdate{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, sessionUpdateTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "user_message_chunk":
+			payload := new(ContentChunk)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.UserMessageChunk = SessionUpdateKindUserMessageChunk, payload
+				return nil
+			}
+		case "user_message":
+			payload := new(UserMessage)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.UserMessage = SessionUpdateKindUserMessage, payload
+				return nil
+			}
+		case "agent_message_chunk":
+			payload := new(ContentChunk)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.AgentMessageChunk = SessionUpdateKindAgentMessageChunk, payload
+				return nil
+			}
+		case "agent_message":
+			payload := new(AgentMessage)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.AgentMessage = SessionUpdateKindAgentMessage, payload
+				return nil
+			}
+		case "agent_thought_chunk":
+			payload := new(ContentChunk)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.AgentThoughtChunk = SessionUpdateKindAgentThoughtChunk, payload
+				return nil
+			}
+		case "agent_thought":
+			payload := new(AgentThought)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.AgentThought = SessionUpdateKindAgentThought, payload
+				return nil
+			}
+		case "state_update":
+			payload := new(StateUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.StateUpdate = SessionUpdateKindStateUpdate, payload
+				return nil
+			}
+		case "tool_call_content_chunk":
+			payload := new(ToolCallContentChunk)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.ToolCallContentChunk = SessionUpdateKindToolCallContentChunk, payload
+				return nil
+			}
+		case "tool_call_update":
+			payload := new(ToolCallUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.ToolCallUpdate = SessionUpdateKindToolCallUpdate, payload
+				return nil
+			}
+		case "terminal_update":
+			payload := new(TerminalUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.TerminalUpdate = SessionUpdateKindTerminalUpdate, payload
+				return nil
+			}
+		case "terminal_output_chunk":
+			payload := new(TerminalOutputChunk)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.TerminalOutputChunk = SessionUpdateKindTerminalOutputChunk, payload
+				return nil
+			}
+		case "plan_update":
+			payload := new(PlanUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.PlanUpdate = SessionUpdateKindPlanUpdate, payload
+				return nil
+			}
+		case "plan_removed":
+			payload := new(PlanRemoved)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.PlanRemoved = SessionUpdateKindPlanRemoved, payload
+				return nil
+			}
+		case "available_commands_update":
+			payload := new(AvailableCommandsUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.AvailableCommandsUpdate = SessionUpdateKindAvailableCommandsUpdate, payload
+				return nil
+			}
+		case "config_option_update":
+			payload := new(ConfigOptionUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.ConfigOptionUpdate = SessionUpdateKindConfigOptionUpdate, payload
+				return nil
+			}
+		case "session_info_update":
+			payload := new(SessionInfoUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.SessionInfoUpdate = SessionUpdateKindSessionInfoUpdate, payload
+				return nil
+			}
+		case "usage_update":
+			payload := new(UsageUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.UsageUpdate = SessionUpdateKindUsageUpdate, payload
+				return nil
+			}
+		case "notice":
+			payload := new(Notice)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Notice = SessionUpdateKindNotice, payload
+				return nil
+			}
+		case "compaction_update":
+			payload := new(CompactionUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.CompactionUpdate = SessionUpdateKindCompactionUpdate, payload
+				return nil
+			}
+		case "compaction_summary_chunk":
+			payload := new(CompactionSummaryChunk)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.CompactionSummaryChunk = SessionUpdateKindCompactionSummaryChunk, payload
+				return nil
+			}
+		case "subagent_update":
+			payload := new(SubagentUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.SubagentUpdate = SessionUpdateKindSubagentUpdate, payload
+				return nil
+			}
+		case "session_message":
+			payload := new(SessionMessage)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.SessionMessage = SessionUpdateKindSessionMessage, payload
+				return nil
+			}
+		case "session_message_chunk":
+			payload := new(SessionMessageChunk)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.SessionMessageChunk = SessionUpdateKindSessionMessageChunk, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("SessionUpdate: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("SessionUpdate", "sessionUpdate")
+	}
+	return fmt.Errorf("SessionUpdate: unknown sessionUpdate tag %s", raw)
 }
 
 // UNSTABLE
@@ -6727,6 +19899,111 @@ type SetProviderRequest struct {
 	ProviderID ProviderId `json:"providerId"`
 }
 
+func (v *SetProviderRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SetProviderRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SetProviderRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SetProviderRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("apiType"); ok {
+		if err := decodeValue(raw, &v.APIType, false, buffered); err != nil {
+			return fmt.Errorf("SetProviderRequest.apiType: %w", err)
+		}
+	} else {
+		return missingField("SetProviderRequest", "apiType")
+	}
+	if raw, ok := raws.get("baseUrl"); ok {
+		if err := decodeValue(raw, &v.BaseURL, false, buffered); err != nil {
+			return fmt.Errorf("SetProviderRequest.baseUrl: %w", err)
+		}
+	} else {
+		return missingField("SetProviderRequest", "baseUrl")
+	}
+	if raw, ok := raws.get("headers"); ok {
+		if err := decodeMap(raw, &v.Headers, false, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("SetProviderRequest.headers: %w", err)
+		}
+	}
+	if raw, ok := raws.get("providerId"); ok {
+		if err := decodeValue(raw, &v.ProviderID, false, buffered); err != nil {
+			return fmt.Errorf("SetProviderRequest.providerId: %w", err)
+		}
+	} else {
+		return missingField("SetProviderRequest", "providerId")
+	}
+	return nil
+}
+
+func (v *SetProviderRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SetProviderRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ProviderID, false, buffered); err != nil {
+			return fmt.Errorf("SetProviderRequest.providerId: %w", err)
+		}
+	} else {
+		return seqTooShort("SetProviderRequest", 0, 5)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.APIType, false, buffered); err != nil {
+			return fmt.Errorf("SetProviderRequest.apiType: %w", err)
+		}
+	} else {
+		return seqTooShort("SetProviderRequest", 1, 5)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.BaseURL, false, buffered); err != nil {
+			return fmt.Errorf("SetProviderRequest.baseUrl: %w", err)
+		}
+	} else {
+		return seqTooShort("SetProviderRequest", 2, 5)
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeMap(raw, &v.Headers, false, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("SetProviderRequest.headers: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 5 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Response to providers/set.
@@ -6736,6 +20013,51 @@ type SetProviderResponse struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *SetProviderResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SetProviderResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SetProviderResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SetProviderResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *SetProviderResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SetProviderResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Request parameters for setting a session configuration option.
@@ -6774,14 +20096,137 @@ type SetSessionConfigOptionRequestOther struct{ Raw json.RawMessage }
 
 func (v SetSessionConfigOptionRequestOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }
 
+// setSessionConfigOptionRequestOtherFields checks the fields an open SetSessionConfigOptionRequest variant must carry.
+type setSessionConfigOptionRequestOtherFields struct {
+	Value json.RawMessage `json:"value"`
+}
+
+func (v *setSessionConfigOptionRequestOtherFields) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *setSessionConfigOptionRequestOtherFields) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *setSessionConfigOptionRequestOtherFields) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = setSessionConfigOptionRequestOtherFields{}
+	if raw, ok := raws.get("value"); ok {
+		if err := decodeValue(raw, &v.Value, true, buffered); err != nil {
+			return fmt.Errorf("setSessionConfigOptionRequestOtherFields.value: %w", err)
+		}
+	} else {
+		return missingField("setSessionConfigOptionRequestOtherFields", "value")
+	}
+	return nil
+}
+
 type SetSessionConfigOptionRequestID struct {
 	// The value ID.
 	Value SessionConfigValueId `json:"value"`
 }
 
+func (v *SetSessionConfigOptionRequestID) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SetSessionConfigOptionRequestID) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SetSessionConfigOptionRequestID) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SetSessionConfigOptionRequestID{}
+	if raw, ok := raws.get("value"); ok {
+		if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionConfigOptionRequestID.value: %w", err)
+		}
+	} else {
+		return missingField("SetSessionConfigOptionRequestID", "value")
+	}
+	return nil
+}
+
+func (v *SetSessionConfigOptionRequestID) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SetSessionConfigOptionRequestID{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionConfigOptionRequestID.value: %w", err)
+		}
+	} else {
+		return seqTooShort("SetSessionConfigOptionRequestID", 0, 1)
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 type SetSessionConfigOptionRequestBoolean struct {
 	// The boolean value.
 	Value bool `json:"value"`
+}
+
+func (v *SetSessionConfigOptionRequestBoolean) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SetSessionConfigOptionRequestBoolean) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SetSessionConfigOptionRequestBoolean) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SetSessionConfigOptionRequestBoolean{}
+	if raw, ok := raws.get("value"); ok {
+		if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionConfigOptionRequestBoolean.value: %w", err)
+		}
+	} else {
+		return missingField("SetSessionConfigOptionRequestBoolean", "value")
+	}
+	return nil
+}
+
+func (v *SetSessionConfigOptionRequestBoolean) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SetSessionConfigOptionRequestBoolean{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionConfigOptionRequestBoolean.value: %w", err)
+		}
+	} else {
+		return seqTooShort("SetSessionConfigOptionRequestBoolean", 0, 1)
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // setSessionConfigOptionRequestShadow mirrors SetSessionConfigOptionRequest without its union methods, for encoding common fields.
@@ -6851,35 +20296,81 @@ func (v SetSessionConfigOptionRequest) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
+var setSessionConfigOptionRequestTags = []string{"id", "boolean"}
+
 func (v *SetSessionConfigOptionRequest) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SetSessionConfigOptionRequest) decodeJSON(data []byte, buffered bool) error {
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SetSessionConfigOptionRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = SetSessionConfigOptionRequest{}
-	if err := json.Unmarshal(data, (*setSessionConfigOptionRequestShadow)(v)); err != nil {
-		return err
-	}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("SetSessionConfigOptionRequest tag: %w", err)
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	switch tag {
-	case "id":
-		v.Kind = SetSessionConfigOptionRequestKindId
-		v.ID = new(SetSessionConfigOptionRequestID)
-		return json.Unmarshal(data, v.ID)
-	case "boolean":
-		v.Kind = SetSessionConfigOptionRequestKindBoolean
-		v.Boolean = new(SetSessionConfigOptionRequestBoolean)
-		return json.Unmarshal(data, v.Boolean)
-	default:
+	if raw, ok := raws.get("configId"); ok {
+		if err := decodeValue(raw, &v.ConfigID, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionConfigOptionRequest.configId: %w", err)
+		}
+	} else {
+		return missingField("SetSessionConfigOptionRequest", "configId")
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionConfigOptionRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("SetSessionConfigOptionRequest", "sessionId")
+	}
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, false, setSessionConfigOptionRequestTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "id":
+			payload := new(SetSessionConfigOptionRequestID)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.ID = SetSessionConfigOptionRequestKindId, payload
+				return nil
+			}
+		case "boolean":
+			payload := new(SetSessionConfigOptionRequestBoolean)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Boolean = SetSessionConfigOptionRequestKindBoolean, payload
+				return nil
+			}
+		}
+	}
+	if tagged && tag != "id" && tag != "boolean" {
+		if e := new(setSessionConfigOptionRequestOtherFields).decodeFields(data, raws, true); e != nil {
+			return fmt.Errorf("SetSessionConfigOptionRequest: data matches no variant: %w", e)
+		}
 		v.Kind = SetSessionConfigOptionRequestKind(tag)
-		v.Other = &SetSessionConfigOptionRequestOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &SetSessionConfigOptionRequestOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("SetSessionConfigOptionRequest: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("SetSessionConfigOptionRequest", "type")
+	}
+	return fmt.Errorf("SetSessionConfigOptionRequest: unknown type tag %s", raw)
 }
 
 // Response to session/set_config_option method.
@@ -6891,6 +20382,72 @@ type SetSessionConfigOptionResponse struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The full set of configuration options and their current values.
 	ConfigOptions []SessionConfigOption `json:"configOptions"`
+}
+
+func (v *SetSessionConfigOptionResponse) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SetSessionConfigOptionResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SetSessionConfigOptionResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SetSessionConfigOptionResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("configOptions"); ok {
+		if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			return fmt.Errorf("SetSessionConfigOptionResponse.configOptions: %w", err)
+		}
+	} else {
+		return missingField("SetSessionConfigOptionResponse", "configOptions")
+	}
+	return nil
+}
+
+func (v *SetSessionConfigOptionResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SetSessionConfigOptionResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			return fmt.Errorf("SetSessionConfigOptionResponse.configOptions: %w", err)
+		}
+	} else {
+		return seqTooShort("SetSessionConfigOptionResponse", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -6917,6 +20474,81 @@ type SetSessionTitleRequest struct {
 	Title string `json:"title"`
 }
 
+func (v *SetSessionTitleRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SetSessionTitleRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SetSessionTitleRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SetSessionTitleRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionTitleRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("SetSessionTitleRequest", "sessionId")
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionTitleRequest.title: %w", err)
+		}
+	} else {
+		return missingField("SetSessionTitleRequest", "title")
+	}
+	return nil
+}
+
+func (v *SetSessionTitleRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SetSessionTitleRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionTitleRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("SetSessionTitleRequest", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionTitleRequest.title: %w", err)
+		}
+	} else {
+		return seqTooShort("SetSessionTitleRequest", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Response from setting the title of a session.
@@ -6930,6 +20562,66 @@ type SetSessionTitleResponse struct {
 	// This differs from the requested title if the Agent normalized it. Clients SHOULD
 	// display this value rather than the one they sent.
 	Title string `json:"title"`
+}
+
+func (v *SetSessionTitleResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SetSessionTitleResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SetSessionTitleResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SetSessionTitleResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionTitleResponse.title: %w", err)
+		}
+	} else {
+		return missingField("SetSessionTitleResponse", "title")
+	}
+	return nil
+}
+
+func (v *SetSessionTitleResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SetSessionTitleResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+			return fmt.Errorf("SetSessionTitleResponse.title: %w", err)
+		}
+	} else {
+		return seqTooShort("SetSessionTitleResponse", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A snapshot of the session's aggregate foreground activity.
@@ -7070,40 +20762,124 @@ func (v StateUpdate) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *StateUpdate) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var stateUpdateTags = []string{"running", "idle", "requires_action", "unknown"}
+
+func (v *StateUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *StateUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *StateUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = StateUpdate{}
-	var tag string
-	if raw, ok := raws["state"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("StateUpdate tag: %w", err)
+	buffered = true
+	raw, present := raws.get("state")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, stateUpdateTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "running":
+			payload := new(RunningStateUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Running = StateUpdateKindRunning, payload
+				return nil
+			}
+		case "idle":
+			payload := new(IdleStateUpdate)
+			if err = payload.decodeFields(nil, withoutKey(raws, "state"), true); err == nil {
+				v.Kind, v.Idle = StateUpdateKindIdle, payload
+				return nil
+			}
+		case "requires_action":
+			payload := new(RequiresActionStateUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.RequiresAction = StateUpdateKindRequiresAction, payload
+				return nil
+			}
+		case "unknown":
+			payload := new(UnknownStateUpdate)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Unknown = StateUpdateKindUnknown, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "running":
-		v.Kind = StateUpdateKindRunning
-		v.Running = new(RunningStateUpdate)
-		return json.Unmarshal(data, v.Running)
-	case "idle":
-		v.Kind = StateUpdateKindIdle
-		v.Idle = new(IdleStateUpdate)
-		return json.Unmarshal(withoutKey(data, "state"), v.Idle)
-	case "requires_action":
-		v.Kind = StateUpdateKindRequiresAction
-		v.RequiresAction = new(RequiresActionStateUpdate)
-		return json.Unmarshal(data, v.RequiresAction)
-	case "unknown":
-		v.Kind = StateUpdateKindUnknown
-		v.Unknown = new(UnknownStateUpdate)
-		return json.Unmarshal(data, v.Unknown)
-	default:
+	if tagged && tag != "running" && tag != "idle" && tag != "requires_action" && tag != "unknown" {
 		v.Kind = StateUpdateKind(tag)
-		v.Other = &StateUpdateOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &StateUpdateOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("StateUpdate: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("StateUpdate", "state")
+	}
+	return fmt.Errorf("StateUpdate: unknown state tag %s", raw)
+}
+
+func (v *StateUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = StateUpdate{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, stateUpdateTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "running":
+			payload := new(RunningStateUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Running = StateUpdateKindRunning, payload
+				return nil
+			}
+		case "idle":
+			payload := new(IdleStateUpdate)
+			if err = errSeq; err == nil {
+				v.Kind, v.Idle = StateUpdateKindIdle, payload
+				return nil
+			}
+		case "requires_action":
+			payload := new(RequiresActionStateUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.RequiresAction = StateUpdateKindRequiresAction, payload
+				return nil
+			}
+		case "unknown":
+			payload := new(UnknownStateUpdate)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Unknown = StateUpdateKindUnknown, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("StateUpdate: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("StateUpdate", "state")
+	}
+	return fmt.Errorf("StateUpdate: unknown state tag %s", raw)
 }
 
 // String format types for string properties in elicitation schemas.
@@ -7120,6 +20896,27 @@ const (
 	StringFormatDateTime StringFormat = "date-time"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *StringFormat) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("StringFormat: %w", err)
+	}
+	switch StringFormat(s) {
+	case StringFormatEmail, StringFormatUri, StringFormatDate, StringFormatDateTime:
+		*v = StringFormat(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("StringFormat: unknown variant %q", s)
+		}
+		*v = StringFormat(s)
+	}
+	return nil
+}
+
+func (v *StringFormat) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // String item schema for multi-select enum properties.
 type StringMultiSelectItems struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -7129,6 +20926,70 @@ type StringMultiSelectItems struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// Allowed enum values. Must contain at least one value.
 	Enum []string `json:"enum"`
+}
+
+func (v *StringMultiSelectItems) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *StringMultiSelectItems) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *StringMultiSelectItems) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = StringMultiSelectItems{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("enum"); ok {
+		if err := decodeList(raw, &v.Enum, false, false, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("StringMultiSelectItems.enum: %w", err)
+		}
+	} else {
+		return missingField("StringMultiSelectItems", "enum")
+	}
+	return nil
+}
+
+func (v *StringMultiSelectItems) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = StringMultiSelectItems{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeList(raw, &v.Enum, false, false, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("StringMultiSelectItems.enum: %w", err)
+		}
+	} else {
+		return seqTooShort("StringMultiSelectItems", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Schema for string properties in an elicitation form.
@@ -7173,6 +21034,190 @@ type StringPropertySchema struct {
 	Title Nullable[string] `json:"title,omitzero"`
 }
 
+func (v *StringPropertySchema) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *StringPropertySchema) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *StringPropertySchema) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = StringPropertySchema{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("default"); ok {
+		if err := decodeNullable(raw, &v.Default, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Default = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("enum"); ok {
+		if err := decodeNullable(raw, &v.Enum, func(raw json.RawMessage, dst *[]string) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, buffered)
+			})
+		}); err != nil {
+			return fmt.Errorf("StringPropertySchema.enum: %w", err)
+		}
+	}
+	if raw, ok := raws.get("format"); ok {
+		if err := decodeValue(raw, &v.Format, true, buffered); err != nil {
+			return fmt.Errorf("StringPropertySchema.format: %w", err)
+		}
+	}
+	if raw, ok := raws.get("maxLength"); ok {
+		if err := decodeNullable(raw, &v.MaxLength, func(raw json.RawMessage, dst *uint32) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("StringPropertySchema.maxLength: %w", err)
+		}
+	}
+	if raw, ok := raws.get("minLength"); ok {
+		if err := decodeNullable(raw, &v.MinLength, func(raw json.RawMessage, dst *uint32) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("StringPropertySchema.minLength: %w", err)
+		}
+	}
+	if raw, ok := raws.get("oneOf"); ok {
+		if err := decodeNullable(raw, &v.OneOf, func(raw json.RawMessage, dst *[]EnumOption) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *EnumOption) error {
+				return decodeValue(raw, dst, false, buffered)
+			})
+		}); err != nil {
+			return fmt.Errorf("StringPropertySchema.oneOf: %w", err)
+		}
+	}
+	if raw, ok := raws.get("pattern"); ok {
+		if err := decodeNullable(raw, &v.Pattern, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("StringPropertySchema.pattern: %w", err)
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	return nil
+}
+
+func (v *StringPropertySchema) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = StringPropertySchema{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.MinLength, func(raw json.RawMessage, dst *uint32) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("StringPropertySchema.minLength: %w", err)
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.MaxLength, func(raw json.RawMessage, dst *uint32) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("StringPropertySchema.maxLength: %w", err)
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Pattern, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("StringPropertySchema.pattern: %w", err)
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeValue(raw, &v.Format, true, buffered); err != nil {
+			return fmt.Errorf("StringPropertySchema.format: %w", err)
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodeNullable(raw, &v.Default, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Default = Nullable[string]{}
+		}
+	}
+	if len(items) > 7 {
+		raw := items[7]
+		if err := decodeNullable(raw, &v.Enum, func(raw json.RawMessage, dst *[]string) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, buffered)
+			})
+		}); err != nil {
+			return fmt.Errorf("StringPropertySchema.enum: %w", err)
+		}
+	}
+	if len(items) > 8 {
+		raw := items[8]
+		if err := decodeNullable(raw, &v.OneOf, func(raw json.RawMessage, dst *[]EnumOption) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *EnumOption) error {
+				return decodeValue(raw, dst, false, buffered)
+			})
+		}); err != nil {
+			return fmt.Errorf("StringPropertySchema.oneOf: %w", err)
+		}
+	}
+	if len(items) > 9 {
+		raw := items[9]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 10 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Client-initiated session mutations permitted for a specific subagent session.
@@ -7188,6 +21233,64 @@ type SubagentSessionCapabilities struct {
 	// the session. Omitted and null are equivalent and mean unsupported. An object (including
 	// {}) means supported.
 	Cancel *SessionCancelCapabilities `json:"cancel,omitempty"`
+}
+
+func (v *SubagentSessionCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *SubagentSessionCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SubagentSessionCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SubagentSessionCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("cancel"); ok {
+		if err := decodePtr(raw, &v.Cancel, true, true); err != nil {
+			v.Cancel = nil
+		}
+	}
+	return nil
+}
+
+func (v *SubagentSessionCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SubagentSessionCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Cancel, true, true); err != nil {
+			v.Cancel = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -7242,6 +21345,160 @@ type SubagentUpdate struct {
 	// Optional and nullable. Omitted means unchanged. null clears it. If no
 	// title is set, the Client chooses a fallback presentation.
 	Title Nullable[string] `json:"title,omitzero"`
+}
+
+func (v *SubagentUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SubagentUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SubagentUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SubagentUpdate{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("additionalDirectories"); ok {
+		if err := decodeNullable(raw, &v.AdditionalDirectories, func(raw json.RawMessage, dst *[]AbsolutePath) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *AbsolutePath) error {
+				return decodeValue(raw, dst, false, buffered)
+			})
+		}); err != nil {
+			return fmt.Errorf("SubagentUpdate.additionalDirectories: %w", err)
+		}
+	}
+	if raw, ok := raws.get("capabilities"); ok {
+		if err := decodeNullable(raw, &v.Capabilities, func(raw json.RawMessage, dst *SubagentSessionCapabilities) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Capabilities = Nullable[SubagentSessionCapabilities]{}
+		}
+	}
+	if raw, ok := raws.get("cwd"); ok {
+		if err := decodeNullable(raw, &v.Cwd, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("SubagentUpdate.cwd: %w", err)
+		}
+	}
+	if raw, ok := raws.get("description"); ok {
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("SubagentUpdate.sessionId: %w", err)
+		}
+	} else {
+		return missingField("SubagentUpdate", "sessionId")
+	}
+	if raw, ok := raws.get("state"); ok {
+		if err := decodeNullable(raw, &v.State, func(raw json.RawMessage, dst *StateUpdate) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.State = Nullable[StateUpdate]{}
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	return nil
+}
+
+func (v *SubagentUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SubagentUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("SubagentUpdate.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("SubagentUpdate", 0, 8)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Description = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Capabilities, func(raw json.RawMessage, dst *SubagentSessionCapabilities) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Capabilities = Nullable[SubagentSessionCapabilities]{}
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.State, func(raw json.RawMessage, dst *StateUpdate) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.State = Nullable[StateUpdate]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Cwd, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("SubagentUpdate.cwd: %w", err)
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodeNullable(raw, &v.AdditionalDirectories, func(raw json.RawMessage, dst *[]AbsolutePath) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *AbsolutePath) error {
+				return decodeValue(raw, dst, false, buffered)
+			})
+		}); err != nil {
+			return fmt.Errorf("SubagentUpdate.additionalDirectories: %w", err)
+		}
+	}
+	if len(items) > 7 {
+		raw := items[7]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 8 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // ApplyUpdate applies a later update for the same entity to this stored SubagentUpdate state.
@@ -7305,6 +21562,85 @@ type SystemPrompt struct {
 	Mode SystemPromptMode `json:"mode"`
 }
 
+func (v *SystemPrompt) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *SystemPrompt) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *SystemPrompt) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = SystemPrompt{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeList(raw, &v.Content, false, false, func(raw json.RawMessage, dst *ContentBlock) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("SystemPrompt.content: %w", err)
+		}
+	} else {
+		return missingField("SystemPrompt", "content")
+	}
+	if raw, ok := raws.get("mode"); ok {
+		if err := decodeValue(raw, &v.Mode, false, buffered); err != nil {
+			return fmt.Errorf("SystemPrompt.mode: %w", err)
+		}
+	} else {
+		return missingField("SystemPrompt", "mode")
+	}
+	return nil
+}
+
+func (v *SystemPrompt) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = SystemPrompt{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Mode, false, buffered); err != nil {
+			return fmt.Errorf("SystemPrompt.mode: %w", err)
+		}
+	} else {
+		return seqTooShort("SystemPrompt", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeList(raw, &v.Content, false, false, func(raw json.RawMessage, dst *ContentBlock) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("SystemPrompt.content: %w", err)
+		}
+	} else {
+		return seqTooShort("SystemPrompt", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // How the Agent combines a client-provided system prompt with its own instructions.
@@ -7330,6 +21666,27 @@ const (
 	SystemPromptModeOverride SystemPromptMode = "override"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *SystemPromptMode) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("SystemPromptMode: %w", err)
+	}
+	switch SystemPromptMode(s) {
+	case SystemPromptModeAppend, SystemPromptModeOverride:
+		*v = SystemPromptMode(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("SystemPromptMode: unknown variant %q", s)
+		}
+		*v = SystemPromptMode(s)
+	}
+	return nil
+}
+
+func (v *SystemPromptMode) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // A display-only reference to an agent-owned terminal.
 // Terminal state and output are delivered separately through
 // terminal_update and terminal_output_chunk session updates.
@@ -7341,6 +21698,66 @@ type Terminal struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The ID of the terminal to display.
 	TerminalID TerminalId `json:"terminalId"`
+}
+
+func (v *Terminal) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Terminal) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Terminal) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Terminal{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("terminalId"); ok {
+		if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
+			return fmt.Errorf("Terminal.terminalId: %w", err)
+		}
+	} else {
+		return missingField("Terminal", "terminalId")
+	}
+	return nil
+}
+
+func (v *Terminal) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Terminal{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
+			return fmt.Errorf("Terminal.terminalId: %w", err)
+		}
+	} else {
+		return seqTooShort("Terminal", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Capabilities for terminal authentication methods.
@@ -7355,6 +21772,51 @@ type TerminalAuthCapabilities struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 }
 
+func (v *TerminalAuthCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TerminalAuthCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TerminalAuthCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TerminalAuthCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *TerminalAuthCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TerminalAuthCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Capability to cancel a terminal with terminal/cancel.
 // Supplying {} advertises support. An omitted or null cancel does not.
 type TerminalCancelCapabilities struct {
@@ -7363,6 +21825,53 @@ type TerminalCancelCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *TerminalCancelCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *TerminalCancelCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TerminalCancelCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TerminalCancelCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *TerminalCancelCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TerminalCancelCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Client-initiated controls a terminal currently supports.
@@ -7379,6 +21888,62 @@ type TerminalCapabilities struct {
 	// Omitted and null are equivalent and mean unsupported. An object (including {})
 	// means supported. Agents SHOULD stop advertising it once the terminal reports exitStatus.
 	Cancel *TerminalCancelCapabilities `json:"cancel,omitempty"`
+}
+
+func (v *TerminalCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TerminalCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TerminalCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TerminalCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("cancel"); ok {
+		if err := decodePtr(raw, &v.Cancel, true, true); err != nil {
+			v.Cancel = nil
+		}
+	}
+	return nil
+}
+
+func (v *TerminalCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TerminalCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Cancel, true, true); err != nil {
+			v.Cancel = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Exit information for an agent-owned terminal.
@@ -7400,6 +21965,81 @@ type TerminalExitStatus struct {
 	Signal Nullable[string] `json:"signal,omitzero"`
 }
 
+func (v *TerminalExitStatus) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TerminalExitStatus) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TerminalExitStatus) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TerminalExitStatus{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("exitCode"); ok {
+		if err := decodeNullable(raw, &v.ExitCode, func(raw json.RawMessage, dst *int64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ExitCode = Nullable[int64]{}
+		}
+	}
+	if raw, ok := raws.get("signal"); ok {
+		if err := decodeNullable(raw, &v.Signal, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Signal = Nullable[string]{}
+		}
+	}
+	return nil
+}
+
+func (v *TerminalExitStatus) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TerminalExitStatus{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.ExitCode, func(raw json.RawMessage, dst *int64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ExitCode = Nullable[int64]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Signal, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Signal = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Unique identifier for an agent-owned terminal within a session.
 type TerminalId string
 
@@ -7412,6 +22052,66 @@ type TerminalOutput struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// Base64-encoded replacement terminal output bytes.
 	Data string `json:"data"`
+}
+
+func (v *TerminalOutput) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TerminalOutput) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TerminalOutput) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TerminalOutput{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("data"); ok {
+		if err := decodeValue(raw, &v.Data, false, buffered); err != nil {
+			return fmt.Errorf("TerminalOutput.data: %w", err)
+		}
+	} else {
+		return missingField("TerminalOutput", "data")
+	}
+	return nil
+}
+
+func (v *TerminalOutput) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TerminalOutput{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Data, false, buffered); err != nil {
+			return fmt.Errorf("TerminalOutput.data: %w", err)
+		}
+	} else {
+		return seqTooShort("TerminalOutput", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A chunk of bytes appended to an agent-owned terminal's output.
@@ -7428,6 +22128,81 @@ type TerminalOutputChunk struct {
 	TerminalID TerminalId `json:"terminalId"`
 }
 
+func (v *TerminalOutputChunk) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TerminalOutputChunk) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TerminalOutputChunk) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TerminalOutputChunk{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("data"); ok {
+		if err := decodeValue(raw, &v.Data, false, buffered); err != nil {
+			return fmt.Errorf("TerminalOutputChunk.data: %w", err)
+		}
+	} else {
+		return missingField("TerminalOutputChunk", "data")
+	}
+	if raw, ok := raws.get("terminalId"); ok {
+		if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
+			return fmt.Errorf("TerminalOutputChunk.terminalId: %w", err)
+		}
+	} else {
+		return missingField("TerminalOutputChunk", "terminalId")
+	}
+	return nil
+}
+
+func (v *TerminalOutputChunk) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TerminalOutputChunk{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
+			return fmt.Errorf("TerminalOutputChunk.terminalId: %w", err)
+		}
+	} else {
+		return seqTooShort("TerminalOutputChunk", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Data, false, buffered); err != nil {
+			return fmt.Errorf("TerminalOutputChunk.data: %w", err)
+		}
+	} else {
+		return seqTooShort("TerminalOutputChunk", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // The size of an agent-owned terminal in character cells.
 type TerminalSize struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -7439,6 +22214,81 @@ type TerminalSize struct {
 	Cols uint16 `json:"cols"`
 	// Number of rows.
 	Rows uint16 `json:"rows"`
+}
+
+func (v *TerminalSize) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TerminalSize) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TerminalSize) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TerminalSize{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("cols"); ok {
+		if err := decodeValue(raw, &v.Cols, false, buffered); err != nil {
+			return fmt.Errorf("TerminalSize.cols: %w", err)
+		}
+	} else {
+		return missingField("TerminalSize", "cols")
+	}
+	if raw, ok := raws.get("rows"); ok {
+		if err := decodeValue(raw, &v.Rows, false, buffered); err != nil {
+			return fmt.Errorf("TerminalSize.rows: %w", err)
+		}
+	} else {
+		return missingField("TerminalSize", "rows")
+	}
+	return nil
+}
+
+func (v *TerminalSize) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TerminalSize{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Cols, false, buffered); err != nil {
+			return fmt.Errorf("TerminalSize.cols: %w", err)
+		}
+	} else {
+		return seqTooShort("TerminalSize", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Rows, false, buffered); err != nil {
+			return fmt.Errorf("TerminalSize.rows: %w", err)
+		}
+	} else {
+		return seqTooShort("TerminalSize", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // An upsert for the stored state of an agent-owned terminal.
@@ -7474,6 +22324,156 @@ type TerminalUpdate struct {
 	Size Nullable[TerminalSize] `json:"size,omitzero"`
 	// Unique identifier for this terminal within the session.
 	TerminalID TerminalId `json:"terminalId"`
+}
+
+func (v *TerminalUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TerminalUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TerminalUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TerminalUpdate{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("capabilities"); ok {
+		if err := decodeNullable(raw, &v.Capabilities, func(raw json.RawMessage, dst *TerminalCapabilities) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Capabilities = Nullable[TerminalCapabilities]{}
+		}
+	}
+	if raw, ok := raws.get("command"); ok {
+		if err := decodeNullable(raw, &v.Command, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Command = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("cwd"); ok {
+		if err := decodeNullable(raw, &v.Cwd, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Cwd = Nullable[AbsolutePath]{}
+		}
+	}
+	if raw, ok := raws.get("exitStatus"); ok {
+		if err := decodeNullable(raw, &v.ExitStatus, func(raw json.RawMessage, dst *TerminalExitStatus) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ExitStatus = Nullable[TerminalExitStatus]{}
+		}
+	}
+	if raw, ok := raws.get("output"); ok {
+		if err := decodeNullable(raw, &v.Output, func(raw json.RawMessage, dst *TerminalOutput) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Output = Nullable[TerminalOutput]{}
+		}
+	}
+	if raw, ok := raws.get("size"); ok {
+		if err := decodeNullable(raw, &v.Size, func(raw json.RawMessage, dst *TerminalSize) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Size = Nullable[TerminalSize]{}
+		}
+	}
+	if raw, ok := raws.get("terminalId"); ok {
+		if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
+			return fmt.Errorf("TerminalUpdate.terminalId: %w", err)
+		}
+	} else {
+		return missingField("TerminalUpdate", "terminalId")
+	}
+	return nil
+}
+
+func (v *TerminalUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TerminalUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
+			return fmt.Errorf("TerminalUpdate.terminalId: %w", err)
+		}
+	} else {
+		return seqTooShort("TerminalUpdate", 0, 8)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Command, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Command = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Cwd, func(raw json.RawMessage, dst *AbsolutePath) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Cwd = Nullable[AbsolutePath]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Output, func(raw json.RawMessage, dst *TerminalOutput) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Output = Nullable[TerminalOutput]{}
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.ExitStatus, func(raw json.RawMessage, dst *TerminalExitStatus) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ExitStatus = Nullable[TerminalExitStatus]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Size, func(raw json.RawMessage, dst *TerminalSize) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Size = Nullable[TerminalSize]{}
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodeNullable(raw, &v.Capabilities, func(raw json.RawMessage, dst *TerminalCapabilities) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Capabilities = Nullable[TerminalCapabilities]{}
+		}
+	}
+	if len(items) > 7 {
+		raw := items[7]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 8 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // ApplyUpdate applies a later update for the same entity to this stored TerminalUpdate state.
@@ -7521,6 +22521,66 @@ type TextCommandInput struct {
 	Hint string `json:"hint"`
 }
 
+func (v *TextCommandInput) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TextCommandInput) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TextCommandInput) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TextCommandInput{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("hint"); ok {
+		if err := decodeValue(raw, &v.Hint, false, buffered); err != nil {
+			return fmt.Errorf("TextCommandInput.hint: %w", err)
+		}
+	} else {
+		return missingField("TextCommandInput", "hint")
+	}
+	return nil
+}
+
+func (v *TextCommandInput) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TextCommandInput{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Hint, false, buffered); err != nil {
+			return fmt.Errorf("TextCommandInput.hint: %w", err)
+		}
+	} else {
+		return seqTooShort("TextCommandInput", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Text provided to or from an LLM.
 type TextContent struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -7533,6 +22593,77 @@ type TextContent struct {
 	Annotations *Annotations `json:"annotations,omitempty"`
 	// Text payload carried by this content block.
 	Text string `json:"text"`
+}
+
+func (v *TextContent) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TextContent) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TextContent) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TextContent{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("annotations"); ok {
+		if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
+			v.Annotations = nil
+		}
+	}
+	if raw, ok := raws.get("text"); ok {
+		if err := decodeValue(raw, &v.Text, false, buffered); err != nil {
+			return fmt.Errorf("TextContent.text: %w", err)
+		}
+	} else {
+		return missingField("TextContent", "text")
+	}
+	return nil
+}
+
+func (v *TextContent) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TextContent{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Text, false, buffered); err != nil {
+			return fmt.Errorf("TextContent.text: %w", err)
+		}
+	} else {
+		return seqTooShort("TextContent", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
+			v.Annotations = nil
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Text-based resource contents.
@@ -7551,6 +22682,92 @@ type TextResourceContents struct {
 	URI string `json:"uri"`
 }
 
+func (v *TextResourceContents) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TextResourceContents) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TextResourceContents) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TextResourceContents{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("mimeType"); ok {
+		if err := decodeValue(raw, &v.MimeType, true, true); err != nil {
+			v.MimeType = nil
+		}
+	}
+	if raw, ok := raws.get("text"); ok {
+		if err := decodeValue(raw, &v.Text, false, buffered); err != nil {
+			return fmt.Errorf("TextResourceContents.text: %w", err)
+		}
+	} else {
+		return missingField("TextResourceContents", "text")
+	}
+	if raw, ok := raws.get("uri"); ok {
+		if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
+			return fmt.Errorf("TextResourceContents.uri: %w", err)
+		}
+	} else {
+		return missingField("TextResourceContents", "uri")
+	}
+	return nil
+}
+
+func (v *TextResourceContents) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TextResourceContents{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Text, false, buffered); err != nil {
+			return fmt.Errorf("TextResourceContents.text: %w", err)
+		}
+	} else {
+		return seqTooShort("TextResourceContents", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
+			return fmt.Errorf("TextResourceContents.uri: %w", err)
+		}
+	} else {
+		return seqTooShort("TextResourceContents", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.MimeType, true, true); err != nil {
+			v.MimeType = nil
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Items definition for titled multi-select enum properties.
 type TitledMultiSelectItems struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -7562,6 +22779,70 @@ type TitledMultiSelectItems struct {
 	AnyOf []EnumOption `json:"anyOf"`
 }
 
+func (v *TitledMultiSelectItems) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *TitledMultiSelectItems) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *TitledMultiSelectItems) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = TitledMultiSelectItems{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("anyOf"); ok {
+		if err := decodeList(raw, &v.AnyOf, false, false, func(raw json.RawMessage, dst *EnumOption) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("TitledMultiSelectItems.anyOf: %w", err)
+		}
+	} else {
+		return missingField("TitledMultiSelectItems", "anyOf")
+	}
+	return nil
+}
+
+func (v *TitledMultiSelectItems) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = TitledMultiSelectItems{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeList(raw, &v.AnyOf, false, false, func(raw json.RawMessage, dst *EnumOption) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("TitledMultiSelectItems.anyOf: %w", err)
+		}
+	} else {
+		return seqTooShort("TitledMultiSelectItems", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Capability to cancel a tool call with tool_call/cancel.
 // Supplying {} advertises support. An omitted or null cancel does not.
 type ToolCallCancelCapabilities struct {
@@ -7570,6 +22851,53 @@ type ToolCallCancelCapabilities struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *ToolCallCancelCapabilities) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *ToolCallCancelCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ToolCallCancelCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ToolCallCancelCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *ToolCallCancelCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ToolCallCancelCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Client-initiated controls a tool call currently supports.
@@ -7586,6 +22914,62 @@ type ToolCallCapabilities struct {
 	// Omitted and null are equivalent and mean unsupported. An object (including {})
 	// means supported. Agents SHOULD stop advertising it once the tool call reaches a final status.
 	Cancel *ToolCallCancelCapabilities `json:"cancel,omitempty"`
+}
+
+func (v *ToolCallCapabilities) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ToolCallCapabilities) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ToolCallCapabilities) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ToolCallCapabilities{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("cancel"); ok {
+		if err := decodePtr(raw, &v.Cancel, true, true); err != nil {
+			v.Cancel = nil
+		}
+	}
+	return nil
+}
+
+func (v *ToolCallCapabilities) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ToolCallCapabilities{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodePtr(raw, &v.Cancel, true, true); err != nil {
+			v.Cancel = nil
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Content produced by a tool call.
@@ -7694,36 +23078,112 @@ func (v ToolCallContent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (v *ToolCallContent) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+var toolCallContentTags = []string{"content", "diff", "terminal"}
+
+func (v *ToolCallContent) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ToolCallContent) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ToolCallContent) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = ToolCallContent{}
-	var tag string
-	if raw, ok := raws["type"]; ok {
-		if err := json.Unmarshal(raw, &tag); err != nil {
-			return fmt.Errorf("ToolCallContent tag: %w", err)
+	buffered = true
+	raw, present := raws.get("type")
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, toolCallContentTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "content":
+			payload := new(Content)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Content = ToolCallContentKindContent, payload
+				return nil
+			}
+		case "diff":
+			payload := new(Diff)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Diff = ToolCallContentKindDiff, payload
+				return nil
+			}
+		case "terminal":
+			payload := new(Terminal)
+			if err = payload.decodeFields(data, raws, true); err == nil {
+				v.Kind, v.Terminal = ToolCallContentKindTerminal, payload
+				return nil
+			}
 		}
 	}
-	switch tag {
-	case "content":
-		v.Kind = ToolCallContentKindContent
-		v.Content = new(Content)
-		return json.Unmarshal(data, v.Content)
-	case "diff":
-		v.Kind = ToolCallContentKindDiff
-		v.Diff = new(Diff)
-		return json.Unmarshal(data, v.Diff)
-	case "terminal":
-		v.Kind = ToolCallContentKindTerminal
-		v.Terminal = new(Terminal)
-		return json.Unmarshal(data, v.Terminal)
-	default:
+	if tagged && tag != "content" && tag != "diff" && tag != "terminal" {
 		v.Kind = ToolCallContentKind(tag)
-		v.Other = &ToolCallContentOther{Raw: append(json.RawMessage(nil), data...)}
+		v.Other = &ToolCallContentOther{Raw: objectData(data, raws)}
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("ToolCallContent: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("ToolCallContent", "type")
+	}
+	return fmt.Errorf("ToolCallContent: unknown type tag %s", raw)
+}
+
+func (v *ToolCallContent) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ToolCallContent{}
+	buffered = true
+	present := len(items) > 0
+	var raw json.RawMessage
+	if present {
+		raw = items[0]
+	}
+	tag, tagged := "", false
+	if present {
+		tag, tagged = decodeTag(raw, buffered, toolCallContentTags)
+	}
+	var err error
+	if tagged {
+		switch tag {
+		case "content":
+			payload := new(Content)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Content = ToolCallContentKindContent, payload
+				return nil
+			}
+		case "diff":
+			payload := new(Diff)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Diff = ToolCallContentKindDiff, payload
+				return nil
+			}
+		case "terminal":
+			payload := new(Terminal)
+			if err = payload.decodeSeq(items[1:], true); err == nil {
+				v.Kind, v.Terminal = ToolCallContentKindTerminal, payload
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("ToolCallContent: data matches no variant: %w", err)
+	}
+	if !present {
+		return missingField("ToolCallContent", "type")
+	}
+	return fmt.Errorf("ToolCallContent: unknown type tag %s", raw)
 }
 
 // A streamed item of tool-call content.
@@ -7742,6 +23202,81 @@ type ToolCallContentChunk struct {
 	Content ToolCallContent `json:"content"`
 	// The ID of the tool call this content belongs to.
 	ToolCallID ToolCallId `json:"toolCallId"`
+}
+
+func (v *ToolCallContentChunk) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ToolCallContentChunk) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ToolCallContentChunk) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ToolCallContentChunk{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("ToolCallContentChunk.content: %w", err)
+		}
+	} else {
+		return missingField("ToolCallContentChunk", "content")
+	}
+	if raw, ok := raws.get("toolCallId"); ok {
+		if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
+			return fmt.Errorf("ToolCallContentChunk.toolCallId: %w", err)
+		}
+	} else {
+		return missingField("ToolCallContentChunk", "toolCallId")
+	}
+	return nil
+}
+
+func (v *ToolCallContentChunk) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ToolCallContentChunk{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
+			return fmt.Errorf("ToolCallContentChunk.toolCallId: %w", err)
+		}
+	} else {
+		return seqTooShort("ToolCallContentChunk", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+			return fmt.Errorf("ToolCallContentChunk.content: %w", err)
+		}
+	} else {
+		return seqTooShort("ToolCallContentChunk", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Unique identifier for a tool call within a session.
@@ -7764,6 +23299,81 @@ type ToolCallLocation struct {
 	Path AbsolutePath `json:"path"`
 }
 
+func (v *ToolCallLocation) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ToolCallLocation) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ToolCallLocation) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ToolCallLocation{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("line"); ok {
+		if err := decodeNullable(raw, &v.Line, func(raw json.RawMessage, dst *uint32) error {
+			return decodeNonZero(raw, dst)
+		}); err != nil {
+			v.Line = Nullable[uint32]{}
+		}
+	}
+	if raw, ok := raws.get("path"); ok {
+		if err := decodeValue(raw, &v.Path, false, buffered); err != nil {
+			return fmt.Errorf("ToolCallLocation.path: %w", err)
+		}
+	} else {
+		return missingField("ToolCallLocation", "path")
+	}
+	return nil
+}
+
+func (v *ToolCallLocation) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ToolCallLocation{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Path, false, buffered); err != nil {
+			return fmt.Errorf("ToolCallLocation.path: %w", err)
+		}
+	} else {
+		return seqTooShort("ToolCallLocation", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Line, func(raw json.RawMessage, dst *uint32) error {
+			return decodeNonZero(raw, dst)
+		}); err != nil {
+			v.Line = Nullable[uint32]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Permission request details for a tool call.
 type ToolCallPermissionSubject struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -7776,6 +23386,68 @@ type ToolCallPermissionSubject struct {
 	// notification, in the order it was received, before showing the prompt. A first-seen
 	// toolCallId creates the tool call.
 	ToolCall ToolCallUpdate `json:"toolCall"`
+}
+
+func (v *ToolCallPermissionSubject) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *ToolCallPermissionSubject) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ToolCallPermissionSubject) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ToolCallPermissionSubject{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("toolCall"); ok {
+		if err := decodeValue(raw, &v.ToolCall, false, buffered); err != nil {
+			return fmt.Errorf("ToolCallPermissionSubject.toolCall: %w", err)
+		}
+	} else {
+		return missingField("ToolCallPermissionSubject", "toolCall")
+	}
+	return nil
+}
+
+func (v *ToolCallPermissionSubject) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ToolCallPermissionSubject{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ToolCall, false, buffered); err != nil {
+			return fmt.Errorf("ToolCallPermissionSubject.toolCall: %w", err)
+		}
+	} else {
+		return seqTooShort("ToolCallPermissionSubject", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // Execution status of a tool call.
@@ -7799,6 +23471,27 @@ const (
 	// The tool call was cancelled before it completed.
 	ToolCallStatusCancelled ToolCallStatus = "cancelled"
 )
+
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *ToolCallStatus) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("ToolCallStatus: %w", err)
+	}
+	switch ToolCallStatus(s) {
+	case ToolCallStatusPending, ToolCallStatusInProgress, ToolCallStatusPaused, ToolCallStatusCompleted, ToolCallStatusFailed, ToolCallStatusCancelled:
+		*v = ToolCallStatus(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("ToolCallStatus: unknown variant %q", s)
+		}
+		*v = ToolCallStatus(s)
+	}
+	return nil
+}
+
+func (v *ToolCallStatus) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
 
 // Represents an upsert for a tool call that the language model has requested.
 // Tool calls are actions that the agent executes on behalf of the language model,
@@ -7854,6 +23547,201 @@ type ToolCallUpdate struct {
 	Title Nullable[string] `json:"title,omitzero"`
 	// Unique identifier for this tool call within the session.
 	ToolCallID ToolCallId `json:"toolCallId"`
+}
+
+func (v *ToolCallUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *ToolCallUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *ToolCallUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = ToolCallUpdate{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("capabilities"); ok {
+		if err := decodeNullable(raw, &v.Capabilities, func(raw json.RawMessage, dst *ToolCallCapabilities) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Capabilities = Nullable[ToolCallCapabilities]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ToolCallContent) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ToolCallContent) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Content = Nullable[[]ToolCallContent]{}
+		}
+	}
+	if raw, ok := raws.get("kind"); ok {
+		if err := decodeNullable(raw, &v.Kind, func(raw json.RawMessage, dst *ToolKind) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Kind = Nullable[ToolKind]{}
+		}
+	}
+	if raw, ok := raws.get("locations"); ok {
+		if err := decodeNullable(raw, &v.Locations, func(raw json.RawMessage, dst *[]ToolCallLocation) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ToolCallLocation) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Locations = Nullable[[]ToolCallLocation]{}
+		}
+	}
+	if raw, ok := raws.get("name"); ok {
+		if err := decodeNullable(raw, &v.Name, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Name = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("rawInput"); ok {
+		if err := decodeValue(raw, &v.RawInput, true, true); err != nil {
+			v.RawInput = nil
+		}
+	}
+	if raw, ok := raws.get("rawOutput"); ok {
+		if err := decodeValue(raw, &v.RawOutput, true, true); err != nil {
+			v.RawOutput = nil
+		}
+	}
+	if raw, ok := raws.get("status"); ok {
+		if err := decodeNullable(raw, &v.Status, func(raw json.RawMessage, dst *ToolCallStatus) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Status = Nullable[ToolCallStatus]{}
+		}
+	}
+	if raw, ok := raws.get("title"); ok {
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if raw, ok := raws.get("toolCallId"); ok {
+		if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
+			return fmt.Errorf("ToolCallUpdate.toolCallId: %w", err)
+		}
+	} else {
+		return missingField("ToolCallUpdate", "toolCallId")
+	}
+	return nil
+}
+
+func (v *ToolCallUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = ToolCallUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
+			return fmt.Errorf("ToolCallUpdate.toolCallId: %w", err)
+		}
+	} else {
+		return seqTooShort("ToolCallUpdate", 0, 11)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Name, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Name = Nullable[string]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Title = Nullable[string]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Kind, func(raw json.RawMessage, dst *ToolKind) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Kind = Nullable[ToolKind]{}
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.Status, func(raw json.RawMessage, dst *ToolCallStatus) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Status = Nullable[ToolCallStatus]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ToolCallContent) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ToolCallContent) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Content = Nullable[[]ToolCallContent]{}
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodeNullable(raw, &v.Locations, func(raw json.RawMessage, dst *[]ToolCallLocation) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ToolCallLocation) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Locations = Nullable[[]ToolCallLocation]{}
+		}
+	}
+	if len(items) > 7 {
+		raw := items[7]
+		if err := decodeValue(raw, &v.RawInput, true, true); err != nil {
+			v.RawInput = nil
+		}
+	}
+	if len(items) > 8 {
+		raw := items[8]
+		if err := decodeValue(raw, &v.RawOutput, true, true); err != nil {
+			v.RawOutput = nil
+		}
+	}
+	if len(items) > 9 {
+		raw := items[9]
+		if err := decodeNullable(raw, &v.Capabilities, func(raw json.RawMessage, dst *ToolCallCapabilities) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Capabilities = Nullable[ToolCallCapabilities]{}
+		}
+	}
+	if len(items) > 10 {
+		raw := items[10]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 11 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // ApplyUpdate applies a later update for the same entity to this stored ToolCallUpdate state.
@@ -7928,6 +23816,27 @@ const (
 	ToolKindOther ToolKind = "other"
 )
 
+// UnmarshalJSON keeps any string, as Rust's open enum does, and reads the
+// map form {"variant": null} of a known variant.
+func (v *ToolKind) UnmarshalJSON(data []byte) error {
+	s, mapForm, err := enumValue(data)
+	if err != nil {
+		return fmt.Errorf("ToolKind: %w", err)
+	}
+	switch ToolKind(s) {
+	case ToolKindRead, ToolKindEdit, ToolKindDelete, ToolKindMove, ToolKindSearch, ToolKindExecute, ToolKindThink, ToolKindFetch, ToolKindSwitchMode, ToolKindOther:
+		*v = ToolKind(s)
+	default:
+		if mapForm {
+			return fmt.Errorf("ToolKind: unknown variant %q", s)
+		}
+		*v = ToolKind(s)
+	}
+	return nil
+}
+
+func (v *ToolKind) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Request parameters for unarchiving a session.
@@ -7947,6 +23856,66 @@ type UnarchiveSessionRequest struct {
 	SessionID SessionId `json:"sessionId"`
 }
 
+func (v *UnarchiveSessionRequest) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *UnarchiveSessionRequest) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *UnarchiveSessionRequest) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = UnarchiveSessionRequest{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("UnarchiveSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return missingField("UnarchiveSessionRequest", "sessionId")
+	}
+	return nil
+}
+
+func (v *UnarchiveSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = UnarchiveSessionRequest{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("UnarchiveSessionRequest.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("UnarchiveSessionRequest", 0, 2)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Response from unarchiving a session.
@@ -7956,6 +23925,51 @@ type UnarchiveSessionResponse struct {
 	// Implementations MUST NOT assign meaning to keys they do not recognize.
 	// See protocol docs: Extensibility
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v *UnarchiveSessionResponse) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *UnarchiveSessionResponse) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *UnarchiveSessionResponse) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = UnarchiveSessionResponse{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	return nil
+}
+
+func (v *UnarchiveSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = UnarchiveSessionResponse{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 1 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -7982,23 +23996,66 @@ type UnknownStateUpdate struct {
 	Background Nullable[[]BackgroundWork] `json:"background,omitzero"`
 }
 
-func (v *UnknownStateUpdate) UnmarshalJSON(data []byte) error {
-	var raws map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+func (v *UnknownStateUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *UnknownStateUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
 		return err
 	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *UnknownStateUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = UnknownStateUpdate{}
-	if raw, ok := raws["_meta"]; ok {
-		var value Nullable[Meta]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Meta = value
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
 		}
 	}
-	if raw, ok := raws["background"]; ok {
-		var value Nullable[[]BackgroundWork]
-		if json.Unmarshal(raw, &value) == nil {
-			v.Background = value
+	if raw, ok := raws.get("background"); ok {
+		if err := decodeNullable(raw, &v.Background, func(raw json.RawMessage, dst *[]BackgroundWork) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *BackgroundWork) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Background = Nullable[[]BackgroundWork]{}
 		}
+	}
+	return nil
+}
+
+func (v *UnknownStateUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = UnknownStateUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeNullable(raw, &v.Background, func(raw json.RawMessage, dst *[]BackgroundWork) error {
+			return decodeList(raw, dst, false, false, func(raw json.RawMessage, dst *BackgroundWork) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Background = Nullable[[]BackgroundWork]{}
+		}
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 2 {
+		return seqTooLong(len(items))
 	}
 	return nil
 }
@@ -8017,6 +24074,87 @@ type UnsupportedProtocolVersionErrorData struct {
 	Supported []ProtocolVersion `json:"supported"`
 }
 
+func (v *UnsupportedProtocolVersionErrorData) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *UnsupportedProtocolVersionErrorData) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *UnsupportedProtocolVersionErrorData) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = UnsupportedProtocolVersionErrorData{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("requested"); ok {
+		if err := decodeValue(raw, &v.Requested, false, buffered); err != nil {
+			return fmt.Errorf("UnsupportedProtocolVersionErrorData.requested: %w", err)
+		}
+	} else {
+		return missingField("UnsupportedProtocolVersionErrorData", "requested")
+	}
+	if raw, ok := raws.get("supported"); ok {
+		if err := decodeList(raw, &v.Supported, false, false, func(raw json.RawMessage, dst *ProtocolVersion) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("UnsupportedProtocolVersionErrorData.supported: %w", err)
+		}
+	} else {
+		return missingField("UnsupportedProtocolVersionErrorData", "supported")
+	}
+	return nil
+}
+
+func (v *UnsupportedProtocolVersionErrorData) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = UnsupportedProtocolVersionErrorData{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Requested, false, buffered); err != nil {
+			return fmt.Errorf("UnsupportedProtocolVersionErrorData.requested: %w", err)
+		}
+	} else {
+		return seqTooShort("UnsupportedProtocolVersionErrorData", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeList(raw, &v.Supported, false, false, func(raw json.RawMessage, dst *ProtocolVersion) error {
+			return decodeValue(raw, dst, false, buffered)
+		}); err != nil {
+			return fmt.Errorf("UnsupportedProtocolVersionErrorData.supported: %w", err)
+		}
+	} else {
+		return seqTooShort("UnsupportedProtocolVersionErrorData", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Notification containing a session update from the agent.
 // Agents can send session updates at any point while the session exists.
 // See protocol docs: Agent Reports Output
@@ -8030,6 +24168,83 @@ type UpdateSessionNotification struct {
 	SessionID SessionId `json:"sessionId"`
 	// The actual update content.
 	Update SessionUpdate `json:"update"`
+}
+
+func (v *UpdateSessionNotification) UnmarshalJSON(data []byte) error {
+	return v.decodeJSON(data, false)
+}
+
+func (v *UpdateSessionNotification) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *UpdateSessionNotification) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = UpdateSessionNotification{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("sessionId"); ok {
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("UpdateSessionNotification.sessionId: %w", err)
+		}
+	} else {
+		return missingField("UpdateSessionNotification", "sessionId")
+	}
+	if raw, ok := raws.get("update"); ok {
+		if err := decodeValue(raw, &v.Update, false, buffered); err != nil {
+			return fmt.Errorf("UpdateSessionNotification.update: %w", err)
+		}
+	} else {
+		return missingField("UpdateSessionNotification", "update")
+	}
+	return nil
+}
+
+func (v *UpdateSessionNotification) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = UpdateSessionNotification{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+			return fmt.Errorf("UpdateSessionNotification.sessionId: %w", err)
+		}
+	} else {
+		return seqTooShort("UpdateSessionNotification", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Update, false, buffered); err != nil {
+			return fmt.Errorf("UpdateSessionNotification.update: %w", err)
+		}
+	} else {
+		return seqTooShort("UpdateSessionNotification", 1, 3)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // UNSTABLE
@@ -8058,6 +24273,141 @@ type Usage struct {
 	TotalTokens uint64 `json:"totalTokens"`
 }
 
+func (v *Usage) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *Usage) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *Usage) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = Usage{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("cachedReadTokens"); ok {
+		if err := decodeNullable(raw, &v.CachedReadTokens, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.CachedReadTokens = Nullable[uint64]{}
+		}
+	}
+	if raw, ok := raws.get("cachedWriteTokens"); ok {
+		if err := decodeNullable(raw, &v.CachedWriteTokens, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.CachedWriteTokens = Nullable[uint64]{}
+		}
+	}
+	if raw, ok := raws.get("inputTokens"); ok {
+		if err := decodeValue(raw, &v.InputTokens, false, buffered); err != nil {
+			return fmt.Errorf("Usage.inputTokens: %w", err)
+		}
+	} else {
+		return missingField("Usage", "inputTokens")
+	}
+	if raw, ok := raws.get("outputTokens"); ok {
+		if err := decodeValue(raw, &v.OutputTokens, false, buffered); err != nil {
+			return fmt.Errorf("Usage.outputTokens: %w", err)
+		}
+	} else {
+		return missingField("Usage", "outputTokens")
+	}
+	if raw, ok := raws.get("thoughtTokens"); ok {
+		if err := decodeNullable(raw, &v.ThoughtTokens, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ThoughtTokens = Nullable[uint64]{}
+		}
+	}
+	if raw, ok := raws.get("totalTokens"); ok {
+		if err := decodeValue(raw, &v.TotalTokens, false, buffered); err != nil {
+			return fmt.Errorf("Usage.totalTokens: %w", err)
+		}
+	} else {
+		return missingField("Usage", "totalTokens")
+	}
+	return nil
+}
+
+func (v *Usage) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = Usage{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.TotalTokens, false, buffered); err != nil {
+			return fmt.Errorf("Usage.totalTokens: %w", err)
+		}
+	} else {
+		return seqTooShort("Usage", 0, 7)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.InputTokens, false, buffered); err != nil {
+			return fmt.Errorf("Usage.inputTokens: %w", err)
+		}
+	} else {
+		return seqTooShort("Usage", 1, 7)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeValue(raw, &v.OutputTokens, false, buffered); err != nil {
+			return fmt.Errorf("Usage.outputTokens: %w", err)
+		}
+	} else {
+		return seqTooShort("Usage", 2, 7)
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.ThoughtTokens, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.ThoughtTokens = Nullable[uint64]{}
+		}
+	}
+	if len(items) > 4 {
+		raw := items[4]
+		if err := decodeNullable(raw, &v.CachedReadTokens, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.CachedReadTokens = Nullable[uint64]{}
+		}
+	}
+	if len(items) > 5 {
+		raw := items[5]
+		if err := decodeNullable(raw, &v.CachedWriteTokens, func(raw json.RawMessage, dst *uint64) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.CachedWriteTokens = Nullable[uint64]{}
+		}
+	}
+	if len(items) > 6 {
+		raw := items[6]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 7 {
+		return seqTooLong(len(items))
+	}
+	return nil
+}
+
 // Context window and cost update for a session.
 type UsageUpdate struct {
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
@@ -8072,6 +24422,96 @@ type UsageUpdate struct {
 	Size uint64 `json:"size"`
 	// Tokens currently in context.
 	Used uint64 `json:"used"`
+}
+
+func (v *UsageUpdate) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *UsageUpdate) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *UsageUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = UsageUpdate{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("cost"); ok {
+		if err := decodeNullable(raw, &v.Cost, func(raw json.RawMessage, dst *Cost) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Cost = Nullable[Cost]{}
+		}
+	}
+	if raw, ok := raws.get("size"); ok {
+		if err := decodeValue(raw, &v.Size, false, buffered); err != nil {
+			return fmt.Errorf("UsageUpdate.size: %w", err)
+		}
+	} else {
+		return missingField("UsageUpdate", "size")
+	}
+	if raw, ok := raws.get("used"); ok {
+		if err := decodeValue(raw, &v.Used, false, buffered); err != nil {
+			return fmt.Errorf("UsageUpdate.used: %w", err)
+		}
+	} else {
+		return missingField("UsageUpdate", "used")
+	}
+	return nil
+}
+
+func (v *UsageUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = UsageUpdate{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.Used, false, buffered); err != nil {
+			return fmt.Errorf("UsageUpdate.used: %w", err)
+		}
+	} else {
+		return seqTooShort("UsageUpdate", 0, 4)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeValue(raw, &v.Size, false, buffered); err != nil {
+			return fmt.Errorf("UsageUpdate.size: %w", err)
+		}
+	} else {
+		return seqTooShort("UsageUpdate", 1, 4)
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Cost, func(raw json.RawMessage, dst *Cost) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Cost = Nullable[Cost]{}
+		}
+	}
+	if len(items) > 3 {
+		raw := items[3]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 4 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // A user message upsert.
@@ -8098,6 +24538,85 @@ type UserMessage struct {
 	Content Nullable[[]ContentBlock] `json:"content,omitzero"`
 	// A unique identifier for the message.
 	MessageID MessageId `json:"messageId"`
+}
+
+func (v *UserMessage) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *UserMessage) decodeJSON(data []byte, buffered bool) error {
+	if isArray(data) {
+		items, err := splitArray(data)
+		if err != nil {
+			return err
+		}
+		return v.decodeSeq(items, buffered)
+	}
+	raws, err := splitObject(data)
+	if err != nil {
+		return err
+	}
+	return v.decodeFields(data, raws, buffered)
+}
+
+func (v *UserMessage) decodeFields(data []byte, raws rawObject, buffered bool) error {
+	*v = UserMessage{}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if raw, ok := raws.get("content"); ok {
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ContentBlock) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Content = Nullable[[]ContentBlock]{}
+		}
+	}
+	if raw, ok := raws.get("messageId"); ok {
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("UserMessage.messageId: %w", err)
+		}
+	} else {
+		return missingField("UserMessage", "messageId")
+	}
+	return nil
+}
+
+func (v *UserMessage) decodeSeq(items []json.RawMessage, buffered bool) error {
+	*v = UserMessage{}
+	if len(items) > 0 {
+		raw := items[0]
+		if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+			return fmt.Errorf("UserMessage.messageId: %w", err)
+		}
+	} else {
+		return seqTooShort("UserMessage", 0, 3)
+	}
+	if len(items) > 1 {
+		raw := items[1]
+		if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ContentBlock) error {
+			return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+				return decodeValue(raw, dst, false, true)
+			})
+		}); err != nil {
+			v.Content = Nullable[[]ContentBlock]{}
+		}
+	}
+	if len(items) > 2 {
+		raw := items[2]
+		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+			return decodeValue(raw, dst, false, true)
+		}); err != nil {
+			v.Meta = Nullable[Meta]{}
+		}
+	}
+	if len(items) > 3 {
+		return seqTooLong(len(items))
+	}
+	return nil
 }
 
 // ApplyUpdate applies a later update for the same entity to this stored UserMessage state.

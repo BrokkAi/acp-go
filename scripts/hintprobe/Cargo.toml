@@ -1,0 +1,19 @@
+# Decode probe for the Rust schema crate pinned by ROADMAP.md. It is a
+# development tool for scripts/capture_hint_fixtures.py, which writes
+# src/dispatch.rs and builds it; nothing in the Go module depends on it.
+[package]
+name = "acp-hintprobe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+agent-client-protocol-schema = { version = "=1.15.1", default-features = false }
+serde = "=1.0.229"
+serde_json = { version = "=1.0.154", features = ["preserve_order", "raw_value"] }
+
+[features]
+unstable = ["agent-client-protocol-schema/unstable"]
+unstable_protocol_v2 = ["agent-client-protocol-schema/unstable_protocol_v2"]
+
+[workspace]

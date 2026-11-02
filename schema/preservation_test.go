@@ -42,30 +42,37 @@ func TestMetaPayloadsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestOpenWorldEnumsDecodeUnknownValues pins the second guardrail: enum string
-// types carry no closed set, so a value this schema release does not name must
-// still decode and re-encode instead of failing.
+// TestOpenWorldEnumsDecodeUnknownValues pins the second guardrail: an enum
+// the schema leaves open (it has a catch-all string member) decodes and
+// re-encodes a value this release does not name. A closed v1 enum decodes as
+// Rust's does: an unknown value fails, or reads as its #[serde(other)] member
+// (ToolKind's "other").
 func TestOpenWorldEnumsDecodeUnknownValues(t *testing.T) {
-	var response PromptResponse
-	if err := json.Unmarshal([]byte(`{"stopReason":"future_reason"}`), &response); err != nil {
+	var notice Notice
+	if err := json.Unmarshal([]byte(`{"severity":"future_severity","title":"t","message":"m"}`), &notice); err != nil {
 		t.Fatal(err)
 	}
-	if response.StopReason != StopReason("future_reason") {
-		t.Fatalf("stop reason = %q", response.StopReason)
+	if notice.Severity != NoticeSeverity("future_severity") {
+		t.Fatalf("severity = %q", notice.Severity)
+	}
+	encoded, err := json.Marshal(notice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"future_severity"`) {
+		t.Fatalf("unknown severity was not preserved: %s", encoded)
+	}
+
+	var response PromptResponse
+	if err := json.Unmarshal([]byte(`{"stopReason":"future_reason"}`), &response); err == nil {
+		t.Fatalf("closed stop reason accepted an unknown value: %q", response.StopReason)
 	}
 
 	var call ToolCall
 	if err := json.Unmarshal([]byte(`{"toolCallId":"t","title":"x","kind":"future_kind"}`), &call); err != nil {
 		t.Fatal(err)
 	}
-	if call.Kind == nil || *call.Kind != ToolKind("future_kind") {
-		t.Fatalf("tool kind = %v", call.Kind)
-	}
-	encoded, err := json.Marshal(call)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(encoded), `"future_kind"`) {
-		t.Fatalf("unknown tool kind was not preserved: %s", encoded)
+	if call.Kind == nil || *call.Kind != ToolKindOther {
+		t.Fatalf("tool kind = %v, want other", call.Kind)
 	}
 }

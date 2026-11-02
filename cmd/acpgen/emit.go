@@ -17,6 +17,7 @@ func emit(r *ir, pin, packageName string) []genFile {
 		{"types_gen.go", emitTypes(r, pin, packageName)},
 		{"methods_gen.go", emitMethods(r, pin, packageName)},
 		{"parity_gen_test.go", emitParity(r, pin, packageName)},
+		{"hints_gen_test.go", emitHints(r, pin, packageName)},
 	}
 }
 
@@ -147,16 +148,18 @@ func (v Nullable[T]) IsZero() bool { return !v.Set }
 func emitTypes(r *ir, pin, packageName string) []byte {
 	var b strings.Builder
 	b.WriteString(header(pin, "wire types"))
-	b.WriteString("package " + packageName + "\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n)\n\n")
+	b.WriteString("package " + packageName + "\n\nimport (\n\t\"encoding/json\"\n\t\"errors\"\n\t\"fmt\"\n\t\"reflect\"\n\t\"strings\"\n)\n\n")
 	b.WriteString("// Meta is the reserved _meta channel for extension data.\ntype Meta map[string]any\n\n")
 	// Shared helpers are written once per generated file.
-	probeHelpersEmitted, withoutKeyEmitted, unchangedEmitted = false, false, false
+	unchangedEmitted = false
+	curIR = r
 	if r.PreserveNull || r.HasNullable {
 		emitNullable(&b)
 	}
 	if r.PreserveNull {
 		emitMetaPatch(&b)
 	}
+	emitDecodeHelpers(&b, r.PreserveNull || r.HasNullable, r.hasNonZero())
 
 	for _, td := range r.Defs {
 		writeDoc(&b, "", td.Doc)
@@ -178,6 +181,7 @@ func emitTypes(r *ir, pin, packageName string) []byte {
 				}
 				b.WriteString(")\n\n")
 			}
+			emitEnumDecode(&b, td)
 
 		case kindStruct:
 			emitStruct(&b, td)
@@ -187,6 +191,7 @@ func emitTypes(r *ir, pin, packageName string) []byte {
 
 		case kindAny:
 			fmt.Fprintf(&b, "type %s any\n\n", td.Name)
+			emitAnyValidator(&b, td)
 
 		case kindRaw:
 			fmt.Fprintf(&b, "type %s = json.RawMessage\n\n", td.Name)
@@ -212,7 +217,12 @@ func emitStruct(b *strings.Builder, td *typeDef) {
 		fmt.Fprintf(b, "\t%s map[string]json.RawMessage `json:\"-\"`\n", fl.ExtrasGo)
 	}
 	b.WriteString("}\n\n")
-	emitLenientStruct(b, td)
+	emitFlattenedCodec(b, td)
+	var seq []string
+	if !td.ObjectOnly {
+		seq = td.SeqOrder
+	}
+	emitStructDecode(b, td, td.Name, td.Fields, seq)
 	emitApplyUpdate(b, td)
 }
 
@@ -331,11 +341,6 @@ func payloadType(r *ir, td *typeDef, v variant) string {
 func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 	kindType := td.Name + "Kind"
 	shadow := unexport(td.Name) + "Shadow"
-	for _, v := range td.Variants {
-		if v.Const != "" && v.Payload != "" && capturesExtras(r, v.Payload, map[string]bool{}) {
-			emitWithoutKey(b)
-		}
-	}
 
 	fmt.Fprintf(b, "type %s string\n\n", kindType)
 	b.WriteString("const (\n")
@@ -360,6 +365,7 @@ func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 	}
 	b.WriteString("}\n\n")
 	emitOpenPayload(b, td)
+	emitOtherFields(b, td)
 
 	// Inline variant payload structs.
 	for _, v := range td.Variants {
@@ -372,6 +378,7 @@ func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 			fmt.Fprintf(b, "\t%s\n", f.goDecl())
 		}
 		b.WriteString("}\n\n")
+		emitStructDecode(b, nil, td.Name+v.GoName, v.Inline, v.SeqOrder)
 	}
 
 	if len(td.Fields) > 0 {
@@ -403,31 +410,7 @@ func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 	}
 	fmt.Fprintf(b, "\treturn json.Marshal(obj)\n}\n\n")
 
-	// Unmarshal: route on the wire tag; absent tag selects the default variant.
-	fmt.Fprintf(b, "func (v *%s) UnmarshalJSON(data []byte) error {\n", td.Name)
-	fmt.Fprintf(b, "\tvar raws map[string]json.RawMessage\n\tif err := json.Unmarshal(data, &raws); err != nil {\n\t\treturn err\n\t}\n\t*v = %s{}\n", td.Name)
-	if len(td.Fields) > 0 {
-		fmt.Fprintf(b, "\tif err := json.Unmarshal(data, (*%s)(v)); err != nil {\n\t\treturn err\n\t}\n", shadow)
-	}
-	fmt.Fprintf(b, "\tvar tag string\n\tif raw, ok := raws[%q]; ok {\n\t\tif err := json.Unmarshal(raw, &tag); err != nil {\n\t\t\treturn fmt.Errorf(\"%s tag: %%w\", err)\n\t\t}\n\t}\n\tswitch tag {\n", td.TagJSON, td.Name)
-	for _, v := range td.Variants {
-		switch {
-		case v.Open:
-			continue
-		case v.Const != "" && v.Payload != "" && capturesExtras(r, v.Payload, map[string]bool{}):
-			fmt.Fprintf(b, "\tcase %q:\n\t\tv.Kind = %s%s\n\t\tv.%s = new(%s)\n\t\treturn json.Unmarshal(withoutKey(data, %q), v.%s)\n", v.Const, kindType, pascal(v.Const), v.GoName, payloadType(r, td, v), td.TagJSON, v.GoName)
-		case v.Const != "":
-			fmt.Fprintf(b, "\tcase %q:\n\t\tv.Kind = %s%s\n\t\tv.%s = new(%s)\n\t\treturn json.Unmarshal(data, v.%s)\n", v.Const, kindType, pascal(v.Const), v.GoName, payloadType(r, td, v), v.GoName)
-		case v.Default:
-			fmt.Fprintf(b, "\tcase \"\":\n\t\tv.%s = new(%s)\n\t\treturn json.Unmarshal(data, v.%s)\n", v.GoName, payloadType(r, td, v), v.GoName)
-		}
-	}
-	if hasOpenVariant(td) {
-		fmt.Fprintf(b, "\tdefault:\n\t\tv.Kind = %s(tag)\n\t\tv.Other = &%sOther{Raw: append(json.RawMessage(nil), data...)}\n\t\treturn nil\n\t}\n", kindType, td.Name)
-	} else {
-		fmt.Fprintf(b, "\tdefault:\n\t\treturn fmt.Errorf(\"%s: unknown %s tag %%q\", tag)\n\t}\n", td.Name, td.TagJSON)
-	}
-	fmt.Fprintf(b, "}\n\n")
+	emitTaggedUnionDecode(b, r, td)
 }
 
 // emitOpenPayload declares the catch-all payload of a union's open variant:
@@ -484,6 +467,7 @@ func emitUntaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 			fmt.Fprintf(b, "\t%s\n", f.goDecl())
 		}
 		b.WriteString("}\n\n")
+		emitStructDecode(b, nil, td.Name+v.GoName, v.Inline, v.SeqOrder)
 	}
 
 	if len(td.Fields) > 0 {
@@ -523,118 +507,7 @@ func emitUntaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 	}
 	fmt.Fprintf(b, "\treturn json.Marshal(obj)\n}\n\n")
 
-	fmt.Fprintf(b, "func (v *%s) UnmarshalJSON(data []byte) error {\n", td.Name)
-	fmt.Fprintf(b, "\t*v = %s{}\n", td.Name)
-	if len(td.Fields) > 0 {
-		fmt.Fprintf(b, "\tif err := json.Unmarshal(data, (*%s)(v)); err != nil {\n\t\treturn err\n\t}\n", shadow)
-	}
-	if hasOpenVariant(td) {
-		// With a catch-all, a variant whose shape probe matches but whose
-		// payload does not decode falls through to the next candidate, as
-		// an untagged serde enum does, and finally to the raw value.
-		for _, v := range td.Variants {
-			if v.Open {
-				continue // classification keeps the open variant last
-			}
-			fmt.Fprintf(b, "\tif %s {\n\t\tpayload := new(%s)\n\t\tif json.Unmarshal(data, payload) == nil {\n\t\t\tv.%s = payload\n\t\t\tv.raw, v.rawVariant = append(json.RawMessage(nil), data...), %q\n\t\t\treturn nil\n\t\t}\n\t}\n", untaggedProbe(r, v), payloadType(r, td, v), v.GoName, v.GoName)
-		}
-		fmt.Fprintf(b, "\tv.Other = &%sOther{Raw: append(json.RawMessage(nil), data...)}\n\treturn nil\n}\n\n", td.Name)
-		emitProbeHelpers(b)
-		return
-	}
-	for i, v := range td.Variants {
-		keyword := "if"
-		if i > 0 {
-			keyword = "} else if"
-		}
-		fmt.Fprintf(b, "\t%s %s {\n\t\tv.%s = new(%s)\n\t\treturn json.Unmarshal(data, v.%s)\n\t", keyword, untaggedProbe(r, v), v.GoName, payloadType(r, td, v), v.GoName)
-	}
-	fmt.Fprintf(b, "}\n\treturn fmt.Errorf(\"%s: payload matches no variant\")\n}\n\n", td.Name)
-	emitProbeHelpers(b)
-}
-
-// emitProbeHelpers writes the shape-probe helpers shared across unions, once.
-func emitProbeHelpers(b *strings.Builder) {
-	if !probeHelpersEmitted {
-		probeHelpersEmitted = true
-		b.WriteString(`
-func hasKeys(data []byte, keys ...string) bool {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return false
-	}
-	for _, k := range keys {
-		if _, ok := obj[k]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func arrayHasKeys(data []byte, keys ...string) bool {
-	var items []json.RawMessage
-	if err := json.Unmarshal(data, &items); err != nil {
-		return false
-	}
-	if len(items) == 0 {
-		return true // an empty array fits the first variant
-	}
-	return hasKeys(items[0], keys...)
-}
-
-`)
-	}
-}
-
-var probeHelpersEmitted bool
-
-// untaggedProbe renders the shape test guarding one untagged variant. Ref and
-// array variants probe the payload def's required keys; inline variants probe
-// their own required carrier keys.
-func untaggedProbe(r *ir, v variant) string {
-	if v.Payload != "" {
-		return probeCall(r, v.Payload)
-	}
-	var keys []string
-	for _, f := range v.Inline {
-		if f.Required {
-			keys = append(keys, f.JSONName)
-		}
-	}
-	if len(keys) == 0 {
-		return "true"
-	}
-	return fmt.Sprintf("hasKeys(data, %s)", quoteList(keys))
-}
-
-// requiredKeysExpr lists the payload def's required wire keys for probing.
-func requiredKeysExpr(r *ir, defName string) []string {
-	td := r.ByName[defName]
-	if td == nil {
-		return nil
-	}
-	var keys []string
-	for _, f := range td.Fields {
-		if f.Required {
-			keys = append(keys, f.JSONName)
-		}
-	}
-	return keys
-}
-
-// probeCall renders the shape test guarding one untagged variant. Array
-// variants probe their first element against the item def's required keys.
-func probeCall(r *ir, payload string) string {
-	if item := strings.TrimPrefix(payload, "[]"); item != payload {
-		keys := requiredKeysExpr(r, item)
-		return fmt.Sprintf("arrayHasKeys(data, %s)", quoteList(keys))
-	}
-	keys := requiredKeysExpr(r, payload)
-	if len(keys) == 0 {
-		// No required keys to disambiguate: accept only in listed order.
-		return "true"
-	}
-	return fmt.Sprintf("hasKeys(data, %s)", quoteList(keys))
+	emitUntaggedUnionDecode(b, r, td)
 }
 
 func quoteList(items []string) string {
