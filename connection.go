@@ -16,15 +16,6 @@ import (
 	"github.com/BrokkAi/acp-go/schema"
 )
 
-// RPCError preserves the peer's JSON-RPC error, including extension data.
-type RPCError struct {
-	Code    int             `json:"code"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data,omitempty"`
-}
-
-func (e *RPCError) Error() string { return fmt.Sprintf("ACP error %d: %s", e.Code, e.Message) }
-
 type packet struct {
 	Version string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -408,6 +399,11 @@ func (c *Connection) executeRequest(ctx context.Context, p packet) packet {
 		}
 		if errors.Is(err, context.Canceled) {
 			response.Error = &RPCError{Code: -32800, Message: "request cancelled"}
+		}
+		// A handler error with invalid Data or Extra JSON would otherwise fail
+		// to encode and leave the peer waiting for a response forever.
+		if _, encodeErr := json.Marshal(response.Error); encodeErr != nil {
+			response.Error = &RPCError{Code: -32603, Message: "encode error response: " + encodeErr.Error()}
 		}
 	} else {
 		response.Result, err = json.Marshal(value)

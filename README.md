@@ -57,6 +57,17 @@ inbound batches receive one grouped response array, response batches route by
 ID, and malformed response-shaped members are ignored. This root transport is
 also used by the draft-v2 package, while its typed v1 facade remains v1-only.
 
+`*acp.RPCError` is the JSON-RPC error object as it appears on the wire, kept
+losslessly like Rust's raw JSON-RPC error. `Call` returns it for an error
+response, and a handler returns one (directly or wrapped) to choose its error
+response. `Data` keeps an omitted `data` (nil), `"data": null`, and a value
+apart, and `Extra` keeps every other member, such as extension fields, so a
+relay can re-emit the object unchanged. `code`, `message`, and `data` always
+come from the typed fields, never from `Extra`, so no member is ever encoded
+twice. `acp.IsAuthRequired` and `acp.IsResourceNotFound` classify by code
+alone. `RPCError.SchemaError` is the explicit conversion to the typed v1
+`schema.Error`, and drops `Extra`, as Rust's `into_acp_error` does.
+
 Run `go test -race ./...` and `go vet ./...`. No agent credentials are needed.
 The fuzz seed corpus runs as part of that command; see
 [CONTRIBUTING.md](CONTRIBUTING.md) for longer campaigns and opt-in tests
