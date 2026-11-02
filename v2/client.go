@@ -44,6 +44,13 @@ func Connect(in io.ReadCloser, out io.WriteCloser, onRequest acp.Handler, onNoti
 	return &Connection{Connection: acp.Connect(in, out, onRequest, onNotification)}
 }
 
+// ConnectObserving is Connect with a request observer that sees each incoming
+// request in wire order before its handler starts, such as
+// SessionTracker.TrackerRequests.
+func ConnectObserving(in io.ReadCloser, out io.WriteCloser, onRequest acp.Handler, onNotification acp.Notifications, observe acp.RequestObserver) *Connection {
+	return &Connection{Connection: acp.ConnectObserving(in, out, onRequest, onNotification, observe)}
+}
+
 func (c *Connection) beginInitialize() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

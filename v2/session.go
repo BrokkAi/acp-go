@@ -165,6 +165,14 @@ func (s *SessionHandle) SetConfigOption(ctx context.Context, request schema.SetS
 	return result.ConfigOptions, nil
 }
 
+// Close closes the session and, once the agent confirms, drops its tracked
+// projection and work.
 func (s *SessionHandle) Close(ctx context.Context) error {
-	return s.connection.CloseSession(ctx, s.initialization, s.sessionID)
+	if err := s.connection.CloseSession(ctx, s.initialization, s.sessionID); err != nil {
+		return err
+	}
+	if s.tracker != nil {
+		s.tracker.Forget(s.sessionID)
+	}
+	return nil
 }

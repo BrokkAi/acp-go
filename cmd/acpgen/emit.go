@@ -150,6 +150,7 @@ func emitTypes(r *ir, pin, packageName string) []byte {
 	probeHelpersEmitted, withoutKeyEmitted, unchangedEmitted = false, false, false
 	if r.PreserveNull {
 		emitNullable(&b)
+		emitMetaPatch(&b)
 	}
 
 	for _, td := range r.Defs {
@@ -207,6 +208,107 @@ func emitStruct(b *strings.Builder, td *typeDef) {
 	}
 	b.WriteString("}\n\n")
 	emitLenientStruct(b, td)
+	emitApplyUpdate(b, td)
+}
+
+// emitMetaPatch writes ApplyMetaUpdate, the v2 Metadata Patches rule for the
+// top-level _meta of upsert updates, mirroring Rust's apply_meta_update.
+func emitMetaPatch(b *strings.Builder) {
+	b.WriteString(`// ApplyMetaUpdate applies the top-level _meta patch of an upsert update to
+// stored metadata.
+//
+// An omitted update leaves stored unchanged, and null clears it. An object
+// patches stored one top-level key at a time: keys it omits keep their stored
+// values, a key set to null is removed, and any other value replaces that
+// key's stored value whole. Nested objects are not merged, and a null nested
+// inside a value is kept as data. A key set to null is never stored, including
+// on an entity's first update. Removing every key leaves an empty object,
+// which means the same as no metadata.
+//
+// A patch stores a new map; the previously stored map and the update's map
+// are never modified, so metadata shared with an earlier update or snapshot
+// stays intact.
+//
+// Use this only for the top-level _meta of upsert updates, as their
+// ApplyUpdate methods do. Other _meta fields are not patches.
+// See protocol docs: Metadata Patches
+func ApplyMetaUpdate(stored *Nullable[Meta], update Nullable[Meta]) {
+	if !update.Set {
+		return
+	}
+	if update.Null {
+		*stored = Nullable[Meta]{Set: true, Null: true}
+		return
+	}
+	meta := make(Meta, len(update.Value))
+	if stored.Set && !stored.Null {
+		for key, value := range stored.Value {
+			meta[key] = value
+		}
+	}
+	for key, value := range update.Value {
+		if isJSONNull(value) {
+			delete(meta, key)
+		} else {
+			meta[key] = value
+		}
+	}
+	*stored = Nullable[Meta]{Set: true, Value: meta}
+}
+
+// isJSONNull reports whether a metadata value encodes as JSON null, the
+// removal signal of a metadata patch, so a patch built in Go behaves exactly
+// like the same patch decoded from the wire.
+func isJSONNull(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case bool, float64, string, json.Number:
+		return false
+	case map[string]any:
+		return v == nil
+	case []any:
+		return v == nil
+	}
+	encoded, err := json.Marshal(value)
+	return err == nil && string(encoded) == "null"
+}
+
+`)
+}
+
+// emitApplyUpdate writes the ApplyUpdate method of an upsert, mirroring
+// Rust's ToolCallUpdate::apply_update and TerminalUpdate::apply_update.
+func emitApplyUpdate(b *strings.Builder, td *typeDef) {
+	if !td.Upsert {
+		return
+	}
+	fmt.Fprintf(b, `// ApplyUpdate applies a later update for the same entity to this stored %s state.
+//
+// Omitted fields leave the stored value unchanged. Fields set to null are
+// stored as null, so callers can tell an explicit clear from an update that
+// did not mention the field. Other values replace the stored value whole.
+// Required fields are replaced. The top-level _meta is patched by key, as
+// described by ApplyMetaUpdate.
+//
+// Start a first-seen entity from the zero value with only its ID set and apply
+// its first update to that, so the first update's null _meta keys are not
+// stored. Values are stored by reference; neither update is modified.
+func (v *%s) ApplyUpdate(update %s) {
+`, td.Name, td.Name, td.Name)
+	for _, f := range td.Fields {
+		switch {
+		case f.JSONName == "_meta":
+			fmt.Fprintf(b, "\tApplyMetaUpdate(&v.%s, update.%s)\n", f.GoName, f.GoName)
+		case f.Required:
+			fmt.Fprintf(b, "\tv.%s = update.%s\n", f.GoName, f.GoName)
+		case f.Nullable:
+			fmt.Fprintf(b, "\tif update.%s.Set {\n\t\tv.%s = update.%s\n\t}\n", f.GoName, f.GoName, f.GoName)
+		default: // json.RawMessage keeps an explicit null as the bytes "null".
+			fmt.Fprintf(b, "\tif update.%s != nil {\n\t\tv.%s = update.%s\n\t}\n", f.GoName, f.GoName, f.GoName)
+		}
+	}
+	b.WriteString("}\n\n")
 }
 
 // payloadType renders the Go type of a union variant payload field.

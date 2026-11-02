@@ -66,3 +66,64 @@ func TestResumeSessionFromStartAppliesReplayBeforeResponse(t *testing.T) {
 		t.Fatal("resume response returned before replay updates were applied")
 	}
 }
+
+// A from-start replay rebuilds the session's state instead of merging into
+// what an earlier replay left: keys and entities the new history no longer
+// has do not survive, and the timeline is not duplicated.
+func TestTrackerResumeFromStartRebuildsProjection(t *testing.T) {
+	tracker := NewSessionTracker()
+	histories := [][]string{
+		{
+			`{"sessionUpdate":"tool_call_update","toolCallId":"t","title":"Old","_meta":{"stale":true,"a":1}}`,
+			`{"sessionUpdate":"agent_message_chunk","messageId":"old","content":{"type":"text","text":"gone"}}`,
+		},
+		{
+			`{"sessionUpdate":"tool_call_update","toolCallId":"t","_meta":{"a":2}}`,
+		},
+	}
+	replays := 0
+	var serverConnection *acp.Connection
+	client, serverConnection := pipeClientWithServerNotifications(t,
+		func(_ context.Context, method string, raw json.RawMessage) (any, error) {
+			switch method {
+			case schema.InitializeMethodName:
+				return sessionInitialization(), nil
+			case schema.SessionResumeMethodName:
+				request := decode[schema.ResumeSessionRequest](t, raw)
+				for _, update := range histories[replays] {
+					if err := serverConnection.Notify(context.Background(), schema.SessionUpdateMethodName,
+						json.RawMessage(`{"sessionId":"`+string(request.SessionID)+`","update":`+update+`}`)); err != nil {
+						return nil, err
+					}
+				}
+				replays++
+				return schema.ResumeSessionResponse{}, nil
+			default:
+				return nil, &acp.RPCError{Code: -32601}
+			}
+		},
+		tracker.TrackerNotifications(nil),
+		nil,
+	)
+	ctx := context.Background()
+	initialization, err := client.InitializeWithInfo(ctx, Capabilities{}, ClientInfo{Name: "resume-client", Version: "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range histories {
+		if _, err := tracker.ResumeSessionFromStart(ctx, client, initialization, "s", hostRoot+"/repo", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projection := tracker.Projection("s")
+	call, _ := projection.ToolCall("t")
+	assertWire(t, call, `{"toolCallId":"t","_meta":{"a":2}}`)
+	if got := projection.Timeline(); len(got) != 1 || projection.Text() != "" {
+		t.Fatalf("timeline after second replay = %v, text %q", got, projection.Text())
+	}
+
+	tracker.ResetProjection("s")
+	if got := tracker.Projection("s").Timeline(); len(got) != 0 {
+		t.Fatalf("ResetProjection kept %v", got)
+	}
+}

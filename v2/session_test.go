@@ -181,8 +181,14 @@ func TestSessionHandleCommandsAndCancellation(t *testing.T) {
 	if cancelled.StopReason == nil || *cancelled.StopReason != schema.StopReasonCancelled {
 		t.Fatalf("cancelled result = %+v", cancelled)
 	}
+	if len(tracker.Projection(session.SessionID).Timeline()) == 0 {
+		t.Fatal("session projection is empty before close")
+	}
 	if err := handle.Close(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if got := tracker.Projection(session.SessionID).Timeline(); len(got) != 0 {
+		t.Fatalf("closing the session kept its projection: %v", got)
 	}
 }
 

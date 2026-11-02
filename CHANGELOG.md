@@ -41,6 +41,48 @@ series, minor releases may contain breaking API changes.
   `session/set_title`, and proxy chains (`proxy/initialize`, `proxy/successor`,
   `InitializeProxyRequest`/`Response`, `ProxySuccessor*`, and the `Proxy*`
   envelopes). These are types only; facades follow in their own issues.
+- Draft v2 metadata patches and entity upserts (#67), mirroring Rust's
+  `apply_meta_update` and `ToolCallUpdate`/`TerminalUpdate::apply_update`:
+  - `schema/v2` and `schema/v2/unstable` generate `ApplyMetaUpdate`, the
+    Metadata Patches rule for the top-level `_meta` of upserts: omitted leaves
+    stored metadata unchanged, `null` clears it, and an object patches it by
+    top-level key, where a key set to `null` is removed (and never stored,
+    even on a first update), any other value replaces the key whole, and
+    nested objects are not merged. Any Go value that encodes as JSON `null`
+    removes its key, and the stored and update maps are never modified.
+  - They also generate `ApplyUpdate` on every upsert: `ToolCallUpdate`,
+    `TerminalUpdate`, `UserMessage`, `AgentMessage`, `AgentThought`,
+    `SessionInfoUpdate`, `CompactionUpdate`, and, in `schema/v2/unstable`,
+    `SubagentUpdate` and `SessionMessage`. Omitted fields keep the stored
+    value, `null` is stored as an explicit clear, other values replace it, and
+    `_meta` is patched with `ApplyMetaUpdate`. The generator fails if an
+    upsert gains a field that cannot represent `null`.
+  - `acpv2.UpdateProjection` now stores user messages, Agent messages and
+    thoughts, tool calls, terminals, compactions, session info, and usage,
+    keyed by kind and ID, with `UserMessage`, `AgentMessage`, `AgentThought`,
+    `ToolCall`, `Terminal` (`TerminalState` keeps the latest output snapshot
+    as received and the decoded current bytes), `Compaction`, `SessionInfo`,
+    `Usage`, and `Timeline` (first-seen order) accessors. Plans, notices, and
+    the draft subagent and session-message entities are not projected.
+    Upserts use the generated `ApplyUpdate`; message, tool-call content,
+    terminal output, and compaction summary chunks append to the current
+    content, as the spec requires. `ApplyPermissionRequest` applies a
+    `tool_call` permission subject's `toolCall` like a `tool_call_update`.
+    Accessors return snapshots that later updates never change; they share
+    storage with the projection and must not be modified. `Text` is
+    unchanged.
+  - `acpv2.SessionTracker` keeps a per-session `Projection` that sees every
+    update, including replay and updates before `running`, and that
+    `BeginWork` does not reset. `TrackerRequests` applies permission subjects
+    to it on the connection's read loop, in receive order relative to
+    `session/update`, before the permission handler runs. `ResetProjection`,
+    `Forget`, and `ResumeSessionFromStart` (which resets the session first,
+    so a full replay rebuilds rather than merges) manage its lifetime, and
+    `SessionHandle.Close` forgets the closed session. `ActiveWork` keeps
+    only the Agent text it reports.
+  - `acp.ConnectObserving` and `acpv2.ConnectObserving` take an optional
+    `acp.RequestObserver` that sees each incoming request in wire order, on
+    the read loop, before its handler starts.
 - Method registries gain `SideProxy` for the proxy-chain methods.
 - `cmd/acpgen` models the 1.15.1 schema shapes: the `proxyMethods` meta group
   and `x-side: "proxy"`; a tagged union flattened into its parent object
@@ -172,6 +214,15 @@ series, minor releases may contain breaking API changes.
     empty map, not nil, for a schema without properties).
   - `ResourceLink.Size` is `Nullable[uint64]` and `TerminalExitStatus.ExitCode`
     is `Nullable[int64]`.
+  - Patch fields of the upserts and `UsageUpdate` that the schema writes as
+    `anyOf [$ref, null]` are `Nullable[T]` instead of pointers, so an explicit
+    `null` (clear) no longer decodes the same as an omitted field (#67):
+    `ToolCallUpdate.Kind`, `.Status`, and `.Capabilities`;
+    `TerminalUpdate.Cwd`, `.Output`, `.ExitStatus`, `.Size`, and
+    `.Capabilities`; `UsageUpdate.Cost`; and, in `schema/v2/unstable`,
+    `SubagentUpdate.Capabilities`, `.State`, and `.Cwd`, and
+    `SessionMessage.SenderSessionID`, `.RecipientSessionID`,
+    `.SenderMessageID`, and `.RecipientMessageID`.
 - Breaking (v1 unstable): `IdleStateUpdate.StopReason` is the new open
   `IdleStopReason`, Rust's name for it (its union adds `error` with the new
   `IdleStateUpdate.Error`, and custom reasons keep `StopReasonFields`; the
