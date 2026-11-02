@@ -8,6 +8,43 @@ series, minor releases may contain breaking API changes.
 
 ### Added
 
+- A standard-library MCP server framework in `mcp` and `v2/mcp`, mirroring
+  Rust `agent-client-protocol` 5.0.0's `mcp_server` module and the tool-call
+  rules of `agent-client-protocol-rmcp`'s `rmcp_3` builder (#63). The types are
+  shared, so one `Server` attaches to v1 and v2 sessions:
+  - `Server`, `NewServer`, `Service`, `ServiceFunc`, `Request`, `Outcome`,
+    `Error` (an inner MCP error), and `RequestContext` with the server ID,
+    logical request ID, validated metadata, outer and operation cancellation,
+    and operation-scoped `Notify`. `context.Cause` on an operation's context
+    reports `ErrRequestCancelled`, `ErrServerUnavailable`, or
+    `ErrConnectionClosed`.
+  - `ToolRegistry`, `Tool`, generic `NewTool`, `ToolResult`, `TextContent`,
+    `UnknownToolError`, and `NewToolServer` (`server/discover`, `tools/list`,
+    `tools/call`, plus `initialize`/`ping` for older standalone clients).
+    Unknown or disabled tools are an inner `-32602`; tool errors and arguments
+    that fail the caller-supplied input schema are `isError` results; a
+    cancelled call is an inner `-32603`; `serverInfo` defaults to version
+    `0.0.0`.
+  - `Server.Serve` for a direct MCP client without an ACP session.
+  - `MessageRouter.Attach`, `Attachment`, and the attached-session helpers
+    `NewAttachedSession`, `LoadAttachedSession`, `ResumeAttachedSession`, and
+    `ForkAttachedSession` (v1) and `NewAttachedSession` and
+    `ResumeAttachedSession` (v2): unique `mcp-server:<uuid>` IDs, registration
+    before the request, release on failure or `Attachment.Close`, and, for
+    v2, `-32602` before writing when the request already declares the name.
+  - `Attachment.HandleSessionSetup` and `Attachment.AppendDeclarations` for
+    connection-scoped proxy attachment, appending to the raw params so unknown
+    fields survive.
+  - `ErrorCodeResourceLimitExceeded` (`-33000`), `ErrorCodeServerUnavailable`
+    (`-33001`), and `ErrorCodeBackendFailure` (`-33002`), and
+    `MessageRouter.SetMaxActive`, which answers `-33000` past its limit.
+  - `MessageRouter.UnregisterAndWait` and `MessageRequest.RawParams`.
+  - v1 `mcp.LoadSession`.
+- `acp.Connection.InputClosed`, closed when the connection stops reading
+  frames. On a clean EOF it closes before `Done`, which still waits for
+  in-flight handlers, so long-running handlers can stop instead of waiting on
+  a peer that is gone.
+
 - `acp.RPCError` gains `Extra`, which keeps the members of a JSON-RPC error
   object other than `code`, `message`, and `data`, matching the reference
   SDK's raw JSON-RPC error (#66). Errors returned by `Call` keep the peer's
@@ -123,6 +160,16 @@ series, minor releases may contain breaking API changes.
 
 ### Changed
 
+- `mcp.MessageRouter` and the v2 `MessageRouter` now cancel an active request
+  when the connection's input reaches EOF, answer a request cancelled by
+  `Unregister` with `-33001` instead of `-32800`, report a service error as
+  `-33002` with the message `MCP backend failure` and the error text in
+  `data`.
+- **Breaking:** a `MessageRouter` no longer rebinds a server ID after
+  `Unregister`; the MCP-over-ACP RFD forbids reusing a server ID on a
+  connection.
+- v1 `mcp.NewSession` sends `"mcpServers": []` instead of `null` when no
+  servers are given; the v1 schema requires the array.
 - v1 `unstable.Handle` follows the reference SDK's handler chain and error
   shapes, the same as `v2/unstable.Handle`: an unstable method the handler
   does not implement now goes to `next` instead of answering method-not-found
@@ -133,7 +180,6 @@ series, minor releases may contain breaking API changes.
 - v1 `unstable.ForkSession` now requires
   `sessionCapabilities.additionalDirectories` before sending additional
   directories, as the protocol requires.
-
 - The v1 and draft v2 agent runtimes now send their initialization lifecycle
   refusals in the reference Rust SDK's wire shape: code `-32600`, message
   `Invalid request`, and the explanation as a JSON string in `data`. A request

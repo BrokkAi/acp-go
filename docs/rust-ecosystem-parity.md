@@ -62,7 +62,9 @@ compiling as a tested example and no new dependencies. Delivered as
 `github.com/BrokkAi/acp-go/cookbook` (#22). The recipes that need an MCP server
 SDK (`global_mcp_server`, `per_session_mcp_server`, `filtering_tools`) or the
 conductor (`running_proxies_with_conductor`) do not port; the package
-documentation records why.
+documentation records why. The MCP server framework in `mcp`/`v2/mcp` (#63)
+now covers what the three MCP recipes need, so porting them is a possible
+follow-up.
 
 ## `agent-client-protocol-trace-viewer` — port as a tool
 
@@ -114,7 +116,12 @@ entire value is the `rmcp` integration, which is a third-party crate.
 Porting it would require a third-party Go MCP implementation (for example the
 official `modelcontextprotocol/go-sdk`), which the dependency policy forbids.
 The ACP-side transport it targets is already covered: `v2/mcp` provides the
-opt-in MCP-over-ACP surface with no external module. Revisit only if the
+opt-in MCP-over-ACP surface with no external module, and `mcp`/`v2/mcp`
+provide a standard-library MCP server framework (#63) whose `NewToolServer`
+follows the `rmcp_3` builder's tool-call rules (`isError` results for tool and
+argument failures, `-32602` for unknown or disabled tools, `-32603` for
+cancellation, `serverInfo` version `0.0.0` by default) with caller-supplied
+JSON Schemas instead of generated ones. Revisit the bridge itself only if the
 dependency policy changes.
 
 ## Related crates outside this evaluation

@@ -241,7 +241,17 @@ MCP-over-ACP remains an explicit draft opt-in through
 carry the request-scoped `mcp/message` mover: `MessageClient` drives an
 agent-to-provider request and routes its request-scoped notifications, and
 `MessageRouter` serves registered server IDs on the provider side, keeping
-inner MCP errors in the response carrier. Generated
+inner MCP errors in the response carrier. On top of that mover, both packages
+share a standard-library MCP server framework: a `Service` per operation with
+a `RequestContext` (server and request IDs, validated metadata, cancellation,
+scoped notifications), a typed `ToolRegistry` with caller-supplied JSON
+Schemas and allow/deny lists, `NewToolServer` with the reference SDK's
+`tools/call` error rules, standalone serving with `Server.Serve`, and automatic
+attachment: `NewAttachedSession` and its load/resume/fork siblings generate a
+unique `serverId`, register before the request, append the declaration, and
+release the registration on failure or `Attachment.Close`, while
+`Attachment.HandleSessionSetup` attaches a server to every session a proxy
+forwards. See [docs/unstable-facades.md](docs/unstable-facades.md). Generated
 protocol versions and error codes use the schema's exact integer widths; in
 particular, `ProtocolVersion` is a `uint16`, so strings and values above 65535
 fail to decode.
