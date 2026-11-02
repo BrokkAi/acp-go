@@ -19,7 +19,6 @@ package unstable
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"github.com/BrokkAi/acp-go"
@@ -69,6 +68,8 @@ func DisableProvider(ctx context.Context, connection *acp.Connection, initializa
 }
 
 // ForkSession forks an existing session, gated on sessionCapabilities.fork.
+// Additional directories need sessionCapabilities.additionalDirectories, which
+// the protocol requires before a client sends them, and must be absolute.
 func ForkSession(ctx context.Context, connection *acp.Connection, initialization schema.InitializeResponse, request schema.ForkSessionRequest) (schema.ForkSessionResponse, error) {
 	var result schema.ForkSessionResponse
 	if err := requireFork(initialization); err != nil {
@@ -79,6 +80,9 @@ func ForkSession(ctx context.Context, connection *acp.Connection, initialization
 	}
 	if err := acpvalidate.AbsolutePath("fork working directory", request.Cwd); err != nil {
 		return result, err
+	}
+	if len(request.AdditionalDirectories) > 0 && !advertisesAdditionalDirectories(initialization) {
+		return result, fmt.Errorf("agent did not advertise additionalDirectories support")
 	}
 	for _, directory := range request.AdditionalDirectories {
 		if err := acpvalidate.AbsolutePath("fork additional directory", directory); err != nil {
@@ -108,81 +112,7 @@ func requireFork(initialization schema.InitializeResponse) error {
 	return nil
 }
 
-// ProviderHandler serves the agent side of providers/list, providers/set, and
-// providers/disable.
-type ProviderHandler interface {
-	ListProviders(context.Context, schema.ListProvidersRequest) (schema.ListProvidersResponse, error)
-	SetProvider(context.Context, schema.SetProviderRequest) (schema.SetProviderResponse, error)
-	DisableProvider(context.Context, schema.DisableProviderRequest) (schema.DisableProviderResponse, error)
-}
-
-// ForkHandler serves the agent side of session/fork.
-type ForkHandler interface {
-	ForkSession(context.Context, schema.ForkSessionRequest) (schema.ForkSessionResponse, error)
-}
-
-// Handle composes the unstable agent-side dispatch with another handler. Pass
-// nil for next when unstable methods are the only ones hosted. Each handler is
-// optional: a method whose handler is missing answers method-not-found, and any
-// method outside this package is delegated to next unchanged.
-func Handle(next acp.Handler, handler any) acp.Handler {
-	providers, _ := handler.(ProviderHandler)
-	fork, _ := handler.(ForkHandler)
-	return func(ctx context.Context, method string, raw json.RawMessage) (any, error) {
-		switch method {
-		case schema.ProvidersListMethodName:
-			if providers == nil {
-				return nil, methodNotFound(method)
-			}
-			request, err := decode[schema.ListProvidersRequest](raw)
-			if err != nil {
-				return nil, err
-			}
-			return providers.ListProviders(ctx, request)
-		case schema.ProvidersSetMethodName:
-			if providers == nil {
-				return nil, methodNotFound(method)
-			}
-			request, err := decode[schema.SetProviderRequest](raw)
-			if err != nil {
-				return nil, err
-			}
-			return providers.SetProvider(ctx, request)
-		case schema.ProvidersDisableMethodName:
-			if providers == nil {
-				return nil, methodNotFound(method)
-			}
-			request, err := decode[schema.DisableProviderRequest](raw)
-			if err != nil {
-				return nil, err
-			}
-			return providers.DisableProvider(ctx, request)
-		case schema.SessionForkMethodName:
-			if fork == nil {
-				return nil, methodNotFound(method)
-			}
-			request, err := decode[schema.ForkSessionRequest](raw)
-			if err != nil {
-				return nil, err
-			}
-			return fork.ForkSession(ctx, request)
-		default:
-			if next == nil {
-				return nil, methodNotFound(method)
-			}
-			return next(ctx, method, raw)
-		}
-	}
-}
-
-func decode[T any](raw json.RawMessage) (T, error) {
-	var request T
-	if err := json.Unmarshal(raw, &request); err != nil {
-		return request, &acp.RPCError{Code: -32602, Message: err.Error()}
-	}
-	return request, nil
-}
-
-func methodNotFound(method string) error {
-	return &acp.RPCError{Code: -32601, Message: "unsupported method: " + method}
+func advertisesAdditionalDirectories(initialization schema.InitializeResponse) bool {
+	capabilities := initialization.AgentCapabilities
+	return capabilities != nil && capabilities.SessionCapabilities != nil && capabilities.SessionCapabilities.AdditionalDirectories != nil
 }

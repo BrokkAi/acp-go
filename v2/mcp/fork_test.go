@@ -11,11 +11,13 @@ import (
 	"github.com/BrokkAi/acp-go/acptest"
 	schema "github.com/BrokkAi/acp-go/schema/v2/unstable"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
+	"github.com/BrokkAi/acp-go/v2/agent"
 	"github.com/BrokkAi/acp-go/v2/mcp"
 	acpunstable "github.com/BrokkAi/acp-go/v2/unstable"
 )
 
 type forkAgent struct {
+	*acptest.V2Agent
 	requests chan schema.ForkSessionRequest
 	forkedID schema.SessionId
 }
@@ -25,20 +27,32 @@ func (a *forkAgent) ForkSession(_ context.Context, request schema.ForkSessionReq
 	return schema.ForkSessionResponse{SessionID: a.forkedID}, nil
 }
 
-// forkFixture serves the shared v2 fake agent with session/fork composed in
-// through v2/unstable.Handle, and returns a v2 client connection to it.
+// forkFixture runs the v2 agent runtime over the shared v2 fake agent, with
+// session/fork installed through v2/unstable, and returns an initialized v2
+// client connection to it.
 func forkFixture(t *testing.T, forkedID schema.SessionId) (*acpv2.Connection, chan schema.ForkSessionRequest) {
 	t.Helper()
 	pair := acptest.NewPairWithDeadline(time.Now().Add(5 * time.Second))
-	agent := &forkAgent{requests: make(chan schema.ForkSessionRequest, 4), forkedID: forkedID}
-	server := acp.Connect(pair.B, pair.B, acpunstable.Handle(acptest.AgentHandler(2), agent), nil)
+	implementation := &forkAgent{V2Agent: &acptest.V2Agent{}, requests: make(chan schema.ForkSessionRequest, 4), forkedID: forkedID}
+	runtime := agent.New(implementation)
+	runtime.Extensions = acpunstable.Handle(nil, implementation)
+	runtime.InitializeResult = acpunstable.Advertise(implementation)
+	done := make(chan error, 1)
+	go func() { done <- runtime.Serve(context.Background(), pair.B, pair.B) }()
 	client := acpv2.Connect(pair.A, pair.A, nil, nil)
 	t.Cleanup(func() {
 		_ = client.Close()
-		_ = server.Close()
 		pair.Close()
+		<-done
 	})
-	return client, agent.requests
+	var initialization schema.InitializeResponse
+	if _, err := client.InitializeExtended(context.Background(), acpv2.Capabilities{}, acpv2.ClientInfo{Name: "client", Version: "1"}, &initialization); err != nil {
+		t.Fatal(err)
+	}
+	if initialization.Capabilities.Session.Fork == nil {
+		t.Fatal("runtime did not advertise session/fork")
+	}
+	return client, implementation.requests
 }
 
 func forkInitialization(transports *schema.McpCapabilities) schema.InitializeResponse {

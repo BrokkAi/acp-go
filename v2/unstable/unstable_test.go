@@ -13,45 +13,14 @@ import (
 	"github.com/BrokkAi/acp-go/acptest"
 	schema "github.com/BrokkAi/acp-go/schema/v2/unstable"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
+	"github.com/BrokkAi/acp-go/v2/agent"
 	acpunstable "github.com/BrokkAi/acp-go/v2/unstable"
 )
 
-type recorded struct {
-	method string
-	params json.RawMessage
-}
-
-// connect serves agent on one end of an in-memory pair and returns a v2 client
-// connection on the other, plus every request the agent received in order.
-func connect(t *testing.T, agent acp.Handler) (*acpv2.Connection, chan recorded) {
-	t.Helper()
-	pair := acptest.NewPairWithDeadline(time.Now().Add(5 * time.Second))
-	requests := make(chan recorded, 16)
-	server := acp.Connect(pair.B, pair.B, func(ctx context.Context, method string, raw json.RawMessage) (any, error) {
-		requests <- recorded{method: method, params: append(json.RawMessage(nil), raw...)}
-		return agent(ctx, method, raw)
-	}, nil)
-	client := acpv2.Connect(pair.A, pair.A, nil, nil)
-	t.Cleanup(func() {
-		_ = client.Close()
-		_ = server.Close()
-		pair.Close()
-	})
-	return client, requests
-}
-
-func expectNoRequest(t *testing.T, requests chan recorded) {
-	t.Helper()
-	select {
-	case request := <-requests:
-		t.Fatalf("validation wrote %s to the wire", request.method)
-	default:
-	}
-}
-
-// fakeAgent is a typed unstable agent: it keeps provider configuration in
-// memory and records fork requests.
+// fakeAgent is the shared v2 fake agent extended with typed unstable
+// handlers: it keeps provider configuration in memory and records forks.
 type fakeAgent struct {
+	*acptest.V2Agent
 	mu        sync.Mutex
 	providers map[schema.ProviderId]schema.ProviderCurrentConfig
 	forks     []schema.ForkSessionRequest
@@ -59,7 +28,11 @@ type fakeAgent struct {
 }
 
 func newFakeAgent() *fakeAgent {
-	return &fakeAgent{providers: map[schema.ProviderId]schema.ProviderCurrentConfig{}, forkedID: "forked"}
+	return &fakeAgent{
+		V2Agent:   &acptest.V2Agent{},
+		providers: map[schema.ProviderId]schema.ProviderCurrentConfig{},
+		forkedID:  "forked",
+	}
 }
 
 func (a *fakeAgent) ListProviders(context.Context, schema.ListProvidersRequest) (schema.ListProvidersResponse, error) {
@@ -97,40 +70,63 @@ func (a *fakeAgent) ForkSession(_ context.Context, request schema.ForkSessionReq
 	return schema.ForkSessionResponse{SessionID: a.forkedID}, nil
 }
 
-// unstableInitialize answers initialize with the unstable response, which is
-// the only one that can advertise providers and session/fork, and defers every
-// other baseline method to the shared v2 fake agent.
-func unstableInitialize(next acp.Handler) acp.Handler {
-	return func(ctx context.Context, method string, raw json.RawMessage) (any, error) {
-		if method != schema.InitializeMethodName {
-			return next(ctx, method, raw)
-		}
-		return schema.InitializeResponse{
-			ProtocolVersion: schema.ProtocolVersion(acpv2.Version),
-			Info:            schema.Implementation{Name: "unstable-agent", Version: "1"},
-			Capabilities: &schema.AgentCapabilities{
-				Providers: &schema.ProvidersCapabilities{},
-				Session: &schema.SessionCapabilities{
-					Fork:                  &schema.SessionForkCapabilities{},
-					AdditionalDirectories: &schema.SessionAdditionalDirectoriesCapabilities{},
-				},
-			},
-		}, nil
-	}
+// providersOnly implements the baseline and providers, but not session/fork.
+type providersOnly struct {
+	*acptest.V2Agent
+	acpunstable.ProviderHandler
 }
 
-// initialize sends initialize and decodes the result into the unstable
-// response, as the package documentation describes.
+func withAdditionalDirectories(response *schema.InitializeResponse) error {
+	response.Capabilities.Session.AdditionalDirectories = &schema.SessionAdditionalDirectoriesCapabilities{}
+	return nil
+}
+
+// serve runs the v2 agent runtime with the unstable dispatch installed, as
+// the package documentation describes, and returns a client connection to
+// it plus each request that reached the dispatch, in order.
+func serve(t *testing.T, implementation agent.Agent, next acp.Handler) (*acpv2.Connection, chan string) {
+	t.Helper()
+	pair := acptest.NewPairWithDeadline(time.Now().Add(5 * time.Second))
+	dispatched := make(chan string, 16)
+	handle := acpunstable.Handle(next, implementation)
+	runtime := agent.New(implementation)
+	runtime.Extensions = func(ctx context.Context, method string, raw json.RawMessage) (any, error) {
+		dispatched <- method
+		return handle(ctx, method, raw)
+	}
+	runtime.InitializeResult = acpunstable.Advertise(implementation, withAdditionalDirectories)
+	done := make(chan error, 1)
+	go func() { done <- runtime.Serve(context.Background(), pair.B, pair.B) }()
+	client := acpv2.Connect(pair.A, pair.A, nil, nil)
+	t.Cleanup(func() {
+		_ = client.Close()
+		pair.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("agent runtime did not stop")
+		}
+	})
+	return client, dispatched
+}
+
+// initialize runs the validated v2 initialize and returns the unstable view.
 func initialize(t *testing.T, connection *acpv2.Connection) schema.InitializeResponse {
 	t.Helper()
 	var initialization schema.InitializeResponse
-	if err := connection.Call(context.Background(), schema.InitializeMethodName, schema.InitializeRequest{
-		ProtocolVersion: schema.ProtocolVersion(acpv2.Version),
-		Info:            schema.Implementation{Name: "client", Version: "1"},
-	}, &initialization); err != nil {
+	if _, err := connection.InitializeExtended(context.Background(), acpv2.Capabilities{}, acpv2.ClientInfo{Name: "client", Version: "1"}, &initialization); err != nil {
 		t.Fatal(err)
 	}
 	return initialization
+}
+
+func expectNothingDispatched(t *testing.T, dispatched chan string) {
+	t.Helper()
+	select {
+	case method := <-dispatched:
+		t.Fatalf("validation wrote %s to the wire", method)
+	default:
+	}
 }
 
 func providersInitialization() schema.InitializeResponse {
@@ -144,9 +140,51 @@ func forkInitialization() schema.InitializeResponse {
 	}}}
 }
 
+func rpcError(t *testing.T, err error) *acp.RPCError {
+	t.Helper()
+	var rpc *acp.RPCError
+	if !errors.As(err, &rpc) {
+		t.Fatalf("error = %v, want an RPC error", err)
+	}
+	return rpc
+}
+
+func TestAdvertiseAnnouncesImplementedCapabilities(t *testing.T) {
+	connection, _ := serve(t, newFakeAgent(), nil)
+	initialization := initialize(t, connection)
+	capabilities := initialization.Capabilities
+	if capabilities == nil || capabilities.Providers == nil || capabilities.Session == nil || capabilities.Session.Fork == nil || capabilities.Session.AdditionalDirectories == nil {
+		t.Fatalf("capabilities = %+v", capabilities)
+	}
+	if initialization.Info.Name != "v2-router-agent" || initialization.ProtocolVersion != schema.ProtocolVersion(acpv2.Version) {
+		t.Fatalf("stable fields were not carried over: %+v", initialization)
+	}
+
+	connection, _ = serve(t, providersOnly{&acptest.V2Agent{}, newFakeAgent()}, nil)
+	capabilities = initialize(t, connection).Capabilities
+	if capabilities.Providers == nil || capabilities.Session.Fork != nil {
+		t.Fatalf("providers-only agent advertised %+v / fork %+v", capabilities, capabilities.Session.Fork)
+	}
+}
+
+func TestUnstableMethodsAreRefusedBeforeInitialize(t *testing.T) {
+	connection, dispatched := serve(t, newFakeAgent(), nil)
+	for _, method := range []string{schema.ProvidersListMethodName, schema.SessionForkMethodName} {
+		err := connection.Call(context.Background(), method, map[string]any{}, nil)
+		rpc := rpcError(t, err)
+		var detail string
+		_ = json.Unmarshal(rpc.Data, &detail)
+		if rpc.Code != -32600 || rpc.Message != "Invalid request" || detail != "ACP initialization must complete before `"+method+"` can be used" {
+			t.Fatalf("%s before initialize = %+v (data %s)", method, rpc, rpc.Data)
+		}
+	}
+	expectNothingDispatched(t, dispatched)
+}
+
 func TestProviderFacadesFailBeforeWriting(t *testing.T) {
 	ctx := context.Background()
-	connection, requests := connect(t, acpunstable.Handle(acptest.AgentHandler(2), newFakeAgent()))
+	connection, dispatched := serve(t, newFakeAgent(), nil)
+	initialize(t, connection)
 	withoutProviders := schema.InitializeResponse{Capabilities: &schema.AgentCapabilities{Session: &schema.SessionCapabilities{}}}
 	for _, initialization := range []schema.InitializeResponse{{}, withoutProviders} {
 		if _, err := acpunstable.ListProviders(ctx, connection, initialization); err == nil || !strings.Contains(err.Error(), "provider configuration") {
@@ -166,68 +204,51 @@ func TestProviderFacadesFailBeforeWriting(t *testing.T) {
 	if _, err := acpunstable.DisableProvider(ctx, connection, initialization, ""); err == nil || !strings.Contains(err.Error(), "provider ID is required") {
 		t.Fatalf("empty provider ID error = %v", err)
 	}
-	expectNoRequest(t, requests)
+	expectNothingDispatched(t, dispatched)
 }
 
-func TestProviderFacadesRoundTripThroughHandle(t *testing.T) {
+func TestProviderFacadesRoundTripThroughTheRuntime(t *testing.T) {
 	ctx := context.Background()
-	connection, requests := connect(t, unstableInitialize(acpunstable.Handle(acptest.AgentHandler(2), newFakeAgent())))
+	connection, dispatched := serve(t, newFakeAgent(), nil)
 	initialization := initialize(t, connection)
-	<-requests
 
-	if err := connection.Call(ctx, schema.SessionNewMethodName, schema.NewSessionRequest{Cwd: "/repo"}, new(json.RawMessage)); err != nil {
-		t.Fatalf("baseline method was not delegated to the next handler: %v", err)
+	if _, err := connection.NewSession(ctx, "/repo"); err != nil {
+		t.Fatalf("baseline session/new: %v", err)
 	}
-	<-requests
-
 	if _, err := acpunstable.SetProvider(ctx, connection, initialization, schema.SetProviderRequest{
 		ProviderID: "main", APIType: "openai", BaseURL: "https://llm.example.test",
 		Headers: map[string]string{"authorization": "Bearer token"},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	request := <-requests
-	if request.method != schema.ProvidersSetMethodName {
-		t.Fatalf("method = %s", request.method)
-	}
-	var set map[string]any
-	if err := json.Unmarshal(request.params, &set); err != nil {
-		t.Fatal(err)
-	}
-	if set["providerId"] != "main" || set["apiType"] != "openai" || set["baseUrl"] != "https://llm.example.test" {
-		t.Fatalf("providers/set params = %s", request.params)
-	}
-
 	providers, err := acpunstable.ListProviders(ctx, connection, initialization)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if request := <-requests; request.method != schema.ProvidersListMethodName || string(request.params) != "{}" {
-		t.Fatalf("providers/list frame = %s %s", request.method, request.params)
-	}
 	if len(providers.Providers) != 2 || providers.Providers[0].Current == nil || providers.Providers[0].Current.BaseURL != "https://llm.example.test" || providers.Providers[1].Current != nil {
 		t.Fatalf("providers after set = %+v", providers.Providers)
 	}
-
 	if _, err := acpunstable.DisableProvider(ctx, connection, initialization, "main"); err != nil {
 		t.Fatal(err)
-	}
-	if request := <-requests; request.method != schema.ProvidersDisableMethodName || !strings.Contains(string(request.params), `"providerId":"main"`) {
-		t.Fatalf("providers/disable frame = %s %s", request.method, request.params)
 	}
 	providers, err = acpunstable.ListProviders(ctx, connection, initialization)
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-requests
 	if providers.Providers[0].Current != nil {
 		t.Fatalf("provider still configured after disable: %+v", providers.Providers[0])
+	}
+	for _, want := range []string{schema.ProvidersSetMethodName, schema.ProvidersListMethodName, schema.ProvidersDisableMethodName, schema.ProvidersListMethodName} {
+		if method := <-dispatched; method != want {
+			t.Fatalf("dispatched %s, want %s (session/new must stay with the runtime)", method, want)
+		}
 	}
 }
 
 func TestForkSessionFailsBeforeWriting(t *testing.T) {
 	ctx := context.Background()
-	connection, requests := connect(t, acpunstable.Handle(acptest.AgentHandler(2), newFakeAgent()))
+	connection, dispatched := serve(t, newFakeAgent(), nil)
+	initialize(t, connection)
 	valid := schema.ForkSessionRequest{SessionID: "source", Cwd: "/repo"}
 	withoutAdditional := forkInitialization()
 	withoutAdditional.Capabilities.Session.AdditionalDirectories = nil
@@ -255,17 +276,16 @@ func TestForkSessionFailsBeforeWriting(t *testing.T) {
 			t.Fatalf("%s: error = %v, want it to mention %q", name, err, test.want)
 		}
 	}
-	expectNoRequest(t, requests)
+	expectNothingDispatched(t, dispatched)
 }
 
-func TestForkSessionRoundTripThroughHandle(t *testing.T) {
+func TestForkSessionRoundTripThroughTheRuntime(t *testing.T) {
 	ctx := context.Background()
-	agent := newFakeAgent()
-	connection, requests := connect(t, unstableInitialize(acpunstable.Handle(acptest.AgentHandler(2), agent)))
+	implementation := newFakeAgent()
+	connection, dispatched := serve(t, implementation, nil)
 	initialization := initialize(t, connection)
-	<-requests
 
-	request := schema.ForkSessionRequest{
+	result, err := acpunstable.ForkSession(ctx, connection, initialization, schema.ForkSessionRequest{
 		SessionID:             "source",
 		Cwd:                   `C:\agent\workspace`,
 		AdditionalDirectories: []schema.AbsolutePath{"/", `C:\agent\extra`},
@@ -273,119 +293,126 @@ func TestForkSessionRoundTripThroughHandle(t *testing.T) {
 			Mode:    schema.SystemPromptModeAppend,
 			Content: []schema.ContentBlock{{Text: &schema.TextContent{Text: "Summarize only."}}},
 		},
-	}
-	result, err := acpunstable.ForkSession(ctx, connection, initialization, request)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.SessionID != "forked" {
 		t.Fatalf("forked session = %q", result.SessionID)
 	}
-	frame := <-requests
-	if frame.method != schema.SessionForkMethodName {
-		t.Fatalf("method = %s", frame.method)
+	if method := <-dispatched; method != schema.SessionForkMethodName {
+		t.Fatalf("dispatched %s", method)
 	}
-	var wire map[string]json.RawMessage
-	if err := json.Unmarshal(frame.params, &wire); err != nil {
-		t.Fatal(err)
+	implementation.mu.Lock()
+	defer implementation.mu.Unlock()
+	if len(implementation.forks) != 1 {
+		t.Fatalf("agent received %+v", implementation.forks)
 	}
-	if _, ok := wire["mcpServers"]; ok {
-		t.Fatalf("fork without servers sent mcpServers: %s", frame.params)
+	fork := implementation.forks[0]
+	if fork.SessionID != "source" || len(fork.AdditionalDirectories) != 2 || fork.MCPServers != nil {
+		t.Fatalf("agent received %+v", fork)
 	}
-	if string(wire["systemPrompt"]) != `{"content":[{"text":"Summarize only.","type":"text"}],"mode":"append"}` {
-		t.Fatalf("systemPrompt was not passed through unchanged: %s", wire["systemPrompt"])
-	}
-	agent.mu.Lock()
-	defer agent.mu.Unlock()
-	if len(agent.forks) != 1 || agent.forks[0].SessionID != "source" || agent.forks[0].SystemPrompt == nil || agent.forks[0].SystemPrompt.Mode != schema.SystemPromptModeAppend {
-		t.Fatalf("agent received %+v", agent.forks)
+	if fork.SystemPrompt == nil || fork.SystemPrompt.Mode != schema.SystemPromptModeAppend || len(fork.SystemPrompt.Content) != 1 || fork.SystemPrompt.Content[0].Text.Text != "Summarize only." {
+		t.Fatalf("systemPrompt was not passed through unchanged: %+v", fork.SystemPrompt)
 	}
 }
 
 func TestForkSessionRejectsBlankForkedSessionID(t *testing.T) {
 	// A raw agent, not Handle, so the blank ID reaches the client.
-	connection, requests := connect(t, func(context.Context, string, json.RawMessage) (any, error) {
+	pair := acptest.NewPairWithDeadline(time.Now().Add(5 * time.Second))
+	server := acp.Connect(pair.B, pair.B, func(context.Context, string, json.RawMessage) (any, error) {
 		return schema.ForkSessionResponse{SessionID: " "}, nil
+	}, nil)
+	connection := acpv2.Connect(pair.A, pair.A, nil, nil)
+	t.Cleanup(func() {
+		_ = connection.Close()
+		_ = server.Close()
+		pair.Close()
 	})
 	_, err := acpunstable.ForkSession(context.Background(), connection, forkInitialization(), schema.ForkSessionRequest{SessionID: "source", Cwd: "/repo"})
 	if err == nil || !strings.Contains(err.Error(), "forked session ID is required") {
 		t.Fatalf("blank forked session ID error = %v", err)
 	}
-	if request := <-requests; request.method != schema.SessionForkMethodName {
-		t.Fatalf("method = %s", request.method)
-	}
 }
 
-func rpcError(t *testing.T, err error) *acp.RPCError {
-	t.Helper()
-	var rpc *acp.RPCError
-	if !errors.As(err, &rpc) {
-		t.Fatalf("error = %v, want an RPC error", err)
-	}
-	return rpc
-}
-
-func TestHandleDispatch(t *testing.T) {
+func TestHandleFallsThroughInTheRuntime(t *testing.T) {
 	ctx := context.Background()
 	next := func(_ context.Context, method string, _ json.RawMessage) (any, error) {
-		return "next:" + method, nil
+		if method == schema.SessionForkMethodName {
+			return schema.ForkSessionResponse{SessionID: "from-next"}, nil
+		}
+		return map[string]string{"next": method}, nil
+	}
+	connection, _ := serve(t, providersOnly{&acptest.V2Agent{}, newFakeAgent()}, next)
+	initialize(t, connection)
+
+	// session/fork is an unstable method this handler does not implement, so
+	// it falls through to next, as in the reference SDK's handler chain.
+	var fork schema.ForkSessionResponse
+	if err := connection.Call(ctx, schema.SessionForkMethodName, schema.ForkSessionRequest{SessionID: "source", Cwd: "/repo"}, &fork); err != nil || fork.SessionID != "from-next" {
+		t.Fatalf("session/fork fallthrough = %+v, %v", fork, err)
+	}
+	// nes/* left the upstream schema, so it is just another foreign method.
+	for _, method := range []string{"nes/start", "_vendor/extension"} {
+		var result map[string]string
+		if err := connection.Call(ctx, method, map[string]any{}, &result); err != nil || result["next"] != method {
+			t.Fatalf("%s fallthrough = %v, %v", method, result, err)
+		}
+	}
+	var providers schema.ListProvidersResponse
+	if err := connection.Call(ctx, schema.ProvidersListMethodName, schema.ListProvidersRequest{}, &providers); err != nil || len(providers.Providers) != 2 {
+		t.Fatalf("implemented method was not served here: %+v, %v", providers, err)
 	}
 
-	t.Run("delegates methods it does not own", func(t *testing.T) {
-		handler := acpunstable.Handle(next, newFakeAgent())
-		// nes/* left the upstream schema, so it is just another foreign method.
-		for _, method := range []string{schema.SessionNewMethodName, "nes/start", "_vendor/extension"} {
-			result, err := handler(ctx, method, json.RawMessage(`{}`))
-			if err != nil || result != "next:"+method {
-				t.Fatalf("%s fallthrough = %#v, %v", method, result, err)
-			}
+	connection, _ = serve(t, providersOnly{&acptest.V2Agent{}, newFakeAgent()}, nil)
+	initialize(t, connection)
+	for _, method := range []string{schema.SessionForkMethodName, "_vendor/extension"} {
+		rpc := rpcError(t, connection.Call(ctx, method, map[string]any{"sessionId": "source", "cwd": "/repo"}, nil))
+		if rpc.Code != -32601 || rpc.Message != "Method not found" || string(rpc.Data) != `"`+method+`"` {
+			t.Fatalf("%s without next = %+v (data %s)", method, rpc, rpc.Data)
 		}
-	})
+	}
+}
 
-	t.Run("missing handler answers method not found", func(t *testing.T) {
-		providersOnly := struct{ acpunstable.ProviderHandler }{newFakeAgent()}
-		handler := acpunstable.Handle(next, providersOnly)
-		if _, err := handler(ctx, schema.ProvidersListMethodName, json.RawMessage(`{}`)); err != nil {
-			t.Fatal(err)
-		}
-		_, err := handler(ctx, schema.SessionForkMethodName, json.RawMessage(`{"sessionId":"s","cwd":"/repo"}`))
-		rpc := rpcError(t, err)
-		if rpc.Code != -32601 || rpc.Message != "Method not found" || string(rpc.Data) != `"session/fork"` {
-			t.Fatalf("missing fork handler error = %+v", rpc)
-		}
-		for _, method := range []string{schema.ProvidersListMethodName, schema.ProvidersSetMethodName, schema.ProvidersDisableMethodName, schema.SessionForkMethodName} {
-			_, err := acpunstable.Handle(next, nil)(ctx, method, json.RawMessage(`{}`))
-			if rpc := rpcError(t, err); rpc.Code != -32601 {
-				t.Fatalf("%s with no handler = %+v", method, rpc)
-			}
-		}
-		_, err = acpunstable.Handle(nil, nil)(ctx, schema.SessionNewMethodName, json.RawMessage(`{}`))
-		if rpc := rpcError(t, err); rpc.Code != -32601 || string(rpc.Data) != `"session/new"` {
-			t.Fatalf("unhandled method without next = %+v", rpc)
-		}
-	})
+func TestHandleErrorShapes(t *testing.T) {
+	ctx := context.Background()
 
-	t.Run("malformed params never reach the handler", func(t *testing.T) {
-		agent := newFakeAgent()
-		handler := acpunstable.Handle(nil, agent)
+	t.Run("malformed params echo the params and never reach the handler", func(t *testing.T) {
+		implementation := newFakeAgent()
+		handler := acpunstable.Handle(nil, implementation)
 		for _, method := range []string{schema.ProvidersSetMethodName, schema.SessionForkMethodName} {
 			_, err := handler(ctx, method, json.RawMessage(`{"providerId":7,"sessionId":7}`))
 			rpc := rpcError(t, err)
-			if rpc.Code != -32602 || rpc.Message != "Invalid params" || !strings.Contains(string(rpc.Data), `"phase":"deserialization"`) {
+			var data struct {
+				Error string          `json:"error"`
+				JSON  json.RawMessage `json:"json"`
+				Phase string          `json:"phase"`
+			}
+			if err := json.Unmarshal(rpc.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			if rpc.Code != -32602 || rpc.Message != "Invalid params" || data.Error == "" || string(data.JSON) != `{"providerId":7,"sessionId":7}` || data.Phase != "deserialization" {
 				t.Fatalf("%s malformed params error = %+v (data %s)", method, rpc, rpc.Data)
 			}
 		}
-		if len(agent.providers) != 0 || len(agent.forks) != 0 {
+		_, err := handler(ctx, schema.ProvidersSetMethodName, nil)
+		if rpc := rpcError(t, err); rpc.Code != -32602 || !strings.Contains(string(rpc.Data), `"json":null`) {
+			t.Fatalf("absent params error = %+v (data %s)", rpc, rpc.Data)
+		}
+		if len(implementation.providers) != 0 || len(implementation.forks) != 0 {
 			t.Fatal("malformed params reached the handler")
 		}
 	})
 
 	t.Run("fork response without session ID is an internal error", func(t *testing.T) {
-		agent := newFakeAgent()
-		agent.forkedID = ""
-		_, err := acpunstable.Handle(nil, agent)(ctx, schema.SessionForkMethodName, json.RawMessage(`{"sessionId":"s","cwd":"/repo"}`))
-		if rpc := rpcError(t, err); rpc.Code != -32603 {
-			t.Fatalf("blank forked session error = %+v", rpc)
+		implementation := newFakeAgent()
+		implementation.forkedID = ""
+		_, err := acpunstable.Handle(nil, implementation)(ctx, schema.SessionForkMethodName, json.RawMessage(`{"sessionId":"s","cwd":"/repo"}`))
+		rpc := rpcError(t, err)
+		var detail string
+		_ = json.Unmarshal(rpc.Data, &detail)
+		if rpc.Code != -32603 || rpc.Message != "Internal error" || !strings.Contains(detail, "forked session ID") {
+			t.Fatalf("blank forked session error = %+v (data %s)", rpc, rpc.Data)
 		}
 	})
 

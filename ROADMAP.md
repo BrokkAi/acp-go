@@ -132,9 +132,9 @@ The typed facade surface is delivered: client facades and agent dispatch for
 providers and session fork on v1 and draft v2 (#61), the session-update
 projection helper, and the MCP session options, including the draft-v2 MCP
 fork, all live in [docs/unstable-facades.md](docs/unstable-facades.md)'s
-packages (`unstable`, `v2/unstable`, `mcp`, `v2/mcp`). The `v2/agent` runtime
-stays baseline-only; draft-v2 agents serve these methods by composing
-`v2/unstable.Handle` on their own connection.
+packages (`unstable`, `v2/unstable`, `mcp`, `v2/mcp`). Agents serve the
+unstable methods by installing `Handle` and `Advertise` on the v1 or draft-v2
+runtime's `Extensions` and `InitializeResult`, behind its initialization gate.
 
 The native MCP-over-ACP binding is delivered (#39): `mcp` and `v2/mcp` expose
 the standard-library message mover decided above, with `MessageClient` on the

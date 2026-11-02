@@ -3,118 +3,107 @@ package unstable
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/unstabledispatch"
 	"github.com/BrokkAi/acp-go/internal/v2session"
+	stable "github.com/BrokkAi/acp-go/schema/v2"
 	schema "github.com/BrokkAi/acp-go/schema/v2/unstable"
 )
 
 // ProviderHandler serves the agent side of providers/list, providers/set, and
-// providers/disable. An agent that implements it should advertise
-// capabilities.providers in its initialize response.
+// providers/disable. Advertise announces capabilities.providers for it.
 type ProviderHandler interface {
 	ListProviders(context.Context, schema.ListProvidersRequest) (schema.ListProvidersResponse, error)
 	SetProvider(context.Context, schema.SetProviderRequest) (schema.SetProviderResponse, error)
 	DisableProvider(context.Context, schema.DisableProviderRequest) (schema.DisableProviderResponse, error)
 }
 
-// ForkHandler serves the agent side of session/fork. An agent that implements
-// it should advertise capabilities.session.fork in its initialize response.
-// The returned response must carry the new session's non-blank ID; Handle
-// answers -32603 instead of sending a response without one.
+// ForkHandler serves the agent side of session/fork. Advertise announces
+// capabilities.session.fork for it. The returned response must carry the new
+// session's non-blank ID; Handle answers -32603 instead of sending a response
+// without one.
 type ForkHandler interface {
 	ForkSession(context.Context, schema.ForkSessionRequest) (schema.ForkSessionResponse, error)
 }
 
 // Handle composes the draft-v2 unstable agent-side dispatch with another
-// handler. Pass nil for next when unstable methods are the only ones hosted.
+// handler, in the reference SDK's handler-chaining order. Each method handler
+// implements (see the handler interfaces in this package) is served here;
+// every other request, including an unstable method handler does not
+// implement, goes to next. With no next, those requests answer -32601
+// (method not found, with the method name as data).
 //
-// handler may implement any subset of the handler interfaces in this package.
-// A method this package owns whose interface handler does not implement
-// answers -32601 (method not found); malformed params answer -32602 (invalid
-// params) without reaching the handler. Every other method is delegated to
-// next unchanged, or answers -32601 when next is nil.
+// Params that do not decode answer -32602 in the reference SDK's shape, whose
+// data echoes the received params, and never reach the handler.
 //
-// Handle does not check capabilities: the agent decides what it advertises in
-// its initialize response, and should implement the matching interfaces.
+// Install it as the v2/agent runtime's Extensions, so that the runtime's
+// initialization gate and version negotiation run in front of it:
+//
+//	runtime := agent.New(implementation)
+//	runtime.Extensions = unstable.Handle(nil, implementation)
+//	runtime.InitializeResult = unstable.Advertise(implementation)
 func Handle(next acp.Handler, handler any) acp.Handler {
-	bound := make(map[string]acp.Handler, len(routes))
-	for method, bind := range routes {
-		bound[method] = bind(handler)
-	}
-	return func(ctx context.Context, method string, raw json.RawMessage) (any, error) {
-		serve, owned := bound[method]
-		switch {
-		case serve != nil:
-			return serve(ctx, method, raw)
-		case owned, next == nil:
-			return nil, methodNotFound(method)
-		default:
-			return next(ctx, method, raw)
-		}
-	}
+	return unstabledispatch.Handle(next, handler, routes)
 }
 
-// routes maps every method Handle owns to the binding that serves it from a
-// handler. Serving another unstable method takes its handler interface and one
-// entry here.
-var routes = map[string]binding{
-	schema.ProvidersListMethodName:    route(ProviderHandler.ListProviders, nil),
-	schema.ProvidersSetMethodName:     route(ProviderHandler.SetProvider, nil),
-	schema.ProvidersDisableMethodName: route(ProviderHandler.DisableProvider, nil),
-	schema.SessionForkMethodName:      route(ForkHandler.ForkSession, checkForkResponse),
-}
-
-// binding adapts a handler to one method, or returns nil when the handler
-// does not implement that method's interface.
-type binding func(handler any) acp.Handler
-
-// route builds the binding for one interface method: it decodes the params,
-// calls the method, and runs check, when non-nil, on a successful response
-// before it is sent.
-func route[H, Request, Response any](method func(H, context.Context, Request) (Response, error), check func(Response) error) binding {
-	return func(handler any) acp.Handler {
-		implementation, ok := handler.(H)
-		if !ok {
-			return nil
-		}
-		return func(ctx context.Context, _ string, raw json.RawMessage) (any, error) {
-			var request Request
-			if err := json.Unmarshal(raw, &request); err != nil {
-				return nil, invalidParams(err)
-			}
-			response, err := method(implementation, ctx, request)
-			if err != nil {
-				return nil, err
-			}
-			if check != nil {
-				if err := check(response); err != nil {
-					return nil, err
-				}
-			}
-			return response, nil
-		}
-	}
+// routes maps every method Handle serves to the binding that serves it from a
+// handler. Serving another unstable method takes its handler interface, one
+// entry here, and its capability in Advertise.
+var routes = map[string]unstabledispatch.Binding{
+	schema.ProvidersListMethodName:    unstabledispatch.Route(ProviderHandler.ListProviders, nil),
+	schema.ProvidersSetMethodName:     unstabledispatch.Route(ProviderHandler.SetProvider, nil),
+	schema.ProvidersDisableMethodName: unstabledispatch.Route(ProviderHandler.DisableProvider, nil),
+	schema.SessionForkMethodName:      unstabledispatch.Route(ForkHandler.ForkSession, checkForkResponse),
 }
 
 func checkForkResponse(response schema.ForkSessionResponse) error {
 	if err := v2session.ValidateForkResponse(response); err != nil {
-		return &acp.RPCError{Code: -32603, Message: "agent returned a session/fork response without the forked session ID"}
+		return unstabledispatch.InternalError("agent returned a session/fork response without the forked session ID")
 	}
 	return nil
 }
 
-// methodNotFound answers -32601 in the reference SDK's shape: the generic
-// message, with the method name as data.
-func methodNotFound(method string) error {
-	data, _ := json.Marshal(method)
-	return &acp.RPCError{Code: -32601, Message: "Method not found", Data: data}
-}
-
-// invalidParams answers -32602 in the reference SDK's shape. Unlike the
-// reference, data does not echo the params back: providers/set carries
-// authorization headers.
-func invalidParams(err error) error {
-	data, _ := json.Marshal(map[string]string{"error": err.Error(), "phase": "deserialization"})
-	return &acp.RPCError{Code: -32602, Message: "Invalid params", Data: data}
+// Advertise returns a hook for the v2/agent runtime's InitializeResult. It
+// carries the agent's stable initialize response over to the unstable
+// InitializeResponse field for field (through its JSON form, which the
+// unstable schema extends), advertises capabilities.providers when handler
+// implements ProviderHandler and capabilities.session.fork when it implements
+// ForkHandler, keeping any value the agent already set, and then applies each
+// customize function in order.
+//
+// session.fork is added only when the agent advertised the baseline session
+// capabilities, which the runtime requires anyway; Advertise never advertises
+// the baseline on the agent's behalf.
+func Advertise(handler any, customize ...func(*schema.InitializeResponse) error) func(stable.InitializeResponse) (any, error) {
+	return func(response stable.InitializeResponse) (any, error) {
+		encoded, err := json.Marshal(response)
+		if err != nil {
+			return nil, err
+		}
+		var extended schema.InitializeResponse
+		if err := json.Unmarshal(encoded, &extended); err != nil {
+			return nil, fmt.Errorf("convert initialize response to the unstable schema: %w", err)
+		}
+		if _, ok := handler.(ProviderHandler); ok {
+			if extended.Capabilities == nil {
+				extended.Capabilities = &schema.AgentCapabilities{}
+			}
+			if extended.Capabilities.Providers == nil {
+				extended.Capabilities.Providers = &schema.ProvidersCapabilities{}
+			}
+		}
+		if _, ok := handler.(ForkHandler); ok && extended.Capabilities != nil && extended.Capabilities.Session != nil {
+			if extended.Capabilities.Session.Fork == nil {
+				extended.Capabilities.Session.Fork = &schema.SessionForkCapabilities{}
+			}
+		}
+		for _, apply := range customize {
+			if err := apply(&extended); err != nil {
+				return nil, err
+			}
+		}
+		return extended, nil
+	}
 }

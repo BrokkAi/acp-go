@@ -61,16 +61,36 @@ series, minor releases may contain breaking API changes.
   requires a non-blank forked session ID in the response, and forwards
   `systemPrompt` unchanged. All checks fail before writing to the wire.
 - `v2/unstable.Handle`, `ProviderHandler`, and `ForkHandler` serve those
-  methods on the agent side. A method without an implementation answers
-  `-32601`, malformed params answer `-32602` without reaching the handler, a
-  fork response without a session ID answers `-32603`, and every other method
-  goes to the next handler.
+  methods on the agent side, and `v2/unstable.Advertise` announces the
+  implemented capabilities in the initialize response. v1 `unstable` gains
+  `Advertise` too.
+- `agent.Runtime` and `v2/agent.Runtime` gain `Extensions`, an `acp.Handler`
+  that serves every request the runtime does not own, behind the runtime's
+  initialization gate, and `InitializeResult`, a hook that replaces the stable
+  initialize response on the wire with an extended one, such as the unstable
+  response from `Advertise`. The runtime validates the stable view of the
+  value it sends. Installing `Handle` and `Advertise` there serves the
+  unstable methods with the reference SDK's layering.
+- `v2.Connection.InitializeExtended` runs the validated `InitializeWithInfo`
+  and also decodes the result into an extended type, such as the unstable
+  `InitializeResponse` the `v2/unstable` and `v2/mcp` facades gate on.
 - `v2/mcp.ForkSession` forks a draft-v2 session with MCP servers, applying the
   same fork checks plus the per-transport capability checks of `NewSession` and
   `ResumeSession`, including the native `acp` transport, gated on
   `capabilities.session.mcp.acp`.
 
 ### Changed
+
+- v1 `unstable.Handle` follows the reference SDK's handler chain and error
+  shapes, the same as `v2/unstable.Handle`: an unstable method the handler
+  does not implement now goes to `next` instead of answering method-not-found
+  there; `-32601` is `Method not found` with the method name as data;
+  malformed params answer `-32602` `Invalid params` with data `{"error",
+  "json", "phase"}` echoing the received params; and a fork response with a
+  blank session ID answers `-32603` `Internal error` instead of being sent.
+- v1 `unstable.ForkSession` now requires
+  `sessionCapabilities.additionalDirectories` before sending additional
+  directories, as the protocol requires.
 
 - The v1 and draft v2 agent runtimes now send their initialization lifecycle
   refusals in the reference Rust SDK's wire shape: code `-32600`, message

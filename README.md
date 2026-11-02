@@ -158,7 +158,8 @@ operations, session fork/archive/status/title, auth status, client-provided
 system prompts, subagents, proxy chains, and end-turn token usage. The
 `unstable` (v1) and `v2/unstable` (draft v2) packages add typed facades on
 top: capability-gated provider configuration and session fork for clients, and
-`Handle` dispatch for agents that serve those methods. The `mcp` and `v2/mcp`
+`Handle` dispatch plus `Advertise` for agents, installed on the agent
+runtimes' `Extensions` and `InitializeResult` hooks. The `mcp` and `v2/mcp`
 packages carry the session helpers that accept MCP servers, including fork.
 The stable `acp`, `v2`, `schema`, and `schema/v2` packages do not import or
 expose any of it. See [docs/unstable-facades.md](docs/unstable-facades.md).
