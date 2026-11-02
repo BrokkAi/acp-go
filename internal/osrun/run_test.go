@@ -41,7 +41,7 @@ func TestProcessTreeCancellation(t *testing.T) {
 }
 func TestKillAfterWaitLeavesPIDAlone(t *testing.T) {
 	// Once reaped, the PID may belong to another process, so Kill must not use it.
-	cmd := StartCommand(context.Background(), "", []string{os.Args[0], "-test.run=^$"}, nil)
+	cmd := StartCommand(context.Background(), "", []string{os.Args[0], "-test.run=^$"}, map[string]string{"GORACE": "atexit_sleep_ms=0"})
 	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
 	}

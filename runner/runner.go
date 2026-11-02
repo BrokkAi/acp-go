@@ -115,38 +115,38 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 	defer host.Close()
 	host.SetAutoApprove(a.Config.AutoApprove)
 	a.Log.Info("Starting agent", "command", strings.Join(a.Config.Agent.Command, " "), "transcript", transcript.Name())
-	cmd := osrun.StartCommand(context.Background(), a.Config.Directory, a.Config.Agent.Command, a.Config.Agent.Environment)
 	diagnostics := &osrun.Tail{Capacity: 64 << 10}
-	cmd.Stderr = io.MultiWriter(diagnostics, host.ProcessWriter("Agent stderr", ""))
-	in, err := cmd.StdinPipe()
+	process, err := osrun.StartAgent(a.Config.Directory, a.Config.Agent.Command, a.Config.Agent.Environment,
+		io.MultiWriter(diagnostics, host.ProcessWriter("Agent stderr", "")))
 	if err != nil {
-		return result, err
-	}
-	defer in.Close()
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		return result, err
-	}
-	defer out.Close()
-	if err := cmd.Start(); err != nil {
 		return result, fmt.Errorf("launch ACP agent: %w", err)
 	}
+	// crashed is the exit error of an agent that failed on its own before the
+	// run ended.
+	var crashed error
 	defer func() {
-		_ = osrun.Kill(cmd)
-		_ = cmd.Wait()
+		exitErr := endAgent(ctx, process, runErr, crashed)
 		text, _ := diagnostics.Text()
 		_ = host.Record(map[string]string{"stderr": text})
-		if runErr != nil && text != "" {
+		switch {
+		case exitErr != nil:
+			runErr = withAgentExit(runErr, &AgentExitError{Err: exitErr, Stderr: text})
+		case runErr != nil && text != "":
 			runErr = fmt.Errorf("%w\nAgent diagnostics: %s", runErr, text)
 		}
 	}()
-	connection := acp.Connect(out, in, host.Request, host.Notification)
+	connection := acp.Connect(process.Stdout, process.Stdin, host.Request, host.Notification)
+	release := process.Supervise(connection, shutdown)
 	phase = PhaseInitialize
 	started := time.Now()
 	defer func() {
+		crashed = release()
 		record := map[string]any{"event": "session_end", "phase": phase, "elapsed": time.Since(started).String()}
 		if runErr != nil {
 			record["error"] = runErr.Error()
+		}
+		if crashed != nil {
+			record["agent_exit"] = crashed.Error()
 		}
 		if cause := context.Cause(ctx); cause != nil {
 			record["context_cause"] = cause.Error()
@@ -216,6 +216,54 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 		return "", errors.New("agent answer exceeded 2 MiB")
 	}
 	return text, nil
+}
+
+// shutdown bounds the graceful agent shutdown; tests shorten it.
+var shutdown = osrun.DefaultShutdown
+
+// AgentExitError reports an agent process that exited with a failure status on
+// its own, either during the run or within the grace period after the runner
+// closed its stdin. Like the Rust SDK's AcpAgent, the runner reports this exit
+// in place of the protocol result. When the run itself succeeded, Execute
+// returns its result together with this error. A setup failure keeps its
+// *SetupError, wrapping this error.
+type AgentExitError struct {
+	// Err is the *exec.ExitError describing the exit status.
+	Err error
+	// Stderr is the bounded tail of the agent's stderr, possibly empty.
+	Stderr string
+}
+
+func (e *AgentExitError) Error() string {
+	if e.Stderr == "" {
+		return "agent process exited with " + e.Err.Error()
+	}
+	return "agent process exited with " + e.Err.Error() + ": " + e.Stderr
+}
+func (e *AgentExitError) Unwrap() error { return e.Err }
+
+// endAgent ends the agent process after the connection is closed, as the Rust
+// SDK's AcpAgent does. Only a successful run shuts the agent down gracefully:
+// stdin EOF, then SIGTERM, then SIGKILL, bounded by shutdown. A failed or
+// cancelled run, including one whose agent failed on its own, kills the
+// process group at once. endAgent returns the exit error of an agent that failed on its own,
+// whether during the run (crashed) or after its stdin closed.
+func endAgent(ctx context.Context, process *osrun.Agent, runErr, crashed error) error {
+	if runErr == nil && crashed == nil {
+		return process.Stop(ctx, shutdown)
+	}
+	process.Kill(shutdown)
+	return crashed
+}
+
+// withAgentExit reports an agent's failed exit in place of the run error,
+// keeping a setup failure's phase.
+func withAgentExit(runErr error, exit *AgentExitError) error {
+	if setup, ok := runErr.(*SetupError); ok {
+		setup.Err = exit
+		return setup
+	}
+	return exit
 }
 
 // newHost is a variable so tests can substitute the transcript writer.

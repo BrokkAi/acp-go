@@ -46,6 +46,23 @@ series, minor releases may contain breaking API changes.
 - A handler error whose `Data` or `Extra` is not valid JSON, or whose `Code`
   does not fit `int32`, is answered with `-32603` instead of failing to send
   any response.
+- `runner` and `v2/runner` manage the agent process as the Rust SDK's
+  `AcpAgent` does (#75). They used to kill its process group at once.
+  - After a successful run they close the agent's stdin and wait up to one
+    second for it to exit. On Unix an agent still running then gets `SIGTERM`
+    to its process group and `SIGKILL` two seconds later. On Windows its
+    process tree is killed.
+  - A failed or cancelled run still kills the process group at once.
+  - Any process left in the group after the agent exits is killed.
+  - If the agent exits mid-run, the runner kills its process group and ends
+    the connection within a second, so a descendant holding stdout open can no
+    longer hang the run.
+  - A failure exit, during the run or after stdin closes, is returned as the
+    new `AgentExitError` (also in `v2/runner`) with the exit status and stderr
+    tail. It replaces the run error, or comes alongside the result of a
+    successful run. A `SetupError` keeps its phase and wraps it.
+- `examples/minimal-client` closes the agent's stdin and waits up to a second
+  before killing it.
 
 ### Fixed
 

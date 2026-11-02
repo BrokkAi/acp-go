@@ -263,6 +263,20 @@ confirm the selection, malformed selector options, transport and context
 errors, and the legacy `unknown session mode` error, so a failure that matches
 none of these is not necessarily an agent rejection.
 
+Both runners (`runner` and `v2/runner`) manage the agent process as the Rust
+SDK's `AcpAgent` does. After a successful run they close the agent's stdin and
+give it one second to exit on its own. On Unix, an agent still running then gets
+`SIGTERM` to its whole process group, and `SIGKILL` two seconds later; on
+Windows its process tree is killed. A failed or cancelled run kills the process
+group at once. Whatever remains of the process group is killed once the agent
+exits, so wrapper launchers such as `npx` or `uvx` leave no orphans. If the
+agent exits while the run is still in progress, the runner kills its process
+group and ends the connection within a second, even if a descendant still holds
+stdout open. An agent that exits with a failure status on its own, during the
+run or after its stdin closes, is reported as `*runner.AgentExitError` with the
+exit status and the stderr tail. A successful run still returns its result
+alongside that error, and a setup failure keeps its `SetupError` phase.
+
 Terminal-type authentication methods run outside the protocol connection:
 advertise them with `acp.TerminalAuthCapabilities()`, resolve the advertised
 method with `runner.TerminalAuthMethod`, run the configured agent program

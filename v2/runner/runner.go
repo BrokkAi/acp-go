@@ -69,6 +69,54 @@ const (
 	PhasePrompt Phase = "session/prompt"
 )
 
+// shutdown bounds the graceful agent shutdown; tests shorten it.
+var shutdown = osrun.DefaultShutdown
+
+// AgentExitError reports an agent process that exited with a failure status on
+// its own, either during the run or within the grace period after the runner
+// closed its stdin. Like the Rust SDK's AcpAgent, the runner reports this exit
+// in place of the protocol result. When the run itself succeeded, Execute
+// returns its result together with this error. A setup failure keeps its
+// *SetupError, wrapping this error.
+type AgentExitError struct {
+	// Err is the *exec.ExitError describing the exit status.
+	Err error
+	// Stderr is the bounded tail of the agent's stderr, possibly empty.
+	Stderr string
+}
+
+func (e *AgentExitError) Error() string {
+	if e.Stderr == "" {
+		return "agent process exited with " + e.Err.Error()
+	}
+	return "agent process exited with " + e.Err.Error() + ": " + e.Stderr
+}
+func (e *AgentExitError) Unwrap() error { return e.Err }
+
+// endAgent ends the agent process after the connection is closed, as the Rust
+// SDK's AcpAgent does. Only a successful run shuts the agent down gracefully:
+// stdin EOF, then SIGTERM, then SIGKILL, bounded by shutdown. A failed or
+// cancelled run, including one whose agent failed on its own, kills the
+// process group at once. endAgent returns the exit error of an agent that failed on its own,
+// whether during the run (crashed) or after its stdin closed.
+func endAgent(ctx context.Context, process *osrun.Agent, runErr, crashed error) error {
+	if runErr == nil && crashed == nil {
+		return process.Stop(ctx, shutdown)
+	}
+	process.Kill(shutdown)
+	return crashed
+}
+
+// withAgentExit reports an agent's failed exit in place of the run error,
+// keeping a setup failure's phase.
+func withAgentExit(runErr error, exit *AgentExitError) error {
+	if setup, ok := runErr.(*SetupError); ok {
+		setup.Err = exit
+		return setup
+	}
+	return exit
+}
+
 // SetupError marks failures before the agent accepts a prompt. Phase names the
 // step that failed.
 type SetupError struct {
@@ -125,46 +173,45 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 		"command", strings.Join(r.Config.Agent.Command, " "),
 		"transcript", transcript.Name(),
 	)
-	command := osrun.StartCommand(context.Background(), directory, r.Config.Agent.Command, r.Config.Agent.Environment)
 	diagnostics := &osrun.Tail{Capacity: 64 << 10}
-	command.Stderr = diagnostics
-	stdin, err := command.StdinPipe()
+	process, err := osrun.StartAgent(directory, r.Config.Agent.Command, r.Config.Agent.Environment, diagnostics)
 	if err != nil {
-		return result, &SetupError{Err: err, Phase: PhaseLaunch}
-	}
-	stdout, err := command.StdoutPipe()
-	if err != nil {
-		return result, &SetupError{Err: err, Phase: PhaseLaunch}
-	}
-	if err := command.Start(); err != nil {
 		return result, &SetupError{Err: fmt.Errorf("launch ACP v2 agent: %w", err), Phase: PhaseLaunch}
 	}
+	// crashed is the exit error of an agent that failed on its own before the
+	// run ended.
+	var crashed error
 	defer func() {
-		_ = osrun.Kill(command)
-		_ = command.Wait()
+		exitErr := endAgent(ctx, process, runErr, crashed)
 		text, _ := diagnostics.Text()
 		_ = host.Record(map[string]string{"event": "agent_stderr", "text": text})
-		if runErr != nil && text != "" {
+		switch {
+		case exitErr != nil:
+			runErr = withAgentExit(runErr, &AgentExitError{Err: exitErr, Stderr: text})
+		case runErr != nil && text != "":
 			runErr = fmt.Errorf("%w\nAgent diagnostics: %s", runErr, text)
 		}
 	}()
-	defer stdin.Close()
-	defer stdout.Close()
 
-	connection := acpv2.Connect(stdout, stdin, host.Request, acpv2.SessionUpdates(func(update acpv2.Update) error {
+	connection := acpv2.Connect(process.Stdout, process.Stdin, host.Request, acpv2.SessionUpdates(func(update acpv2.Update) error {
 		if err := host.Record(map[string]any{"event": "session_update", "update": update}); err != nil {
 			return err
 		}
 		tracker.Observe(update)
 		return nil
 	}))
+	release := process.Supervise(connection, shutdown)
 	started := time.Now()
 	phase := PhaseInitialize
 	promptAccepted := false
 	defer func() {
+		crashed = release()
 		record := map[string]any{"event": "session_end", "phase": phase, "elapsed": time.Since(started).String()}
 		if runErr != nil {
 			record["error"] = runErr.Error()
+		}
+		if crashed != nil {
+			record["agent_exit"] = crashed.Error()
 		}
 		if cause := context.Cause(ctx); cause != nil {
 			record["context_cause"] = cause.Error()
