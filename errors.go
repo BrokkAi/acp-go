@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"slices"
 	"strconv"
@@ -24,7 +25,13 @@ const (
 //
 // RPCError is lossless, like the reference SDK's raw JSON-RPC error: decoding
 // and re-encoding an error object keeps its code, message, data, and every
-// other member.
+// other member, so the result is semantically unchanged. Members after code,
+// message, and data are re-emitted in sorted key order, and whitespace is not
+// kept.
+//
+// Code must fit int32, the reference SDK's code type. Decoding rejects an
+// object whose code or message is missing, null, or of the wrong type; see
+// UnmarshalJSON.
 //
 // Data distinguishes three cases. A nil or empty Data means the object had no
 // "data" member, and none is encoded. The literal JSON null means the object
@@ -38,8 +45,10 @@ const (
 // twice. An Extra entry with an empty value is omitted. Extra members are
 // encoded after the typed fields in sorted key order.
 //
-// Data and Extra values must be valid JSON; otherwise encoding fails, and a
-// Handler error that cannot be encoded is answered with -32603 instead.
+// Data and Extra values must be valid JSON and Code must fit int32; otherwise
+// encoding fails, and a Handler error that cannot be encoded is answered with
+// -32603 instead. A Handler that returns an *RPCError received from Call
+// forwards the peer's Extra members along with its code, message, and data.
 type RPCError struct {
 	Code    int
 	Message string
@@ -52,6 +61,9 @@ func (e *RPCError) Error() string { return fmt.Sprintf("ACP error %d: %s", e.Cod
 // MarshalJSON encodes the error object with its typed fields first, then the
 // Extra members in sorted key order.
 func (e RPCError) MarshalJSON() ([]byte, error) {
+	if !validErrorCode(e.Code) {
+		return nil, fmt.Errorf("acp: JSON-RPC error code %d does not fit int32", e.Code)
+	}
 	var b bytes.Buffer
 	b.WriteString(`{"code":`)
 	b.WriteString(strconv.Itoa(e.Code))
@@ -94,29 +106,62 @@ func (e RPCError) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON decodes an error object, keeping "data": null distinct from an
-// omitted "data" and collecting every other unknown member into Extra. Member
-// names match exactly. A missing or null "code" or "message" decodes as the
-// zero value, and JSON null leaves the receiver unchanged.
+// omitted "data" and collecting every other member into Extra. It replaces the
+// receiver. Member names match exactly.
+//
+// Like the reference SDK, it rejects anything other than a JSON object, a
+// missing or null "code" or "message", a "code" that is not an integer in the
+// int32 range (including 1.0, 1e3, and -0, which the reference SDK reads as
+// floats),
+// a non-string "message", and a repeated "code", "message", or "data". A
+// repeated extension member keeps its last value.
 func (e *RPCError) UnmarshalJSON(data []byte) error {
-	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
-		return nil
-	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(data, &members); err != nil {
-		return err
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return errors.New("acp: JSON-RPC error must be an object")
 	}
 	var decoded RPCError
-	for key, value := range members {
+	var hasCode, hasMessage, hasData bool
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return errors.New("acp: JSON-RPC error member name is not a string")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
 		switch key {
 		case "code":
-			if err := json.Unmarshal(value, &decoded.Code); err != nil {
-				return fmt.Errorf("acp: RPCError code: %w", err)
+			if hasCode {
+				return errors.New("acp: duplicate JSON-RPC error code")
 			}
+			hasCode = true
+			code, err := decodeErrorCode(value)
+			if err != nil {
+				return err
+			}
+			decoded.Code = code
 		case "message":
+			if hasMessage {
+				return errors.New("acp: duplicate JSON-RPC error message")
+			}
+			hasMessage = true
+			if string(value) == "null" {
+				return errors.New("acp: JSON-RPC error message is null")
+			}
 			if err := json.Unmarshal(value, &decoded.Message); err != nil {
-				return fmt.Errorf("acp: RPCError message: %w", err)
+				return fmt.Errorf("acp: JSON-RPC error message: %w", err)
 			}
 		case "data":
+			if hasData {
+				return errors.New("acp: duplicate JSON-RPC error data")
+			}
+			hasData = true
 			decoded.Data = value
 		default:
 			if decoded.Extra == nil {
@@ -125,8 +170,40 @@ func (e *RPCError) UnmarshalJSON(data []byte) error {
 			decoded.Extra[key] = value
 		}
 	}
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return errors.New("acp: trailing data after JSON-RPC error")
+	}
+	if !hasCode {
+		return errors.New("acp: JSON-RPC error is missing code")
+	}
+	if !hasMessage {
+		return errors.New("acp: JSON-RPC error is missing message")
+	}
 	*e = decoded
 	return nil
+}
+
+// decodeErrorCode accepts exactly the JSON integers that fit int32, the type
+// of the reference SDK's raw error code.
+func decodeErrorCode(value json.RawMessage) (int, error) {
+	if len(value) == 0 || (value[0] != '-' && (value[0] < '0' || value[0] > '9')) {
+		return 0, fmt.Errorf("acp: JSON-RPC error code %s is not an integer", value)
+	}
+	if string(value) == "-0" {
+		return 0, errors.New("acp: JSON-RPC error code -0 is not an integer")
+	}
+	code, err := strconv.ParseInt(string(value), 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("acp: JSON-RPC error code %s is not an int32 integer", value)
+	}
+	return int(code), nil
+}
+
+func validErrorCode(code int) bool {
+	return code >= math.MinInt32 && code <= math.MaxInt32
 }
 
 func reservedErrorMember(name string) bool {
@@ -139,7 +216,7 @@ func reservedErrorMember(name string) bool {
 // null, or value form. It fails when Code does not fit the schema's int32
 // ErrorCode.
 func (e *RPCError) SchemaError() (schema.Error, error) {
-	if e.Code < math.MinInt32 || e.Code > math.MaxInt32 {
+	if !validErrorCode(e.Code) {
 		return schema.Error{}, fmt.Errorf("acp: JSON-RPC error code %d does not fit an ACP ErrorCode", e.Code)
 	}
 	return schema.Error{Code: schema.ErrorCode(e.Code), Message: e.Message, Data: e.Data}, nil

@@ -12,6 +12,14 @@ import (
 	"testing"
 )
 
+// Codes just outside int32. On 32-bit platforms they wrap, and the tests that
+// use them are skipped there because int cannot hold such a code at all.
+var (
+	int32Max, int32Min int64 = math.MaxInt32, math.MinInt32
+	aboveInt32               = int(int32Max + 1)
+	belowInt32               = int(int32Min - 1)
+)
+
 func TestRPCErrorRoundTripsDataPresenceAndExtensions(t *testing.T) {
 	for _, code := range []int{math.MinInt32, -32000, -32002, -32602, 0, 12345, math.MaxInt32} {
 		for _, data := range []string{"", "null", `{"detail":[1,2]}`} {
@@ -114,14 +122,62 @@ func TestRPCErrorDecodingReplacesAndRejectsMalformedObjects(t *testing.T) {
 	if decoded.Code != 2 || decoded.Message != "new" || decoded.Data != nil || decoded.Extra != nil {
 		t.Fatalf("stale members survived decoding: %+v", decoded)
 	}
-	if err := json.Unmarshal([]byte(`null`), &decoded); err != nil || decoded.Code != 2 {
-		t.Fatalf("null should leave the error unchanged: %v %+v", err, decoded)
-	}
-	for _, malformed := range []string{`17`, `[]`, `"error"`, `{"code":"-32000","message":"peer"}`, `{"code":1.5,"message":"peer"}`, `{"code":-32000,"message":7}`} {
-		var target RPCError
+	for _, malformed := range []string{
+		// The reference SDK's malformed_raw_errors_are_still_rejected list.
+		`null`,
+		`{"code":-32000}`,
+		`{"message":"peer"}`,
+		`{"code":null,"message":"peer"}`,
+		`{"code":"-32000","message":"peer"}`,
+		`{"code":1.5,"message":"peer"}`,
+		`{"code":-32000,"message":null}`,
+		// Codes the reference SDK's i32 rejects, including float spellings.
+		`{"code":2147483648,"message":"peer"}`,
+		`{"code":-2147483649,"message":"peer"}`,
+		`{"code":1.0,"message":"peer"}`,
+		`{"code":1e3,"message":"peer"}`,
+		`{"code":-0,"message":"peer"}`,
+		// Repeated typed members, which serde rejects as duplicate fields.
+		`{"code":1,"message":"peer","code":2}`,
+		`{"code":1,"message":"peer","message":"again"}`,
+		`{"code":1,"message":"peer","data":1,"data":2}`,
+		// Non-objects and wrong member types.
+		`17`, `[]`, `"error"`, `{"code":-32000,"message":7}`,
+	} {
+		target := decoded
 		if err := json.Unmarshal([]byte(malformed), &target); err == nil {
 			t.Fatalf("decoded malformed error object %s as %+v", malformed, target)
 		}
+		if target.Code != 2 || target.Message != "new" {
+			t.Fatalf("rejected %s but changed the receiver to %+v", malformed, target)
+		}
+	}
+	var repeated RPCError
+	if err := json.Unmarshal([]byte(`{"code":1,"message":"peer","x":1,"x":2}`), &repeated); err != nil || string(repeated.Extra["x"]) != "2" {
+		t.Fatalf("a repeated extension member should keep its last value: %v %+v", err, repeated)
+	}
+	for _, code := range []int{math.MinInt32, math.MaxInt32} {
+		wire := fmt.Sprintf(`{"code":%d,"message":"edge"}`, code)
+		if err := json.Unmarshal([]byte(wire), &repeated); err != nil || repeated.Code != code {
+			t.Fatalf("rejected int32 bound %s: %v", wire, err)
+		}
+	}
+}
+
+func TestRPCErrorRoundTripSortsExtensionMembers(t *testing.T) {
+	// Re-encoding is semantically unchanged, but members after code, message,
+	// and data come back in sorted key order and whitespace is dropped.
+	wire := `{"zeta":1, "message":"peer","alpha":{"b":2},"data":null,"code":-32000,"_meta":{}}`
+	var decoded RPCError
+	if err := json.Unmarshal([]byte(wire), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"code":-32000,"message":"peer","data":null,"_meta":{},"alpha":{"b":2},"zeta":1}`; string(encoded) != want {
+		t.Fatalf("got  %s\nwant %s", encoded, want)
 	}
 }
 
@@ -129,7 +185,12 @@ func TestRPCErrorRejectsInvalidRawJSON(t *testing.T) {
 	for _, err := range []RPCError{
 		{Code: 1, Data: json.RawMessage(`{`)},
 		{Code: 1, Extra: map[string]json.RawMessage{"bad": json.RawMessage(`nope`)}},
+		{Code: aboveInt32},
+		{Code: belowInt32},
 	} {
+		if strconv.IntSize == 32 && err.Data == nil && err.Extra == nil {
+			continue
+		}
 		if _, marshalErr := json.Marshal(err); marshalErr == nil {
 			t.Fatalf("encoded invalid raw JSON in %+v", err)
 		}
@@ -173,7 +234,7 @@ func TestRPCErrorSchemaErrorDropsExtensions(t *testing.T) {
 		}
 	}
 	if strconv.IntSize == 64 {
-		if _, err := (&RPCError{Code: math.MaxInt32 + 1}).SchemaError(); err == nil {
+		if _, err := (&RPCError{Code: aboveInt32}).SchemaError(); err == nil {
 			t.Fatal("converted a code outside int32")
 		}
 	}
@@ -206,11 +267,32 @@ func TestCallReturnsPeerErrorWithExtensions(t *testing.T) {
 	}
 }
 
+// forwardedPeerError returns the *RPCError a Call would return for the given
+// peer error object, as a relaying handler would receive it.
+func forwardedPeerError(t *testing.T, errorObject string) error {
+	t.Helper()
+	c, peer := pipeClient(t, nil, nil)
+	go func() {
+		var request packet
+		if err := json.NewDecoder(peer).Decode(&request); err != nil {
+			return
+		}
+		_, _ = fmt.Fprintf(peer, `{"jsonrpc":"2.0","id":%s,"error":%s}`+"\n", request.ID, errorObject)
+	}()
+	err := c.Call(context.Background(), "upstream/request", nil, nil)
+	var rpc *RPCError
+	if !errors.As(err, &rpc) {
+		t.Fatalf("expected *RPCError from Call, got %v", err)
+	}
+	return rpc
+}
+
 func TestHandlerErrorsEncodeExtensions(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		err  error
-		want string
+		name     string
+		err      error
+		want     string
+		contains string
 	}{
 		{
 			name: "extensions and null data",
@@ -226,12 +308,27 @@ func TestHandlerErrorsEncodeExtensions(t *testing.T) {
 			want: `{"code":-32602,"message":"bad"}`,
 		},
 		{
-			name: "invalid extension JSON",
-			err:  &RPCError{Code: -32602, Message: "bad", Extra: map[string]json.RawMessage{"broken": json.RawMessage(`{`)}},
-			want: `{"code":-32603,"message":"encode error response: `,
+			name: "forwarded peer error",
+			err:  forwardedPeerError(t, `{"zeta":"z","code":-32000,"message":"login","_meta":{"trace":1}}`),
+			want: `{"code":-32000,"message":"login","_meta":{"trace":1},"zeta":"z"}`,
+		},
+		{
+			name:     "invalid extension JSON",
+			err:      &RPCError{Code: -32602, Message: "bad", Extra: map[string]json.RawMessage{"broken": json.RawMessage(`{`)}},
+			want:     `{"code":-32603,"message":"encode error response: `,
+			contains: `broken`,
+		},
+		{
+			name:     "code outside int32",
+			err:      &RPCError{Code: aboveInt32, Message: "too wide"},
+			want:     `{"code":-32603,"message":"encode error response: `,
+			contains: `2147483648`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "code outside int32" && strconv.IntSize == 32 {
+				t.Skip("int cannot hold a code outside int32")
+			}
 			_, peer := pipeClient(t, func(context.Context, string, json.RawMessage) (any, error) {
 				return nil, tc.err
 			}, nil)
@@ -243,11 +340,11 @@ func TestHandlerErrorsEncodeExtensions(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := `{"jsonrpc":"2.0","id":4,"error":` + tc.want + "}\n"
-			if strings.HasSuffix(tc.want, ": ") {
+			if tc.contains != "" {
 				// The encoder's error text belongs to encoding/json; only the
 				// fallback code and prefix are part of this package's contract.
 				want = `{"jsonrpc":"2.0","id":4,"error":` + tc.want
-				if !strings.HasPrefix(string(line), want) || !strings.Contains(string(line), `broken`) {
+				if !strings.HasPrefix(string(line), want) || !strings.Contains(string(line), tc.contains) {
 					t.Fatalf("got  %s\nwant prefix %s", line, want)
 				}
 				return

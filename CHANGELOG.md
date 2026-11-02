@@ -28,12 +28,24 @@ series, minor releases may contain breaking API changes.
   cannot be repeated after any other request; reconnect to initialize again",
   replacing `agent is already initialized`. Clients that matched on the old
   messages must match on `data` instead (#74).
-- `acp.RPCError` has custom JSON encoding. Member names now match exactly, as
-  JSON-RPC requires: a differently cased `"Code"` is an extension member, not
-  the code. Decoding into an existing value replaces it instead of merging.
-  Existing `RPCError` literals encode as before.
-- A handler error whose `Data` or `Extra` is not valid JSON is answered with
-  `-32603` instead of failing to send any response.
+- **Breaking:** the new `Extra` field means unkeyed `RPCError` literals such
+  as `acp.RPCError{-32602, "bad", nil}` no longer compile; use keyed fields.
+  Keyed literals keep working and encode as before.
+- **Breaking:** `RPCError` now has its own `MarshalJSON` and `UnmarshalJSON`.
+  A struct that embeds `acp.RPCError` inherits them, so the outer struct's
+  other fields no longer appear in its JSON.
+- `acp.RPCError` decodes as strictly as the reference SDK: an error object
+  whose `code` or `message` is missing, null, or mistyped, whose `code` is not
+  an integer in the `int32` range (including `1.0`, `1e3`, and `-0`), or that
+  repeats `code`, `message`, or `data` is rejected. A peer error response like
+  that is now a malformed frame. Member names match exactly, as JSON-RPC
+  requires: a differently cased `"Code"` is an extension member, not the code.
+  Decoding into an existing value replaces it instead of merging. Re-encoding
+  is semantically unchanged; members after `code`, `message`, and `data` are
+  emitted in sorted key order.
+- A handler error whose `Data` or `Extra` is not valid JSON, or whose `Code`
+  does not fit `int32`, is answered with `-32603` instead of failing to send
+  any response.
 
 ### Fixed
 

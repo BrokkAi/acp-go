@@ -62,10 +62,16 @@ losslessly like Rust's raw JSON-RPC error. `Call` returns it for an error
 response, and a handler returns one (directly or wrapped) to choose its error
 response. `Data` keeps an omitted `data` (nil), `"data": null`, and a value
 apart, and `Extra` keeps every other member, such as extension fields, so a
-relay can re-emit the object unchanged. `code`, `message`, and `data` always
-come from the typed fields, never from `Extra`, so no member is ever encoded
-twice. `acp.IsAuthRequired` and `acp.IsResourceNotFound` classify by code
-alone. `RPCError.SchemaError` is the explicit conversion to the typed v1
+relay can re-emit the object semantically unchanged; members after `code`,
+`message`, and `data` are re-emitted in sorted key order. A handler that
+returns a `*RPCError` obtained from `Call` therefore forwards the peer's
+`Extra` members too. `code`, `message`, and `data` always come from the typed
+fields, never from `Extra`, so no member is ever encoded twice. As in Rust,
+decoding rejects an error object whose `code` or `message` is missing, null,
+or mistyped, whose `code` is not an `int32` integer, or that repeats `code`,
+`message`, or `data`, and a handler error whose `Code` does not fit `int32` is
+answered with `-32603`. `acp.IsAuthRequired` and `acp.IsResourceNotFound`
+classify by code alone. `RPCError.SchemaError` is the explicit conversion to the typed v1
 `schema.Error`, and drops `Extra`, as Rust's `into_acp_error` does.
 
 Run `go test -race ./...` and `go vet ./...`. No agent credentials are needed.
