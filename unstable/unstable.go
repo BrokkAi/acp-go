@@ -1,6 +1,7 @@
 /*
 Package unstable exposes narrow, opt-in typed facades for ACP's optional
-("unstable") methods: agent provider configuration and session fork.
+("unstable") methods: agent provider configuration, session fork, and
+session archive, status, and title.
 
 Every method here lives behind its own package import because the ACP release
 marks the surface unstable and may change or remove it. Nothing in this package
@@ -14,6 +15,14 @@ initialize result into unstable.InitializeResponse to use these facades:
 	var initialization unstable.InitializeResponse
 	json.Unmarshal(encodedInitializeResult, &initialization)
 	providers, err := unstable.ListProviders(ctx, connection, initialization)
+
+On the agent side, Install serves the handler interfaces in this package on
+the agent runtime and advertises their capabilities:
+
+	runtime := agent.New(implementation)
+	if err := unstable.Install(runtime, implementation); err != nil {
+		return err
+	}
 */
 package unstable
 

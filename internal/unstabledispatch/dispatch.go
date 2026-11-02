@@ -12,9 +12,43 @@ package unstabledispatch
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sort"
 
 	"github.com/BrokkAi/acp-go"
 )
+
+// MergeOverrides binds handler to each of overrides, the stable runtime
+// methods whose unstable form an Install serves, and returns a copy of
+// existing (a runtime's Overrides) with the bound methods added. It refuses a
+// method existing already serves, so that Install never silently replaces an
+// override the caller set. With nothing bound it returns existing unchanged.
+func MergeOverrides(existing map[string]acp.Handler, handler any, overrides map[string]Binding) (map[string]acp.Handler, error) {
+	methods := make([]string, 0, len(overrides))
+	for method := range overrides {
+		methods = append(methods, method)
+	}
+	// A fixed order makes the reported conflict deterministic.
+	sort.Strings(methods)
+	bound := make(map[string]acp.Handler, len(methods))
+	for _, method := range methods {
+		serve := overrides[method](handler)
+		if serve == nil {
+			continue
+		}
+		if _, taken := existing[method]; taken {
+			return nil, fmt.Errorf("runtime override for %s is already set", method)
+		}
+		bound[method] = serve
+	}
+	if len(bound) == 0 {
+		return existing, nil
+	}
+	for method, serve := range existing {
+		bound[method] = serve
+	}
+	return bound, nil
+}
 
 // Binding adapts a handler to one method, or returns nil when the handler
 // does not implement that method's interface.

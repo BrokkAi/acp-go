@@ -10,6 +10,7 @@
 package acpvalidate
 
 import (
+	"encoding/json"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -21,6 +22,21 @@ import (
 func Identifier(kind, value string) error {
 	if strings.TrimSpace(value) == "" {
 		return fmt.Errorf("%s is required", kind)
+	}
+	return nil
+}
+
+// RequiredMember requires a response object to carry member with a non-null
+// value, as the reference SDK's typed response does before it decodes: the
+// generated Go types read an omitted required member as its zero value.
+// method names the response in the error.
+func RequiredMember(method string, raw json.RawMessage, member string) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return fmt.Errorf("%s response: %w", method, err)
+	}
+	if value, ok := members[member]; !ok || string(value) == "null" {
+		return fmt.Errorf("agent returned a %s response without the required %s", method, member)
 	}
 	return nil
 }

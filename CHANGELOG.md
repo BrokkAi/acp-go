@@ -212,9 +212,76 @@ series, minor releases may contain breaking API changes.
     capability, as live events outside the timeline (`Notices`,
     `DrainNotices`), and `Compactions` lists its compactions in first-seen
     order.
+- `unstable` and `v2/unstable` gain the session archive, status, and title
+  facades (#71): `ArchiveSession` and `UnarchiveSession` (gated on the
+  `archive` session capability), `SessionStatus` (`status`), and
+  `SetSessionTitle` (`title`), each requiring a non-blank session ID (and
+  title) before writing, plus `ListSessions`, the unstable `session/list`
+  whose `archived` filter needs the `archive` capability. The filter and
+  `SessionStatus` stay open enums: unknown values are sent and decoded
+  unchanged. `SessionStatus` rejects a response without `status` and
+  `SetSessionTitle` one without `title` (omitted or `null`), as the reference
+  SDK's typed responses do.
+- `ArchiveHandler`, `StatusHandler`, and `TitleHandler` serve those methods on
+  the agent side through `Handle`, and `Advertise` announces the `status` and
+  `title` session capabilities (v2 entries only alongside the baseline session
+  capabilities). Status and title responses are sent as returned, as the
+  reference SDK sends them; archive-aware list entries without `archived`,
+  which the archive RFD requires on every entry, answer `-32603` instead of
+  being sent.
+- `agent.Runtime` and `v2/agent.Runtime` gain `Overrides`, a
+  `map[string]acp.Handler` that serves the named methods in place of the
+  runtime's own dispatch to the `Agent`, with the raw params, after the
+  initialization gate and the method's capability check and ahead of
+  `Extensions`. `Serve` refuses an override for `initialize`,
+  `session/prompt`, or a notification such as `session/cancel`, or a nil
+  handler, before reading. In v2 an override for `auth/login`,
+  `auth/logout`, or `session/delete` satisfies the implementation check those
+  capabilities make at initialize.
+- `agent.ClientFromContext(ctx)` and `v2/agent.ClientFromContext(ctx)` return
+  the connection's `Client` inside the requests the runtime dispatches,
+  including `Overrides` and `Extensions` handlers, which take no `Client`
+  argument. It is the client the stable dispatch passes to the `Agent`, so an
+  override of `session/load` can stream its replay as `session/update` before
+  it answers, and `session/new` and `session/resume` overrides can call the
+  client, as the reference SDK gives every request handler its connection.
+- `unstable.Install(runtime, handler, customize...)` and
+  `v2/unstable.Install` set `Extensions` (`Handle`, chained in front of any
+  `Extensions` already set), `InitializeResult` (`Advertise`), and the
+  `Overrides` the handler needs on an agent runtime in one call, and refuse a
+  nil runtime, an `InitializeResult` already set, or a conflicting override
+  without changing the runtime. For an `ArchiveHandler` they serve
+  `session/list` from `ListSessionsWithArchive`, so that the `archived` filter
+  and `SessionInfo.archived` survive, and announce the `archive` capability
+  (v1 only alongside the agent's own `sessionCapabilities.list`), which
+  `Advertise` alone never does: an agent cannot advertise `archive` without
+  serving the filter. That decision is made from the `Agent`'s own initialize
+  response, before the `customize` functions run.
+- `acp.SessionNotFoundError(sessionID)` builds the reference SDK's v1
+  `session_not_found` error: `-32002` `Resource not found` with data
+  `{"sessionId": ...}`. It is v1-only.
+- `v2.SessionNotFoundError(sessionID)` builds the draft-v2 `session_not_found`
+  error with `SessionNotFoundErrorData`, `v2.SessionNotFoundData(err)` decodes
+  that data from any error that is or wraps a `-32002` `*acp.RPCError`, and
+  `v2.SchemaError` converts an `*acp.RPCError` to the typed draft-v2
+  `schema.Error`.
 
 ### Changed
 
+- The generated v1 and draft-v2 unstable `SessionStatusResponse` decode a
+  malformed optional field as not reported, per its
+  `x-deserialize-default-on-error` hints, so a malformed draft-v2 `state`
+  snapshot reads as nil instead of failing the response, as the session-status
+  RFD requires.
+- The generated `SessionInfo` in all four schema packages decodes a malformed
+  optional field (`archived` in the unstable packages, `title`, `updatedAt`,
+  `_meta`, and v1 `additionalDirectories`) as not reported, per its
+  `x-deserialize-default-on-error` hints, as the reference SDK's
+  `DefaultOnError` does, so one malformed `archived` reads as nil instead of
+  failing the whole `session/list` page. v1 `additionalDirectories` still
+  differs: the reference SDK also skips its invalid items and keeps the rest
+  (`VecSkipError`), while one invalid item drops the whole list here, until
+  skip-invalid-items hints are honored (#82).
 - `mcp.MessageRouter` and the v2 `MessageRouter` follow the reference
   binding for low-level `Register` services too:
   - an active request is cancelled when the connection's input reaches EOF,

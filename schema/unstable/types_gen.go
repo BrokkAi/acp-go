@@ -4425,6 +4425,59 @@ type SessionInfo struct {
 	UpdatedAt *string `json:"updatedAt,omitempty"`
 }
 
+func (v *SessionInfo) UnmarshalJSON(data []byte) error {
+	var raws map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return err
+	}
+	*v = SessionInfo{}
+	if raw, ok := raws["_meta"]; ok {
+		var value Meta
+		if json.Unmarshal(raw, &value) == nil {
+			v.Meta = value
+		}
+	}
+	if raw, ok := raws["additionalDirectories"]; ok {
+		var value []string
+		if json.Unmarshal(raw, &value) == nil {
+			v.AdditionalDirectories = value
+		}
+	}
+	if raw, ok := raws["archived"]; ok {
+		var value *bool
+		if json.Unmarshal(raw, &value) == nil {
+			v.Archived = value
+		}
+	}
+	if raw, ok := raws["cwd"]; ok {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return fmt.Errorf("SessionInfo.cwd: %w", err)
+		}
+		v.Cwd = value
+	}
+	if raw, ok := raws["sessionId"]; ok {
+		var value SessionId
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return fmt.Errorf("SessionInfo.sessionId: %w", err)
+		}
+		v.SessionID = value
+	}
+	if raw, ok := raws["title"]; ok {
+		var value *string
+		if json.Unmarshal(raw, &value) == nil {
+			v.Title = value
+		}
+	}
+	if raw, ok := raws["updatedAt"]; ok {
+		var value *string
+		if json.Unmarshal(raw, &value) == nil {
+			v.UpdatedAt = value
+		}
+	}
+	return nil
+}
+
 // Update to session metadata. All fields are optional to support partial updates.
 // Agents send this notification to update session information like title or custom metadata.
 // Clients can use it to keep session titles and state current.
@@ -4612,6 +4665,28 @@ type SessionStatusResponse struct {
 	// Whether the Agent has the session in memory.
 	// Required. Clients MUST treat a value they do not recognize as saved.
 	Status SessionStatus `json:"status"`
+}
+
+func (v *SessionStatusResponse) UnmarshalJSON(data []byte) error {
+	var raws map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return err
+	}
+	*v = SessionStatusResponse{}
+	if raw, ok := raws["_meta"]; ok {
+		var value Meta
+		if json.Unmarshal(raw, &value) == nil {
+			v.Meta = value
+		}
+	}
+	if raw, ok := raws["status"]; ok {
+		var value SessionStatus
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return fmt.Errorf("SessionStatusResponse.status: %w", err)
+		}
+		v.Status = value
+	}
+	return nil
 }
 
 // UNSTABLE

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -37,4 +38,28 @@ func (s *server) extendInitialize(response schema.InitializeResponse) (any, sche
 		return nil, response, fmt.Errorf("extended initialize response is not an initialize response: %w", err)
 	}
 	return json.RawMessage(encoded), view, nil
+}
+
+// checkOverrides validates Runtime.Overrides and copies it, so that later
+// changes to the caller's map do not race with the connection.
+func checkOverrides(overrides map[string]acp.Handler) (map[string]acp.Handler, error) {
+	if len(overrides) == 0 {
+		return nil, nil
+	}
+	copied := make(map[string]acp.Handler, len(overrides))
+	for method, handler := range overrides {
+		switch method {
+		case schema.InitializeMethodName, schema.SessionPromptMethodName:
+			return nil, fmt.Errorf("runtime override for %s is not allowed: the runtime serves it itself", method)
+		}
+		if schema.Methods[method].Notification {
+			// Overrides answer requests; a notification never reaches them.
+			return nil, fmt.Errorf("runtime override for %s is not allowed: it is a notification, not a request", method)
+		}
+		if handler == nil {
+			return nil, fmt.Errorf("runtime override for %s is nil", method)
+		}
+		copied[method] = handler
+	}
+	return copied, nil
 }

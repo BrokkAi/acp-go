@@ -22,6 +22,7 @@ type Runtime struct {
 	// itself, such as the unstable methods that
 	// github.com/BrokkAi/acp-go/v2/unstable.Handle dispatches. It runs behind
 	// the runtime's initialization gate. Unset, those requests answer -32601.
+	// The handler reaches the connection's Client through ClientFromContext.
 	Extensions acp.Handler
 
 	// InitializeResult, when set, receives the agent's initialize response
@@ -31,6 +32,25 @@ type Runtime struct {
 	// returned value as a stable v2 initialize response and validates that
 	// view before sending the value.
 	InitializeResult func(schema.InitializeResponse) (any, error)
+
+	// Overrides, when set, serves the named methods in place of the runtime's
+	// own dispatch to Agent, keyed by method name. An override receives the
+	// raw params, so it can read and answer fields the stable schema does not
+	// carry. It runs behind the initialization gate and the method's
+	// capability check (session/list still requires the baseline
+	// capabilities.session, for example), and takes precedence over
+	// Extensions for methods the runtime does not own. An override for
+	// auth/login, auth/logout, or session/delete stands in for the Agent
+	// interface those capabilities otherwise require. initialize and
+	// session/prompt cannot be overridden, because the runtime itself
+	// validates the handshake and the prompt response, and notifications
+	// such as session/cancel cannot either, because overrides answer
+	// requests; Serve refuses those keys and nil handlers before reading from
+	// the connection. An override, like an Extensions handler, reaches the
+	// connection's Client through ClientFromContext.
+	// github.com/BrokkAi/acp-go/v2/unstable.Install sets the overrides the
+	// unstable facades need, such as session/list with the archived filter.
+	Overrides map[string]acp.Handler
 }
 
 func New(implementation Agent) *Runtime {
@@ -42,8 +62,12 @@ func (r *Runtime) Serve(ctx context.Context, in io.ReadCloser, out io.WriteClose
 	if r.Agent == nil {
 		return errors.New("agent implementation is required")
 	}
+	overrides, err := checkOverrides(r.Overrides)
+	if err != nil {
+		return err
+	}
 	client := &clientConnection{connectionReady: make(chan struct{})}
-	state := &server{agent: r.Agent, client: client, extensions: r.Extensions, initializeResult: r.InitializeResult}
+	state := &server{agent: r.Agent, client: client, extensions: r.Extensions, initializeResult: r.InitializeResult, overrides: overrides}
 	connection := acp.Connect(in, out, state.handle, state.notification, acp.WithProtocolVersion(uint16(version)))
 	client.attach(connection)
 	defer connection.Close()
@@ -64,6 +88,7 @@ type server struct {
 	client           *clientConnection
 	extensions       acp.Handler
 	initializeResult func(schema.InitializeResponse) (any, error)
+	overrides        map[string]acp.Handler
 
 	mu           sync.Mutex
 	initialized  bool
@@ -79,12 +104,16 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 	if !s.isInitialized() {
 		return nil, initializationRequired(method)
 	}
+	if err := s.gate(method); err != nil {
+		return nil, err
+	}
+	ctx = withClient(ctx, s.client)
+	if override, ok := s.overrides[method]; ok {
+		return override(ctx, method, raw)
+	}
 
 	switch method {
 	case schema.AuthLoginMethodName:
-		if !s.advertisesAuth() {
-			return nil, methodNotFound(method)
-		}
 		implementation, ok := s.agent.(AuthLoginer)
 		if !ok {
 			return nil, methodNotFound(method)
@@ -95,9 +124,6 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return implementation.AuthLogin(ctx, s.client, request)
 	case schema.AuthLogoutMethodName:
-		if !s.advertisesAuth() {
-			return nil, methodNotFound(method)
-		}
 		implementation, ok := s.agent.(AuthLogouter)
 		if !ok {
 			return nil, methodNotFound(method)
@@ -108,45 +134,30 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return implementation.AuthLogout(ctx, s.client, request)
 	case schema.SessionNewMethodName:
-		if err := s.requireSessions(); err != nil {
-			return nil, err
-		}
 		request, err := decodeRequest[schema.NewSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
 		return s.agent.NewSession(ctx, s.client, request)
 	case schema.SessionResumeMethodName:
-		if err := s.requireSessions(); err != nil {
-			return nil, err
-		}
 		request, err := decodeRequest[schema.ResumeSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
 		return s.agent.ResumeSession(ctx, s.client, request)
 	case schema.SessionCloseMethodName:
-		if err := s.requireSessions(); err != nil {
-			return nil, err
-		}
 		request, err := decodeRequest[schema.CloseSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
 		return s.agent.CloseSession(ctx, s.client, request)
 	case schema.SessionListMethodName:
-		if err := s.requireSessions(); err != nil {
-			return nil, err
-		}
 		request, err := decodeRequest[schema.ListSessionsRequest](raw)
 		if err != nil {
 			return nil, err
 		}
 		return s.agent.ListSessions(ctx, s.client, request)
 	case schema.SessionDeleteMethodName:
-		if !s.advertisesDelete() {
-			return nil, methodNotFound(method)
-		}
 		implementation, ok := s.agent.(SessionDeleter)
 		if !ok {
 			return nil, methodNotFound(method)
@@ -157,9 +168,6 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return implementation.DeleteSession(ctx, s.client, request)
 	case schema.SessionPromptMethodName:
-		if err := s.requireSessions(); err != nil {
-			return nil, err
-		}
 		request, err := decodeRequest[schema.PromptRequest](raw)
 		if err != nil {
 			return nil, err
@@ -238,12 +246,14 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 	if len(response.AuthMethods) > 0 {
 		_, canLogin := s.agent.(AuthLoginer)
 		_, canLogout := s.agent.(AuthLogouter)
+		canLogin = canLogin || s.overrides[schema.AuthLoginMethodName] != nil
+		canLogout = canLogout || s.overrides[schema.AuthLogoutMethodName] != nil
 		if !canLogin || !canLogout {
 			return nil, errors.New("authMethods requires both auth/login and auth/logout implementations")
 		}
 	}
 	if response.Capabilities.Session.Delete != nil {
-		if _, ok := s.agent.(SessionDeleter); !ok {
+		if _, ok := s.agent.(SessionDeleter); !ok && s.overrides[schema.SessionDeleteMethodName] == nil {
 			return nil, errors.New("session.delete capability requires a SessionDeleter implementation")
 		}
 	}
@@ -271,6 +281,25 @@ func (s *server) isInitialized() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.initialized
+}
+
+// gate applies the capability check of a method the runtime owns, before
+// either its own dispatch or an override serves it.
+func (s *server) gate(method string) error {
+	switch method {
+	case schema.AuthLoginMethodName, schema.AuthLogoutMethodName:
+		if !s.advertisesAuth() {
+			return methodNotFound(method)
+		}
+	case schema.SessionNewMethodName, schema.SessionResumeMethodName, schema.SessionCloseMethodName,
+		schema.SessionListMethodName, schema.SessionPromptMethodName:
+		return s.requireSessions()
+	case schema.SessionDeleteMethodName:
+		if !s.advertisesDelete() {
+			return methodNotFound(method)
+		}
+	}
+	return nil
 }
 
 func (s *server) requireSessions() error {

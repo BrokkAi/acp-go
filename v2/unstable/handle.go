@@ -38,8 +38,10 @@ type ForkHandler interface {
 // Params that do not decode answer -32602 in the reference SDK's shape, whose
 // data echoes the received params, and never reach the handler.
 //
-// Install it as the v2/agent runtime's Extensions, so that the runtime's
-// initialization gate and version negotiation run in front of it:
+// Install wires Handle, Advertise, and the runtime overrides together and is
+// the usual way to serve this package's methods. Handle alone is the v2/agent
+// runtime's Extensions, so that the runtime's initialization gate and version
+// negotiation run in front of it:
 //
 //	runtime := agent.New(implementation)
 //	runtime.Extensions = unstable.Handle(nil, implementation)
@@ -56,6 +58,10 @@ var routes = map[string]unstabledispatch.Binding{
 	schema.ProvidersSetMethodName:     unstabledispatch.Route(ProviderHandler.SetProvider, nil),
 	schema.ProvidersDisableMethodName: unstabledispatch.Route(ProviderHandler.DisableProvider, nil),
 	schema.SessionForkMethodName:      unstabledispatch.Route(ForkHandler.ForkSession, checkForkResponse),
+	schema.SessionArchiveMethodName:   unstabledispatch.Route(ArchiveHandler.ArchiveSession, nil),
+	schema.SessionUnarchiveMethodName: unstabledispatch.Route(ArchiveHandler.UnarchiveSession, nil),
+	schema.SessionStatusMethodName:    unstabledispatch.Route(StatusHandler.SessionStatus, nil),
+	schema.SessionSetTitleMethodName:  unstabledispatch.Route(TitleHandler.SetSessionTitle, nil),
 }
 
 func checkForkResponse(response schema.ForkSessionResponse) error {
@@ -69,14 +75,25 @@ func checkForkResponse(response schema.ForkSessionResponse) error {
 // carries the agent's stable initialize response over to the unstable
 // InitializeResponse field for field (through its JSON form, which the
 // unstable schema extends), advertises capabilities.providers when handler
-// implements ProviderHandler and capabilities.session.fork when it implements
-// ForkHandler, keeping any value the agent already set, and then applies each
-// customize function in order.
+// implements ProviderHandler and the capabilities.session entry of each
+// session handler it implements (fork for ForkHandler, status for
+// StatusHandler, and title for TitleHandler), keeping any value the agent
+// already set, and then applies each customize function in order.
 //
-// session.fork is added only when the agent advertised the baseline session
-// capabilities, which the runtime requires anyway; Advertise never advertises
-// the baseline on the agent's behalf.
+// Advertise never announces capabilities.session.archive: an agent that does
+// must also serve the archived session/list filter, which only Install wires
+// up. Install announces it for an ArchiveHandler.
+//
+// The session entries are added only when the agent advertised the baseline
+// session capabilities, which the runtime requires anyway; Advertise never
+// advertises the baseline on the agent's behalf.
 func Advertise(handler any, customize ...func(*schema.InitializeResponse) error) func(stable.InitializeResponse) (any, error) {
+	return advertise(handler, false, customize)
+}
+
+// advertise is Advertise; archive also announces the archive capability,
+// which only Install, which serves the archived filter, may do.
+func advertise(handler any, archive bool, customize []func(*schema.InitializeResponse) error) func(stable.InitializeResponse) (any, error) {
 	return func(response stable.InitializeResponse) (any, error) {
 		encoded, err := json.Marshal(response)
 		if err != nil {
@@ -99,6 +116,7 @@ func Advertise(handler any, customize ...func(*schema.InitializeResponse) error)
 				extended.Capabilities.Session.Fork = &schema.SessionForkCapabilities{}
 			}
 		}
+		advertiseSessionHandlers(handler, archive, &extended)
 		for _, apply := range customize {
 			if err := apply(&extended); err != nil {
 				return nil, err
