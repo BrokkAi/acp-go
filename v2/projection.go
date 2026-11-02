@@ -9,61 +9,6 @@ import (
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
-// UpdateProjection accumulates agent-message chunks and patch snapshots by
-// messageId. It follows the reference SDK's one-shot text projection.
-type UpdateProjection struct {
-	mu       sync.RWMutex
-	order    []schema.MessageId
-	messages map[schema.MessageId][]schema.ContentBlock
-}
-
-func NewUpdateProjection() *UpdateProjection {
-	return &UpdateProjection{messages: make(map[schema.MessageId][]schema.ContentBlock)}
-}
-
-func (p *UpdateProjection) Apply(update schema.SessionUpdate) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	switch {
-	case update.AgentMessageChunk != nil:
-		chunk := update.AgentMessageChunk
-		p.message(chunk.MessageID)
-		p.messages[chunk.MessageID] = append(p.messages[chunk.MessageID], chunk.Content)
-	case update.AgentMessage != nil:
-		message := update.AgentMessage
-		p.message(message.MessageID)
-		switch {
-		case !message.Content.Set:
-			// Omitted content preserves the accumulated value.
-		case message.Content.Null:
-			p.messages[message.MessageID] = nil
-		default:
-			p.messages[message.MessageID] = append([]schema.ContentBlock(nil), message.Content.Value...)
-		}
-	}
-}
-
-func (p *UpdateProjection) Text() string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	result := make([]byte, 0, 128)
-	for _, id := range p.order {
-		for _, block := range p.messages[id] {
-			if block.Text != nil {
-				result = append(result, block.Text.Text...)
-			}
-		}
-	}
-	return string(result)
-}
-
-func (p *UpdateProjection) message(id schema.MessageId) {
-	if _, exists := p.messages[id]; !exists {
-		p.order = append(p.order, id)
-		p.messages[id] = nil
-	}
-}
-
 // WorkResult is the projected output and stop reason at an idle update.
 type WorkResult struct {
 	Text       string
@@ -122,16 +67,22 @@ func (w *ActiveWork) Wait(ctx context.Context) (WorkResult, error) {
 	}
 }
 
-// SessionTracker owns one ActiveWork projection per session. Incoming traffic
-// remains application-owned; install TrackerNotifications when the connection
-// is created, before session setup or replay can begin.
+// SessionTracker owns, per session, an UpdateProjection of the session's
+// entities and an ActiveWork projection of the current foreground work.
+// Incoming traffic remains application-owned; install TrackerNotifications
+// (and TrackerPermissions, to apply permission requests' tool calls) when the
+// connection is created, before session setup or replay can begin.
 type SessionTracker struct {
-	mu       sync.Mutex
-	sessions map[SessionID]*ActiveWork
+	mu          sync.Mutex
+	sessions    map[SessionID]*ActiveWork
+	projections map[SessionID]*UpdateProjection
 }
 
 func NewSessionTracker() *SessionTracker {
-	return &SessionTracker{sessions: make(map[SessionID]*ActiveWork)}
+	return &SessionTracker{
+		sessions:    make(map[SessionID]*ActiveWork),
+		projections: make(map[SessionID]*UpdateProjection),
+	}
 }
 
 // TrackerNotifications returns a notification adapter for this tracker. The
@@ -153,8 +104,54 @@ func (t *SessionTracker) TrackerNotifications(next acp.Notifications) acp.Notifi
 	}
 }
 
+// TrackerPermissions returns a permission host that applies the toolCall of
+// each request's tool_call subject to the session projection, as a
+// tool_call_update, before next handles the request. A nil next answers every
+// request with the cancelled outcome.
+func (t *SessionTracker) TrackerPermissions(next Permissions) Permissions {
+	return trackerPermissions{tracker: t, next: next}
+}
+
+type trackerPermissions struct {
+	tracker *SessionTracker
+	next    Permissions
+}
+
+func (h trackerPermissions) RequestPermission(ctx context.Context, request schema.RequestPermissionRequest) (schema.RequestPermissionResponse, error) {
+	h.tracker.Projection(request.SessionID).ApplyPermissionRequest(request)
+	if h.next == nil {
+		return CancelPermission(), nil
+	}
+	return h.next.RequestPermission(ctx, request)
+}
+
+// Observe applies one session update to the session's projection and to its
+// current work. Replayed and live updates take the same path.
 func (t *SessionTracker) Observe(update Update) {
-	t.Work(update.SessionID).Apply(update.Update)
+	t.mu.Lock()
+	projection := t.projectionLocked(update.SessionID)
+	work := t.workLocked(update.SessionID)
+	t.mu.Unlock()
+	projection.Apply(update.Update)
+	work.Apply(update.Update)
+}
+
+// Projection returns the session's entity projection, creating one if
+// needed. Unlike the work projection, it spans every update observed for the
+// session, including replay, and BeginWork does not reset it.
+func (t *SessionTracker) Projection(sessionID SessionID) *UpdateProjection {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.projectionLocked(sessionID)
+}
+
+func (t *SessionTracker) projectionLocked(sessionID SessionID) *UpdateProjection {
+	if projection := t.projections[sessionID]; projection != nil {
+		return projection
+	}
+	projection := NewUpdateProjection()
+	t.projections[sessionID] = projection
+	return projection
 }
 
 // Work returns the current work projection, creating one if needed.

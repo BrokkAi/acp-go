@@ -29,6 +29,15 @@
 // ACP v2 patch fields distinguish an omitted property from JSON null. Those
 // fields use Nullable[T], whose Set, Null, and Value members preserve all
 // three wire states: omitted, explicit null, and a concrete value.
+//
+// The upsert updates (ToolCallUpdate, TerminalUpdate, UserMessage,
+// AgentMessage, AgentThought, SessionInfoUpdate, and CompactionUpdate) have
+// an ApplyUpdate method that applies a later update to stored entity state,
+// as Rust's apply_update does. Their top-level _meta is a metadata patch,
+// applied by ApplyMetaUpdate: an object patches the stored metadata by
+// top-level key instead of replacing it. This differs from v1, where a _meta
+// object replaces the stored metadata as a whole, and from every other v2
+// _meta, which describes only the object carrying it.
 // Integer formats retain their JSON Schema wire width; ProtocolVersion is a
 // uint16 and ErrorCode is an int32.
 //

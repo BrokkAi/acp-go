@@ -39,6 +39,66 @@ func (v *Nullable[T]) UnmarshalJSON(data []byte) error {
 
 func (v Nullable[T]) IsZero() bool { return !v.Set }
 
+// ApplyMetaUpdate applies the top-level _meta patch of an upsert update to
+// stored metadata.
+//
+// An omitted update leaves stored unchanged, and null clears it. An object
+// patches stored one top-level key at a time: keys it omits keep their stored
+// values, a key set to null is removed, and any other value replaces that
+// key's stored value whole. Nested objects are not merged, and a null nested
+// inside a value is kept as data. A key set to null is never stored, including
+// on an entity's first update. Removing every key leaves an empty object,
+// which means the same as no metadata.
+//
+// A patch stores a new map; the previously stored map and the update's map
+// are never modified, so metadata shared with an earlier update or snapshot
+// stays intact.
+//
+// Use this only for the top-level _meta of upsert updates, as their
+// ApplyUpdate methods do. Other _meta fields are not patches.
+// See protocol docs: Metadata Patches
+func ApplyMetaUpdate(stored *Nullable[Meta], update Nullable[Meta]) {
+	if !update.Set {
+		return
+	}
+	if update.Null {
+		*stored = Nullable[Meta]{Set: true, Null: true}
+		return
+	}
+	meta := make(Meta, len(update.Value))
+	if stored.Set && !stored.Null {
+		for key, value := range stored.Value {
+			meta[key] = value
+		}
+	}
+	for key, value := range update.Value {
+		if isJSONNull(value) {
+			delete(meta, key)
+		} else {
+			meta[key] = value
+		}
+	}
+	*stored = Nullable[Meta]{Set: true, Value: meta}
+}
+
+// isJSONNull reports whether a metadata value encodes as JSON null, the
+// removal signal of a metadata patch, so a patch built in Go behaves exactly
+// like the same patch decoded from the wire.
+func isJSONNull(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case bool, float64, string, json.Number:
+		return false
+	case map[string]any:
+		return v == nil
+	case []any:
+		return v == nil
+	}
+	encoded, err := json.Marshal(value)
+	return err == nil && string(encoded) == "null"
+}
+
 // An absolute filesystem path used by the protocol.
 // Uses the native syntax of the machine the Agent runs on, such as /home/user/project,
 // C:\Users\user\project, or \\server\share\project. It is not a URI.
@@ -107,6 +167,25 @@ type AgentMessage struct {
 	MessageID MessageId `json:"messageId"`
 }
 
+// ApplyUpdate applies a later update for the same entity to this stored AgentMessage state.
+//
+// Omitted fields leave the stored value unchanged. Fields set to null are
+// stored as null, so callers can tell an explicit clear from an update that
+// did not mention the field. Other values replace the stored value whole.
+// Required fields are replaced. The top-level _meta is patched by key, as
+// described by ApplyMetaUpdate.
+//
+// Start a first-seen entity from the zero value with only its ID set and apply
+// its first update to that, so the first update's null _meta keys are not
+// stored. Values are stored by reference; neither update is modified.
+func (v *AgentMessage) ApplyUpdate(update AgentMessage) {
+	ApplyMetaUpdate(&v.Meta, update.Meta)
+	if update.Content.Set {
+		v.Content = update.Content
+	}
+	v.MessageID = update.MessageID
+}
+
 // An agent thought or reasoning message upsert.
 // Only messageId is required. content has patch semantics:
 // an omitted field leaves existing thought content unchanged, null clears the
@@ -131,6 +210,25 @@ type AgentThought struct {
 	Content Nullable[[]ContentBlock] `json:"content,omitzero"`
 	// A unique identifier for the thought message.
 	MessageID MessageId `json:"messageId"`
+}
+
+// ApplyUpdate applies a later update for the same entity to this stored AgentThought state.
+//
+// Omitted fields leave the stored value unchanged. Fields set to null are
+// stored as null, so callers can tell an explicit clear from an update that
+// did not mention the field. Other values replace the stored value whole.
+// Required fields are replaced. The top-level _meta is patched by key, as
+// described by ApplyMetaUpdate.
+//
+// Start a first-seen entity from the zero value with only its ID set and apply
+// its first update to that, so the first update's null _meta keys are not
+// stored. Values are stored by reference; neither update is modified.
+func (v *AgentThought) ApplyUpdate(update AgentThought) {
+	ApplyMetaUpdate(&v.Meta, update.Meta)
+	if update.Content.Set {
+		v.Content = update.Content
+	}
+	v.MessageID = update.MessageID
 }
 
 // Optional annotations for the client. The client can use annotations to inform how objects are used or displayed
@@ -942,6 +1040,29 @@ type CompactionUpdate struct {
 	Status CompactionStatus `json:"status"`
 	// Complete replacement user-displayable summary content for the compaction.
 	Summary Nullable[[]ContentBlock] `json:"summary,omitzero"`
+}
+
+// ApplyUpdate applies a later update for the same entity to this stored CompactionUpdate state.
+//
+// Omitted fields leave the stored value unchanged. Fields set to null are
+// stored as null, so callers can tell an explicit clear from an update that
+// did not mention the field. Other values replace the stored value whole.
+// Required fields are replaced. The top-level _meta is patched by key, as
+// described by ApplyMetaUpdate.
+//
+// Start a first-seen entity from the zero value with only its ID set and apply
+// its first update to that, so the first update's null _meta keys are not
+// stored. Values are stored by reference; neither update is modified.
+func (v *CompactionUpdate) ApplyUpdate(update CompactionUpdate) {
+	ApplyMetaUpdate(&v.Meta, update.Meta)
+	v.CompactionID = update.CompactionID
+	if update.Error.Set {
+		v.Error = update.Error
+	}
+	v.Status = update.Status
+	if update.Summary.Set {
+		v.Summary = update.Summary
+	}
 }
 
 // Notification sent by the agent when a URL-based elicitation is complete.
@@ -4563,6 +4684,27 @@ type SessionInfoUpdate struct {
 	UpdatedAt Nullable[string] `json:"updatedAt,omitzero"`
 }
 
+// ApplyUpdate applies a later update for the same entity to this stored SessionInfoUpdate state.
+//
+// Omitted fields leave the stored value unchanged. Fields set to null are
+// stored as null, so callers can tell an explicit clear from an update that
+// did not mention the field. Other values replace the stored value whole.
+// Required fields are replaced. The top-level _meta is patched by key, as
+// described by ApplyMetaUpdate.
+//
+// Start a first-seen entity from the zero value with only its ID set and apply
+// its first update to that, so the first update's null _meta keys are not
+// stored. Values are stored by reference; neither update is modified.
+func (v *SessionInfoUpdate) ApplyUpdate(update SessionInfoUpdate) {
+	ApplyMetaUpdate(&v.Meta, update.Meta)
+	if update.Title.Set {
+		v.Title = update.Title
+	}
+	if update.UpdatedAt.Set {
+		v.UpdatedAt = update.UpdatedAt
+	}
+}
+
 // An opaque cursor used to paginate session/list results.
 type SessionListCursor string
 
@@ -5661,21 +5803,55 @@ type TerminalUpdate struct {
 	// Client-initiated controls this terminal currently supports, such as cancellation.
 	// Omission leaves the capabilities unchanged, null clears them, and an object replaces
 	// the whole previous value. A new terminal starts with none.
-	Capabilities *TerminalCapabilities `json:"capabilities,omitempty"`
+	Capabilities Nullable[TerminalCapabilities] `json:"capabilities,omitzero"`
 	// The command being run.
 	Command Nullable[string] `json:"command,omitzero"`
 	// The absolute working directory of the command.
-	Cwd *AbsolutePath `json:"cwd,omitempty"`
+	Cwd Nullable[AbsolutePath] `json:"cwd,omitzero"`
 	// Exit information. A concrete object marks the terminal as exited.
-	ExitStatus *TerminalExitStatus `json:"exitStatus,omitempty"`
+	ExitStatus Nullable[TerminalExitStatus] `json:"exitStatus,omitzero"`
 	// An authoritative replacement snapshot of terminal output bytes.
-	Output *TerminalOutput `json:"output,omitempty"`
+	Output Nullable[TerminalOutput] `json:"output,omitzero"`
 	// The terminal size the command runs with, when known.
 	// Clients can render output at this size so that column layouts, progress bars,
 	// and cursor-positioned output display as the program wrote them.
-	Size *TerminalSize `json:"size,omitempty"`
+	Size Nullable[TerminalSize] `json:"size,omitzero"`
 	// Unique identifier for this terminal within the session.
 	TerminalID TerminalId `json:"terminalId"`
+}
+
+// ApplyUpdate applies a later update for the same entity to this stored TerminalUpdate state.
+//
+// Omitted fields leave the stored value unchanged. Fields set to null are
+// stored as null, so callers can tell an explicit clear from an update that
+// did not mention the field. Other values replace the stored value whole.
+// Required fields are replaced. The top-level _meta is patched by key, as
+// described by ApplyMetaUpdate.
+//
+// Start a first-seen entity from the zero value with only its ID set and apply
+// its first update to that, so the first update's null _meta keys are not
+// stored. Values are stored by reference; neither update is modified.
+func (v *TerminalUpdate) ApplyUpdate(update TerminalUpdate) {
+	ApplyMetaUpdate(&v.Meta, update.Meta)
+	if update.Capabilities.Set {
+		v.Capabilities = update.Capabilities
+	}
+	if update.Command.Set {
+		v.Command = update.Command
+	}
+	if update.Cwd.Set {
+		v.Cwd = update.Cwd
+	}
+	if update.ExitStatus.Set {
+		v.ExitStatus = update.ExitStatus
+	}
+	if update.Output.Set {
+		v.Output = update.Output
+	}
+	if update.Size.Set {
+		v.Size = update.Size
+	}
+	v.TerminalID = update.TerminalID
 }
 
 // All text that was typed after the command name is provided as input.
@@ -5991,14 +6167,14 @@ type ToolCallUpdate struct {
 	// Client-initiated controls this tool call currently supports, such as cancellation.
 	// Omission leaves the capabilities unchanged, null clears them, and an object replaces
 	// the whole previous value. A new tool call starts with none.
-	Capabilities *ToolCallCapabilities `json:"capabilities,omitempty"`
+	Capabilities Nullable[ToolCallCapabilities] `json:"capabilities,omitzero"`
 	// Content produced by the tool call.
 	Content Nullable[[]ToolCallContent] `json:"content,omitzero"`
 	// The category of tool being invoked.
 	// Helps clients choose appropriate icons and UI treatment.
 	// Omission leaves the kind unchanged, null resets it to other, and a value replaces it.
 	// A new tool call starts as other.
-	Kind *ToolKind `json:"kind,omitempty"`
+	Kind Nullable[ToolKind] `json:"kind,omitzero"`
 	// File locations affected by this tool call.
 	// Enables "follow-along" features in clients.
 	Locations Nullable[[]ToolCallLocation] `json:"locations,omitzero"`
@@ -6015,13 +6191,56 @@ type ToolCallUpdate struct {
 	// Current execution status of the tool call.
 	// Omission leaves the status unchanged, null resets it to pending, and a value
 	// replaces it. A new tool call starts as pending.
-	Status *ToolCallStatus `json:"status,omitempty"`
+	Status Nullable[ToolCallStatus] `json:"status,omitzero"`
 	// Human-readable title describing what the tool is doing.
 	// Omission leaves the title unchanged, null unsets it, and a string replaces it.
 	// A new tool call starts without a title.
 	Title Nullable[string] `json:"title,omitzero"`
 	// Unique identifier for this tool call within the session.
 	ToolCallID ToolCallId `json:"toolCallId"`
+}
+
+// ApplyUpdate applies a later update for the same entity to this stored ToolCallUpdate state.
+//
+// Omitted fields leave the stored value unchanged. Fields set to null are
+// stored as null, so callers can tell an explicit clear from an update that
+// did not mention the field. Other values replace the stored value whole.
+// Required fields are replaced. The top-level _meta is patched by key, as
+// described by ApplyMetaUpdate.
+//
+// Start a first-seen entity from the zero value with only its ID set and apply
+// its first update to that, so the first update's null _meta keys are not
+// stored. Values are stored by reference; neither update is modified.
+func (v *ToolCallUpdate) ApplyUpdate(update ToolCallUpdate) {
+	ApplyMetaUpdate(&v.Meta, update.Meta)
+	if update.Capabilities.Set {
+		v.Capabilities = update.Capabilities
+	}
+	if update.Content.Set {
+		v.Content = update.Content
+	}
+	if update.Kind.Set {
+		v.Kind = update.Kind
+	}
+	if update.Locations.Set {
+		v.Locations = update.Locations
+	}
+	if update.Name.Set {
+		v.Name = update.Name
+	}
+	if update.RawInput != nil {
+		v.RawInput = update.RawInput
+	}
+	if update.RawOutput != nil {
+		v.RawOutput = update.RawOutput
+	}
+	if update.Status.Set {
+		v.Status = update.Status
+	}
+	if update.Title.Set {
+		v.Title = update.Title
+	}
+	v.ToolCallID = update.ToolCallID
 }
 
 // Categories of tools that can be invoked.
@@ -6091,7 +6310,7 @@ type UsageUpdate struct {
 	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// Cumulative session cost.
 	// Omitted leaves the last reported cost unchanged. null clears it. A value replaces it.
-	Cost *Cost `json:"cost,omitempty"`
+	Cost Nullable[Cost] `json:"cost,omitzero"`
 	// Total context window size in tokens.
 	Size uint64 `json:"size"`
 	// Tokens currently in context.
@@ -6122,4 +6341,23 @@ type UserMessage struct {
 	Content Nullable[[]ContentBlock] `json:"content,omitzero"`
 	// A unique identifier for the message.
 	MessageID MessageId `json:"messageId"`
+}
+
+// ApplyUpdate applies a later update for the same entity to this stored UserMessage state.
+//
+// Omitted fields leave the stored value unchanged. Fields set to null are
+// stored as null, so callers can tell an explicit clear from an update that
+// did not mention the field. Other values replace the stored value whole.
+// Required fields are replaced. The top-level _meta is patched by key, as
+// described by ApplyMetaUpdate.
+//
+// Start a first-seen entity from the zero value with only its ID set and apply
+// its first update to that, so the first update's null _meta keys are not
+// stored. Values are stored by reference; neither update is modified.
+func (v *UserMessage) ApplyUpdate(update UserMessage) {
+	ApplyMetaUpdate(&v.Meta, update.Meta)
+	if update.Content.Set {
+		v.Content = update.Content
+	}
+	v.MessageID = update.MessageID
 }

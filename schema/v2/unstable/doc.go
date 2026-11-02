@@ -12,6 +12,9 @@
 // boundaries. Callers who need Rust's finer feature isolation can import only
 // generated subpackages that deliberately expose narrower facades.
 //
+// Upserts carry the same ApplyUpdate and ApplyMetaUpdate helpers as schema/v2,
+// including the draft-only SubagentUpdate and SessionMessage.
+//
 // Regenerate with:
 //
 //	go run ./cmd/acpgen \

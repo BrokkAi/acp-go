@@ -77,6 +77,8 @@ type typeDef struct {
 	// Lenient structs get a decoder that honors their fields'
 	// x-deserialize-default-on-error hints (see lenientDefs).
 	Lenient bool
+	// Upsert structs get an ApplyUpdate method (see patchDefs).
+	Upsert bool
 }
 
 // lenientDefs are the state-update snapshots whose optional fields must read
@@ -89,6 +91,28 @@ var lenientDefs = map[string]bool{
 	"RunningStateUpdate":        true,
 	"RequiresActionStateUpdate": true,
 	"UnknownStateUpdate":        true,
+}
+
+// patchDefs are the v2 updates whose optional fields are patches: omission
+// leaves the stored value unchanged, null clears it, and a value replaces it.
+// Rust models every optional field of these with MaybeUndefined, but the
+// schema writes some of them as anyOf [$ref, null], which elsewhere means that
+// omission and null are equivalent. Within these defs such fields keep null
+// distinct as Nullable. Upserts also get an ApplyUpdate method that applies a
+// later update to stored entity state, patching the top-level _meta by key
+// (see the v2 Metadata Patches rule). UsageUpdate is not an entity upsert: its
+// _meta describes the notification and is not a patch.
+var patchDefs = map[string]struct{ upsert bool }{
+	"AgentMessage":      {upsert: true},
+	"AgentThought":      {upsert: true},
+	"CompactionUpdate":  {upsert: true},
+	"SessionInfoUpdate": {upsert: true},
+	"SessionMessage":    {upsert: true},
+	"SubagentUpdate":    {upsert: true},
+	"TerminalUpdate":    {upsert: true},
+	"ToolCallUpdate":    {upsert: true},
+	"UsageUpdate":       {},
+	"UserMessage":       {upsert: true},
 }
 
 // rustEnumNames gives the Rust type name of a flattened union's enum when
@@ -150,6 +174,12 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 		if td.Kind == kindStruct && (lenientDefs[name] || td.Flatten != nil) {
 			td.Lenient = true
 		}
+		if preserveNull && td.Kind == kindStruct && patchDefs[name].upsert {
+			if err := checkUpsert(td); err != nil {
+				return nil, err
+			}
+			td.Upsert = true
+		}
 		for _, out := range append([]*typeDef{td}, td.Extra...) {
 			if _, taken := r.ByName[out.Name]; taken {
 				return nil, fmt.Errorf("%s: generated type name is already taken", out.Name)
@@ -168,6 +198,30 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 		return nil, err
 	}
 	return r, nil
+}
+
+// checkUpsert fails when an upsert has a field ApplyUpdate cannot patch
+// without losing the omitted/null/value distinction, or no top-level _meta.
+func checkUpsert(td *typeDef) error {
+	meta := false
+	for _, f := range td.Fields {
+		switch {
+		case f.Variant != "":
+			return fmt.Errorf("%s: upsert with a flattened union is not supported", td.Name)
+		case f.JSONName == "_meta":
+			if !f.Nullable || f.GoType != "Meta" {
+				return fmt.Errorf("%s: upsert _meta is not a nullable Meta", td.Name)
+			}
+			meta = true
+		case f.Required, f.Nullable, f.GoType == "json.RawMessage":
+		default:
+			return fmt.Errorf("%s.%s: upsert patch field %s cannot represent null", td.Name, f.JSONName, f.declType())
+		}
+	}
+	if !meta {
+		return fmt.Errorf("%s: upsert without a top-level _meta", td.Name)
+	}
+	return nil
 }
 
 func classify(name string, def *rawSchema, root *rootSchema, preserveNull bool) (*typeDef, error) {
@@ -218,6 +272,11 @@ func classify(name string, def *rawSchema, root *rootSchema, preserveNull bool) 
 				return nil, fmt.Errorf("%s.%s: %w", name, p.key, err)
 			}
 			f.Required = required[p.key]
+			if _, patch := patchDefs[name]; patch && preserveNull && !f.Required {
+				if _, ok := nullableRef(p.value.unwrap()); ok {
+					f.Nullable = true
+				}
+			}
 			td.Fields = append(td.Fields, f)
 		}
 		return td, nil

@@ -189,6 +189,18 @@ The generated v2 types use `Nullable[T]` where the draft
 distinguishes omitted fields from explicit JSON null, such as message-content
 patches.
 
+Draft-v2 upserts (`tool_call_update`, `terminal_update`, the message updates,
+`session_info_update`, and `compaction_update`) have a generated `ApplyUpdate`
+that applies a later update to stored entity state: omitted fields are
+unchanged, `null` clears, and values replace. Their top-level `_meta` is a
+metadata patch applied by `schema.ApplyMetaUpdate`: `null` clears it, and an
+object patches it by top-level key, removing keys set to `null` and replacing
+the others whole without merging nested objects. v1 is unchanged: there a
+`_meta` object still replaces the stored metadata as a whole.
+`acpv2.UpdateProjection` uses these helpers to store every v2 entity by kind
+and ID, applying chunks in receive order, so live delivery and replay share one
+code path.
+
 ACP v2 changes prompt semantics: `session/prompt` returns once the agent inserts
 the user message into the conversation, while completion is reported later
 through an idle `state_update`. The response carries the required `messageId`
@@ -250,7 +262,8 @@ implementation without downgrading or cross-version conversion.
 Draft-v2 sessions can use `acpv2.NewSessionHandle` for Rust-shaped prompt,
 configuration, cancellation, and close commands. `acpv2.SessionTracker` owns
 connection-scoped update projections and active-work state; install it before
-session setup. `acpv2.CancellablePermissions` resolves pending permission
+session setup. Its per-session `Projection` sees every update, including
+replay, and `TrackerPermissions` applies permission requests' tool calls to it. `acpv2.CancellablePermissions` resolves pending permission
 requests as cancelled when active work is cancelled.
 `ResumeSessionFromStart` requires handlers to be installed before the resume
 request and returns only after replay updates have been applied in wire order.

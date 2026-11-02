@@ -56,6 +56,12 @@ schema crate or when the Rust SDK moves its exact pin.
    - new or removed enum members, and whether unknown tags still decode;
    - required/optional field changes, including pointer and `Nullable`
      differences between v1 and v2;
+   - new v2 upsert updates or patch fields. Patch fields of the defs in
+     `patchDefs` (`cmd/acpgen/ir.go`) keep `null` distinct from omission, and
+     their upserts get a generated `ApplyUpdate` that patches the top-level
+     `_meta` with `ApplyMetaUpdate`. Add a new upsert to `patchDefs` (a field
+     it cannot patch fails generation), and check that the Metadata Patches
+     rule still lists the same updates;
    - JSON field names, integer widths, and defaults;
    - `x-deserialize-*` hints (default-on-error, default-on-null, skip invalid
      items). `cmd/acpgen` honors default-on-error only on the state-update
