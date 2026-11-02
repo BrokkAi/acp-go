@@ -78,10 +78,12 @@ only remaining work.
     JSON-RPC body without creating a connection; its client treats an array
     from the server as malformed.
 - Rust-shaped v2 session command surface:
-  - reusable session-update projection storing every entity with
+  - reusable session-update projection storing messages, thoughts, tool
+    calls, terminals, compactions, session info, and usage with
     omitted/null/value patch semantics and top-level `_meta` metadata patches
     (`ApplyMetaUpdate` and generated `ApplyUpdate` upserts, #67), shared by
-    live delivery and replay,
+    live delivery and replay, with permission subjects applied in receive
+    order and full replays rebuilding the projection,
   - per-session active-work tracker using running→idle completion,
   - explicit `SessionHandle`,
   - prompt acceptance, config-option replacement, and close commands,

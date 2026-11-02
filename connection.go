@@ -44,6 +44,7 @@ type Connection struct {
 	cancel      context.CancelFunc
 	onRequest   Handler
 	onNotify    Notifications
+	onObserve   RequestObserver
 	writes      chan outgoing
 	workers     chan struct{}
 	mu          sync.Mutex
@@ -59,11 +60,22 @@ type Connection struct {
 	tasks       sync.WaitGroup
 }
 
+// RequestObserver sees each incoming request in wire order, on the read loop,
+// before its handler starts, so state it records is ordered with the
+// notifications around the request. Like Notifications, it must return
+// promptly and must not call back into the Connection.
+type RequestObserver func(method string, params json.RawMessage)
+
 // Connect owns both streams until Close. Frames are limited to 8 MiB; at most
 // 32 incoming requests run concurrently. Unknown notifications can be ignored.
 func Connect(in io.ReadCloser, out io.WriteCloser, h Handler, n Notifications) *Connection {
+	return ConnectObserving(in, out, h, n, nil)
+}
+
+// ConnectObserving is Connect with an optional RequestObserver.
+func ConnectObserving(in io.ReadCloser, out io.WriteCloser, h Handler, n Notifications, observe RequestObserver) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Connection{in: in, out: out, ctx: ctx, cancel: cancel, onRequest: h, onNotify: n, writes: make(chan outgoing, 32), workers: make(chan struct{}, 32), pending: make(map[string]chan packet), inbound: make(map[string][]inboundCancellation)}
+	c := &Connection{in: in, out: out, ctx: ctx, cancel: cancel, onRequest: h, onNotify: n, onObserve: observe, writes: make(chan outgoing, 32), workers: make(chan struct{}, 32), pending: make(map[string]chan packet), inbound: make(map[string][]inboundCancellation)}
 	c.loops.Add(2)
 	go c.readLoop()
 	go c.writeLoop()
@@ -314,6 +326,9 @@ func (c *Connection) readLoop() {
 		if string(p.ID) == "null" {
 			c.stop(errors.New("null ACP request ID"))
 			return
+		}
+		if c.onObserve != nil {
+			c.onObserve(p.Method, p.Params)
 		}
 		c.startRequest(p)
 	}

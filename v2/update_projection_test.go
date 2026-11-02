@@ -1,10 +1,15 @@
 package v2
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
@@ -137,32 +142,58 @@ func TestUpdateProjectionToolCalls(t *testing.T) {
 }
 
 // The toolCall of a permission request's tool_call subject applies to the
-// stored tool call like a tool_call_update, before the host sees it.
-func TestSessionTrackerPermissionsApplyToolCall(t *testing.T) {
+// stored tool call like a tool_call_update, in receive order relative to
+// session/update notifications, before the permission handler runs. The
+// handler blocks until the notification that follows the request on the wire
+// has been observed, so applying the subject on the handler path would apply
+// it after that notification.
+func TestTrackerRequestsApplyPermissionSubjectInReceiveOrder(t *testing.T) {
 	tracker := NewSessionTracker()
-	tracker.Observe(Update{SessionID: "s", Update: schema.SessionUpdate{ToolCallUpdate: &schema.ToolCallUpdate{
-		ToolCallID: "call",
-		Title:      schema.Nullable[string]{Set: true, Value: "Edit"},
-		Meta:       schema.Nullable[schema.Meta]{Set: true, Value: schema.Meta{"a": 1.0}},
-	}}})
-	var request schema.RequestPermissionRequest
-	if err := json.Unmarshal([]byte(`{"sessionId":"s","title":"Allow?","options":[],
-		"subject":{"type":"tool_call","toolCall":{"toolCallId":"call","status":"pending","_meta":{"b":2}}}}`), &request); err != nil {
-		t.Fatal(err)
-	}
-	var seen schema.ToolCallUpdate
-	host := tracker.TrackerPermissions(permissionFunc(func(ctx context.Context, request schema.RequestPermissionRequest) (schema.RequestPermissionResponse, error) {
-		seen, _ = tracker.Projection(request.SessionID).ToolCall("call")
+	notified := make(chan struct{})
+	var once sync.Once
+	var atHandler schema.ToolCallUpdate
+	host := permissionFunc(func(ctx context.Context, request schema.RequestPermissionRequest) (schema.RequestPermissionResponse, error) {
+		select {
+		case <-notified:
+		case <-ctx.Done():
+			return schema.RequestPermissionResponse{}, ctx.Err()
+		}
+		atHandler, _ = tracker.Projection(request.SessionID).ToolCall("call")
 		return CancelPermission(), nil
-	}))
-	if _, err := host.RequestPermission(context.Background(), request); err != nil {
+	})
+	local, peer := net.Pipe()
+	deadline := time.Now().Add(5 * time.Second)
+	_ = local.SetDeadline(deadline)
+	_ = peer.SetDeadline(deadline)
+	client := ConnectObserving(local, local, HandlePermissions(nil, host),
+		tracker.TrackerNotifications(func(method string, _ json.RawMessage) error {
+			if method == schema.SessionUpdateMethodName {
+				once.Do(func() { close(notified) })
+			}
+			return nil
+		}),
+		tracker.TrackerRequests(nil),
+	)
+	t.Cleanup(func() { _ = client.Close(); _ = peer.Close() })
+
+	frames := `{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"sessionId":"s","title":"Allow?","options":[],` +
+		`"subject":{"type":"tool_call","toolCall":{"toolCallId":"call","status":"pending","_meta":{"stale":1,"keep":1}}}}}` + "\n" +
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call","_meta":{"stale":null}}}}` + "\n" +
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","messageId":"m","content":{"type":"text","text":"x"}}}}` + "\n"
+	go func() { _, _ = peer.Write([]byte(frames)) }()
+	response, err := bufio.NewReader(peer).ReadBytes('\n')
+	if err != nil {
 		t.Fatal(err)
 	}
-	assertWire(t, seen, `{"toolCallId":"call","title":"Edit","status":"pending","_meta":{"a":1,"b":2}}`)
-
-	response, err := tracker.TrackerPermissions(nil).RequestPermission(context.Background(), request)
-	if err != nil || response.Outcome.Cancelled == nil {
-		t.Fatalf("nil host response = %+v, %v", response, err)
+	if !bytes.Contains(response, []byte(`"cancelled"`)) {
+		t.Fatalf("permission response = %s", response)
+	}
+	const want = `{"toolCallId":"call","status":"pending","_meta":{"keep":1}}`
+	assertWire(t, atHandler, want)
+	call, _ := tracker.Projection("s").ToolCall("call")
+	assertWire(t, call, want)
+	if got := tracker.Projection("s").Timeline(); !reflect.DeepEqual(got, []EntityRef{{EntityToolCall, "call"}, {EntityAgentMessage, "m"}}) {
+		t.Fatalf("timeline = %v", got)
 	}
 }
 
@@ -172,9 +203,6 @@ func TestUpdateProjectionTerminals(t *testing.T) {
 		terminal, ok := projection.Terminal("term")
 		if !ok {
 			t.Fatal("terminal missing")
-		}
-		if terminal.Terminal.Output.Set {
-			t.Fatal("terminal state kept an output snapshot")
 		}
 		return string(terminal.Output)
 	}
@@ -187,13 +215,16 @@ func TestUpdateProjectionTerminals(t *testing.T) {
 		t.Fatalf("output = %q", got)
 	}
 	applyWire(t, projection,
-		`{"sessionUpdate":"terminal_update","terminalId":"term","output":{"data":"c25hcHNob3Qg"}}`,
+		`{"sessionUpdate":"terminal_update","terminalId":"term","output":{"data":"c25hcHNob3Qg","_meta":{"snapshot":1}}}`,
 		`{"sessionUpdate":"terminal_output_chunk","terminalId":"term","data":"Y2h1bms="}`,
 		`{"sessionUpdate":"terminal_output_chunk","terminalId":"term","data":"not base64!"}`,
 	)
 	if got := output(); got != "snapshot chunk" {
 		t.Fatalf("output = %q", got)
 	}
+	// The latest snapshot is kept as received, with its _meta.
+	snapshot, _ := projection.Terminal("term")
+	assertWire(t, snapshot.Terminal.Output, `{"data":"c25hcHNob3Qg","_meta":{"snapshot":1}}`)
 	// An invalid snapshot keeps the stored bytes; the other fields apply.
 	applyWire(t, projection, `{"sessionUpdate":"terminal_update","terminalId":"term","output":{"data":"!!"},
 		"size":null,"capabilities":null,"exitStatus":{"exitCode":0},"_meta":{"a":null,"c":3}}`)
@@ -202,17 +233,25 @@ func TestUpdateProjectionTerminals(t *testing.T) {
 	}
 	terminal, _ := projection.Terminal("term")
 	assertWire(t, terminal.Terminal, `{"terminalId":"term","command":"cargo test","cwd":"/work","size":null,
-		"capabilities":null,"exitStatus":{"exitCode":0},"_meta":{"b":2,"c":3}}`)
+		"capabilities":null,"exitStatus":{"exitCode":0},"output":{"data":"!!"},"_meta":{"b":2,"c":3}}`)
 	applyWire(t, projection, `{"sessionUpdate":"terminal_update","terminalId":"term","output":null}`)
 	if got := output(); got != "" {
 		t.Fatalf("output after null = %q", got)
 	}
-	if _, ok := projection.Terminal("bad"); ok {
-		t.Fatal("invalid chunk created a terminal")
+	// An invalid chunk for an unseen terminal still creates it and fixes its
+	// timeline position.
+	applyWire(t, projection,
+		`{"sessionUpdate":"terminal_output_chunk","terminalId":"bad","data":"%%"}`,
+		`{"sessionUpdate":"agent_message_chunk","messageId":"m","content":{"type":"text","text":"x"}}`,
+		`{"sessionUpdate":"terminal_output_chunk","terminalId":"bad","data":"b2s="}`,
+	)
+	bad, ok := projection.Terminal("bad")
+	if !ok || string(bad.Output) != "ok" {
+		t.Fatalf("terminal created by an invalid chunk = %+v, %v", bad, ok)
 	}
-	applyWire(t, projection, `{"sessionUpdate":"terminal_output_chunk","terminalId":"bad","data":"%%"}`)
-	if _, ok := projection.Terminal("bad"); ok {
-		t.Fatal("invalid chunk created a terminal")
+	want := []EntityRef{{EntityTerminal, "term"}, {EntityTerminal, "bad"}, {EntityAgentMessage, "m"}}
+	if got := projection.Timeline(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("timeline = %v", got)
 	}
 }
 
@@ -338,6 +377,15 @@ func TestSessionTrackerProjectionSurvivesBeginWork(t *testing.T) {
 		t.Fatal("tool call missing")
 	}
 	assertWire(t, call, `{"toolCallId":"t","title":"Before","status":"completed","_meta":{"a":1,"b":2}}`)
-	work, _ := tracker.Work("s").projection.ToolCall("t")
-	assertWire(t, work, `{"toolCallId":"t","status":"completed","_meta":{"b":2}}`)
+	// The work projection keeps only the Agent text of the current turn.
+	send(`{"sessionUpdate":"agent_message_chunk","messageId":"m","content":{"type":"text","text":"hi"}}`)
+	work := tracker.Work("s").projection
+	if _, ok := work.ToolCall("t"); ok || work.Text() != "hi" {
+		t.Fatalf("work projection stored %v, text %q", work.Timeline(), work.Text())
+	}
+
+	tracker.Forget("s")
+	if _, ok := tracker.Projection("s").ToolCall("t"); ok {
+		t.Fatal("Forget kept the session projection")
+	}
 }

@@ -10,9 +10,10 @@ import (
 
 // UpdateProjection folds v2 session updates into stored entity state: user
 // messages, Agent messages, Agent thoughts, tool calls, terminals,
-// compactions, session info, and usage. Live delivery and replay go through
-// the same Apply, so replaying the original updates in receive order
-// reproduces the stored state, including removals.
+// compactions, session info, and usage. Plans, notices, and other session
+// updates are not stored. Live delivery and replay go through the same
+// Apply, so replaying the original updates in receive order reproduces the
+// stored state, including removals.
 //
 // Each upsert is applied with the generated ApplyUpdate of its schema type:
 // omitted fields leave the stored value unchanged, null is stored as an
@@ -22,10 +23,13 @@ import (
 // unseen ID creates the entity and fixes its position in Timeline. Entities
 // are keyed by kind and ID, so a thought and a message may share a messageId.
 //
-// Values returned by the accessors share storage with the projection; treat
-// them as read-only. The projection never modifies a value it has returned.
+// Accessors return snapshots: later updates never change a value already
+// returned. Snapshots share storage with the projection, so callers must not
+// modify them.
 type UpdateProjection struct {
-	mu            sync.RWMutex
+	mu sync.RWMutex
+	// agentTextOnly limits the projection to Agent messages, for Text.
+	agentTextOnly bool
 	timeline      []EntityRef
 	userMessages  map[schema.MessageId]*schema.UserMessage
 	agentMessages map[schema.MessageId]*schema.AgentMessage
@@ -58,8 +62,10 @@ type EntityRef struct {
 
 // TerminalState is the stored state of one Agent-owned terminal.
 type TerminalState struct {
-	// Terminal holds the stored terminal_update fields. Its Output field is
-	// always unset: the terminal's bytes are kept decoded in Output.
+	// Terminal holds the stored terminal_update fields, as Rust's
+	// TerminalUpdate::apply_update stores them. Its Output is the latest
+	// output snapshot as received, including its _meta; it does not include
+	// chunks received after it.
 	Terminal schema.TerminalUpdate
 	// Output is the current output: the bytes of the latest valid output
 	// snapshot followed by the chunks received after it. An output snapshot
@@ -69,7 +75,17 @@ type TerminalState struct {
 }
 
 func NewUpdateProjection() *UpdateProjection {
+	return newUpdateProjection(false)
+}
+
+// newTextProjection keeps only Agent messages, which is all Text needs.
+func newTextProjection() *UpdateProjection {
+	return newUpdateProjection(true)
+}
+
+func newUpdateProjection(agentTextOnly bool) *UpdateProjection {
 	return &UpdateProjection{
+		agentTextOnly: agentTextOnly,
 		userMessages:  make(map[schema.MessageId]*schema.UserMessage),
 		agentMessages: make(map[schema.MessageId]*schema.AgentMessage),
 		agentThoughts: make(map[schema.MessageId]*schema.AgentThought),
@@ -82,6 +98,9 @@ func NewUpdateProjection() *UpdateProjection {
 // Apply folds one session update in receive order. Updates the projection
 // does not store, including unknown variants, are ignored.
 func (p *UpdateProjection) Apply(update schema.SessionUpdate) {
+	if p.agentTextOnly && update.AgentMessage == nil && update.AgentMessageChunk == nil {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	switch {
@@ -119,12 +138,11 @@ func (p *UpdateProjection) Apply(update schema.SessionUpdate) {
 		p.applyTerminal(*update.TerminalUpdate)
 	case update.TerminalOutputChunk != nil:
 		chunk := update.TerminalOutputChunk
-		data, err := base64.StdEncoding.DecodeString(chunk.Data)
-		if err != nil {
-			return
-		}
+		// Even an invalid chunk creates the terminal and fixes its position.
 		terminal := entity(p, EntityTerminal, p.terminals, chunk.TerminalID, newTerminal)
-		terminal.Output = append(terminal.Output, data...)
+		if data, err := base64.StdEncoding.DecodeString(chunk.Data); err == nil {
+			terminal.Output = append(terminal.Output, data...)
+		}
 	case update.CompactionUpdate != nil:
 		compaction := entity(p, EntityCompaction, p.compactions, update.CompactionUpdate.CompactionID, newCompaction)
 		compaction.ApplyUpdate(*update.CompactionUpdate)
@@ -164,10 +182,8 @@ func (p *UpdateProjection) applyToolCall(update schema.ToolCallUpdate) {
 
 func (p *UpdateProjection) applyTerminal(update schema.TerminalUpdate) {
 	terminal := entity(p, EntityTerminal, p.terminals, update.TerminalID, newTerminal)
-	output := update.Output
-	update.Output = schema.Nullable[schema.TerminalOutput]{}
 	terminal.Terminal.ApplyUpdate(update)
-	switch {
+	switch output := update.Output; {
 	case !output.Set:
 	case output.Null:
 		terminal.Output = nil

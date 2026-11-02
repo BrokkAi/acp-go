@@ -57,18 +57,32 @@ series, minor releases may contain breaking API changes.
     value, `null` is stored as an explicit clear, other values replace it, and
     `_meta` is patched with `ApplyMetaUpdate`. The generator fails if an
     upsert gains a field that cannot represent `null`.
-  - `acpv2.UpdateProjection` now stores every v2 entity, keyed by kind and ID,
-    with `UserMessage`, `AgentMessage`, `AgentThought`, `ToolCall`, `Terminal`
-    (decoded output bytes in `TerminalState`), `Compaction`, `SessionInfo`,
-    `Usage`, and `Timeline` (first-seen order) accessors. Upserts use the
-    generated `ApplyUpdate`; message, tool-call content, terminal output, and
-    compaction summary chunks append to the current content, as the spec
-    requires. `ApplyPermissionRequest` applies a `tool_call` permission
-    subject's `toolCall` like a `tool_call_update`. `Text` is unchanged.
+  - `acpv2.UpdateProjection` now stores user messages, Agent messages and
+    thoughts, tool calls, terminals, compactions, session info, and usage,
+    keyed by kind and ID, with `UserMessage`, `AgentMessage`, `AgentThought`,
+    `ToolCall`, `Terminal` (`TerminalState` keeps the latest output snapshot
+    as received and the decoded current bytes), `Compaction`, `SessionInfo`,
+    `Usage`, and `Timeline` (first-seen order) accessors. Plans, notices, and
+    the draft subagent and session-message entities are not projected.
+    Upserts use the generated `ApplyUpdate`; message, tool-call content,
+    terminal output, and compaction summary chunks append to the current
+    content, as the spec requires. `ApplyPermissionRequest` applies a
+    `tool_call` permission subject's `toolCall` like a `tool_call_update`.
+    Accessors return snapshots that later updates never change; they share
+    storage with the projection and must not be modified. `Text` is
+    unchanged.
   - `acpv2.SessionTracker` keeps a per-session `Projection` that sees every
     update, including replay and updates before `running`, and that
-    `BeginWork` does not reset. `TrackerPermissions` wraps a permission host
-    so permission subjects reach that projection before the host runs.
+    `BeginWork` does not reset. `TrackerRequests` applies permission subjects
+    to it on the connection's read loop, in receive order relative to
+    `session/update`, before the permission handler runs. `ResetProjection`,
+    `Forget`, and `ResumeSessionFromStart` (which resets the session first,
+    so a full replay rebuilds rather than merges) manage its lifetime, and
+    `SessionHandle.Close` forgets the closed session. `ActiveWork` keeps
+    only the Agent text it reports.
+  - `acp.ConnectObserving` and `acpv2.ConnectObserving` take an optional
+    `acp.RequestObserver` that sees each incoming request in wire order, on
+    the read loop, before its handler starts.
 - Method registries gain `SideProxy` for the proxy-chain methods.
 - `cmd/acpgen` models the 1.15.1 schema shapes: the `proxyMethods` meta group
   and `x-side: "proxy"`; a tagged union flattened into its parent object
