@@ -4,6 +4,7 @@ package v2
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sync"
@@ -72,6 +73,10 @@ func (c *Connection) Initialize(ctx context.Context, capabilities Capabilities) 
 }
 
 func (c *Connection) InitializeWithInfo(ctx context.Context, capabilities Capabilities, info ClientInfo) (Initialization, error) {
+	return c.initialize(ctx, capabilities, info, nil)
+}
+
+func (c *Connection) initialize(ctx context.Context, capabilities Capabilities, info ClientInfo, extended any) (Initialization, error) {
 	var result Initialization
 	if info.Name == "" || info.Version == "" {
 		return result, fmt.Errorf("client name and version are required")
@@ -84,7 +89,12 @@ func (c *Connection) InitializeWithInfo(ctx context.Context, capabilities Capabi
 		Info:            info,
 		ProtocolVersion: Version,
 	}
-	if err := c.Call(ctx, schema.InitializeMethodName, request, &result); err != nil {
+	var encoded json.RawMessage
+	if err := c.Call(ctx, schema.InitializeMethodName, request, &encoded); err != nil {
+		return result, err
+	}
+	if err := decodeInitialize(encoded, &result, extended); err != nil {
+		c.completeInitialize(Initialization{}, false)
 		return result, err
 	}
 	if result.ProtocolVersion != Version {

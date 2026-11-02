@@ -156,8 +156,11 @@ generated from Rust schema crate 1.15.1's unstable artifacts and carry the
 combined optional feature types, including LLM providers, MCP-over-ACP, plan
 operations, session fork/archive/status/title, auth status, client-provided
 system prompts, subagents, proxy chains, and end-turn token usage. The
-`unstable`, `mcp`, and `v2/mcp` packages add typed facades on top, and
-`v2/unstable` is reserved for draft-v2 facades.
+`unstable` (v1) and `v2/unstable` (draft v2) packages add typed facades on
+top: capability-gated provider configuration and session fork for clients, and
+`Handle` dispatch plus `Advertise` for agents, installed on the agent
+runtimes' `Extensions` and `InitializeResult` hooks. The `mcp` and `v2/mcp`
+packages carry the session helpers that accept MCP servers, including fork.
 The stable `acp`, `v2`, `schema`, and `schema/v2` packages do not import or
 expose any of it. See [docs/unstable-facades.md](docs/unstable-facades.md).
 

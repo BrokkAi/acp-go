@@ -15,6 +15,20 @@ import (
 // Runtime owns the JSON-RPC loop for an Agent implementation.
 type Runtime struct {
 	Agent Agent
+
+	// Extensions, when set, serves every request the runtime does not handle
+	// itself, such as the unstable methods that
+	// github.com/BrokkAi/acp-go/unstable.Handle dispatches. It runs behind the
+	// runtime's initialization gate. Unset, those requests answer -32601.
+	Extensions acp.Handler
+
+	// InitializeResult, when set, receives the agent's initialize response
+	// and returns the value sent instead, typically the unstable initialize
+	// response that advertises extension capabilities (see
+	// github.com/BrokkAi/acp-go/unstable.Advertise). The runtime decodes the
+	// returned value as a stable initialize response and validates that view
+	// before sending the value.
+	InitializeResult func(schema.InitializeResponse) (any, error)
 }
 
 func New(implementation Agent) *Runtime {
@@ -28,7 +42,7 @@ func (r *Runtime) Serve(ctx context.Context, in io.ReadCloser, out io.WriteClose
 		return errors.New("agent implementation is required")
 	}
 	client := &clientConnection{connectionReady: make(chan struct{})}
-	state := &server{agent: r.Agent, client: client}
+	state := &server{agent: r.Agent, client: client, extensions: r.Extensions, initializeResult: r.InitializeResult}
 	connection := acp.Connect(in, out, state.handle, state.notification)
 	client.attach(connection)
 	defer connection.Close()
@@ -45,8 +59,10 @@ func (r *Runtime) Serve(ctx context.Context, in io.ReadCloser, out io.WriteClose
 }
 
 type server struct {
-	agent  Agent
-	client *clientConnection
+	agent            Agent
+	client           *clientConnection
+	extensions       acp.Handler
+	initializeResult func(schema.InitializeResponse) (any, error)
 
 	mu                sync.Mutex
 	initialized       bool
@@ -185,7 +201,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return implementation.Logout(ctx, s.client, request)
 	default:
-		return nil, methodNotFound(method)
+		return s.serveExtension(ctx, method, raw)
 	}
 }
 
@@ -226,6 +242,10 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 	if err != nil {
 		return nil, err
 	}
+	result, response, err := s.extendInitialize(response)
+	if err != nil {
+		return nil, err
+	}
 	if response.ProtocolVersion != acp.Version {
 		return nil, fmt.Errorf("agent selected unsupported ACP version %d", response.ProtocolVersion)
 	}
@@ -234,7 +254,7 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 	s.initialized = true
 	s.agentCapabilities = response.AgentCapabilities
 	s.mu.Unlock()
-	return response, nil
+	return result, nil
 }
 
 func (s *server) advertisesMethod(method string) bool {

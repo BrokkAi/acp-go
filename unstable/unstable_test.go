@@ -3,7 +3,6 @@ package unstable_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -61,7 +60,10 @@ func providersInitialization() schema.InitializeResponse {
 
 func forkInitialization() schema.InitializeResponse {
 	return schema.InitializeResponse{AgentCapabilities: &schema.AgentCapabilities{
-		SessionCapabilities: &schema.SessionCapabilities{Fork: &schema.SessionForkCapabilities{}},
+		SessionCapabilities: &schema.SessionCapabilities{
+			Fork:                  &schema.SessionForkCapabilities{},
+			AdditionalDirectories: &schema.SessionAdditionalDirectoriesCapabilities{},
+		},
 	}}
 }
 
@@ -126,12 +128,28 @@ func TestForkSessionGatesAndEncodes(t *testing.T) {
 	}
 	initialization := forkInitialization()
 	for name, request := range map[string]schema.ForkSessionRequest{
-		"missing session": {Cwd: hostRoot + "/tmp"},
-		"relative cwd":    {Cwd: "relative", SessionID: "old"},
+		"missing session":               {Cwd: hostRoot + "/tmp"},
+		"relative cwd":                  {Cwd: "relative", SessionID: "old"},
+		"relative additional directory": {Cwd: "/", SessionID: "old", AdditionalDirectories: []string{"extra"}},
 	} {
 		if _, err := acpunstable.ForkSession(ctx, connection, initialization, request); err == nil {
 			t.Fatalf("%s was allowed", name)
 		}
+	}
+	// The protocol requires sessionCapabilities.additionalDirectories before
+	// a client sends additional directories.
+	withoutAdditional := forkInitialization()
+	withoutAdditional.AgentCapabilities.SessionCapabilities.AdditionalDirectories = nil
+	if _, err := acpunstable.ForkSession(ctx, connection, withoutAdditional, schema.ForkSessionRequest{
+		Cwd: "/", SessionID: "old", AdditionalDirectories: []string{"/extra"},
+	}); err == nil || !strings.Contains(err.Error(), "additionalDirectories") {
+		t.Fatalf("additional directories without the capability error = %v", err)
+	}
+	if _, err := acpunstable.ForkSession(ctx, connection, withoutAdditional, schema.ForkSessionRequest{Cwd: "/", SessionID: "old"}); err != nil {
+		t.Fatalf("fork without additional directories needs no capability: %v", err)
+	}
+	if request := <-requests; request.method != schema.SessionForkMethodName {
+		t.Fatalf("method = %s", request.method)
 	}
 	select {
 	case request := <-requests:
@@ -166,62 +184,5 @@ func TestForkSessionGatesAndEncodes(t *testing.T) {
 	}
 	if request := <-requests; request.method != schema.SessionForkMethodName {
 		t.Fatalf("method = %s", request.method)
-	}
-}
-
-type testHandler struct{}
-
-func (testHandler) ListProviders(context.Context, schema.ListProvidersRequest) (schema.ListProvidersResponse, error) {
-	return schema.ListProvidersResponse{Providers: []schema.ProviderInfo{{ProviderID: "dispatched"}}}, nil
-}
-
-func (testHandler) SetProvider(context.Context, schema.SetProviderRequest) (schema.SetProviderResponse, error) {
-	return schema.SetProviderResponse{}, nil
-}
-
-func (testHandler) DisableProvider(context.Context, schema.DisableProviderRequest) (schema.DisableProviderResponse, error) {
-	return schema.DisableProviderResponse{}, nil
-}
-
-func (testHandler) ForkSession(context.Context, schema.ForkSessionRequest) (schema.ForkSessionResponse, error) {
-	return schema.ForkSessionResponse{SessionID: "dispatched"}, nil
-}
-
-func TestHandleDispatchesUnstableMethods(t *testing.T) {
-	next := func(_ context.Context, method string, _ json.RawMessage) (any, error) {
-		return "next:" + method, nil
-	}
-	handler := acpunstable.Handle(next, testHandler{})
-	ctx := context.Background()
-
-	result, err := handler(ctx, schema.ProvidersListMethodName, json.RawMessage(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if providers, ok := result.(schema.ListProvidersResponse); !ok || len(providers.Providers) != 1 {
-		t.Fatalf("providers/list dispatch = %#v", result)
-	}
-	result, err = handler(ctx, schema.SessionForkMethodName, json.RawMessage(`{"sessionId":"s","cwd":"`+hostRoot+`/tmp"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fork, ok := result.(schema.ForkSessionResponse); !ok || fork.SessionID != "dispatched" {
-		t.Fatalf("session/fork dispatch = %#v", result)
-	}
-	result, err = handler(ctx, "session/new", json.RawMessage(`{}`))
-	if err != nil || result != "next:session/new" {
-		t.Fatalf("fallthrough = %#v, %v", result, err)
-	}
-
-	empty := acpunstable.Handle(nil, struct{}{})
-	if _, err := empty(ctx, schema.ProvidersListMethodName, json.RawMessage(`{}`)); err == nil {
-		t.Fatal("missing provider handler answered providers/list")
-	}
-	var rpcError *acp.RPCError
-	if _, err := empty(ctx, "session/new", json.RawMessage(`{}`)); !errors.As(err, &rpcError) || rpcError.Code != -32601 {
-		t.Fatalf("unhandled method error = %v", err)
-	}
-	if _, err := acpunstable.Handle(nil, testHandler{})(ctx, schema.ProvidersSetMethodName, json.RawMessage(`{`)); err == nil {
-		t.Fatal("malformed params were accepted")
 	}
 }

@@ -4,14 +4,34 @@ github.com/BrokkAi/acp-go/unstable: the import boundary for narrow, opt-in
 typed facades over ACP's optional draft-v2 methods. Nothing here is reachable
 from the stable v2 facade.
 
-The package has no facades at the moment. Its only one, Next Edit Suggestions,
-was removed with the rest of NES from the upstream unstable schema (Rust schema
-crate 1.15.1). Until new facades land here, use the generated draft-v2 unstable
-bindings in github.com/BrokkAi/acp-go/schema/v2/unstable directly. Capability
-gating reads the unstable draft-v2 initialize response, which is the only place
-the optional capability fields are published:
+The client facades cover agent provider configuration (ListProviders,
+SetProvider, DisableProvider) and session fork (ForkSession, the counterpart of
+the reference SDK's v2::ForkSessionBuilder). Each checks its advertised
+capability and request invariants before writing to the wire. Forks that carry
+MCP servers go through github.com/BrokkAi/acp-go/v2/mcp.ForkSession instead.
+
+Capability gating reads the unstable draft-v2 initialize response, which is the
+only place the optional capability fields are published. The stable
+v2.Initialization drops them, so initialize with
+v2.Connection.InitializeExtended, which validates the result and records the
+connection state like InitializeWithInfo and also decodes it into the unstable
+type:
 
 	var initialization unstable.InitializeResponse // schema/v2/unstable
-	json.Unmarshal(encodedInitializeResult, &initialization)
+	_, err := connection.InitializeExtended(ctx, capabilities, info, &initialization)
+	providers, err := acpunstable.ListProviders(ctx, connection, initialization)
+
+Do not send initialize through Connection.Call instead: that skips the version
+and agent-info checks and leaves the connection uninitialized for the stable
+facades.
+
+On the agent side, Handle dispatches these methods to typed handlers and
+Advertise announces their capabilities in the initialize response. Install
+both on the v2/agent runtime, whose initialization gate, version negotiation,
+and baseline methods then sit in front of them, as in the reference SDK:
+
+	runtime := agent.New(implementation)
+	runtime.Extensions = acpunstable.Handle(nil, implementation)
+	runtime.InitializeResult = acpunstable.Advertise(implementation)
 */
 package unstable

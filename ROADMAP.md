@@ -129,12 +129,12 @@ only remaining work.
 ### 1. Optional typed facades for unstable methods
 
 The typed facade surface is delivered: client facades and agent dispatch for
-providers and session fork, the session-update projection helper, and the MCP
-session options all live in
-[docs/unstable-facades.md](docs/unstable-facades.md)'s packages
-(`unstable`, `mcp`, `v2/mcp`). `v2/unstable` held only the Next Edit
-Suggestions facades, which left with NES's removal from the upstream unstable
-schema; it is kept as the import boundary for future draft-v2 facades.
+providers and session fork on v1 and draft v2 (#61), the session-update
+projection helper, and the MCP session options, including the draft-v2 MCP
+fork, all live in [docs/unstable-facades.md](docs/unstable-facades.md)'s
+packages (`unstable`, `v2/unstable`, `mcp`, `v2/mcp`). Agents serve the
+unstable methods by installing `Handle` and `Advertise` on the v1 or draft-v2
+runtime's `Extensions` and `InitializeResult`, behind its initialization gate.
 
 The native MCP-over-ACP binding is delivered (#39): `mcp` and `v2/mcp` expose
 the standard-library message mover decided above, with `MessageClient` on the
@@ -163,11 +163,10 @@ standard-library-only and behind its own package or command.
 The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
 them is tracked separately: stable notice and compaction helpers (#57),
 client-provided system prompts (#58), v2 error and custom stop reasons (#59),
-subagents (#60), v2 providers and `session/fork` (#61), `-32022` version
-negotiation (#62), v2 metadata patch helpers (#67), the proxy-chain method
-rename (#69), v2 background work and `tool_call/cancel`/`terminal/cancel`
-(#70), unstable session archive/status/title (#71), and unstable auth status
-(#72).
+subagents (#60), `-32022` version negotiation (#62), v2 metadata patch
+helpers (#67), the proxy-chain method rename (#69), v2 background work and
+`tool_call/cancel`/`terminal/cancel` (#70), unstable session
+archive/status/title (#71), and unstable auth status (#72).
 
 ## Guardrails
 
