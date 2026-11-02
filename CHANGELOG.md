@@ -4,6 +4,37 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## Unreleased
+
+### Changed
+
+- The v1 and draft v2 agent runtimes now send their initialization lifecycle
+  refusals in the reference Rust SDK's wire shape: code `-32600`, message
+  `Invalid request`, and the explanation as a JSON string in `data`. A request
+  sent before initialization completes now carries "ACP initialization must
+  complete before `<method>` can be used", replacing the `agent is not
+  initialized` message. A repeated `initialize` now carries "ACP initialization
+  cannot be repeated after any other request; reconnect to initialize again",
+  replacing `agent is already initialized`. Clients that matched on the old
+  messages must match on `data` instead (#74).
+
+### Fixed
+
+- The v1 and draft v2 agent runtimes could call `Agent.Initialize` twice when
+  two `initialize` requests were in flight at once, because the
+  already-initialized check released its lock before the handler ran. The
+  runtimes now mark initialization as in progress under the lock and answer a
+  concurrent `initialize` with `-32600` and the data "ACP initialization is
+  already in progress on this connection" without reaching the handler. A
+  failed initialization clears the in-progress state, so a later `initialize`
+  can retry. Failures include a handler error, an unsupported selected
+  protocol version, and a rejected v2 advertisement. The draft v2 runtime
+  matches the reference Rust SDK. In the Rust SDK, the v1 agent mode does no
+  lifecycle tracking (`InitializationRole::Unchecked`) and passes a repeated
+  `initialize` to the handler. The acp-go v1 runtime still refuses every
+  repeat, so it refuses the concurrent one too, until #62 aligns v1 repeat
+  handling (#74).
+
 ## 0.12.1 - 2026-10-05
 
 ### Fixed

@@ -50,6 +50,7 @@ type server struct {
 
 	mu                sync.Mutex
 	initialized       bool
+	initializing      bool
 	agentCapabilities *schema.AgentCapabilities
 	promptCancels     map[schema.SessionId]*promptCancel
 }
@@ -63,7 +64,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		return s.initialize(ctx, raw)
 	}
 	if !s.isInitialized() {
-		return nil, &acp.RPCError{Code: -32600, Message: "agent is not initialized"}
+		return nil, initializationRequired(method)
 	}
 
 	switch method {
@@ -202,9 +203,24 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 	s.mu.Lock()
 	if s.initialized {
 		s.mu.Unlock()
-		return nil, &acp.RPCError{Code: -32600, Message: "agent is already initialized"}
+		// The reference SDK's refusal for a repeat it does not accept. It
+		// also accepts a repeat sent before any other request; until #62
+		// implements that, every repeat is refused here.
+		return nil, invalidRequest("ACP initialization cannot be repeated after any other request; reconnect to initialize again")
 	}
+	if s.initializing {
+		s.mu.Unlock()
+		return nil, invalidRequest("ACP initialization is already in progress on this connection")
+	}
+	s.initializing = true
 	s.mu.Unlock()
+	// Clear the in-progress state on every exit so that a failed attempt
+	// leaves the connection uninitialized and a later initialize can retry.
+	defer func() {
+		s.mu.Lock()
+		s.initializing = false
+		s.mu.Unlock()
+	}()
 
 	response, err := s.agent.Initialize(ctx, s.client, request)
 	if err != nil {
@@ -323,6 +339,19 @@ func decodeRequest[T any](raw json.RawMessage) (T, error) {
 		return request, &acp.RPCError{Code: -32602, Message: err.Error()}
 	}
 	return request, nil
+}
+
+// invalidRequest builds a -32600 error in the reference SDK's shape: the
+// generic JSON-RPC message, with the explanation as a JSON string in data.
+func invalidRequest(detail string) error {
+	data, _ := json.Marshal(detail)
+	return &acp.RPCError{Code: -32600, Message: "Invalid request", Data: data}
+}
+
+// initializationRequired refuses a request that arrives before initialize
+// has completed, matching the reference SDK.
+func initializationRequired(method string) error {
+	return invalidRequest(fmt.Sprintf("ACP initialization must complete before `%s` can be used", method))
 }
 
 func methodNotFound(method string) error {
