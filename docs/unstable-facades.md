@@ -7,8 +7,7 @@ crate the reference Rust SDK `agent-client-protocol` 5.0.0 pins).
 `github.com/BrokkAi/acp-go/unstable` (v1) and
 `github.com/BrokkAi/acp-go/v2/unstable` (draft v2) add narrow typed facades on
 top where a capability check or a composite invariant earns its keep, and never
-re-export them through the stable `acp` or `v2` facades. `v2/unstable` has no
-facades at present.
+re-export them through the stable `acp` or `v2` facades.
 
 Next Edit Suggestions (`nes/*`, `document/did*`, and their capabilities) were
 removed from the upstream unstable schema in crate 1.15, so acp-go no longer
@@ -33,6 +32,12 @@ json.Unmarshal(encodedInitializeResult, &initialization)
 providers, err := unstable.ListProviders(ctx, connection, initialization)
 ```
 
+The draft-v2 facades read `schema/v2/unstable.InitializeResponse` the same way.
+`v2.Connection.Initialize` decodes into the stable `v2.Initialization`, which
+drops the unstable capabilities, so a client that needs them sends
+`initialize` through `Connection.Call` and decodes the raw result into both
+types, or into the unstable one alone.
+
 ## Implemented here
 
 | Facade | Gate | Notes |
@@ -42,7 +47,38 @@ providers, err := unstable.ListProviders(ctx, connection, initialization)
 | `MessageClient` | — | Consumer side of the request-scoped `mcp/message` binding: requires a server ID, request ID, and inner MCP method, rejects duplicate active IDs, routes request-scoped notifications to the owning call, and cancels through the outer ACP request. Implemented for v1 and draft v2. |
 | `MessageRouter` | — | Provider side of the request-scoped binding: server-ID registry and dispatch, request-scoped notifications through `MessageRequest.Notify`, `Unregister` cancellation, and the binding's outer error codes (`-32602`, `-32800`, `-33001`, `-33002`). Implemented for v1 and draft v2. |
 | `Handle` | — | Agent-side dispatch: routes providers/* and session/fork to optional `ProviderHandler`/`ForkHandler` implementations, answers method-not-found when a handler is missing, and delegates every other method to the next handler. |
+| `v2/unstable.ListProviders`, `SetProvider`, `DisableProvider` | `capabilities.providers` | Draft-v2 counterparts of the v1 provider facades, with the same non-blank provider ID check. |
+| `v2/unstable.ForkSession` | `capabilities.session.fork` | Counterpart of the reference SDK's `v2::ForkSessionBuilder`. Requires a session ID and an absolute `cwd`; additional directories need `capabilities.session.additionalDirectories`, as on the stable v2 `session/new`, and must be absolute. Rejects inline MCP servers (use `v2/mcp.ForkSession`) and requires a non-blank forked session ID in the response. `systemPrompt` is forwarded unchanged; its capability checks are #58. |
+| `v2/mcp.ForkSession` | `capabilities.session.fork` | The same fork checks, plus the `v2/mcp` transport checks for each server: stdio, HTTP, and the native `acp` transport each need their `capabilities.session.mcp` entry. |
+| `v2/unstable.Handle` | — | Draft-v2 agent-side dispatch, described below. |
 | `Projection` | — | Client-side: folds optional session updates into ordered per-session state (see below). `Projection.Notifications` adapts `session/update` notifications. |
+
+## Draft-v2 agent-side dispatch
+
+`v2/unstable.Handle(next, handler)` serves `providers/list`, `providers/set`,
+`providers/disable`, and `session/fork` from whichever of `ProviderHandler` and
+`ForkHandler` the handler implements, and delegates every other method to
+`next`. Errors use the reference SDK's codes and shapes: a method this package
+owns without an implementation answers `-32601` (`Method not found`, with the
+method name as data), malformed params answer `-32602` (`Invalid params`)
+without reaching the handler, and a fork response with a blank session ID
+answers `-32603` instead of reaching the wire. The `-32602` data carries the
+decode error but, unlike the reference, not the params, because
+`providers/set` carries authorization headers.
+
+The `v2/agent` runtime serves only the stable baseline, and its `Agent`
+interface returns the stable initialize response, which cannot advertise
+`providers` or `session.fork`. An agent that serves these methods therefore
+hosts its own connection: it answers `initialize` with the unstable
+`InitializeResponse` and wraps its handler:
+
+```go
+handler := v2unstable.Handle(baseline, implementation)
+connection := acp.Connect(stdin, stdout, handler, notifications)
+```
+
+Further unstable draft-v2 methods (session archive/status/title in #71, auth
+status in #72) join the same dispatch as additional handler interfaces.
 
 ## Session updates: projection, not request facades
 

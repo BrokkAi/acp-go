@@ -51,6 +51,24 @@ series, minor releases may contain breaking API changes.
   (`ElicitationContentValue`); defs that are exactly another def, generated as
   aliases (`InitializeProxyRequest = InitializeRequest`); and typeless method
   payloads, generated as `json.RawMessage` aliases (`ProxySuccessorResponse`).
+- `v2/unstable` gains the draft-v2 provider and fork facades (#61):
+  `ListProviders`, `SetProvider`, and `DisableProvider`, gated on
+  `capabilities.providers`, and `ForkSession`, the counterpart of the
+  reference SDK's `v2::ForkSessionBuilder`, gated on
+  `capabilities.session.fork`. `ForkSession` requires a source session ID and
+  an absolute `cwd`, gates additional directories on
+  `capabilities.session.additionalDirectories`, rejects inline MCP servers,
+  requires a non-blank forked session ID in the response, and forwards
+  `systemPrompt` unchanged. All checks fail before writing to the wire.
+- `v2/unstable.Handle`, `ProviderHandler`, and `ForkHandler` serve those
+  methods on the agent side. A method without an implementation answers
+  `-32601`, malformed params answer `-32602` without reaching the handler, a
+  fork response without a session ID answers `-32603`, and every other method
+  goes to the next handler.
+- `v2/mcp.ForkSession` forks a draft-v2 session with MCP servers, applying the
+  same fork checks plus the per-transport capability checks of `NewSession` and
+  `ResumeSession`, including the native `acp` transport, gated on
+  `capabilities.session.mcp.acp`.
 
 ### Changed
 
