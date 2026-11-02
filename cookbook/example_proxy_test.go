@@ -41,6 +41,10 @@ type successorMessage struct {
 // Serve method satisfies proxyrouter.Proxy.
 type toolsProxy struct {
 	server schema.McpServer
+	// report, when set, receives the protocol errors the connection absorbs,
+	// such as a malformed successor notification. A notification has no
+	// response, so it does not close the connection.
+	report func(error)
 }
 
 func (p toolsProxy) Serve(ctx context.Context, in io.ReadCloser, out io.WriteCloser) error {
@@ -52,7 +56,11 @@ func (p toolsProxy) Serve(ctx context.Context, in io.ReadCloser, out io.WriteClo
 		toClient:    newNotifyQueue(),
 		toSuccessor: newNotifyQueue(),
 	}
-	link.connection = acp.Connect(in, out, link.request, link.notification)
+	var options []acp.ConnectOption
+	if p.report != nil {
+		options = append(options, acp.WithErrorHandler(p.report))
+	}
+	link.connection = acp.Connect(in, out, link.request, link.notification, options...)
 	close(link.ready)
 	defer link.connection.Close()
 	go link.toClient.run(ctx, link.connection)

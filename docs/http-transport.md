@@ -56,8 +56,9 @@ JSON rather than a batch.
   on the stream.
 - A body that is not valid UTF-8 is a plain-text `400`.
 - A malformed body that spans lines is a plain-text `400`. The Rust crate
-  re-encodes it as one JSON string for the agent, which acp-go agents cannot
-  answer in place yet (#73).
+  re-encodes it as one JSON string for the agent, which answers it with
+  `-32600`. acp-go connections now answer such a value in place too (#73), but
+  this server does not forward it that way yet.
 - The client fails an `initialize` whose response body is not valid JSON, and
   its connection answers an event that is not valid JSON with the parse error.
 

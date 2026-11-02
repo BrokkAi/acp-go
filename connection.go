@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -31,11 +33,19 @@ type outgoing struct {
 	sent chan error
 }
 
-// Handler serves agent-to-client requests. It must honor cancellation.
+// Handler serves agent-to-client requests. It must honor cancellation. A
+// panic is recovered: the request is answered with -32603 (Internal error),
+// or -32800 if it was cancelled, and the panic goes to the WithErrorHandler
+// hook. As in the reference SDK, a request whose handler panics after input
+// closed (see InputClosed) is not answered.
 type Handler func(context.Context, string, json.RawMessage) (any, error)
 
 // Notifications run in wire order, before a subsequent response is delivered.
 // They must return promptly and must not call back into this Connection.
+//
+// A notification has no response, so an error a Notifications function
+// returns does not close the connection, as in the reference SDK: it goes to
+// the WithErrorHandler hook, or is dropped when there is none.
 type Notifications func(string, json.RawMessage) error
 
 type Connection struct {
@@ -47,7 +57,8 @@ type Connection struct {
 	onNotify    Notifications
 	onObserve   RequestObserver
 	writes      chan outgoing
-	workers     chan struct{}
+	version     uint16
+	onError     func(error)
 	mu          sync.Mutex
 	sequence    uint64
 	inboundSeq  uint64
@@ -65,19 +76,80 @@ type Connection struct {
 // RequestObserver sees each incoming request in wire order, on the read loop,
 // before its handler starts, so state it records is ordered with the
 // notifications around the request. Like Notifications, it must return
-// promptly and must not call back into the Connection.
+// promptly and must not call back into the Connection. A request rejected
+// before dispatch, such as a v2 request with a null id, is not observed. A
+// panic is recovered and reported like a handler panic, and the request still
+// runs.
 type RequestObserver func(method string, params json.RawMessage)
 
-// Connect owns both streams until Close. Frames are limited to 8 MiB; at most
-// 32 incoming requests run concurrently. Unknown notifications can be ignored.
-func Connect(in io.ReadCloser, out io.WriteCloser, h Handler, n Notifications) *Connection {
-	return ConnectObserving(in, out, h, n, nil)
+// ConnectOption configures a Connection created by Connect.
+type ConnectOption func(*Connection)
+
+// WithRequestObserver sets a RequestObserver; nil sets none.
+func WithRequestObserver(observe RequestObserver) ConnectOption {
+	return func(c *Connection) { c.onObserve = observe }
 }
 
-// ConnectObserving is Connect with an optional RequestObserver.
-func ConnectObserving(in io.ReadCloser, out io.WriteCloser, h Handler, n Notifications, observe RequestObserver) *Connection {
+// WithProtocolVersion records the ACP protocol version this connection's API
+// speaks, which a version-neutral Connection cannot learn from the wire. As in
+// the reference SDK, which fixes it per connection, it decides how a request
+// with a null id is handled: version 2 and later answer it with -32600
+// (Invalid request) and id null without running a handler, and the connection
+// keeps serving. Without this option, or with version 1, null is a valid
+// JSON-RPC id and the request runs normally. v2.Connect and the draft-v2
+// agent runtime set version 2.
+func WithProtocolVersion(version uint16) ConnectOption {
+	return func(c *Connection) { c.version = version }
+}
+
+// WithErrorHandler sets a function that receives the failures a Connection
+// absorbs instead of closing: an error returned by the Notifications
+// function, and a *HandlerPanic recovered from a request handler, the
+// Notifications function, or the RequestObserver. It runs on the goroutine
+// that failed, possibly concurrently with itself, so it must be safe for
+// concurrent use, return promptly, and not call back into this Connection. A
+// panic in it is recovered and logged, never reported to it again. Without
+// it, panics are written to the standard logger, as net/http does, and
+// notification errors are dropped.
+func WithErrorHandler(report func(error)) ConnectOption {
+	return func(c *Connection) { c.onError = report }
+}
+
+// HandlerPanic reports a panic recovered from a request handler, a
+// Notifications function, or a RequestObserver. A panicking request handler's
+// request is answered with -32603 (Internal error), or -32800 when it was
+// already cancelled, and the connection keeps serving. The stack is never
+// sent to the peer.
+type HandlerPanic struct {
+	// Method is the method of the request or notification being handled.
+	Method string
+	// Value is the value passed to panic.
+	Value any
+	// Stack is the panicking goroutine's stack trace.
+	Stack []byte
+}
+
+func (p *HandlerPanic) Error() string {
+	return fmt.Sprintf("acp: %s handler panicked: %v", p.Method, p.Value)
+}
+
+// Connect owns both streams until Close. Frames are limited to 8 MiB. Each
+// incoming request runs in its own goroutine with no concurrency limit, as in
+// the reference SDK, so a peer that pipelines many requests is served rather
+// than disconnected. Unknown notifications can be ignored.
+//
+// One bad message or one failing handler does not close the connection. A
+// valid JSON value that is not a JSON-RPC message is answered with -32600 and
+// id null, or ignored when it is shaped like a response, as the reference SDK
+// does. A notification handler's error is reported, and a handler panic is
+// recovered and answered. Only invalid UTF-8, an oversized frame, or a
+// transport failure closes the connection.
+func Connect(in io.ReadCloser, out io.WriteCloser, h Handler, n Notifications, options ...ConnectOption) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Connection{in: in, out: out, ctx: ctx, cancel: cancel, onRequest: h, onNotify: n, onObserve: observe, writes: make(chan outgoing, 32), inputDone: make(chan struct{}), workers: make(chan struct{}, 32), pending: make(map[string]chan packet), inbound: make(map[string][]inboundCancellation)}
+	c := &Connection{in: in, out: out, ctx: ctx, cancel: cancel, onRequest: h, onNotify: n, writes: make(chan outgoing, 32), inputDone: make(chan struct{}), pending: make(map[string]chan packet), inbound: make(map[string][]inboundCancellation)}
+	for _, option := range options {
+		option(c)
+	}
 	c.loops.Add(2)
 	go c.readLoop()
 	go c.writeLoop()
@@ -102,7 +174,8 @@ func (c *Connection) Close() error {
 func (c *Connection) Done() <-chan struct{} { return c.ctx.Done() }
 
 // InputClosed is closed once the connection stops reading frames: the peer
-// closed its output (EOF), a frame was invalid, or the connection was closed.
+// closed its output (EOF), a frame was not valid UTF-8 or exceeded 8 MiB, or
+// the connection was closed.
 // On a clean EOF, Done stays open until in-flight handlers return so their
 // responses can still be written; long-running handlers that wait on the peer
 // can select on InputClosed to stop instead of waiting forever.
@@ -280,45 +353,42 @@ func (c *Connection) readLoop() {
 	s.Buffer(make([]byte, 4096), 8<<20)
 	for s.Scan() {
 		line := s.Bytes()
-		if utf8.Valid(line) {
-			// A value the reference SDK cannot read as one JSON-RPC message
-			// gets its single id-null error, and the connection keeps reading.
-			switch jsonline.Classify(line) {
-			case jsonline.Invalid:
-				c.answerFrame(jsonline.ParseError(line))
-				continue
-			case jsonline.Batch:
-				// JSON-RPC batches are not supported on any protocol
-				// version; none of the array's entries runs.
-				c.answerFrame(jsonline.BatchRejection())
-				continue
-			}
-		}
-		trimmed := bytes.TrimSpace(line)
-		var p packet
-		if !utf8.Valid(trimmed) || json.Unmarshal(trimmed, &p) != nil || p.Version != "2.0" {
+		if !utf8.Valid(line) {
+			// The reference SDK reads lines as UTF-8 text, so this is a
+			// transport failure there, not a malformed message.
 			c.stop(errors.New("invalid ACP JSON-RPC frame"))
 			return
 		}
-		if p.Method == "" {
-			if len(p.ID) == 0 || (p.Result == nil) == (p.Error == nil) {
-				c.stop(errors.New("invalid ACP response"))
-				return
-			}
-			c.mu.Lock()
-			ch := c.pending[string(p.ID)]
-			c.mu.Unlock()
-			if ch != nil {
-				select {
-				case ch <- p:
-				default:
-					c.stop(errors.New("duplicate ACP response"))
-					return
-				}
-			}
+		// A value the reference SDK cannot read as one JSON-RPC message gets
+		// its single id-null error, and the connection keeps reading.
+		switch jsonline.Classify(line) {
+		case jsonline.Invalid:
+			c.answerFrame(jsonline.ParseError(line))
+			continue
+		case jsonline.Batch:
+			// JSON-RPC batches are not supported on any protocol version;
+			// none of the array's entries runs.
+			c.answerFrame(jsonline.BatchRejection())
 			continue
 		}
-		if len(p.ID) == 0 {
+		p, kind := decodeMessage(line)
+		switch kind {
+		case malformedCall:
+			c.answerFrame(jsonline.InvalidRequest())
+		case malformedResponse:
+			// Like the reference SDK, a malformed value shaped like a
+			// response is dropped: it completes no call and gets no answer.
+		case responseMessage:
+			c.mu.Lock()
+			ch := c.pending[string(p.ID)]
+			// The first response settles the call; a repeated one finds no
+			// pending call and is ignored, as in the reference SDK.
+			delete(c.pending, string(p.ID))
+			c.mu.Unlock()
+			if ch != nil {
+				ch <- p
+			}
+		case notificationMessage:
 			if p.Method == "$/cancel_request" {
 				var v struct {
 					ID json.RawMessage `json:"requestId"`
@@ -327,21 +397,20 @@ func (c *Connection) readLoop() {
 					c.cancelInbound(string(v.ID))
 				}
 			} else if c.onNotify != nil {
-				if err := c.onNotify(p.Method, p.Params); err != nil {
-					c.stop(err)
-					return
-				}
+				c.notify(p.Method, p.Params)
 			}
-			continue
+		case requestMessage:
+			if string(p.ID) == "null" && c.version >= 2 {
+				// Protocol v2 forbids null request ids. The reference SDK
+				// answers before dispatch and keeps serving.
+				c.answerFrame(jsonline.NullV2RequestID())
+				continue
+			}
+			if c.onObserve != nil {
+				c.observe(p.Method, p.Params)
+			}
+			c.startRequest(p)
 		}
-		if string(p.ID) == "null" {
-			c.stop(errors.New("null ACP request ID"))
-			return
-		}
-		if c.onObserve != nil {
-			c.onObserve(p.Method, p.Params)
-		}
-		c.startRequest(p)
 	}
 	err := s.Err()
 	inputDone()
@@ -375,10 +444,160 @@ func (c *Connection) answerFrame(response []byte) {
 	}()
 }
 
-func (c *Connection) startRequest(p packet) {
-	if err := c.reserveWorker(); err != nil {
+// messageKind is how the reference SDK reads one JSON value that is valid JSON
+// and not an array.
+type messageKind int
+
+const (
+	requestMessage messageKind = iota
+	notificationMessage
+	responseMessage
+	// malformedCall is not a JSON-RPC message and not shaped like a response:
+	// it gets -32600 with id null.
+	malformedCall
+	// malformedResponse is shaped like a response (an object with "result"
+	// or "error" and no "method") but is not a valid one: it is dropped.
+	malformedResponse
+)
+
+// decodeMessage reads line, valid JSON that is not an array, as the reference
+// SDK's RawJsonRpcMessage deserializer does, with member names matched
+// exactly:
+//
+//   - with "method" and neither "result" nor "error": a request when it has
+//     "id", otherwise a notification. "jsonrpc" must be "2.0", "method" a
+//     string, "params" absent, null, an object, or an array, and "id" null, a
+//     string, or an integer in the int64 range.
+//   - with "id", no "method", and exactly one of "result" and "error": a
+//     response, with the same "jsonrpc" and "id" rules and an error object
+//     that RPCError accepts.
+//   - anything else is malformed. It is dropped when it is shaped like a
+//     response (incoming_actor frame_entry, is_response_only_shape) and
+//     answered otherwise.
+//
+// Other members are ignored. A repeated member, including one of the error
+// object, keeps its last value, as serde_json does.
+func decodeMessage(line []byte) (packet, messageKind) {
+	var members map[string]json.RawMessage
+	if trimmed := bytes.TrimLeft(line, " \t\r\n"); trimmed[0] != '{' || json.Unmarshal(line, &members) != nil {
+		return packet{}, malformedCall
+	}
+	id, hasID := members["id"]
+	method, hasMethod := members["method"]
+	result, hasResult := members["result"]
+	rawError, hasError := members["error"]
+	p := packet{Version: "2.0", ID: id, Params: members["params"]}
+	var version string
+	validVersion := json.Unmarshal(members["jsonrpc"], &version) == nil && version == "2.0"
+	switch {
+	case hasMethod && !hasResult && !hasError:
+		if !validVersion || method[0] != '"' || json.Unmarshal(method, &p.Method) != nil || !validParams(p.Params) || (hasID && !validRequestID(id)) {
+			return packet{}, malformedCall
+		}
+		if hasID {
+			return p, requestMessage
+		}
+		return p, notificationMessage
+	case !hasMethod && hasID && hasResult != hasError:
+		if !validVersion || !validRequestID(id) {
+			return packet{}, malformedResponse
+		}
+		p.Params = nil
+		if hasResult {
+			p.Result = result
+			return p, responseMessage
+		}
+		// The reference SDK reads the whole message as a serde_json value
+		// first, so a repeated member of the error object keeps its last
+		// value there instead of being rejected as RPCError rejects it.
+		var errorMembers map[string]json.RawMessage
+		if json.Unmarshal(rawError, &errorMembers) != nil || errorMembers == nil {
+			return packet{}, malformedResponse
+		}
+		canonical, err := json.Marshal(errorMembers)
+		p.Error = new(RPCError)
+		if err != nil || p.Error.UnmarshalJSON(canonical) != nil {
+			return packet{}, malformedResponse
+		}
+		return p, responseMessage
+	case !hasMethod && (hasResult || hasError):
+		return packet{}, malformedResponse
+	default:
+		return packet{}, malformedCall
+	}
+}
+
+// validParams reports whether params, a member's raw JSON or nil when absent,
+// is absent, null, an object, or an array.
+func validParams(params json.RawMessage) bool {
+	return len(params) == 0 || string(params) == "null" || params[0] == '{' || params[0] == '['
+}
+
+// validRequestID reports whether id is a JSON-RPC id the reference SDK reads:
+// null, a string, or an integer that fits int64. A number with a fraction or
+// an exponent, and -0, are floats there, so they are not ids.
+func validRequestID(id json.RawMessage) bool {
+	switch {
+	case string(id) == "null" || id[0] == '"':
+		return true
+	case id[0] == '-' || (id[0] >= '0' && id[0] <= '9'):
+		if string(id) == "-0" || bytes.ContainsAny(id, ".eE") {
+			return false
+		}
+		_, err := strconv.ParseInt(string(id), 10, 64)
+		return err == nil
+	default:
+		return false
+	}
+}
+
+// notify runs the Notifications function. Its error or panic is reported
+// instead of closing the connection: a notification has nothing to answer.
+func (c *Connection) notify(method string, params json.RawMessage) {
+	defer func() {
+		if value := recover(); value != nil {
+			c.reportPanic(method, value)
+		}
+	}()
+	if err := c.onNotify(method, params); err != nil && c.onError != nil {
+		c.report(fmt.Errorf("acp: %s notification handler: %w", method, err))
+	}
+}
+
+// observe runs the RequestObserver, reporting a panic instead of crashing.
+func (c *Connection) observe(method string, params json.RawMessage) {
+	defer func() {
+		if value := recover(); value != nil {
+			c.reportPanic(method, value)
+		}
+	}()
+	c.onObserve(method, params)
+}
+
+// reportPanic hands a recovered handler panic to the error hook, or to the
+// standard logger when there is none.
+func (c *Connection) reportPanic(method string, value any) {
+	failure := &HandlerPanic{Method: method, Value: value, Stack: debug.Stack()}
+	if c.onError != nil {
+		c.report(failure)
 		return
 	}
+	log.Printf("%v\n%s", failure, failure.Stack)
+}
+
+// report calls the error hook. A panic in the hook is recovered and written
+// to the standard logger, never handed back to the hook, so a faulty hook can
+// neither crash the process nor recurse.
+func (c *Connection) report(err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			log.Printf("acp: error handler panicked while reporting %v: %v\n%s", err, value, debug.Stack())
+		}
+	}()
+	c.onError(err)
+}
+
+func (c *Connection) startRequest(p packet) {
 	ctx, cancel := context.WithCancel(c.ctx)
 	generation := c.registerInbound(string(p.ID), cancel)
 	c.tasks.Add(1)
@@ -387,27 +606,10 @@ func (c *Connection) startRequest(p packet) {
 		defer cancel()
 		response, answer := c.executeRequest(rpcctl.WithRequestID(ctx, p.ID), p)
 		c.unregisterInbound(string(p.ID), generation)
-		// Free handler capacity before the peer can observe the response.
-		c.releaseWorker()
 		if answer {
 			_ = c.send(c.ctx, response)
 		}
 	}()
-}
-
-func (c *Connection) reserveWorker() error {
-	select {
-	case c.workers <- struct{}{}:
-		return nil
-	default:
-		err := errors.New("too many simultaneous ACP requests")
-		c.stop(err)
-		return err
-	}
-}
-
-func (c *Connection) releaseWorker() {
-	<-c.workers
 }
 
 type inboundCancellation struct {
@@ -451,8 +653,22 @@ func (c *Connection) cancelInbound(id string) {
 }
 
 // executeRequest runs the handler. answer is false when an internal binding
-// asked for the request to go unanswered (rpcctl.ErrNoResponse).
+// asked for the request to go unanswered (rpcctl.ErrNoResponse), or when the
+// handler panicked after input closed.
 func (c *Connection) executeRequest(ctx context.Context, p packet) (response packet, answer bool) {
+	defer func() {
+		if value := recover(); value != nil {
+			c.reportPanic(p.Method, value)
+			// The reference SDK does not answer a dropped responder while the
+			// connection is shutting down (incoming closed), the same rule
+			// the bindings follow with rpcctl.ErrNoResponse after input EOF.
+			if closedChannel(c.inputDone) {
+				response, answer = packet{}, false
+				return
+			}
+			response, answer = packet{Version: "2.0", ID: p.ID, Error: panicError(ctx, p.Method)}, true
+		}
+	}()
 	var value any
 	var err error = &RPCError{Code: -32601, Message: "unsupported method: " + p.Method}
 	if c.onRequest != nil {
@@ -467,7 +683,7 @@ func (c *Connection) executeRequest(ctx context.Context, p packet) (response pac
 			response.Error = &RPCError{Code: -32603, Message: err.Error()}
 		}
 		if errors.Is(err, context.Canceled) {
-			response.Error = &RPCError{Code: -32800, Message: "request cancelled"}
+			response.Error = &RPCError{Code: -32800, Message: "Request cancelled"}
 		}
 		// A handler error with invalid Data or Extra JSON would otherwise fail
 		// to encode and leave the peer waiting for a response forever.
@@ -482,4 +698,30 @@ func (c *Connection) executeRequest(ctx context.Context, p packet) (response pac
 		}
 	}
 	return response, true
+}
+
+// closedChannel reports whether done is closed.
+func closedChannel(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+// panicError answers a request whose handler panicked. The reference SDK does
+// not catch panics; its closest wire behavior is the answer to a request whose
+// handler dropped its responder without responding (rust-sdk #462): -32800
+// when the request was cancelled, and otherwise -32603 (Internal error) with
+// data naming the method. A panic is answered exactly that way, as if the
+// responder were dropped. Neither the panic value nor the stack reaches the
+// peer.
+func panicError(ctx context.Context, method string) *RPCError {
+	if ctx.Err() != nil {
+		return &RPCError{Code: -32800, Message: "Request cancelled"}
+	}
+	// The method passed JSON decoding, so it is valid UTF-8.
+	data := jsonline.Quote([]byte("request handler dropped its responder for `" + method + "` without responding"))
+	return &RPCError{Code: -32603, Message: "Internal error", Data: data}
 }

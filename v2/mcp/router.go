@@ -103,8 +103,8 @@ func (r *MessageRouter) UnregisterAndWait(ctx context.Context, serverID string) 
 // SetMaxActive limits how many mcp/message requests may be active at once
 // across all registrations; further requests are refused with -33000
 // (ErrorCodeResourceLimitExceeded). Zero, the default, means no limit.
-// acp.Connection runs at most 32 inbound requests at a time and closes the
-// connection beyond that, so a limit below 32 keeps room for other requests.
+// acp.Connection itself does not limit concurrent inbound requests, as in the
+// reference SDK, so this is the way to bound the work a peer can start.
 func (r *MessageRouter) SetMaxActive(limit int) {
 	r.binding.SetMaxActive(limit)
 }

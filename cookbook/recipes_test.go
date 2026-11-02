@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -135,23 +134,40 @@ func TestProxyServeReportsProtocolErrors(t *testing.T) {
 	defer cancel()
 	deadline, _ := ctx.Deadline()
 	pipe := acptest.NewPairWithDeadline(deadline)
+	reported := make(chan error, 1)
 	served := make(chan error, 1)
-	go func() { served <- (toolsProxy{}).Serve(ctx, pipe.B, pipe.B) }()
+	go func() {
+		served <- toolsProxy{report: func(err error) { reported <- err }}.Serve(ctx, pipe.B, pipe.B)
+	}()
 	conductor := pipe.A.Connect(nil, nil)
-	defer conductor.Close()
 
-	// The proxy stops as soon as it reads the frame, so the sender may see
-	// EOF before its own write completes.
-	if err := conductor.Notify(ctx, proxySuccessorMethod, "not an envelope"); err != nil && !errors.Is(err, io.EOF) {
+	// A malformed successor notification has no response to carry the error,
+	// so the proxy reports it and keeps serving, as the reference SDK does.
+	if err := conductor.Notify(ctx, proxySuccessorMethod, map[string]any{"method": 5}); err != nil {
 		t.Fatal(err)
 	}
 	select {
+	case err := <-reported:
+		if !strings.Contains(err.Error(), "invalid _proxy/successor envelope") {
+			t.Fatalf("reported %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("proxy did not report the malformed notification")
+	}
+	// A malformed successor request is answered with an error.
+	err := conductor.Call(ctx, proxySuccessorMethod, map[string]any{"method": 5}, nil)
+	var rpcErr *acp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32602 {
+		t.Fatalf("Call = %v", err)
+	}
+	_ = conductor.Close()
+	select {
 	case err := <-served:
-		if err == nil || !strings.Contains(err.Error(), "invalid _proxy/successor envelope") {
+		if err != nil {
 			t.Fatalf("Serve = %v", err)
 		}
 	case <-ctx.Done():
-		t.Fatal("proxy did not stop")
+		t.Fatal("proxy did not stop at end of input")
 	}
 }
 

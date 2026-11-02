@@ -48,7 +48,8 @@ transports and additional workspace roots against initialization capabilities.
 `Connect` owns and closes both streams. Notifications run in wire order before
 responses and must return promptly without calling back into the connection.
 Requests run concurrently and must honor cancellation. Frames are bounded at
-8 MiB and incoming requests at 32. `Close` cancels and joins handlers.
+8 MiB; incoming requests are not limited, as in the reference Rust SDK.
+`Close` cancels and joins handlers.
 Generic `Call` and `Notify` permit extensions. `CancelRequest`
 sends a typed `$/cancel_request` for a single outstanding request, preserving
 the peer's string or numeric ID. JSON-RPC batches are not supported on either
@@ -57,7 +58,20 @@ SDK 5.0: a JSON array, including `[]`, gets one `-32600` (`Invalid request`)
 error with `id: null`, none of its entries run, and the connection keeps
 serving. Send each message individually. Likewise, a line that is not valid
 JSON (judged as `serde_json` judges it) gets one `-32700` error with
-`id: null` and the line as `data`, and the connection keeps serving. This root
+`id: null` and the line as `data`, and the connection keeps serving.
+
+One bad message or failing handler never closes the connection, as in the Rust
+SDK. Valid JSON that is not a JSON-RPC message gets `-32600` with `id: null`,
+unless it is shaped like a response (no `method`, with `result` or `error`),
+which is dropped without completing any call. A handler panic is recovered and
+answered with `-32603` (`-32800` if the request was cancelled), and a
+notification handler's error is not fatal; both go to the
+`acp.WithErrorHandler` hook, and without one panics are logged. A request with
+a null id runs on the version-neutral connection and on v1, while
+`acp.WithProtocolVersion(2)`, which `v2.Connect` and the draft-v2 agent
+runtime set, answers it with
+`-32600` and `id: null`. Only invalid UTF-8, an oversized frame, or a
+transport failure closes the connection. This root
 transport is
 also used by the draft-v2 package, while its typed v1 facade remains v1-only.
 
@@ -274,7 +288,7 @@ Draft-v2 sessions can use `acpv2.NewSessionHandle` for Rust-shaped prompt,
 configuration, cancellation, and close commands. `acpv2.SessionTracker` owns
 connection-scoped update projections and active-work state; install it before
 session setup. Its per-session `Projection` sees every update, including
-replay. Connect with `acpv2.ConnectObserving` and `TrackerRequests` so that
+replay. Connect with `acp.WithRequestObserver(tracker.TrackerRequests(nil))` so that
 permission requests' tool calls are applied in receive order with the updates
 around them. `SessionTracker.ResumeSessionFromStart` resets the session's
 projection first, so a full replay rebuilds it, and closing a session through

@@ -28,12 +28,13 @@ type Client struct {
 // usual Initialize, NewSession, and Prompt methods; the HTTP specifics stay
 // behind this package. A base URL targets the standard /acp endpoint: an empty
 // path becomes /acp, and other paths gain /acp unless they already end in it,
-// matching the Rust client.
-func Dial(ctx context.Context, endpoint string, h acp.Handler, n acp.Notifications) (*acp.Connection, error) {
-	return Client{Endpoint: endpoint}.Dial(ctx, h, n)
+// matching the Rust client. options configure the connection as in
+// acp.Connect, for example acp.WithErrorHandler or acp.WithProtocolVersion.
+func Dial(ctx context.Context, endpoint string, h acp.Handler, n acp.Notifications, options ...acp.ConnectOption) (*acp.Connection, error) {
+	return Client{Endpoint: endpoint}.Dial(ctx, h, n, options...)
 }
 
-func (c Client) Dial(ctx context.Context, h acp.Handler, n acp.Notifications) (*acp.Connection, error) {
+func (c Client) Dial(ctx context.Context, h acp.Handler, n acp.Notifications, options ...acp.ConnectOption) (*acp.Connection, error) {
 	if strings.TrimSpace(c.Endpoint) == "" {
 		return nil, errors.New("ACP HTTP endpoint is required")
 	}
@@ -48,7 +49,7 @@ func (c Client) Dial(ctx context.Context, h acp.Handler, n acp.Notifications) (*
 	ctx, cancel := context.WithCancel(ctx)
 	reader, writer := io.Pipe()
 	transport := &httpTransport{endpoint: endpoint, http: client, ctx: ctx, cancel: cancel, feed: writer}
-	return acp.Connect(reader, transport, h, n), nil
+	return acp.Connect(reader, transport, h, n, options...), nil
 }
 
 func normalizeEndpoint(raw string) (string, error) {

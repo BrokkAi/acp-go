@@ -150,8 +150,9 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 // does: it cannot initialize, so it needs a known connection, and the agent
 // answers it with its -32700 parse error on the stream while the POST gets 202.
 // The Rust crate re-encodes a body that spans lines as one JSON string, which
-// the agent then answers with -32600; acp-go agents cannot answer a non-object
-// value in place yet (#73), so such a body is refused here instead.
+// the agent then answers with -32600. An acp-go connection now answers such a
+// value in place (#73), but this server does not yet forward it that way, so
+// such a body is still refused here.
 func (s *Server) forwardUnparsable(w http.ResponseWriter, r *http.Request, body []byte) {
 	connectionID := strings.TrimSpace(r.Header.Get(HeaderConnectionID))
 	if connectionID == "" {

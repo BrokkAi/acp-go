@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BrokkAi/acp-go"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -165,14 +166,14 @@ func TestTrackerRequestsApplyPermissionSubjectInReceiveOrder(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	_ = local.SetDeadline(deadline)
 	_ = peer.SetDeadline(deadline)
-	client := ConnectObserving(local, local, HandlePermissions(nil, host),
+	client := Connect(local, local, HandlePermissions(nil, host),
 		tracker.TrackerNotifications(func(method string, _ json.RawMessage) error {
 			if method == schema.SessionUpdateMethodName {
 				once.Do(func() { close(notified) })
 			}
 			return nil
 		}),
-		tracker.TrackerRequests(nil),
+		acp.WithRequestObserver(tracker.TrackerRequests(nil)),
 	)
 	t.Cleanup(func() { _ = client.Close(); _ = peer.Close() })
 

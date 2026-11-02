@@ -69,9 +69,9 @@ func (e *Endpoint) Write(p []byte) (int, error) { return e.conn.Write(p) }
 func (e *Endpoint) Close() error { return e.conn.Close() }
 
 // Connect runs one ACP connection over this endpoint using the standard
-// transport framing.
-func (e *Endpoint) Connect(h acp.Handler, n acp.Notifications) *acp.Connection {
-	return acp.Connect(e.conn, e.conn, h, n)
+// transport framing and the given options.
+func (e *Endpoint) Connect(h acp.Handler, n acp.Notifications, options ...acp.ConnectOption) *acp.Connection {
+	return acp.Connect(e.conn, e.conn, h, n, options...)
 }
 
 // Decode reads one JSON frame from the endpoint.

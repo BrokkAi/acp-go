@@ -69,6 +69,27 @@ func TestBatchRejectionMatchesReferenceWireShape(t *testing.T) {
 	}
 }
 
+func TestInvalidRequestErrorsMatchReferenceWireShape(t *testing.T) {
+	for name, tc := range map[string]struct {
+		build func() []byte
+		want  string
+	}{
+		// Error::invalid_request() sent as an uncorrelated error response.
+		"invalid request": {InvalidRequest, `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}`},
+		// raw_id::null_v2_request_id(), pinned by Rust's request_id_wire_format test.
+		"null v2 request id": {NullV2RequestID, `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"ACP protocol v2 request ids must be a string or an integer, not null"}}`},
+	} {
+		if got := string(tc.build()); got != tc.want {
+			t.Errorf("%s = %s", name, got)
+		}
+		first := tc.build()
+		first[0] = 'x'
+		if tc.build()[0] != '{' {
+			t.Errorf("%s returned shared storage", name)
+		}
+	}
+}
+
 func TestParseErrorMatchesReferenceWireShape(t *testing.T) {
 	for line, want := range map[string]string{
 		`[`:                                `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error","data":{"line":"["}}}`,

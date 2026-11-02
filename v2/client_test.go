@@ -1,8 +1,10 @@
 package v2
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -26,6 +28,38 @@ func pipeClient(t *testing.T, handler acp.Handler, notifications acp.Notificatio
 		_ = peer.Close()
 	})
 	return client, server
+}
+
+func TestV2ConnectRejectsNullRequestIDs(t *testing.T) {
+	local, peer := net.Pipe()
+	_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
+	ran := make(chan string, 2)
+	client := Connect(local, local, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+		ran <- method
+		return map[string]bool{"ok": true}, nil
+	}, nil, acp.WithProtocolVersion(1))
+	t.Cleanup(func() { _ = client.Close(); _ = peer.Close() })
+	reader := bufio.NewReader(peer)
+	// The v2 rule applies even when an earlier option names another version.
+	if _, err := io.WriteString(peer, `{"jsonrpc":"2.0","id":null,"method":"fs/read_text_file","params":{}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"ACP protocol v2 request ids must be a string or an integer, not null"}}`; strings.TrimSpace(line) != want {
+		t.Fatalf("answer = %s, want %s", line, want)
+	}
+	if _, err := io.WriteString(peer, `{"jsonrpc":"2.0","id":1,"method":"after","params":{}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if line, err = reader.ReadString('\n'); err != nil || strings.TrimSpace(line) != `{"jsonrpc":"2.0","id":1,"result":{"ok":true}}` {
+		t.Fatalf("response after null id = %q, %v", line, err)
+	}
+	if method := <-ran; method != "after" {
+		t.Fatalf("handler ran for %s", method)
+	}
 }
 
 func decode[T any](t *testing.T, raw json.RawMessage) T {
