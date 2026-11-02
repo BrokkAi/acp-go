@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -22,9 +23,25 @@ func FuzzConnectionFrame(f *testing.F) {
 		`{"jsonrpc":"2.0","id":"reply","error":{"code":-32000,"message":"auth_required"}}`,
 		`{"jsonrpc":"2.0","id":"reply","error":{"code":-32002,"message":"missing","data":null,"code":1,"extension":{"retry":true}}}`,
 		`{"jsonrpc":"2.0","id":"request","method":"fs/read_text_file","params":{"sessionId":"s","path":"/tmp/x"}}`,
+		// JSON-RPC batch arrays are rejected with one -32600 and never run.
 		`[]`,
 		`[{"jsonrpc":"2.0","method":"session/update","params":{}}]`,
 		`[17,{"jsonrpc":"2.0","id":"request","method":"fs/read_text_file","params":{}}]`,
+		`[{"jsonrpc":"2.0","id":"reply","result":{"ok":true}}]`,
+		`[{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"request"}}]`,
+		`[[]]`,
+		// Lines that are not valid JSON are answered with one -32700, even
+		// when they start like an array.
+		`[`,
+		`[{"jsonrpc":"2.0"}`,
+		"not-json\r",
+		`{"jsonrpc":"2.0","method":"session/update","params":{}} {}`,
+		// serde_json rejects these although encoding/json accepts them.
+		`{"jsonrpc":"2.0","method":"` + `\` + `ud800"}`,
+		`[1e400]`,
+		`{"jsonrpc":"2.0","id":1.7976931348623158e308,"method":"x"}`,
+		strings.Repeat("[", 128) + strings.Repeat("]", 128),
+		strings.Repeat("[", 127) + strings.Repeat("]", 127),
 	}
 	for _, seed := range seeds {
 		f.Add([]byte(seed))

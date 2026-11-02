@@ -20,9 +20,16 @@ progress:
   - Session-scoped methods carry the `Acp-Session-Id` header, matching the set
     of methods that require it in the Rust crate.
 
+JSON-RPC batches are not supported: a JSON array POST body gets `400 Bad
+Request` with a single JSON-RPC `-32600` error with `id: null`, and creates no
+connection. A body that is not valid JSON cannot open a connection; on a live
+connection it is forwarded and the agent answers it with a -32700 parse error
+on the stream. An array or invalid JSON received from the server is treated as
+malformed.
+
 Deliberate limits of this port, all recorded in `docs/http-transport.md`:
-WebSocket upgrade, CORS, per-session streams, and JSON-RPC batch bodies are not
-implemented. This transport also never falls back to stdio or between
-transports: a caller chooses one binding explicitly.
+WebSocket upgrade, CORS, and per-session streams are not implemented. This
+transport also never falls back to stdio or between transports: a caller
+chooses one binding explicitly.
 */
 package acphttp

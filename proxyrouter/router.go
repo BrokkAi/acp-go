@@ -13,6 +13,7 @@ import (
 	"io"
 	"unicode/utf8"
 
+	"github.com/BrokkAi/acp-go/internal/jsonline"
 	schema1 "github.com/BrokkAi/acp-go/schema"
 	schema2 "github.com/BrokkAi/acp-go/schema/v2"
 )
@@ -58,6 +59,24 @@ func (r *Router) Serve(ctx context.Context, in io.ReadCloser, out io.WriteCloser
 		if err != nil {
 			return err
 		}
+		// Like the reference SDK's select_protocol_peer, a first frame that is
+		// not one JSON-RPC message selects nothing: answer it once with id
+		// null and keep reading, so the peer can still initialize.
+		var answer []byte
+		switch jsonline.Classify(line) {
+		case jsonline.Invalid:
+			answer = jsonline.ParseError(line)
+		case jsonline.Batch:
+			// JSON-RPC batches are not supported on any protocol version.
+			answer = jsonline.BatchRejection()
+		}
+		if answer != nil {
+			if _, err := out.Write(append(answer, '\n')); err != nil {
+				return err
+			}
+			continue
+		}
+		line = bytes.TrimSpace(line)
 		selection, err := selectProxy(line)
 		if errors.Is(err, errResponseOnlyFrame) {
 			// Response-only traffic before proxy initialization has no route.
@@ -86,13 +105,6 @@ type selection struct {
 	version uint16
 }
 
-type entry struct {
-	raw          json.RawMessage
-	frame        wireFrame
-	valid        bool
-	responseOnly bool
-}
-
 type wireFrame struct {
 	Version string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -103,84 +115,42 @@ type wireFrame struct {
 var errResponseOnlyFrame = errors.New("response-only frame")
 
 func selectProxy(line []byte) (selection, error) {
-	if len(line) > 0 && line[0] == '[' {
-		return selectProxyBatch(line)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(line, &fields); err != nil {
+		return selection{}, errors.New("invalid JSON-RPC frame")
 	}
-	entries, err := parseEntries([]json.RawMessage{json.RawMessage(line)})
-	if err != nil {
-		return selection{}, err
+	_, hasMethod := fields["method"]
+	_, hasResult := fields["result"]
+	_, hasError := fields["error"]
+	if !hasMethod && (hasResult || hasError) {
+		return selection{}, errResponseOnlyFrame
 	}
-	if len(entries) == 0 {
-		return selection{}, errors.New("empty JSON-RPC batch")
+	var frame wireFrame
+	if err := json.Unmarshal(line, &frame); err != nil || frame.Version != "2.0" ||
+		frame.Method != proxyInitialize || len(frame.ID) == 0 || string(frame.ID) == "null" {
+		return selection{}, errors.New("first ACP proxy request must be _proxy/initialize")
 	}
-	return selectFromEntries(entries)
-}
-
-func selectProxyBatch(line []byte) (selection, error) {
-	var rawEntries []json.RawMessage
-	if err := json.Unmarshal(line, &rawEntries); err != nil || len(rawEntries) == 0 {
-		return selection{}, errors.New("empty or malformed JSON-RPC batch")
+	var params struct {
+		ProtocolVersion uint16 `json:"protocolVersion"`
 	}
-	entries, err := parseEntries(rawEntries)
-	if err != nil {
-		return selection{}, err
+	if err := json.Unmarshal(frame.Params, &params); err != nil || params.ProtocolVersion == 0 {
+		return selection{}, errors.New("invalid proxy initialize protocolVersion")
 	}
-	return selectFromEntries(entries)
-}
-
-func parseEntries(rawEntries []json.RawMessage) ([]entry, error) {
-	entries := make([]entry, 0, len(rawEntries))
-	for _, raw := range rawEntries {
-		item := entry{raw: raw}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &fields); err != nil {
-			return nil, errors.New("invalid JSON-RPC batch entry")
+	if params.ProtocolVersion == 1 {
+		var request schema1.InitializeRequest
+		if err := json.Unmarshal(frame.Params, &request); err != nil {
+			return selection{}, errors.New("invalid v1 proxy initialize parameters")
 		}
-		_, hasMethod := fields["method"]
-		_, hasResult := fields["result"]
-		_, hasError := fields["error"]
-		item.responseOnly = !hasMethod && (hasResult || hasError)
-		if err := json.Unmarshal(raw, &item.frame); err == nil &&
-			item.frame.Version == "2.0" &&
-			(item.frame.Method == "" || (len(item.frame.ID) > 0 && string(item.frame.ID) != "null")) {
-			item.valid = true
+	} else if params.ProtocolVersion == 2 {
+		var request schema2.InitializeRequest
+		if err := json.Unmarshal(frame.Params, &request); err != nil {
+			return selection{}, errors.New("invalid v2 proxy initialize parameters")
 		}
-		entries = append(entries, item)
+		if request.Info.Name == "" || request.Info.Version == "" {
+			return selection{}, errors.New("v2 proxy initialize info requires name and version")
+		}
 	}
-	return entries, nil
-}
-
-func selectFromEntries(entries []entry) (selection, error) {
-	for _, item := range entries {
-		if item.responseOnly {
-			continue
-		}
-		if !item.valid || item.frame.Method != proxyInitialize {
-			return selection{}, errors.New("first ACP proxy request must be _proxy/initialize")
-		}
-		var params struct {
-			ProtocolVersion uint16 `json:"protocolVersion"`
-		}
-		if err := json.Unmarshal(item.frame.Params, &params); err != nil || params.ProtocolVersion == 0 {
-			return selection{}, errors.New("invalid proxy initialize protocolVersion")
-		}
-		if params.ProtocolVersion == 1 {
-			var request schema1.InitializeRequest
-			if err := json.Unmarshal(item.frame.Params, &request); err != nil {
-				return selection{}, errors.New("invalid v1 proxy initialize parameters")
-			}
-		} else if params.ProtocolVersion == 2 {
-			var request schema2.InitializeRequest
-			if err := json.Unmarshal(item.frame.Params, &request); err != nil {
-				return selection{}, errors.New("invalid v2 proxy initialize parameters")
-			}
-			if request.Info.Name == "" || request.Info.Version == "" {
-				return selection{}, errors.New("v2 proxy initialize info requires name and version")
-			}
-		}
-		return selection{version: params.ProtocolVersion}, nil
-	}
-	return selection{}, errResponseOnlyFrame
+	return selection{version: params.ProtocolVersion}, nil
 }
 
 func readLine(reader *bufio.Reader) ([]byte, error) {
@@ -202,7 +172,10 @@ func readLine(reader *bufio.Reader) ([]byte, error) {
 		}
 		break
 	}
-	line = bytes.TrimSpace(line)
+	// Strip one line terminator, "\n" or "\r\n", as the reference SDK's line
+	// reader does, so a parse error reports the same line.
+	line = bytes.TrimSuffix(line, []byte("\n"))
+	line = bytes.TrimSuffix(line, []byte("\r"))
 	if !utf8.Valid(line) {
 		return nil, errors.New("ACP frame is not valid UTF-8")
 	}

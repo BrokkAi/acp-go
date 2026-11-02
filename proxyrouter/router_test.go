@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,52 +88,101 @@ func TestProxyRouterRequiresExactVersion(t *testing.T) {
 	}
 }
 
-func TestProxyRouterPreservesInitialBatchAndFutureFields(t *testing.T) {
-	started := make(chan string, 1)
-	seen := make(chan map[string]json.RawMessage, 1)
+func TestProxyRouterPreservesInitialFrameAndFutureFields(t *testing.T) {
+	seen := make(chan string, 1)
 	proxy := acptest.ProxyFunc(func(ctx context.Context, in io.ReadCloser, out io.WriteCloser) error {
 		defer in.Close()
-		var batch []map[string]json.RawMessage
-		if err := json.NewDecoder(in).Decode(&batch); err != nil {
+		line, err := bufio.NewReader(in).ReadString('\n')
+		if err != nil {
 			return err
 		}
-		seen <- batch[0]
-		started <- "done"
+		seen <- line
 		return nil
 	})
 	rw := start(t, New().WithV2(proxy))
-	batch, err := json.Marshal([]map[string]any{
-		{
-			"jsonrpc": "2.0", "id": 1, "method": "_proxy/initialize",
-			"params": map[string]any{
-				"protocolVersion": 2,
-				"info":            map[string]any{"name": "client", "version": "1"},
-				"future":          true,
-			},
-		},
-		{"jsonrpc": "2.0", "method": "future/notification", "params": map[string]bool{"preserved": true}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rw.Write(append(batch, '\n')); err != nil {
+	initialize := `{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize","params":{"protocolVersion":2,"info":{"name":"client","version":"1"},"future":true}}`
+	if _, err := rw.WriteString(initialize + "\n"); err != nil {
 		t.Fatal(err)
 	}
 	if err := rw.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-started:
+	case line := <-seen:
+		if strings.TrimSpace(line) != initialize {
+			t.Fatalf("replayed initialize = %s, want %s", line, initialize)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("proxy did not receive batch")
+		t.Fatal("proxy did not receive initialize")
 	}
-	params := <-seen
-	var initializeParams map[string]json.RawMessage
-	if err := json.Unmarshal(params["params"], &initializeParams); err != nil {
+}
+
+// batchRejection is the exact line the reference SDK sends for any JSON-RPC
+// batch array.
+const batchRejection = `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"JSON-RPC batches are not supported; send each message individually"}}`
+
+// parseErrorLine is the exact line the reference SDK sends for a line that is
+// not valid JSON; quoted is the line, without its terminator, as a JSON string.
+func parseErrorLine(quoted string) string {
+	return `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error","data":{"line":` + quoted + `}}}`
+}
+
+func TestProxyRouterAnswersUnreadableFirstFramesAndKeepsReading(t *testing.T) {
+	v1 := make(chan string, 1)
+	v2 := make(chan string, 1)
+	rw := start(t, New().
+		WithV1(recordingProxy{name: "v1", started: v1}).
+		WithV2(recordingProxy{name: "v2", started: v2}))
+	for _, frame := range []struct{ wire, answer string }{
+		{"[]\n", batchRejection},
+		{`[{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize","params":{"protocolVersion":2,"info":{"name":"client","version":"1"}}},{"jsonrpc":"2.0","method":"future/notification","params":{}}]` + "\n", batchRejection},
+		{`[{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize","params":{"protocolVersion":1}}]` + "\n", batchRejection},
+		{`[{"jsonrpc":"2.0","id":1,"result":{}}]` + "\n", batchRejection},
+		{"[\n", parseErrorLine(`"["`)},
+		{" [1,\r\n", parseErrorLine(`" [1,"`)},
+		{"\n", parseErrorLine(`""`)},
+		{`{"jsonrpc":"2.0","id":1,"method":"_proxy/initialize"` + "\n", parseErrorLine(`"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"_proxy/initialize\""`)},
+		{"[1e400]\n", parseErrorLine(`"[1e400]"`)},
+	} {
+		if _, err := rw.WriteString(frame.wire); err != nil {
+			t.Fatal(err)
+		}
+		if err := rw.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		line, err := rw.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.TrimSuffix(line, "\n"); got != frame.answer {
+			t.Fatalf("frame %q response = %s, want %s", frame.wire, got, frame.answer)
+		}
+	}
+	if len(v1) != 0 || len(v2) != 0 {
+		t.Fatal("a proxy implementation ran for an unreadable frame")
+	}
+
+	// A single _proxy/initialize after the rejected batches is routed.
+	if _, err := rw.WriteString(`{"jsonrpc":"2.0","id":2,"method":"_proxy/initialize","params":{"protocolVersion":1}}` + "\n"); err != nil {
 		t.Fatal(err)
 	}
-	if _, exists := initializeParams["future"]; !exists {
-		t.Fatalf("future initialize field was dropped: %s", initializeParams)
+	if err := rw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	line, err := rw.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(line); got != `{"id":2,"jsonrpc":"2.0","result":{"protocolVersion":1}}` {
+		t.Fatalf("initialize after batches = %s", got)
+	}
+	select {
+	case name := <-v1:
+		if name != "v1" {
+			t.Fatalf("selected %q", name)
+		}
+	default:
+		t.Fatal("v1 proxy did not run")
 	}
 }
 

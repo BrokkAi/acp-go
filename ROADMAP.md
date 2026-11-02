@@ -61,18 +61,22 @@ only remaining work.
   - canonicalize a newer initialize request to selected v2 parameters,
   - canonicalize v2 initialize parameters when only v1 is configured,
   - never convert traffic after initialization.
-- JSON-RPC batch support:
-  - inbound request, notification, response, and mixed batches,
-  - one grouped response array for request-bearing batches,
-  - malformed response-shaped members ignored as Rust ignores them,
-  - malformed call-shaped members answered with Invalid Request,
-  - duplicate and overlapping inbound request IDs,
-  - response batches routed to pending calls by ID,
-  - batch completion waits for trailing notification handlers,
-  - an incomplete batch does not block independent standalone calls,
-  - explicit outbound `CallBatch` support,
-  - initial initialize parameters validated before sibling dispatch by the
-    protocol router.
+- JSON-RPC batches rejected on v1 and v2, matching the ACP v2 transports
+  "No batches" rule and Rust 5.0 (#68). This is decided: there is no batch
+  support or compatibility path on either version.
+  - any array, including `[]`, gets one `-32600` (`Invalid request`) error
+    with `id: null` and the Rust error data, and none of its entries run,
+  - the connection, agent protocol router, and proxy protocol router keep
+    reading after the rejection,
+  - a line that is not valid JSON, judged as `serde_json` judges it (lone
+    surrogate escapes, float64 overflow, and nesting 128 deep are invalid),
+    gets one `-32700` error with `id: null` and the line as data, with the
+    same keep-reading behavior, so `[`-prefixed garbage is a parse error,
+  - both answers are queued before the next frame is handled, so nothing can
+    overtake them,
+  - the HTTP transport answers an array `POST` with `400` and the same
+    JSON-RPC body without creating a connection; its client treats an array
+    from the server as malformed.
 - Rust-shaped v2 session command surface:
   - reusable agent-message projection with omitted/null/value patch semantics,
   - per-session active-work tracker using running→idle completion,
@@ -92,7 +96,7 @@ only remaining work.
 - Exact-match proxy protocol router:
   - select only the configured exact v1/v2 `_proxy/initialize` version,
   - validate the selected initialize schema,
-  - preserve the complete initial single or batch frame without canonicalization,
+  - preserve the complete initial frame without canonicalization,
   - reject future versions rather than downgrading.
 - Unstable schema surfaces from the exact Rust schema crate 1.15.1 unstable
   artifacts:

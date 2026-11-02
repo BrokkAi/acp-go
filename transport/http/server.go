@@ -14,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/BrokkAi/acp-go/internal/jsonline"
 )
 
 // initializeTimeout bounds how long one initialize POST waits for the agent's
@@ -93,6 +96,23 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ACP HTTP frame exceeds 8 MiB", http.StatusRequestEntityTooLarge)
 		return
 	}
+	if !utf8.Valid(body) {
+		http.Error(w, "Invalid JSON-RPC: body is not valid UTF-8", http.StatusBadRequest)
+		return
+	}
+	switch jsonline.Classify(body) {
+	case jsonline.Batch:
+		// JSON-RPC batches are not supported. Answer the array with one
+		// Invalid Request error, forward none of its entries, and create no
+		// connection, whatever the headers say.
+		w.Header().Set("Content-Type", jsonMIME)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(jsonline.BatchRejection())
+		return
+	case jsonline.Invalid:
+		s.forwardUnparsable(w, r, body)
+		return
+	}
 	payload := bytes.TrimSpace(body)
 	parsed, err := parseFrame(payload)
 	if err != nil {
@@ -119,6 +139,35 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := connection.writeToAgent(payload); err != nil {
+		http.Error(w, "ACP connection is closed", http.StatusGone)
+		return
+	}
+	w.Header().Set(HeaderConnectionID, connection.id)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// forwardUnparsable handles a body that is not valid JSON as the Rust crate
+// does: it cannot initialize, so it needs a known connection, and the agent
+// answers it with its -32700 parse error on the stream while the POST gets 202.
+// The Rust crate re-encodes a body that spans lines as one JSON string, which
+// the agent then answers with -32600; acp-go agents cannot answer a non-object
+// value in place yet (#73), so such a body is refused here instead.
+func (s *Server) forwardUnparsable(w http.ResponseWriter, r *http.Request, body []byte) {
+	connectionID := strings.TrimSpace(r.Header.Get(HeaderConnectionID))
+	if connectionID == "" {
+		http.Error(w, "Acp-Connection-Id header is required after initialize", http.StatusBadRequest)
+		return
+	}
+	connection := s.lookup(connectionID)
+	if connection == nil {
+		http.Error(w, "unknown ACP connection", http.StatusNotFound)
+		return
+	}
+	if bytes.ContainsAny(body, "\r\n") {
+		http.Error(w, "Invalid JSON-RPC: a malformed body must be one line", http.StatusBadRequest)
+		return
+	}
+	if err := connection.writeToAgent(body); err != nil {
 		http.Error(w, "ACP connection is closed", http.StatusGone)
 		return
 	}

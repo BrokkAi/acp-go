@@ -146,6 +146,50 @@ series, minor releases may contain breaking API changes.
   Rust reads it as not reported. This is a known gap, tracked in #82. The
   1.15 default-on-null hints on v1 request fields are unaffected: `null`
   already decodes as empty.
+- **Breaking:** JSON-RPC batches are rejected on both v1 and v2, matching the
+  ACP v2 transports "No batches" rule and the reference Rust SDK 5.0 (#68). A
+  JSON array, including `[]`, now gets exactly one error,
+  `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"JSON-RPC batches are not supported; send each message individually"}}`,
+  and none of its entries runs: no request or notification handler is called,
+  `$/cancel_request` entries cancel nothing, and response entries complete no
+  pending call. The connection keeps serving later single messages.
+- **Breaking:** `agentrouter` and `proxyrouter` answer a batched first frame,
+  including one that holds `initialize` or `_proxy/initialize`, with that same
+  error and keep reading, so a following single initialize is routed
+  normally. Previously they validated and dispatched the batch.
+- **Breaking:** the draft HTTP transport answers a JSON array `POST` body with
+  `400`, `Content-Type: application/json`, and the JSON-RPC error above
+  instead of a plain-text `400`, before checking connection headers and
+  without creating a connection. Its client treats an array from the server as
+  malformed: on the event stream the connection answers it with the same
+  error, and as an `initialize` response body it fails the initialize.
+- A line that is not valid JSON, including an empty line and one that only
+  starts like an array, now gets exactly one parse error, as the reference SDK
+  sends it:
+  `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error","data":{"line":"<the line>"}}}`,
+  with the line as read, without its `\n` or `\r\n` terminator. The connection,
+  `agentrouter`, and `proxyrouter` keep reading afterwards. Previously the
+  connection closed, the agent router exited, and the proxy router answered
+  `-32600` and exited. Invalid UTF-8 still closes the connection, because the
+  reference SDK cannot read it as a line either. Valid JSON that is not a
+  JSON-RPC message still closes it; that is tracked in #73.
+- Validity follows `serde_json`, which the reference SDK parses with, rather
+  than `encoding/json`. A lone UTF-16 surrogate escape such as `"\ud800"`, a
+  number whose float64 evaluation overflows (including values just below
+  `math.MaxFloat64` such as `1.7976931348623158e308`, which `serde_json`
+  rejects), and arrays or objects nested 128 deep are parse errors. So
+  `[1e400]` is a parse error, not a batch.
+- The `-32600` batch rejection and the `-32700` parse error are queued before
+  the next frame is handled, so a later response, or a send from the next
+  frame's notification handler, can no longer overtake them.
+- The draft HTTP server handles a `POST` body that is not valid JSON as the
+  Rust crate does. Without a connection it is still a plain-text `400`. On an
+  unknown connection it is now `404`. On a live connection it is forwarded and
+  answered `202`, and the agent sends the parse error on the stream. A body
+  that is not valid UTF-8 is a plain-text `400`. A malformed body that spans
+  lines stays a `400`: the Rust crate re-encodes it as one JSON string, which
+  acp-go agents cannot answer in place until #73. The HTTP client fails an
+  `initialize` whose response body is not valid JSON.
 
 ### Fixed
 
@@ -169,6 +213,10 @@ series, minor releases may contain breaking API changes.
 
 ### Removed
 
+- **Breaking:** `Connection.CallBatch` and `BatchCall`, and all inbound batch
+  processing (grouped response arrays, response-batch routing, and the agent
+  router's batched-initialize validation). Send each message individually
+  (#68).
 - Next Edit Suggestions, removed from the upstream unstable schema: every
   `nes/*` and `document/did*` method, the `Nes*`, `Did*DocumentNotification`,
   `Position`, `Range`, `PositionEncodingKind`, `TextDocumentContentChangeEvent`,

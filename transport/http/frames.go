@@ -3,6 +3,8 @@ package acphttp
 import (
 	"encoding/json"
 	"errors"
+
+	"github.com/BrokkAi/acp-go/internal/jsonline"
 )
 
 const (
@@ -32,9 +34,13 @@ type frame struct {
 	Error  json.RawMessage `json:"error,omitempty"`
 }
 
+// errBatch reports a JSON-RPC batch array, which this transport never sends,
+// forwards, or accepts as a response.
+var errBatch = errors.New("JSON-RPC batches are not supported; send each message individually")
+
 func parseFrame(data []byte) (frame, error) {
-	if len(data) > 0 && data[0] == '[' {
-		return frame{}, errors.New("ACP HTTP transport does not accept batch bodies")
+	if jsonline.Classify(data) == jsonline.Batch {
+		return frame{}, errBatch
 	}
 	var parsed frame
 	if err := json.Unmarshal(data, &parsed); err != nil {

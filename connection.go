@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/BrokkAi/acp-go/internal/jsonline"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -160,8 +161,8 @@ func (c *Connection) Notify(ctx context.Context, method string, params any) erro
 //
 // requestID identifies the request exactly as the peer saw it on the wire: a
 // JSON string or number, supplied as a Go string, an integer, or a
-// json.RawMessage for exact bytes. Call and CallBatch number their own outbound
-// requests from 1, so those IDs are integers. Null, empty, and non-scalar IDs
+// json.RawMessage for exact bytes. Call numbers its own outbound requests
+// from 1, so those IDs are integers. Null, empty, and non-scalar IDs
 // are rejected.
 func (c *Connection) CancelRequest(ctx context.Context, requestID any) error {
 	id, err := encodeRequestID(requestID)
@@ -255,11 +256,22 @@ func (c *Connection) readLoop() {
 	s := bufio.NewScanner(c.in)
 	s.Buffer(make([]byte, 4096), 8<<20)
 	for s.Scan() {
-		trimmed := bytes.TrimSpace(s.Bytes())
-		if len(trimmed) > 0 && trimmed[0] == '[' {
-			c.startBatch(append([]byte(nil), trimmed...))
-			continue
+		line := s.Bytes()
+		if utf8.Valid(line) {
+			// A value the reference SDK cannot read as one JSON-RPC message
+			// gets its single id-null error, and the connection keeps reading.
+			switch jsonline.Classify(line) {
+			case jsonline.Invalid:
+				c.answerFrame(jsonline.ParseError(line))
+				continue
+			case jsonline.Batch:
+				// JSON-RPC batches are not supported on any protocol
+				// version; none of the array's entries runs.
+				c.answerFrame(jsonline.BatchRejection())
+				continue
+			}
 		}
+		trimmed := bytes.TrimSpace(line)
 		var p packet
 		if !utf8.Valid(trimmed) || json.Unmarshal(trimmed, &p) != nil || p.Version != "2.0" {
 			c.stop(errors.New("invalid ACP JSON-RPC frame"))
@@ -311,6 +323,29 @@ func (c *Connection) readLoop() {
 		err = io.EOF
 	}
 	c.stop(err)
+}
+
+// answerFrame queues the id-null error answering a malformed frame before the
+// read loop handles the next frame, as the reference SDK does, so nothing a
+// later frame causes, such as a request's response or a notification
+// handler's own send, can overtake it. Queueing blocks only while the write
+// queue is full, which is backpressure from a peer that is not reading. Only
+// waiting for the write runs as a task, which EOF still waits for.
+func (c *Connection) answerFrame(response []byte) {
+	w := outgoing{data: append(response, '\n'), sent: make(chan error, 1)}
+	select {
+	case c.writes <- w:
+	case <-c.ctx.Done():
+		return
+	}
+	c.tasks.Add(1)
+	go func() {
+		defer c.tasks.Done()
+		select {
+		case <-w.sent:
+		case <-c.ctx.Done():
+		}
+	}()
 }
 
 func (c *Connection) startRequest(p packet) {
