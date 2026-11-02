@@ -85,11 +85,11 @@ func (w *ActiveWork) Apply(update schema.SessionUpdate) {
 		idle := state.Idle
 		w.result = WorkResult{
 			Text:             w.projection.Text(),
-			StopReason:       idle.StopReason,
+			StopReason:       clonePtr(idle.StopReason),
 			StopReasonFields: maps.Clone(idle.StopReasonFields),
 		}
 		if idle.StopReason != nil && *idle.StopReason == schema.StopReasonError {
-			w.result.Error = idle.Error
+			w.result.Error = clonePtr(idle.Error)
 		}
 		w.completed = true
 		close(w.done)
@@ -262,4 +262,14 @@ func (t *SessionTracker) workLocked(sessionID SessionID) *ActiveWork {
 	work := BeginActiveWork()
 	t.sessions[sessionID] = work
 	return work
+}
+
+// clonePtr returns a shallow copy of *p, so a frozen WorkResult does not
+// change when the caller later mutates the update it observed.
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }

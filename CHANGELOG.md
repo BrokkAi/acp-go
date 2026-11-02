@@ -174,12 +174,8 @@ series, minor releases may contain breaking API changes.
     a custom or future stop reason. `WorkResult.Err` returns a typed
     `*acpv2.WorkError` (its `Failure` is that error, or nil without details)
     only for the `error` stop reason, so callers need not compare strings.
-  - `v2/runner.Result` gains `Error`. When the agent ends the turn with the
-    `error` stop reason, `Execute` still closes the session and shuts the
-    agent down gracefully, then returns the result, projected text included,
-    together with the `*acpv2.WorkError`. If `session/close` or the agent's
-    exit then fails as well, that failure is joined with the
-    `*acpv2.WorkError`, so `errors.As` finds each.
+  - `v2/runner.Result` gains `Error`, the `*acpv2.WorkError` of a turn that
+    ended with the `error` stop reason.
   - `acpv2.NewIdleStateUpdate` and `acpv2.NewErrorIdleStateUpdate` build idle
     `state_update` session updates with a stop reason or with the `error`
     stop reason and its details.
@@ -219,12 +215,15 @@ series, minor releases may contain breaking API changes.
     is fixed there. A repeated idle snapshot, or output after the idle, no
     longer changes it; previously an idle without a stop reason let a later
     idle fill one in, and later output was appended to `Text`.
-  - **Breaking (draft v2):** `SessionHandle.CancelActiveWorkAndWait` is
-    satisfied only by `cancelled`, which covers stops the user or Client
-    chose (agent-client-protocol #2523, #2576). Any other reason, including
-    `error`, returns the result with an error wrapping `ErrWorkNotCancelled`
-    (and the `*WorkError` for `error`); its message names the stop reason
-    instead of printing a pointer.
+  - **Breaking (draft v2):** the error `SessionHandle.CancelActiveWorkAndWait`
+    returns when the work became idle without `cancelled` changed. It now
+    wraps `ErrWorkNotCancelled` (and the `*WorkError` for `error`), and its
+    message names the stop reason instead of printing a pointer, so code
+    matching the old "active work stopped without cancelled reason" text
+    breaks. Because the result is fixed at the first idle, a later idle can
+    no longer supply `cancelled` either. Only `cancelled` satisfies the
+    barrier, as before; it covers stops the user or Client chose
+    (agent-client-protocol #2523, #2576).
   - Tracking assumes each prompt starts new foreground work. A prompt the
     Agent folds into the running turn may leave the tracked work incomplete,
     and `CancelActiveWorkAndWait` returns the earlier result of work that had
@@ -232,7 +231,11 @@ series, minor releases may contain breaking API changes.
     with `ctx` (documented on `ActiveWork` and `SessionHandle`).
 - **Breaking (draft v2):** `v2/runner.Runner.Execute` returns a non-nil
   `*acpv2.WorkError` for a turn that ended with the `error` stop reason,
-  where it returned a nil error before.
+  where it returned a nil error before. It still closes the session and
+  shuts the agent down gracefully, and returns the result, projected text
+  included; the agent's stderr is recorded but not appended to that error.
+  If `session/close` or the agent's exit then fails as well, that failure is
+  joined with the `*acpv2.WorkError`, so `errors.As` finds each.
 - v1 `unstable.Handle` follows the reference SDK's handler chain and error
   shapes, the same as `v2/unstable.Handle`: an unstable method the handler
   does not implement now goes to `next` instead of answering method-not-found

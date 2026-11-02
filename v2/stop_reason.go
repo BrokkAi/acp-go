@@ -38,7 +38,8 @@ var ErrWorkNotCancelled = errors.New("active work became idle without the cancel
 // reason is reported as its stop reason; an empty reason reports none, for an
 // idle update that does not end foreground work or whose cause the Agent
 // cannot determine. Use NewErrorIdleStateUpdate to attach failure details to
-// StopReasonError.
+// StopReasonError. A custom reason must begin with an underscore; like the
+// reference SDK, the helper does not check it.
 func NewIdleStateUpdate(reason schema.StopReason) schema.SessionUpdate {
 	idle := &schema.IdleStateUpdate{}
 	if reason != "" {

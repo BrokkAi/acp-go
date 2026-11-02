@@ -103,7 +103,7 @@ func (e *AgentExitError) Unwrap() error { return e.Err }
 // process group at once. endAgent returns the exit error of an agent that failed on its own,
 // whether during the run (crashed) or after its stdin closed.
 func endAgent(ctx context.Context, process *osrun.Agent, runErr, crashed error) error {
-	if _, ok := runErr.(*acpv2.WorkError); ok {
+	if isWorkError(runErr) {
 		// The agent reported a failed turn over a working connection and the
 		// session closed; the run itself completed. A WorkError joined with
 		// a later failure, such as session/close, is a failed run.
@@ -147,9 +147,11 @@ func (e *SetupError) Unwrap() error { return e.Err }
 // stop reason, Execute closes the session as usual and returns the result,
 // including any projected text, together with an *acpv2.WorkError carrying
 // the reported JSON-RPC error. Every other stop reason, including cancelled,
-// custom, and unknown ones, returns a nil error. If closing the session or
-// the agent's exit then fails too, the *acpv2.WorkError is joined with that
-// failure (an *AgentExitError for the exit), so errors.As finds each.
+// custom, and unknown ones, returns a nil error. As for a successful run, the
+// agent's stderr is recorded but not appended to that error. If closing the
+// session or the agent's exit then fails too, the *acpv2.WorkError is joined
+// with that failure (an *AgentExitError for the exit), so errors.As finds
+// each.
 func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runErr error) {
 	log := r.Log
 	if log == nil {
@@ -211,7 +213,10 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 		switch {
 		case exitErr != nil:
 			runErr = withAgentExit(runErr, &AgentExitError{Err: exitErr, Stderr: text})
-		case runErr != nil && text != "":
+		case runErr != nil && text != "" && !isWorkError(runErr):
+			// A bare *acpv2.WorkError means the run completed with the
+			// error stop reason, so, as for a successful run, the agent's
+			// stderr is recorded but not appended.
 			runErr = fmt.Errorf("%w\nAgent diagnostics: %s", runErr, text)
 		}
 	}()
@@ -344,4 +349,11 @@ type cancelPermissions struct{}
 
 func (cancelPermissions) RequestPermission(context.Context, schema.RequestPermissionRequest) (schema.RequestPermissionResponse, error) {
 	return acpv2.CancelPermission(), nil
+}
+
+// isWorkError reports whether err is a bare *acpv2.WorkError: the turn ended
+// with the error stop reason and nothing else failed.
+func isWorkError(err error) bool {
+	_, ok := err.(*acpv2.WorkError)
+	return ok
 }
