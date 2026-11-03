@@ -229,8 +229,16 @@ distinguishes omitted fields from explicit JSON null, such as message-content
 patches. The stable v1 types use it only for the patch fields Rust models with
 `MaybeUndefined`: `compaction_update`'s `summary`, `error`, and `_meta`, and
 `session_info_update`'s `title` and `updatedAt`. A `Nullable` is sent only
-when `Set` is true, for a value and for `null` alike. These fields still
-decode strictly where Rust skips a malformed value (#82).
+when `Set` is true, for a value and for `null` alike.
+
+All four generated packages decode as the Rust schema crate does, following
+the schema's `x-deserialize-*` hints: a malformed optional field reads as not
+reported (a malformed `Nullable` patch as unset, while an explicit `null`
+stays null), list items that do not decode are skipped where the schema says
+so, and a missing required field or union tag, an unknown value of a closed
+v1 enum, or a value outside a union's arms fails. See
+[docs/schema-pin-workflow.md](docs/schema-pin-workflow.md#decode-rules) for
+the rules.
 
 Draft-v2 upserts (`tool_call_update`, `terminal_update`, the message updates,
 `session_info_update`, and `compaction_update`) have a generated `ApplyUpdate`

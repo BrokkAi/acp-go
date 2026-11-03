@@ -334,10 +334,72 @@ series, minor releases may contain breaking API changes.
   `_meta`, and v1 `additionalDirectories`) as not reported, per its
   `x-deserialize-default-on-error` hints, as the reference SDK's
   `DefaultOnError` does, so one malformed `archived` reads as nil instead of
-  failing the whole `session/list` page. v1 `additionalDirectories` still
-  differs: the reference SDK also skips its invalid items and keeps the rest
-  (`VecSkipError`), while one invalid item drops the whole list here, until
-  skip-invalid-items hints are honored (#82).
+  failing the whole `session/list` page. v1 `additionalDirectories` also
+  skips its invalid items and keeps the rest, as below.
+- **Breaking:** the generated decoders in all four schema packages honor the
+  schema's `x-deserialize-*` hints on every field and decode everything else
+  as strictly as the reference SDK's schema crate (`agent-client-protocol-schema`
+  1.15.1), replacing the per-def `lenientDefs` special case (#82):
+  - `x-deserialize-default-on-error` (`DefaultOnError`): a malformed value
+    reads as the field's default: not reported for optional fields (where
+    `null` reads the same way), unset for a malformed `Nullable` patch field
+    (such as `CompactionUpdate`'s `summary`, `error`, and `_meta`, whose
+    explicit `null` is still kept as null), and an empty list for a required
+    list. A malformed `_meta` or one malformed optional field no longer fails
+    the message.
+  - `x-deserialize-skip-invalid-items` (`VecSkipError`): list items that do
+    not decode are dropped and the others kept, so one bad `availableCommands`,
+    `configOptions`, `sessions`, `ToolCall.content`, or `SessionMessage.content`
+    entry no longer drops the whole message or list.
+  - `x-deserialize-default-on-null` (`DefaultOnNull`): `null` reads as the
+    default, including an empty list for required lists such as
+    `McpServerStdio.args`.
+  - **Breaking:** a missing required field, a `null` where the schema does
+    not admit one, and a `null` list item or map value now fail decoding, as
+    they do in Rust. A union without its required tag (for example a v2
+    `BackgroundWork` or `AvailableCommand` without `type`) is rejected
+    instead of decoding as `Other` with an empty `Kind`, and a known tag
+    whose payload is missing required fields (such as `{"type":"terminal"}`
+    without `terminalId`) is rejected, or read by the union's untagged
+    variant where it has one, in schema order. An open variant needs the
+    fields its schema arm requires (a v2 `AuthMethod` with a custom `type`
+    still needs `methodId` and `name`). Generated structs also match wire
+    keys exactly instead of case-insensitively.
+  - **Breaking:** closed enums reject values they do not name, as Rust does:
+    in v1 `StopReason`, `ToolCallStatus`, `PlanEntryPriority`,
+    `PlanEntryStatus`, `Role`, `PermissionOptionKind`, and `StringFormat`,
+    and in both versions `ElicitationSchemaType` (whose only value is
+    `object`). A malformed optional enum reads as not reported, and an
+    unknown list item is skipped, where the hints say so. v1 `ToolKind` reads
+    an unknown value as `other` (`#[serde(other)]`). Enums the schema leaves
+    open, which are all the other draft-v2 enums, still keep any string.
+  - **Breaking:** unions of primitives (such as `SessionConfigSelectOptions`
+    and `ElicitationContentValue`) accept only values of their arms instead
+    of any JSON value; the Go types are unchanged.
+  - Like serde, structs also decode from a JSON array, positionally in Rust
+    field declaration order, and tagged unions from `[tag, fields...]`.
+    Only what Rust flattens decodes from objects alone: unions with shared
+    fields, `IdleStateUpdate`, `McpError`, and v1 `ToolCallUpdate` and
+    `WaitForTerminalExitResponse` (v2 `ToolCallUpdate` reads from an array).
+    Enums also read the map form `{"variant": null}`. Where serde decodes
+    from buffered content (a default-on-error field, a skip-invalid list
+    item, a union payload, a union with untagged variants), a non-negative
+    integer tag selects the tagged variant at that index.
+  - Decode errors use serde's wording and no longer name Go types.
+  - v1 `McpServer` (and the other v1 unions with a tag-less variant) read any
+    object their tagged variants do not, whatever its `type`, as the
+    reference SDK's untagged fallback does.
+  - v2 `ToolCallLocation.line` decodes as Rust's `NonZeroU32`: `0` reads as
+    no line.
+  - The flattened v2 `IdleStateUpdate.stopReason` reads a stop reason whose
+    fields do not decode as not reported, and a custom stop reason no longer
+    keeps `usage` among its fields.
+  - Encoding is unchanged. Decoding splits objects without copying member
+    values, so a `session/update` decodes faster and with fewer allocations
+    than before. Each package's generated `TestDeserializeHints` compares
+    every hinted and required field, enum, union, and array form with
+    outcomes captured from the Rust crate (`testdata/hints_rust.json`,
+    recaptured by `scripts/capture_hint_fixtures.py`).
 - `mcp.MessageRouter` and the v2 `MessageRouter` follow the reference
   binding for low-level `Register` services too:
   - an active request is cancelled when the connection's input reaches EOF,
@@ -422,9 +484,9 @@ series, minor releases may contain breaking API changes.
   kept distinct from omission.
 - A `Nullable` field is sent only when `Set` is true: callers set
   `Set: true` to send a value as well as to send `null`.
-- Remaining limit: the new v1 `Nullable` fields decode strictly, while Rust
-  reads a malformed value as omitted (`DefaultOnError`) and skips invalid
-  summary blocks (`VecSkipError`); tracked in #82.
+- The new v1 `Nullable` fields read a malformed value as omitted
+  (`DefaultOnError`) and skip invalid summary blocks (`VecSkipError`), as Rust
+  does (#82).
 - Breaking: `unstable.Projection` hands notices and compactions to
   `acp.SessionProjection` (#57). `CompactionState` is now an alias of
   `acp.CompactionState`, which uses the stable schema types and adds `Meta`;

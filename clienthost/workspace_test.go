@@ -53,7 +53,7 @@ func TestWorkspaceCannotEscapeAndCancelledPermission(t *testing.T) {
 		}
 	}
 	h.Close()
-	params := json.RawMessage(`{"sessionId":"s","options":[{"kind":"allow_once","optionId":"yes"}]}`)
+	params := json.RawMessage(`{"sessionId":"s","toolCall":{"toolCallId":"t"},"options":[{"kind":"allow_once","optionId":"yes","name":"Yes"}]}`)
 	result, err := h.Request(context.Background(), "session/request_permission", params)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestPermissionsRequireExplicitOptIn(t *testing.T) {
 	}
 	defer h.Close()
 	h.SetSession("s")
-	raw := json.RawMessage(`{"sessionId":"s","options":[{"kind":"allow_once","optionId":"yes"}]}`)
+	raw := json.RawMessage(`{"sessionId":"s","toolCall":{"toolCallId":"t"},"options":[{"kind":"allow_once","optionId":"yes","name":"Yes"}]}`)
 	for _, allow := range []bool{false, true} {
 		h.SetAutoApprove(allow)
 		result, err := h.Request(context.Background(), "session/request_permission", raw)

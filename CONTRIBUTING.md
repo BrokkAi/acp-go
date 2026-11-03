@@ -88,7 +88,8 @@ go run ./cmd/acpgen -update <v2-version> -unstable \
   -out schema/v2/unstable -package unstable
 go run ./cmd/acpgen -schema schema/v2/unstable/schema.json \
   -meta schema/v2/unstable/meta.json -out schema/v2/unstable -package unstable
-go test -race ./schema/
+python3 scripts/capture_hint_fixtures.py  # Rust decode outcomes; needs cargo
+go test -race ./schema/...
 ```
 
 Commit each version's regenerated files together with its updated pin, and

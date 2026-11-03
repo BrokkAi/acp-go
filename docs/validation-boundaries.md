@@ -64,5 +64,6 @@ naming the value, so tests can assert the message.
 
 - Raw `_meta` payloads round-trip unchanged: `schema.TestMetaPayloadsRoundTrip`,
   and the draft-v2 `Nullable[Meta]` case in `tracecontext`.
-- Unknown enum values decode and re-encode: `schema.TestOpenWorldEnumsDecodeUnknownValues`.
+- Unknown values of open enums decode and re-encode, and closed v1 enums
+  decode as Rust's do: `schema.TestOpenWorldEnumsDecodeUnknownValues`.
 - Unknown union tags are rejected: `schema/golden_test.go`.

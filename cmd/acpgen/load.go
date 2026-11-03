@@ -1,6 +1,9 @@
 package main
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
 
 // rawSchema mirrors the subset of JSON Schema draft 2020-12 that the ACP
 // schema release actually uses. Anything outside this subset fails loudly in
@@ -24,9 +27,75 @@ type rawSchema struct {
 	Method       string                `json:"x-method"`
 	Discriminate json.RawMessage       `json:"discriminator"` // OpenAPI-style; informational only
 	Not          *rawSchema            `json:"not"`
-	// DefaultOnError marks a field whose malformed value Rust reads as
-	// absent (x-deserialize-default-on-error).
+	Default      json.RawMessage       `json:"default"`
+	Minimum      *float64              `json:"minimum"`
+	// The x-deserialize-* hints record the serde_with adapters the Rust
+	// schema crate decodes a field with.
+	//
+	// DefaultOnError (serde_with::DefaultOnError): a value that does not
+	// decode, null included, reads as the field's default.
 	DefaultOnError bool `json:"x-deserialize-default-on-error"`
+	// SkipInvalidItems (serde_with::VecSkipError): list items that do not
+	// decode are dropped and the others kept.
+	SkipInvalidItems bool `json:"x-deserialize-skip-invalid-items"`
+	// DefaultOnNull (serde_with::DefaultOnNull): null reads as the field's
+	// default.
+	DefaultOnNull bool `json:"x-deserialize-default-on-null"`
+	// PropOrder lists the property names in schema order, which is the
+	// Rust struct's field declaration order (schemars keeps it). serde reads
+	// a struct from a JSON array positionally in that order.
+	PropOrder []string `json:"-"`
+}
+
+func (s *rawSchema) UnmarshalJSON(data []byte) error {
+	type plain rawSchema
+	if err := json.Unmarshal(data, (*plain)(s)); err != nil {
+		return err
+	}
+	if s.Properties == nil {
+		return nil
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		return err
+	}
+	keys, err := objectKeys(top["properties"])
+	s.PropOrder = keys
+	return err
+}
+
+// objectKeys returns the keys of a JSON object in document order.
+func objectKeys(data []byte) ([]string, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	var keys []string
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, tok.(string))
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return nil, err
+		}
+	}
+	return keys, nil
+}
+
+// propOrder returns the property names in schema order, falling back to
+// sorted order for schemas built in code.
+func (s *rawSchema) propOrder() []string {
+	if len(s.PropOrder) == len(s.Properties) {
+		return s.PropOrder
+	}
+	var keys []string
+	for _, p := range sortedProps(s.Properties) {
+		keys = append(keys, p.key)
+	}
+	return keys
 }
 
 type rootSchema struct {

@@ -62,7 +62,7 @@ func TestUpdateProjectionKeysEntitiesByKindAndID(t *testing.T) {
 		`{"sessionUpdate":"compaction_summary_chunk","compactionId":"m","content":{"type":"text","text":"sum"}}`,
 		// Later updates patch in place without moving their entity.
 		`{"sessionUpdate":"agent_thought","messageId":"m","_meta":{"k":1}}`,
-		`{"sessionUpdate":"plan_update","planId":"p","plan":{"type":"items","items":[]}}`,
+		`{"sessionUpdate":"plan_update","planId":"p","plan":{"type":"items","planId":"p","entries":[]}}`,
 		`{"sessionUpdate":"future_update","messageId":"m"}`,
 	)
 	want := []EntityRef{
