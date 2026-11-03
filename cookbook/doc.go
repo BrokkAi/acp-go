@@ -89,6 +89,15 @@
 // foreground state and v2 updates carry no prompt ID, so an idle update is not
 // attributable to one particular prompt.
 //
+// Cancelling the active work cancels only the foreground work: tool calls and
+// terminals in the latest background list keep running. The Agent cancels the
+// cancelled work's permission requests with $/cancel_request, which
+// CancellablePermissions answers with the cancelled outcome, and requests for
+// background work stay open. Stop one of them with
+// [github.com/BrokkAi/acp-go/v2.SessionHandle.CancelToolCall] or
+// CancelTerminal, which require the entity to advertise capabilities.cancel;
+// its final status or exitStatus confirms the cancellation.
+//
 // [github.com/BrokkAi/acp-go/v2/runner.Runner] is the process-owning version,
 // and cancels permission requests unless Config.Permissions installs a host.
 //
