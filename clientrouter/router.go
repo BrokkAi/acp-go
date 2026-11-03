@@ -12,15 +12,13 @@ import (
 	"io"
 	"net"
 	"sync"
-	"unicode/utf8"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/negotiate"
 	schema1 "github.com/BrokkAi/acp-go/schema"
 	schema2 "github.com/BrokkAi/acp-go/schema/v2"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
 )
-
-const maxFrame = 8 << 20
 
 // V1Client runs an application client over an initialized-capable ACP v1
 // transport. Serve must send initialize before any other ACP request.
@@ -316,30 +314,14 @@ func readInitialize(reader *bufio.Reader) (wireFrame, error) {
 	return frame, nil
 }
 
+// readLine reads one frame of any size, as the reference SDK's line reader
+// does, without surrounding whitespace.
 func readLine(reader *bufio.Reader) ([]byte, error) {
-	var line []byte
-	for {
-		chunk, err := reader.ReadSlice('\n')
-		line = append(line, chunk...)
-		if errors.Is(err, bufio.ErrBufferFull) {
-			if len(line) > maxFrame {
-				return nil, errors.New("ACP frame exceeds 8 MiB")
-			}
-			continue
-		}
-		if err != nil && !errors.Is(err, io.EOF) {
-			return nil, err
-		}
-		if len(line) == 0 {
-			return nil, io.EOF
-		}
-		break
+	line, err := negotiate.ReadLine(reader)
+	if err != nil {
+		return nil, err
 	}
-	line = bytes.TrimSpace(line)
-	if !utf8.Valid(line) {
-		return nil, errors.New("ACP frame is not valid UTF-8")
-	}
-	return line, nil
+	return bytes.TrimSpace(line), nil
 }
 
 func validateV1Initialize(frame wireFrame) error {

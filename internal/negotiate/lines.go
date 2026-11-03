@@ -2,44 +2,25 @@ package negotiate
 
 import (
 	"bufio"
-	"bytes"
 	"errors"
 	"io"
 	"unicode/utf8"
+
+	"github.com/BrokkAi/acp-go/internal/lines"
 )
 
-// MaxFrame is the largest frame a protocol router reads, matching the
-// connection's frame limit.
-const MaxFrame = 8 << 20
-
-// ReadLine reads one frame for a protocol router and strips one line
-// terminator, "\n" or "\r\n", as the reference SDK's line reader does, so a
-// parse error reports the same line. It returns io.EOF when the input ends
-// before another frame. The line may be followed by more input already
-// buffered in reader; hand both to the selected implementation with
-// NewPrefixedReader. A frame larger than MaxFrame or not valid UTF-8, which
-// the reference SDK cannot read as a line, is an error.
+// ReadLine reads one frame for a protocol router as the reference SDK's line
+// reader does: a frame of any size is read, and one "\n" or "\r\n" terminator
+// is stripped, so a parse error reports the same line. It returns io.EOF when
+// the input ends before another frame. The line may be followed by more input
+// already buffered in reader; hand both to the selected implementation with
+// NewPrefixedReader. A frame that is not valid UTF-8, which the reference SDK
+// cannot read as a line, is an error.
 func ReadLine(reader *bufio.Reader) ([]byte, error) {
-	var line []byte
-	for {
-		chunk, err := reader.ReadSlice('\n')
-		line = append(line, chunk...)
-		if errors.Is(err, bufio.ErrBufferFull) {
-			if len(line) > MaxFrame {
-				return nil, errors.New("ACP frame exceeds 8 MiB")
-			}
-			continue
-		}
-		if err != nil && !errors.Is(err, io.EOF) {
-			return nil, err
-		}
-		if len(line) == 0 {
-			return nil, io.EOF
-		}
-		break
+	line, err := lines.ReadLine(reader)
+	if err != nil {
+		return nil, err
 	}
-	line = bytes.TrimSuffix(line, []byte("\n"))
-	line = bytes.TrimSuffix(line, []byte("\r"))
 	if !utf8.Valid(line) {
 		return nil, errors.New("ACP frame is not valid UTF-8")
 	}

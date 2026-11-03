@@ -107,6 +107,10 @@ Rust crate's `ServerOptions::default()`:
 | `DisableHealth` | `false` | Turns off `GET /health`. |
 | `MaxBodyBytes` | 16 MiB | The `POST` body limit. |
 
+On the HTTP `POST` path, the body limit is the only frame-size limit, as in
+the Rust crate: the agent's frames, its event-stream events, and the
+`initialize` response the client reads may be of any size.
+
 `acphttp.NewServer` validates the options; a `Server` built as a literal with
 invalid options answers every request with `500`.
 
@@ -280,11 +284,6 @@ These are out of scope for this package today:
 - **No WebSocket upgrade.** The Rust server can also upgrade `GET` to
   WebSocket; that is #64, and it will reuse `ServerOptions.CORS` for its
   `Origin` check.
-- **acp-go agents read 8 MiB lines.** The `POST` limit is 16 MiB as in the
-  Rust crate, but the acp-go connection runtime behind `agent.Runtime` ends the
-  connection on a frame over 8 MiB, and the client's connection does the same
-  for an event or `initialize` response over 8 MiB. The Rust SDK has no line
-  limit; removing it is #90.
 - **Connections live until the agent exits.** There is no idle timeout, so a
   server must call `Server.Close`, or the client `DELETE`, to release them.
 
