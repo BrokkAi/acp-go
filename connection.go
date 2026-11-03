@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/BrokkAi/acp-go/internal/jsonline"
+	"github.com/BrokkAi/acp-go/internal/lines"
 	"github.com/BrokkAi/acp-go/internal/rpcctl"
 	"github.com/BrokkAi/acp-go/schema"
 )
@@ -342,8 +343,8 @@ func (c *Connection) drain(ctx context.Context) error {
 func (c *Connection) Done() <-chan struct{} { return c.ctx.Done() }
 
 // InputClosed is closed once the connection stops reading frames: the peer
-// closed its output (EOF), a frame was not valid UTF-8 or exceeded 8 MiB, or
-// the connection was closed.
+// closed its output (EOF), reading failed, a frame was not valid UTF-8, or the
+// connection was closed. Frames have no size limit, as in the reference SDK.
 // On a clean EOF, Done stays open until in-flight handlers return and every
 // frame queued by then, theirs included, is written, as the reference SDK
 // keeps its output working after incoming EOF. Once the handlers have
@@ -728,10 +729,15 @@ func (c *Connection) readLoop() {
 	defer c.loops.Done()
 	inputDone := sync.OnceFunc(func() { close(c.inputDone) })
 	defer inputDone()
-	s := bufio.NewScanner(c.in)
-	s.Buffer(make([]byte, 4096), 8<<20)
-	for s.Scan() {
-		line := s.Bytes()
+	// As in the reference SDK, a frame of any size is read; the line buffer
+	// grows only for a frame that needs it.
+	frames := lines.NewReader(bufio.NewReaderSize(c.in, 64<<10))
+	var err error
+	for {
+		var line []byte
+		if line, err = frames.Next(); err != nil {
+			break
+		}
 		if !utf8.Valid(line) {
 			// The reference SDK reads lines as UTF-8 text, so this is a
 			// transport failure there, not a malformed message.
@@ -806,7 +812,9 @@ func (c *Connection) readLoop() {
 			c.startRequest(p)
 		}
 	}
-	err := s.Err()
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
 	inputDone()
 	if err == nil {
 		// A clean EOF during Shutdown leaves the drain to finish; a read

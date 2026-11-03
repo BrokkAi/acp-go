@@ -2,7 +2,6 @@ package acphttp
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -15,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/BrokkAi/acp-go/internal/jsonline"
+	"github.com/BrokkAi/acp-go/internal/lines"
 )
 
 // keepAliveInterval is how long an idle event stream waits before it sends an
@@ -531,11 +531,8 @@ func (c *serverConn) route() {
 	reader := bufio.NewReader(c.out)
 	initializing := true
 	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			if trimmed, ok := bytes.CutSuffix(line, []byte("\n")); ok {
-				line = bytes.TrimSuffix(trimmed, []byte("\r"))
-			}
+		line, err := lines.ReadLine(reader)
+		if err == nil {
 			if !utf8.Valid(line) {
 				// The Rust line reader fails on a line that is not UTF-8,
 				// which ends the agent's transport as if it had returned:
@@ -555,7 +552,7 @@ func (c *serverConn) route() {
 			case isMessage:
 				c.outbound.route(parsed, parsed.encode())
 			default:
-				c.outbound.routeMalformed(append([]byte(nil), line...))
+				c.outbound.routeMalformed(line)
 			}
 		}
 		if err != nil {

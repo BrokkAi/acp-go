@@ -63,8 +63,8 @@ transports and additional workspace roots against initialization capabilities.
 
 `Connect` owns and closes both streams. Notifications run in wire order before
 responses and must return promptly without calling back into the connection.
-Requests run concurrently and must honor cancellation. Frames are bounded at
-8 MiB; incoming requests are not limited, as in the reference Rust SDK.
+Requests run concurrently and must honor cancellation. Frames have no size
+limit, and incoming requests are not limited, as in the reference Rust SDK.
 `Close` cancels and joins handlers.
 Generic `Call` and `Notify` permit extensions. `CancelRequest`
 sends a typed `$/cancel_request` for a single outstanding request, preserving

@@ -457,6 +457,22 @@ series, minor releases may contain breaking API changes.
 
 ### Changed
 
+- Frames have no size limit, as in Rust `agent-client-protocol` 5.0.0, whose
+  line readers have none (#90). `acp.Connection` (and so `v2.Connection` and
+  the agent runtimes), `agentrouter`, `clientrouter`, `proxyrouter`, the HTTP
+  client's event-stream reader, and `traceviewer` read a line of any length;
+  before, a line over 8 MiB failed the connection, also while `Shutdown`
+  drained it, where the line is now read and discarded. An HTTP `POST` body
+  between 8 and 16 MiB now reaches the agent instead of being accepted with
+  `202` and then ending the connection, and an event or `initialize` response
+  over 8 MiB reaches the client. On the HTTP `POST` path, the server's 16 MiB
+  body limit, which Rust has, is the only limit left. The connection's and the
+  routers' line buffers grow only for a line that needs it and are not kept
+  after a large one; the HTTP client's event-stream reader drops a large
+  event's data buffer, but its line buffer stays as large as the longest line
+  it has read. As in Rust, only a
+  `"\n"` ends a line, and a `"\r"` is removed only before it, so a last line
+  without `"\n"` keeps a trailing `"\r"`.
 - **Breaking (wire):** the proxy-chain methods use the names in the ACP
   proxy-chains RFD and the pinned unstable schema, like Rust
   `agent-client-protocol` 5.0.0 (#69): `_proxy/initialize` is now

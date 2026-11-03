@@ -439,8 +439,10 @@ func (t *httpTransport) openStream(connectionID, sessionID string, scoped bool) 
 func (t *httpTransport) readStream(connectionID, scope string, response *http.Response) {
 	defer response.Body.Close()
 	scanner := bufio.NewScanner(&utf8Stream{r: response.Body})
-	scanner.Buffer(make([]byte, 0, 64*1024), math.MaxInt32)
-	scanner.Split(scanSSELine)
+	// Like the Rust parser, an event line has no size limit. The scanner
+	// keeps a buffer as large as the longest line it has read.
+	scanner.Buffer(make([]byte, 0, 64*1024), math.MaxInt)
+	scanner.Split(scanSSELine())
 	var data bytes.Buffer
 	first := true
 	for scanner.Scan() {
@@ -456,7 +458,12 @@ func (t *httpTransport) readStream(connectionID, scope string, response *http.Re
 					return
 				}
 			}
-			data.Reset()
+			if data.Cap() > 1<<20 {
+				// Do not keep a large event's buffer for the next one.
+				data = bytes.Buffer{}
+			} else {
+				data.Reset()
+			}
 		case line[0] == ':':
 		default:
 			name, value, _ := bytes.Cut(line, []byte(":"))
@@ -553,21 +560,31 @@ func incompleteUTF8(data []byte) bool {
 // scanSSELine splits an event stream into lines ending at "\r\n", "\r", or
 // "\n". A "\r" at the end of the data read so far waits for the next byte, and
 // what is left when the stream ends, a "\r" included, is dropped, as the
-// streaming parser does.
-func scanSSELine(data []byte, atEOF bool) (int, []byte, error) {
-	i := bytes.IndexAny(data, "\r\n")
-	switch {
-	case i < 0:
-		return 0, nil, nil
-	case data[i] == '\n':
-		return i + 1, data[:i], nil
-	case i+1 < len(data):
-		if data[i+1] == '\n' {
-			return i + 2, data[:i], nil
+// streaming parser does. A line may be of any length; the split remembers how
+// far it has searched, so a long line is scanned once, not on every read.
+func scanSSELine() bufio.SplitFunc {
+	searched := 0
+	return func(data []byte, atEOF bool) (int, []byte, error) {
+		i := bytes.IndexAny(data[searched:], "\r\n")
+		if i < 0 {
+			searched = len(data)
+			return 0, nil, nil
 		}
-		return i + 1, data[:i], nil
-	default:
-		return 0, nil, nil
+		i += searched
+		switch {
+		case data[i] == '\n':
+			searched = 0
+			return i + 1, data[:i], nil
+		case i+1 < len(data):
+			searched = 0
+			if data[i+1] == '\n' {
+				return i + 2, data[:i], nil
+			}
+			return i + 1, data[:i], nil
+		default:
+			searched = i
+			return 0, nil, nil
+		}
 	}
 }
 

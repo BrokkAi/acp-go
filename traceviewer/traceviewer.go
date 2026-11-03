@@ -17,6 +17,7 @@ package traceviewer
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -30,6 +31,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BrokkAi/acp-go/internal/lines"
 )
 
 //go:embed viewer.html
@@ -211,21 +214,27 @@ func describe(record json.RawMessage) (string, string) {
 }
 
 func readEvents(reader io.Reader) ([]json.RawMessage, error) {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 4096), 8<<20)
+	// Like the reference viewer, a trace line may be of any size.
+	frames := lines.NewReader(bufio.NewReader(reader))
 	events := []json.RawMessage{}
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+	for {
+		raw, err := frames.Next()
+		if errors.Is(err, io.EOF) {
+			return events, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		line := bytes.TrimSpace(raw)
+		if len(line) == 0 {
 			continue
 		}
 		if len(events) >= maxEvents {
 			return nil, fmt.Errorf("ACP trace exceeds %d events", maxEvents)
 		}
-		if !json.Valid([]byte(line)) {
+		if !json.Valid(line) {
 			return nil, fmt.Errorf("ACP trace line %d is not valid JSON", len(events)+1)
 		}
-		events = append(events, json.RawMessage(line))
+		events = append(events, json.RawMessage(bytes.Clone(line)))
 	}
-	return events, scanner.Err()
 }
