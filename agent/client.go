@@ -14,7 +14,6 @@ type clientConnection struct {
 	connectionValue *acp.Connection
 
 	mu           sync.RWMutex
-	initialized  bool
 	capabilities *schema.ClientCapabilities
 }
 
@@ -33,21 +32,11 @@ func (c *clientConnection) connection() *acp.Connection {
 func (c *clientConnection) initialize(capabilities *schema.ClientCapabilities) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.initialized = true
 	if capabilities != nil {
 		copied := *capabilities
 		capabilities = &copied
 	}
 	c.capabilities = capabilities
-}
-
-func (c *clientConnection) ready() error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if !c.initialized {
-		return &acp.RPCError{Code: -32600, Message: "client has not initialized the agent"}
-	}
-	return nil
 }
 
 func (c *clientConnection) clientCapabilities() schema.ClientCapabilities {
@@ -110,9 +99,6 @@ func (c *clientConnection) WriteTextFile(ctx context.Context, request schema.Wri
 
 func (c *clientConnection) RequestPermission(ctx context.Context, request schema.RequestPermissionRequest) (schema.RequestPermissionResponse, error) {
 	var result schema.RequestPermissionResponse
-	if err := c.ready(); err != nil {
-		return result, err
-	}
 	return result, c.connection().Call(ctx, schema.SessionRequestPermissionMethodName, request, &result)
 }
 
@@ -196,9 +182,6 @@ func (c *clientConnection) ReleaseTerminal(ctx context.Context, request schema.R
 }
 
 func (c *clientConnection) requireHostMethod(supported bool, method string) error {
-	if err := c.ready(); err != nil {
-		return err
-	}
 	if !supported {
 		return &acp.RPCError{Code: -32601, Message: "client did not advertise " + method + " support"}
 	}

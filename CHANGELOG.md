@@ -46,6 +46,35 @@ series, minor releases may contain breaking API changes.
   in-flight handlers, so long-running handlers can stop instead of waiting on
   a peer that is gone.
 
+- Protocol version negotiation per the ACP v2 spec and the reference Rust SDK
+  5.0.0 (#62). An endpoint selects the highest version it supports at or
+  below the requested one, and answers when it supports none with `-32022`
+  (`Unsupported protocol version`) and
+  `data: {"requested": N, "supported": [...]}`. A missing, null, non-integer,
+  or out-of-range `protocolVersion` stays `-32602`, with data
+  `"initialize.protocolVersion must be a valid ACP protocol version"`. See
+  Changed for each endpoint.
+- `acp.ErrorCodeUnsupportedProtocolVersion` (`-32022`) and
+  `acp.IsUnsupportedProtocolVersion`.
+- Typed draft-v2 error data in `github.com/BrokkAi/acp-go/v2` (#66):
+  `UnsupportedProtocolVersionError` builds the `-32022` error on the generated
+  `UnsupportedProtocolVersionErrorData`, like Rust's
+  `v2::schema::Error::unsupported_protocol_version`, and the runtimes and
+  routers answer with exactly it. `SessionNotFoundError` builds the `-32002`
+  error with `SessionNotFoundErrorData`. `UnsupportedProtocolVersionData` and
+  `SessionNotFoundData` decode those variants from any error that is or wraps
+  an `*acp.RPCError` with the matching code. `SchemaError` is the explicit
+  conversion to the typed v2 `schema.Error`: it drops `Extra`, reads omitted
+  and `null` data as nil, and keeps unknown data shapes raw in
+  `ErrorData.Other`.
+- `v2.Connection.SendInitialize` returns an `InitializeOutcome`, like Rust's
+  `v2::InitializeOutcome`: `Initialized` when the agent selects v2, or
+  `LowerVersion` when it selects v1. `LowerVersion` is the new root
+  `acp.InitializationVersionMismatch`, with the requested version and the
+  agent's validated v1 response in `acp.SelectedInitializeResponse`, like
+  Rust's crate-root types. The connection stays open with its previous
+  initialization, if any (none for a first initialize; the previous one for a
+  repeat), so the caller can fall back to a v1 client or close it.
 - `acp.RPCError` gains `Extra`, which keeps the members of a JSON-RPC error
   object other than `code`, `message`, and `data`, matching the reference
   SDK's raw JSON-RPC error (#66). Errors returned by `Call` keep the peer's
@@ -560,8 +589,8 @@ series, minor releases may contain breaking API changes.
     with protocol version 2, including every `v2.Connect` connection, it gets
     `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request","data":"ACP protocol v2 request ids must be a string or an integer, not null"}}`
     without running a handler, and the draft-v2 agent runtime sets version 2.
-    Previously either closed the connection. `agentrouter` still answers a
-    null-id first frame and exits; keeping it reading is part of #62.
+    Previously either closed the connection. `agentrouter` answers a
+    v2-selecting null-id first frame the same way and keeps reading (#62).
   - A request handler panic is recovered. The reference SDK does not catch
     panics; acp-go answers as Rust answers a request whose handler dropped
     its responder without responding, which is the closest Rust wire
@@ -588,6 +617,165 @@ series, minor releases may contain breaking API changes.
     in its own goroutine.
   - Invalid UTF-8, an oversized frame, and transport failures still close the
     connection.
+- **Breaking:** version negotiation in the agent runtimes, routers, and draft
+  v2 client (#62):
+  - The draft v2 agent runtime answers a request below v2 with `-32022`
+    listing `[2]`, instead of a generic `-32600`, without calling
+    `Initialize`. It accepts a request for a newer version and selects v2:
+    the agent sees `protocolVersion: 2` and what parses under v2, and a
+    missing or malformed `info` becomes name and version `"unknown"`. A
+    request for exactly v2 must carry an `info` that parses, or it gets
+    `-32602` with Rust's deserialization data,
+    ``{"error": "missing field `info`", "json": <params>, "phase": "deserialization"}``;
+    the rest is read as leniently as the reference schema reads it, so a
+    `_meta`, `capabilities`, a capability, or an `info` title or `_meta` that
+    does not parse is ignored instead of rejected.
+  - The v1 and draft v2 agent runtimes set the negotiated version, 1 or 2, on
+    every initialize response, as Rust sets it on the serialized result,
+    including the value an `InitializeResult` hook returns. An agent or hook
+    that selected another version previously failed the request with
+    `-32603` (`agent selected unsupported ACP version N`).
+  - The v1 and draft v2 agent runtimes apply their initialization lifecycle
+    in wire order, on the connection's read loop, like Rust's incoming actor,
+    instead of in each handler's goroutine. On the draft v2 runtime, a
+    repeated `initialize` followed immediately by another request now always
+    begins first, so the other request is refused with `-32600` and the
+    repeat succeeds; previously either could win. (The v1 runtime's lifecycle
+    is unchecked, so a v1 repeat never refuses the next request.) Negotiation failures and lifecycle refusals are
+    answered in wire order without starting a handler, and a refused request
+    no longer reaches an `acp.WithRequestObserver` function.
+  - The draft v2 agent runtime accepts a repeated `initialize` sent after the
+    previous one completed and before any other request, and negotiates it
+    like the first one; the latest successful one is authoritative, including
+    its client capabilities. A repeat that fails, whether refused or failed by
+    the agent, keeps the previous initialization and the window open. The
+    first other request closes the window, after which a repeat gets the
+    existing `-32600` refusal. Other requests are refused while a repeat is in
+    progress, and a concurrent `initialize` is still refused.
+  - The v1 agent runtime keeps v1's fallback-to-latest rule: any valid
+    `protocolVersion` selects v1, instead of a `-32600` for anything but 1. A
+    request for a newer version is normalized to v1's shape: identity,
+    terminal authentication, elicitation, and `_meta` carry over when they
+    parse, and v1 file-system or terminal capabilities are never enabled.
+  - The v1 agent runtime follows Rust's unchecked v1 lifecycle: every
+    `initialize` reaches `Initialize`, including a repeat at any time and one
+    sent while another is in progress, so the in-progress and cannot-repeat
+    refusals no longer apply on v1. Other requests are still refused until the
+    first `initialize` succeeds. A successful repeat replaces the advertised
+    capabilities; a failed one keeps the previous initialization.
+  - `agentrouter` routes like Rust's agent protocol router. A request for v2
+    or newer selects v2. When v1 is configured, everything else goes to v1
+    unchanged: a request for v1 or older (including `0`, previously rejected),
+    a malformed `initialize`, any other request, and a notification. A v2-only
+    router answers a request below v2 with `-32022`. A newer request with a
+    missing `info` is normalized instead of rejected, and a v2 request
+    normalized for a v1-only router keeps what parses under v1. Rejections use
+    Rust's error shapes and the router keeps reading instead of closing.
+    Responses before initialization, and notifications with no v1 to receive
+    them, are ignored. A JSON object that is not a JSON-RPC message gets
+    `-32600` with `id: null`, and a v2-selecting request with a `null` id gets
+    `-32600`.
+  - `proxyrouter` negotiates `_proxy/initialize` the same way, like Rust's
+    proxy protocol router, instead of requiring the exact configured version:
+    it selects the highest configured version at or below the requested one,
+    replays an exact-version frame unchanged, normalizes any other, answers an
+    unservable request with `-32022`, and keeps reading after rejections.
+  - The agent and proxy routers reject an exact v2 request whose `info` does
+    not parse with serde's reason, such as
+    ``"invalid initialize params: missing field `info`"``, and read the rest
+    leniently, like Rust's routers. The routers share one frame reader.
+  - `v2.Connection.InitializeWithInfo` returns an
+    `*acp.InitializationVersionMismatch` error when the agent selects v1, and
+    no longer closes the connection when the agent selects a lower or
+    unsupported version.
+  - The draft v2 client may repeat `initialize` after one completed and
+    before it sends any other request, like Rust's initiator; the latest
+    successful one is recorded. A failed repeat keeps the previous
+    initialization instead of clearing it. A repeat after another request, or
+    one sent while another is in progress, fails locally with an
+    `*acp.RPCError` `-32600` carrying Rust's message, replacing "ACP
+    connections may only be initialized once".
+  - A `v2.Connect` connection follows Rust's v2 initiator lifecycle. Until an
+    `initialize` completes, and while a repeat is in progress, its own
+    requests and notifications, including `CancelRequest` outside an
+    `initialize`, fail with `-32600` and
+    ``"ACP initialization must complete before `<method>` can be used"``
+    before anything is written; the agent's requests get the same error
+    without running the handler; the agent's notifications are dropped; and an
+    `initialize` from the agent gets `-32600`
+    after it is negotiated like an agent would (`-32022` below v2, `-32602`
+    for invalid params). A successful response either way while no
+    initialization is complete becomes the same `-32600`. Previously all of
+    these were sent or handled. Every `initialize` the connection sends,
+    including one through `Call` on the embedded `acp.Connection`, is
+    negotiated and recorded: its `protocolVersion` is set to 2 in place and its
+    params validated before it is written, and its response is checked when it
+    arrives, even after the caller gave up (a cancelled initialize stays in
+    progress until its response completes or fails it). A v1 selection outside
+    `SendInitialize` fails with Rust's `-32600` "required ACP protocol version
+    2 but peer negotiated 1". `SendInitialize` writes the request in Rust's
+    member order, `protocolVersion` first. Any other request closes the repeat
+    window.
+  - The draft v2 client checks an initialize response as Rust does: the
+    `protocolVersion` member must be named exactly that; a v2 response whose
+    `info` does not parse fails with json_cast's `-32700` (`Parse error`) and
+    data `{"error": <serde reason>, "json": <response>, "phase": "deserialization"}`;
+    and everything else is read leniently (member names exactly, unparsable
+    capabilities, auth methods, or `_meta` ignored), for `Initialization`, the
+    v1 response, and `InitializeExtended`'s target. An empty `info` name or
+    version is accepted, as Rust accepts it.
+  - The draft v2 agent runtime drops notifications that arrive before an
+    `initialize` completes or during a repeat (except `$/cancel_request` during
+    an `initialize`), as Rust's responder does, and its own requests and
+    notifications fail with the same `-32600` until then; an `initialize` it
+    sends is validated and then fails with the wrong-direction `-32600`. A
+    successful response to the agent's request that arrives during a repeat,
+    and one the agent sends then, becomes the same `-32600`. The typed client
+    helpers' "client has not initialized the agent" error is replaced by
+    Rust's initialization-required error.
+  - The v1 and draft v2 agent runtimes complete an initialization when its
+    response is queued, as Rust's outgoing_response_to does, so nothing the
+    agent sends can precede the response on the wire.
+  - The v1 agent's `RequestPermission` is no longer refused before
+    initialization, as Rust's unchecked v1 agent does not gate its own
+    requests; the capability-gated file-system, terminal, and elicitation
+    helpers report the missing capability (`-32601`) instead of "client has
+    not initialized the agent".
+  - Initialize negotiation reads params and responses with the generated
+    decoders (#82), as serde reads them: a case variant such as `"Info"` or
+    `"Capabilities"` is an unknown member and is ignored, a member that does
+    not parse is ignored at every level the schema marks default-on-error
+    (for example `capabilities.auth.terminal: "bad"` keeps the rest of
+    `auth`), and no Go error text reaches the wire.
+  - `v2/mcp.NewMessageClient` takes a `v2/mcp.Caller` (any value with
+    `acp.Connection`'s `Call` method) instead of `*acpv2.Connection`, so the
+    agent, the consumer side of MCP-over-ACP, can pass its `*acp.Connection`
+    or its `v2/agent.Client`. Existing callers compile unchanged.
+  - The v1 client (`acp.Connection.InitializeWithInfo`) follows Rust's
+    unchecked v1 client: it may initialize again at any time, including while
+    another `initialize` is in progress, instead of refusing a second
+    successful one. A response with a missing or invalid `protocolVersion`
+    fails with `-32602`, one selecting 2 with `-32600` ("required ACP protocol
+    version 1 but peer negotiated 2; use a matching implementation for the
+    negotiated protocol version"), and any other version with `-32600`
+    ("unsupported ACP protocol version N; this endpoint only supports ACP
+    protocol version 1"), as `*acp.RPCError`s; previously an unsupported
+    version closed the connection with a plain error. `acp.Connection` itself
+    is version-neutral, as one connection type serves v1 clients, v1 agents,
+    and other peers, so a raw `Call` with `initialize` is sent as given and
+    its response is not checked; `InitializeWithInfo` is the v1 client role
+    that Rust's v1 client mode applies to every outgoing `initialize`.
+  - The v1 agent runtime applies Rust's outgoing initialize handling: an
+    `initialize` it sends carries `protocolVersion` 1, set in place. The v1
+    agent runtime and both draft v2 endpoints refuse a request that already
+    wraps an initialize in `proxy/successor` with Rust's `-32600` ("initialize
+    requests must be sent as a logical `initialize` message; ...").
+  - The draft v2 client fails an initialize response with a missing or invalid
+    `protocolVersion` with `*acp.RPCError` `-32602`
+    (`"initialize.protocolVersion must be a valid ACP protocol version"`),
+    and one selecting a version other than 1 or 2 with `-32600`
+    (`"unsupported ACP protocol version N; this endpoint only supports ACP protocol version 2"`),
+    as Rust does, instead of plain errors.
 - The v1 and draft v2 agent runtimes now send their initialization lifecycle
   refusals in the reference Rust SDK's wire shape: code `-32600`, message
   `Invalid request`, and the explanation as a JSON string in `data`. A request
@@ -736,6 +924,9 @@ series, minor releases may contain breaking API changes.
 
 ### Fixed
 
+- Two concurrent `initialize` requests on the v1 agent runtime could leave
+  the client capabilities of one and the agent capabilities of the other;
+  both are now recorded together (#62).
 - The v1 and draft v2 agent runtimes could call `Agent.Initialize` twice when
   two `initialize` requests were in flight at once, because the
   already-initialized check released its lock before the handler ran. The
@@ -743,13 +934,19 @@ series, minor releases may contain breaking API changes.
   concurrent `initialize` with `-32600` and the data "ACP initialization is
   already in progress on this connection" without reaching the handler. A
   failed initialization clears the in-progress state, so a later `initialize`
-  can retry. Failures include a handler error, an unsupported selected
-  protocol version, and a rejected v2 advertisement. The draft v2 runtime
+  can retry. Failures include a handler error and a rejected v2
+  advertisement. The draft v2 runtime
   matches the reference Rust SDK. In the Rust SDK, the v1 agent mode does no
   lifecycle tracking (`InitializationRole::Unchecked`) and passes a repeated
-  `initialize` to the handler. The acp-go v1 runtime still refuses every
-  repeat, so it refuses the concurrent one too, until #62 aligns v1 repeat
-  handling (#74).
+  `initialize` to the handler; #62 aligned the v1 runtime with it (see
+  Changed), so the in-progress refusal now applies to the draft v2 runtime
+  only (#74).
+- `v2.Connection.InitializeWithInfo` left the connection marked as
+  initializing after the agent answered `initialize` with an error, so a retry
+  failed with "ACP initialization is already in progress". A failed initialize
+  now leaves the connection uninitialized for a retry (#62).
+- The draft v2 agent runtime kept the client capabilities of an earlier
+  initialization when a later one advertised none (#62).
 - The `RPCError` documentation claimed it preserved extension data while it
   dropped unknown members. It now documents the omitted, `null`, and value
   forms of `data`, which were already preserved and are now tested.

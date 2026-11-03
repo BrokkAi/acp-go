@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	"github.com/BrokkAi/acp-go/internal/negotiate"
 )
 
 // InitializeExtended is InitializeWithInfo that also decodes the agent's
@@ -21,16 +23,8 @@ func (c *Connection) InitializeExtended(ctx context.Context, capabilities Capabi
 	return c.initialize(ctx, capabilities, info, extended)
 }
 
-// decodeInitialize decodes one initialize result into the stable response
-// and, when extended is non-nil, into extended as well.
-func decodeInitialize(encoded json.RawMessage, result *Initialization, extended any) error {
-	if err := json.Unmarshal(encoded, result); err != nil {
-		return err
-	}
-	if extended != nil {
-		if err := json.Unmarshal(encoded, extended); err != nil {
-			return fmt.Errorf("decode extended initialize response: %w", err)
-		}
-	}
-	return nil
+// decodeExtended decodes a validated v2 initialize result into extended as
+// leniently as the reference schema reads the stable response.
+func decodeExtended(encoded json.RawMessage, extended any) error {
+	return negotiate.DecodeResponse(encoded, extended)
 }

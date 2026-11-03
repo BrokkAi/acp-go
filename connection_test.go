@@ -289,31 +289,55 @@ func TestClientIdentity(t *testing.T) {
 	}
 }
 
-func TestClientAllowsOnlyOneSuccessfulInitialize(t *testing.T) {
+// TestClientFollowsTheUncheckedV1Lifecycle matches the reference SDK's v1
+// client: initialize may be repeated, and the selected version is checked
+// with the reference SDK's errors, leaving the connection open.
+func TestClientFollowsTheUncheckedV1Lifecycle(t *testing.T) {
+	results := []string{
+		`{"protocolVersion":1}`,
+		`{"protocolVersion":1}`,
+		`{}`,
+		`{"protocolVersion":"1"}`,
+		`{"protocolVersion":2}`,
+		`{"protocolVersion":7}`,
+		`{"protocolVersion":1}`,
+	}
 	c, peer := pipeClient(t, nil, nil)
-	responses := make(chan struct{}, 1)
 	go func() {
-		defer close(responses)
-		for range 1 {
+		decoder := json.NewDecoder(peer)
+		encoder := json.NewEncoder(peer)
+		for _, result := range results {
 			var request packet
-			if err := json.NewDecoder(peer).Decode(&request); err != nil {
+			if err := decoder.Decode(&request); err != nil {
 				return
 			}
-			_ = json.NewEncoder(peer).Encode(packet{
-				Version: "2.0",
-				ID:      request.ID,
-				Result:  json.RawMessage(`{"protocolVersion":1}`),
-			})
+			_ = encoder.Encode(packet{Version: "2.0", ID: request.ID, Result: json.RawMessage(result)})
 		}
 	}()
-	if _, err := c.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "once", Version: "1"}); err != nil {
-		t.Fatal(err)
+	invalidVersion := `"initialize.protocolVersion must be a valid ACP protocol version"`
+	for i, want := range []struct {
+		code int
+		data string
+	}{
+		{}, {},
+		{-32602, invalidVersion},
+		{-32602, invalidVersion},
+		{-32600, `"required ACP protocol version 1 but peer negotiated 2; use a matching implementation for the negotiated protocol version"`},
+		{-32600, `"unsupported ACP protocol version 7; this endpoint only supports ACP protocol version 1"`},
+		{},
+	} {
+		_, err := c.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "client", Version: "1"})
+		if want.code == 0 {
+			if err != nil {
+				t.Fatalf("initialize %d: %v", i, err)
+			}
+			continue
+		}
+		var rpcErr *RPCError
+		if !errors.As(err, &rpcErr) || rpcErr.Code != want.code || string(rpcErr.Data) != want.data {
+			t.Fatalf("initialize %d: error = %v, want %d %s", i, err, want.code, want.data)
+		}
 	}
-	if _, err := c.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "twice", Version: "1"}); err == nil ||
-		!strings.Contains(err.Error(), "may only be initialized once") {
-		t.Fatalf("duplicate initialize error = %v", err)
-	}
-	<-responses
 }
 
 // The peer can consume a response before its Write call returns.

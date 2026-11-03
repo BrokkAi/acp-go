@@ -10,7 +10,6 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	schema "github.com/BrokkAi/acp-go/schema/v2/unstable"
-	acpv2 "github.com/BrokkAi/acp-go/v2"
 )
 
 // MessageOutcome is the inner MCP outcome of one mcp/message request. Exactly
@@ -61,15 +60,25 @@ func paramsValue(params schema.Nullable[map[string]any]) map[string]any {
 // binding. It sends mcp/message requests and routes request-scoped
 // notifications to the call that owns them.
 type MessageClient struct {
-	connection *acpv2.Connection
+	connection Caller
 	mu         sync.Mutex
 	active     map[messageKey]MessageNotificationHandler
+}
+
+// Caller sends one ACP request, as acp.Connection.Call does. The consumer
+// side of MCP-over-ACP is the agent, so pass the agent's connection to its
+// client: the *acp.Connection an agent serves on, or the
+// github.com/BrokkAi/acp-go/v2/agent.Client a draft-v2 agent runtime hands its
+// handlers. A github.com/BrokkAi/acp-go/v2.Connection is a client connection
+// and follows the client's initialization lifecycle.
+type Caller interface {
+	Call(ctx context.Context, method string, params, result any) error
 }
 
 // NewMessageClient returns the consumer side for one connection. Install
 // Notifications into that connection so provider notifications reach active
 // calls.
-func NewMessageClient(connection *acpv2.Connection) *MessageClient {
+func NewMessageClient(connection Caller) *MessageClient {
 	return &MessageClient{connection: connection, active: map[messageKey]MessageNotificationHandler{}}
 }
 

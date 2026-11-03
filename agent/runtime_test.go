@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -177,16 +176,31 @@ func newSessionCall(ctx context.Context, connection *acp.Connection) error {
 	}, nil)
 }
 
-func TestRuntimeRequiresAndAllowsInitializeOnlyOnce(t *testing.T) {
-	connection := startRuntime(t, testAgent{}, nil, nil)
+func TestRuntimeRequiresInitializeAndAcceptsRepeats(t *testing.T) {
+	implementation := &recordingAgent{}
+	connection := startRuntime(t, implementation, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	requireInvalidRequest(t, newSessionCall(ctx, connection), sessionNewBeforeInit)
 	initializeClient(t, connection, acp.Capabilities{})
-	err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{
-		ProtocolVersion: acp.Version,
-	}, nil)
-	requireInvalidRequest(t, err, initializeNotRepeatable)
+	if err := newSessionCall(ctx, connection); err != nil {
+		t.Fatalf("session/new after initialize: %v", err)
+	}
+	// Like the reference SDK's unchecked v1 lifecycle, a repeat reaches the
+	// agent at any time, even after other requests.
+	var response schema.InitializeResponse
+	if err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: acp.Version}, &response); err != nil {
+		t.Fatalf("repeated initialize: %v", err)
+	}
+	if response.ProtocolVersion != acp.Version {
+		t.Fatalf("repeated initialize selected %d", response.ProtocolVersion)
+	}
+	if calls := implementation.calls.Load(); calls != 2 {
+		t.Fatalf("Initialize calls = %d, want 2", calls)
+	}
+	if err := newSessionCall(ctx, connection); err != nil {
+		t.Fatalf("session/new after repeated initialize: %v", err)
+	}
 }
 
 type initializeOutcome struct {
@@ -237,32 +251,31 @@ func startBlockedInitialize(ctx context.Context, t *testing.T, connection *acp.C
 	return result
 }
 
-// requireInitializeInProgress checks the refusals a connection gives while an
-// initialize is still running: another initialize, and any other request.
-func requireInitializeInProgress(ctx context.Context, t *testing.T, connection *acp.Connection) {
-	t.Helper()
-	err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: acp.Version}, nil)
-	requireInvalidRequest(t, err, initializeInProgress)
-	requireInvalidRequest(t, newSessionCall(ctx, connection), sessionNewBeforeInit)
-}
-
-func TestRuntimeRejectsConcurrentInitialize(t *testing.T) {
+func TestRuntimePassesConcurrentInitializeToAgent(t *testing.T) {
 	implementation := newGatedInitializeAgent()
 	connection := startRuntime(t, implementation, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	first := startBlockedInitialize(ctx, t, connection, implementation)
-	requireInitializeInProgress(ctx, t, connection)
+	// Other requests wait for the first successful initialize.
+	requireInvalidRequest(t, newSessionCall(ctx, connection), sessionNewBeforeInit)
+	// The reference SDK's v1 agent does not track an in-progress
+	// initialization, so a concurrent one reaches the agent too.
+	second := startBlockedInitialize(ctx, t, connection, implementation)
 	implementation.release <- initializeSucceeds
-	if err := <-first; err != nil {
-		t.Fatalf("first initialize: %v", err)
+	implementation.release <- initializeSucceeds
+	for _, result := range []<-chan error{first, second} {
+		if err := <-result; err != nil {
+			t.Fatalf("initialize: %v", err)
+		}
 	}
-	if calls := implementation.calls.Load(); calls != 1 {
-		t.Fatalf("Initialize calls = %d, want 1", calls)
+	if calls := implementation.calls.Load(); calls != 2 {
+		t.Fatalf("Initialize calls = %d, want 2", calls)
 	}
-	err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: acp.Version}, nil)
-	requireInvalidRequest(t, err, initializeNotRepeatable)
+	if err := newSessionCall(ctx, connection); err != nil {
+		t.Fatalf("session/new after initialize: %v", err)
+	}
 }
 
 func TestRuntimeAllowsInitializeRetryAfterFailure(t *testing.T) {
@@ -271,7 +284,6 @@ func TestRuntimeAllowsInitializeRetryAfterFailure(t *testing.T) {
 		failure initializeOutcome
 	}{
 		{name: "handler error", failure: initializeOutcome{err: errors.New("initialize failed")}},
-		{name: "unsupported selected version", failure: initializeOutcome{response: schema.InitializeResponse{ProtocolVersion: 2}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			implementation := newGatedInitializeAgent()
@@ -280,7 +292,7 @@ func TestRuntimeAllowsInitializeRetryAfterFailure(t *testing.T) {
 			defer cancel()
 
 			first := startBlockedInitialize(ctx, t, connection, implementation)
-			requireInitializeInProgress(ctx, t, connection)
+			requireInvalidRequest(t, newSessionCall(ctx, connection), sessionNewBeforeInit)
 			implementation.release <- test.failure
 			if err := <-first; err == nil {
 				t.Fatal("failed initialize returned no error")
@@ -298,18 +310,141 @@ func TestRuntimeAllowsInitializeRetryAfterFailure(t *testing.T) {
 			if err := newSessionCall(ctx, connection); err != nil {
 				t.Fatalf("session/new after retried initialize: %v", err)
 			}
+
+			// A failed repeat keeps the previous initialization.
+			repeat := startBlockedInitialize(ctx, t, connection, implementation)
+			implementation.release <- test.failure
+			if err := <-repeat; err == nil {
+				t.Fatal("failed repeat returned no error")
+			}
+			if err := newSessionCall(ctx, connection); err != nil {
+				t.Fatalf("session/new after failed repeat: %v", err)
+			}
 		})
 	}
 }
 
-func TestRuntimeRejectsMismatchedInitializeVersion(t *testing.T) {
-	connection := startRuntime(t, testAgent{}, nil, nil)
-	err := connection.Call(context.Background(), schema.InitializeMethodName, schema.InitializeRequest{
-		ProtocolVersion: 2,
-	}, nil)
+// recordingAgent records each initialize request it receives.
+type recordingAgent struct {
+	testAgent
+	calls    atomic.Int32
+	requests chan schema.InitializeRequest
+}
+
+func (a *recordingAgent) Initialize(_ context.Context, _ Client, request schema.InitializeRequest) (schema.InitializeResponse, error) {
+	a.calls.Add(1)
+	if a.requests != nil {
+		a.requests <- request
+	}
+	return schema.InitializeResponse{ProtocolVersion: acp.Version}, nil
+}
+
+func TestRuntimeNegotiatesV1ForEveryValidVersion(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		params string
+		check  func(*testing.T, schema.InitializeRequest)
+	}{
+		{
+			name:   "older version",
+			params: `{"protocolVersion":0,"clientInfo":{"name":"old","version":"0"}}`,
+			check: func(t *testing.T, request schema.InitializeRequest) {
+				if request.ClientInfo == nil || request.ClientInfo.Name != "old" {
+					t.Fatalf("clientInfo = %+v", request.ClientInfo)
+				}
+			},
+		},
+		{
+			name: "v2 request",
+			params: `{"protocolVersion":2,"info":{"name":"v2-client","version":"2.0","title":7},` +
+				`"capabilities":{"auth":{"terminal":{}},"elicitation":{"form":{}},"fs":{"readTextFile":true},"terminal":true},` +
+				`"_meta":{"trace":"x"}}`,
+			check: func(t *testing.T, request schema.InitializeRequest) {
+				if request.ClientInfo == nil || request.ClientInfo.Name != "v2-client" || request.ClientInfo.Title != nil {
+					t.Fatalf("clientInfo = %+v", request.ClientInfo)
+				}
+				capabilities := request.ClientCapabilities
+				if capabilities == nil || capabilities.Auth == nil || capabilities.Auth.Terminal == nil || !*capabilities.Auth.Terminal ||
+					capabilities.Elicitation == nil || capabilities.Elicitation.Form == nil ||
+					capabilities.Session == nil || capabilities.Session.ConfigOptions == nil ||
+					capabilities.Session.ConfigOptions.Boolean == nil {
+					t.Fatalf("capabilities = %+v", capabilities)
+				}
+				// Unknown newer fields never enable v1 file-system or
+				// terminal-execution capabilities.
+				if capabilities.Fs != nil || capabilities.Terminal != nil {
+					t.Fatalf("v1-only capabilities enabled: %+v", capabilities)
+				}
+				if request.Meta["trace"] != "x" {
+					t.Fatalf("_meta = %v", request.Meta)
+				}
+			},
+		},
+		{
+			name:   "newer version with malformed fields",
+			params: `{"protocolVersion":7,"info":"malformed","capabilities":{"elicitation":"malformed"},"_meta":7}`,
+			check: func(t *testing.T, request schema.InitializeRequest) {
+				if request.ClientInfo != nil || request.Meta != nil {
+					t.Fatalf("request = %+v", request)
+				}
+				capabilities := request.ClientCapabilities
+				if capabilities == nil || capabilities.Elicitation != nil || capabilities.Session == nil {
+					t.Fatalf("capabilities = %+v", capabilities)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			implementation := &recordingAgent{requests: make(chan schema.InitializeRequest, 1)}
+			connection := startRuntime(t, implementation, nil, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			var response schema.InitializeResponse
+			if err := connection.Call(ctx, schema.InitializeMethodName, json.RawMessage(test.params), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.ProtocolVersion != acp.Version {
+				t.Fatalf("selected protocol = %d", response.ProtocolVersion)
+			}
+			request := <-implementation.requests
+			if request.ProtocolVersion != acp.Version {
+				t.Fatalf("agent saw protocol %d", request.ProtocolVersion)
+			}
+			test.check(t, request)
+		})
+	}
+}
+
+func TestRuntimeRejectsMalformedProtocolVersion(t *testing.T) {
+	for _, params := range []string{
+		`{}`, `{"protocolVersion":null}`, `{"protocolVersion":"1"}`, `{"protocolVersion":1.0}`,
+		`{"protocolVersion":-1}`, `{"protocolVersion":65536}`, `[]`,
+	} {
+		t.Run(params, func(t *testing.T) {
+			implementation := &recordingAgent{}
+			connection := startRuntime(t, implementation, nil, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := connection.Call(ctx, schema.InitializeMethodName, json.RawMessage(params), nil)
+			requireInvalidParams(t, err, "initialize.protocolVersion must be a valid ACP protocol version")
+			if calls := implementation.calls.Load(); calls != 0 {
+				t.Fatalf("Initialize calls = %d, want 0", calls)
+			}
+		})
+	}
+}
+
+// requireInvalidParams checks that err is the reference SDK's -32602 error
+// with detail as a JSON string in data.
+func requireInvalidParams(t *testing.T, err error, detail string) {
+	t.Helper()
 	var rpcErr *acp.RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32600 || !strings.Contains(rpcErr.Message, "only supports ACP protocol version 1") {
-		t.Fatalf("mismatched initialize error = %v", err)
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32602 || rpcErr.Message != "Invalid params" {
+		t.Fatalf("error = %v, want -32602 Invalid params", err)
+	}
+	var data string
+	if err := json.Unmarshal(rpcErr.Data, &data); err != nil || data != detail {
+		t.Fatalf("error data = %s, want %q", rpcErr.Data, detail)
 	}
 }
 

@@ -15,7 +15,7 @@ import (
 	"github.com/BrokkAi/acp-go/agent"
 	"github.com/BrokkAi/acp-go/proxyrouter"
 	"github.com/BrokkAi/acp-go/schema"
-	schemav2 "github.com/BrokkAi/acp-go/schema/v2"
+	acpv2 "github.com/BrokkAi/acp-go/v2"
 )
 
 const (
@@ -324,8 +324,9 @@ func (a *toolsRecordingAgent) NewSession(ctx context.Context, client agent.Clien
 
 func Example_proxyComponent() {
 	ctx := context.Background()
-	// The router hands a connection to the proxy only for an exact v1
-	// _proxy/initialize; it never downgrades or converts versions.
+	// The router hands a connection to the v1 proxy for any
+	// _proxy/initialize, normalizing a newer request to v1; it never converts
+	// traffic after selection.
 	router := proxyrouter.New().WithV1(toolsProxy{
 		server: acp.NewStdioMCPServer("docs", "/usr/local/bin/docs-mcp", []string{"--stdio"}, nil),
 	})
@@ -376,18 +377,25 @@ func Example_proxyComponent() {
 	fmt.Printf("client received %q, then %s\n", conductor.text.String(), turn.StopReason)
 	conductor.mu.Unlock()
 
-	// A v2 conductor gets an explicit rejection from this v1-only router.
-	v2Pipe := acptest.NewPair()
-	go router.Serve(ctx, v2Pipe.B, v2Pipe.B)
-	v2Conductor := v2Pipe.A.Connect(nil, nil)
-	defer v2Conductor.Close()
-	err = v2Conductor.Call(ctx, proxyInitializeMethod, schemav2.InitializeRequest{
-		ProtocolVersion: 2,
-		Info:            schemav2.Implementation{Name: "cookbook-conductor", Version: "0.1.0"},
+	// A v2-only router answers a v1 conductor with -32022 listing the versions
+	// it supports, and keeps the connection open for another attempt. (A
+	// router with a v1 proxy selects v1 for any request, normalizing a newer
+	// one to v1's shape.)
+	v2Only := proxyrouter.New().WithV2(acptest.ProxyFunc(func(context.Context, io.ReadCloser, io.WriteCloser) error {
+		return nil
+	}))
+	v1Pipe := acptest.NewPair()
+	go v2Only.Serve(ctx, v1Pipe.B, v1Pipe.B)
+	v1Conductor := v1Pipe.A.Connect(nil, nil)
+	defer v1Conductor.Close()
+	err = v1Conductor.Call(ctx, proxyInitializeMethod, schema.InitializeRequest{
+		ProtocolVersion: acp.Version,
+		ClientInfo:      &acp.ClientInfo{Name: "cookbook-conductor", Version: "0.1.0"},
 	}, nil)
-	fmt.Println("v2 conductor:", err)
+	unsupported, _ := acpv2.UnsupportedProtocolVersionData(err)
+	fmt.Println("v1 conductor:", err, unsupported.Supported)
 	// Output:
 	// agent received MCP server: docs
 	// client received "Hello through the proxy.", then end_turn
-	// v2 conductor: ACP error -32600: ACP protocol version 2 is not configured
+	// v1 conductor: ACP error -32022: Unsupported protocol version [2]
 }

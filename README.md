@@ -131,13 +131,17 @@ with code `-32601`, like an unadvertised host method;
 `acp.RequireSessionUpdateCapability` exposes the check. The
 runtime enforces protocol initialization, dispatches generated request/response
 types, maps `session/cancel` to prompt-context cancellation, and rejects optional
-methods omitted from the agent's advertised capabilities. It runs at most one
-`Initialize` at a time: an `initialize` that arrives while another is in
-progress gets `-32600` without reaching the agent, and a failed initialization
-leaves the connection uninitialized so the client can retry. Lifecycle
-refusals use the reference SDK's shape: `-32600`, message `Invalid request`,
-and the explanation as a JSON string in `data`. The draft v2 runtime behaves
-the same way.
+methods omitted from the agent's advertised capabilities. Version negotiation
+follows the reference Rust SDK 5.0.0: the v1 runtime keeps v1's
+fallback-to-latest rule, so any valid `protocolVersion` selects v1, and a
+request for a newer version reaches the agent normalized to v1's shape. A
+missing or malformed `protocolVersion` gets `-32602`. Like Rust's v1 agent,
+the runtime does not track the initialization lifecycle beyond refusing other
+requests until the first `initialize` succeeds: every `initialize`, including
+a repeat or a concurrent one, reaches the agent, and the latest successful one
+sets the advertised capabilities. Lifecycle refusals use the reference SDK's
+shape: `-32600`, message `Invalid request`, and the explanation as a JSON
+string in `data`.
 
 The same package gives agents typed `agent.Client` methods for filesystem,
 permission, terminal, and elicitation callbacks. Client applications can compose
@@ -317,19 +321,82 @@ protocol versions and error codes use the schema's exact integer widths; in
 particular, `ProtocolVersion` is a `uint16`, so strings and values above 65535
 fail to decode.
 
+The draft v2 agent runtime follows the v2 initialization rules. A request
+below v2 gets `-32022` (`Unsupported protocol version`) with
+`data: {"requested": 1, "supported": [2]}`, without reaching the agent. A
+request for a newer version selects v2 with what parses under v2, and a
+missing `info` becomes name and version `"unknown"`. A request for exactly v2
+must carry an `info` that parses, or it gets `-32602`; like the reference
+schema, a `_meta`, a capability, or an `info` title that does not parse is
+ignored. The response always carries `protocolVersion: 2`, whatever the agent
+or `InitializeResult` set. The client may repeat `initialize` after it
+completes and before any other request; each repeat is negotiated like the
+first, a failed one keeps the previous initialization, and after another
+request a repeat gets `-32600`. At most one `initialize` runs at a time: one
+that arrives while another is in progress gets `-32600` without reaching the
+agent, and any other request that arrives before an `initialize` has
+completed, including during a repeat, is refused with `-32600`
+(`ACP initialization must complete before ... can be used`). These rules
+follow the order requests arrive on the wire, as in the reference SDK, not the
+order their handlers run.
+`acpv2.UnsupportedProtocolVersionError` builds the same `-32022` error for a
+custom endpoint, and `acpv2.UnsupportedProtocolVersionData`,
+`acpv2.SessionNotFoundData`, and `acpv2.SchemaError` decode the typed v2 error
+data.
+
+On the client side, `acpv2.Connection.SendInitialize` reports a v1 selection as
+`InitializeOutcome.LowerVersion`, an `*acp.InitializationVersionMismatch` with
+the agent's validated v1 response, rather than an error; `InitializeWithInfo`
+returns the same value as its error. The connection stays open with its
+previous initialization, if any, so the application decides whether to fall
+back to a v1 client. As in the reference SDK, the client may repeat
+`initialize` until it sends another request; a failed repeat keeps the
+previous initialization. A response with a missing or invalid
+`protocolVersion` fails with `-32602`, and one selecting a version other than
+1 or 2 with `-32600`, both with the reference SDK's data. Like Rust's v2
+initiator, a `v2.Connect` connection carries no other traffic until an
+`initialize` completes, or while a repeat is in progress: its own requests and
+notifications fail with `-32600` (``ACP initialization must complete before
+`<method>` can be used``) before anything is written (a `$/cancel_request`
+during an `initialize` is allowed), the agent's requests get the same error
+without running the handler, the agent's notifications are dropped, and an
+`initialize` from the agent is refused after it is negotiated. Successful
+responses in either direction during that time become the same error. Every
+`initialize` the connection sends, even through the embedded
+`acp.Connection.Call`, is negotiated and recorded, and one whose caller gave up
+completes when its response arrives. The draft-v2 agent runtime applies the
+responder side of the same rules: notifications before initialization are
+dropped, the agent's own requests and notifications fail until it completes,
+and an initialization completes as its response is queued, so nothing the
+agent sends can precede that response.
+
+The v1 client follows Rust's unchecked v1 client: `InitializeWithInfo` may be
+repeated at any time, and a response's `protocolVersion` is checked with Rust's
+errors, `-32602` when it is missing or invalid and `-32600` when it is 2
+(``required ACP protocol version 1 but peer negotiated 2; ...``) or any other
+version, without closing the connection. `acp.Connection` is version-neutral,
+so a raw `Call` with `initialize` is sent as given; use `InitializeWithInfo`
+for the v1 client role.
+
 `github.com/BrokkAi/acp-go/agentrouter` serves one endpoint with explicit v1 and
-v2 implementations. It selects the highest configured implementation compatible
-with the first initialize request, canonicalizes only that initialize frame, and
-does not convert subsequent traffic.
+v2 implementations, like Rust's agent protocol router. A request for v2 or a
+newer version selects v2; when v1 is configured, everything else, including a
+malformed `initialize` or any other first message, goes to v1 unchanged, and a
+v2-only router answers a request below v2 with `-32022`. Only the initial
+frame is normalized for the selected version, and subsequent traffic is never
+converted. After a rejection the router keeps reading, and responses before
+initialization are ignored.
 
 `github.com/BrokkAi/acp-go/clientrouter` owns the transport needed for explicit
 client-side selection. It starts the highest configured implementation and
 follows the Rust fallback rules: reuse an existing v1-negotiated agent
 connection only for losslessly identical initialization, otherwise reconnect
 with fresh factories, and never turn a v2 rejection into a silent v1 retry.
-`github.com/BrokkAi/acp-go/proxyrouter` requires an exact configured
-`_proxy/initialize` version and hands the complete initial frame to the selected
-implementation without downgrading or cross-version conversion.
+`github.com/BrokkAi/acp-go/proxyrouter` negotiates `_proxy/initialize` the same
+way as the agent router: the highest configured version at or below the
+requested one, the exact-version frame handed over unchanged, any other
+normalized, `-32022` when no configured version fits, and no cross-version
+conversion after selection.
 
 Draft-v2 sessions can use `acpv2.NewSessionHandle` for Rust-shaped prompt,
 configuration, cancellation, and close commands. `acpv2.SessionTracker` owns

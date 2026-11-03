@@ -34,9 +34,9 @@ type:
 	_, err := connection.InitializeExtended(ctx, capabilities, info, &initialization)
 	providers, err := acpunstable.ListProviders(ctx, connection, initialization)
 
-Do not send initialize through Connection.Call instead: that skips the version
-and agent-info checks and leaves the connection uninitialized for the stable
-facades.
+An initialize sent through Connection.Call is negotiated and recorded too, as
+in the reference SDK, but returns only the raw result; InitializeExtended also
+decodes it.
 
 On the agent side, Handle dispatches these methods to typed handlers and
 Advertise announces their capabilities in the initialize response. Install

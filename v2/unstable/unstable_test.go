@@ -325,7 +325,10 @@ func TestForkSessionRoundTripThroughTheRuntime(t *testing.T) {
 func TestForkSessionRejectsBlankForkedSessionID(t *testing.T) {
 	// A raw agent, not Handle, so the blank ID reaches the client.
 	pair := acptest.NewPairWithDeadline(time.Now().Add(5 * time.Second))
-	server := acp.Connect(pair.B, pair.B, func(context.Context, string, json.RawMessage) (any, error) {
+	server := acp.Connect(pair.B, pair.B, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+		if method == "initialize" {
+			return json.RawMessage(`{"protocolVersion":2,"info":{"name":"agent","version":"1"},"capabilities":{"session":{}}}`), nil
+		}
 		return schema.ForkSessionResponse{SessionID: " "}, nil
 	}, nil)
 	connection := acpv2.Connect(pair.A, pair.A, nil, nil)
@@ -334,6 +337,9 @@ func TestForkSessionRejectsBlankForkedSessionID(t *testing.T) {
 		_ = server.Close()
 		pair.Close()
 	})
+	if _, err := connection.Initialize(context.Background(), acpv2.Capabilities{}); err != nil {
+		t.Fatal(err)
+	}
 	_, err := acpunstable.ForkSession(context.Background(), connection, forkInitialization(), schema.ForkSessionRequest{SessionID: "source", Cwd: "/repo"})
 	if err == nil || !strings.Contains(err.Error(), "forked session ID is required") {
 		t.Fatalf("blank forked session ID error = %v", err)

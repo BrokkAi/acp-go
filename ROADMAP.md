@@ -46,21 +46,44 @@ only remaining work.
 - Lossless JSON-RPC error objects, mirroring Rust's raw JSON-RPC error:
   `acp.RPCError` keeps omitted, `null`, and value `data` apart and preserves
   unknown members on both `Call` results and handler-returned errors (#66).
-  Typed decoding of the draft-v2 `ErrorData` variants follows the v2 schema
-  bump (#56).
+  The `v2` package builds and decodes the typed draft-v2 `ErrorData`
+  variants (`-32022` and session-not-found `-32002`) and converts to the typed
+  v2 `schema.Error` explicitly.
 - Stable programmatic tool-call names in v1 and draft v2, surfaced by the
   reference client host with `tool_call_update` patch semantics.
 - Required draft-v2 prompt acceptance identity: the client returns the
   response's `messageId` and the agent runtime refuses to answer
   `session/prompt` without one.
-- Successful initialization is allowed once on v1 and v2 client connections.
-- v1 and v2 agent endpoints reject mismatched initialize versions before user
-  handlers run.
-- Explicit agent protocol router:
-  - route version 1 to v1,
-  - route version 2 or a newer compatible version to v2,
-  - canonicalize a newer initialize request to selected v2 parameters,
-  - canonicalize v2 initialize parameters when only v1 is configured,
+- Client initialization lifecycles like Rust's: the v1 client is unchecked
+  and may initialize again at any time; the draft-v2 client may repeat
+  initialization until it sends another request, and carries no other traffic
+  in either direction until initialization completes.
+- Protocol version negotiation per the v2 spec and Rust 5.0 (#62):
+  - each endpoint selects the highest version it supports at or below the
+    requested one; a missing or malformed `protocolVersion` is `-32602`,
+  - the agent runtimes set the negotiated version on every initialize
+    response, whatever the agent or `InitializeResult` returned,
+  - the agent runtimes apply their lifecycle in wire order, on the read loop,
+    like Rust's incoming actor,
+  - the v1 agent runtime keeps v1's fallback-to-latest rule, normalizes a
+    newer request to v1's shape, and, like Rust's unchecked v1 agent, passes
+    every `initialize`, repeated or concurrent, to the agent,
+  - the draft-v2 agent runtime answers a request below v2 with `-32022` and
+    `{"requested", "supported": [2]}` before the agent runs, accepts a newer
+    request with what parses under v2 (`info` defaults to `"unknown"`), reads
+    an exact v2 request as leniently as the reference schema, and negotiates
+    a repeat sent before any other request like the first one,
+  - the draft-v2 client reports a v1 selection as a typed lower-version
+    outcome, keeps the previous initialization after a failed repeat, and
+    fails locally with Rust's `-32602`/`-32600` errors for an invalid or
+    unsupported selected version.
+- Explicit agent protocol router, like Rust's:
+  - route a request for version 2 or newer to v2, normalizing a newer one,
+  - when v1 is configured, route everything else to v1 unchanged, including
+    a malformed initialize and any other first message,
+  - normalize a v2 initialize request to v1 when only v1 is configured,
+  - answer `-32022` when no configured version fits, keep reading after
+    rejections, and ignore responses before initialization,
   - never convert traffic after initialization.
 - JSON-RPC batches rejected on v1 and v2, matching the ACP v2 transports
   "No batches" rule and Rust 5.0 (#68). This is decided: there is no batch
@@ -83,8 +106,9 @@ only remaining work.
     and a malformed response-shaped value is dropped,
   - a null request id runs on v1 and version-neutral connections and gets
     `-32600` with `id: null` on v2 (`acp.WithProtocolVersion`, set by
-    `v2.Connect` and the draft-v2 agent runtime); `agentrouter` keeping on
-    reading after a null-id first frame is part of #62,
+    `v2.Connect` and the draft-v2 agent runtime); `agentrouter` answers a
+    v2-selecting first frame with a null id the same way and keeps reading
+    (#62),
   - handler panics are recovered and answered with `-32603`, notification
     handler errors are reported rather than fatal, and incoming requests are
     not limited.
@@ -113,11 +137,12 @@ only remaining work.
     losslessly representable as the configured v1 initialization,
   - reconnect with fresh factories when parameters differ,
   - surface v2 rejection without silently retrying as v1.
-- Exact-match proxy protocol router:
-  - select only the configured exact v1/v2 `_proxy/initialize` version,
-  - validate the selected initialize schema,
-  - preserve the complete initial frame without canonicalization,
-  - reject future versions rather than downgrading.
+- Negotiating proxy protocol router (Rust #464):
+  - negotiate `_proxy/initialize` exactly as the agent router negotiates
+    `initialize`,
+  - validate an exact-version request and hand its complete initial frame
+    over unchanged,
+  - normalize a request for another version for the selected implementation.
 - Unstable schema surfaces from the exact Rust schema crate 1.15.1 unstable
   artifacts:
   - v1 and v2 generated bindings in explicit import-only packages,
@@ -206,11 +231,11 @@ standard-library-only and behind its own package or command.
 ### 3. Schema crate 1.15.1 follow-ups
 
 The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
-them is tracked separately: subagents (#60), `-32022` version negotiation
-(#62), the proxy-chain method rename (#69), v2 background work and
-`tool_call/cancel`/`terminal/cancel` (#70), and unstable auth status (#72).
-Unstable session archive/status/title (#71) and client-provided system prompts
-(#58) are delivered.
+them is tracked separately: subagents (#60), the proxy-chain method rename
+(#69), v2 background work and `tool_call/cancel`/`terminal/cancel` (#70), and
+unstable auth status (#72). Unstable session archive/status/title (#71),
+client-provided system prompts (#58), and `-32022` version negotiation (#62)
+are delivered.
 
 ## Guardrails
 
