@@ -227,9 +227,10 @@ func (t *wsTransport) Write(p []byte) (int, error) {
 		payload = parsed.encode()
 	}
 	if err := t.ws.writeMessage(opText, payload); err != nil {
-		err = errors.New("ws send: " + err.Error())
-		t.fail(err)
-		return 0, err
+		// A send that fails because the reader failed the transport while
+		// the frame was going out reports the reader's failure, as the Rust
+		// driver ends with whichever of its reader and writer finished first.
+		return 0, t.fail(errors.New("ws send: " + err.Error()))
 	}
 	return len(p), nil
 }
@@ -275,8 +276,8 @@ func (t *wsTransport) deliver(payload []byte) error {
 }
 
 // fail ends the transport with err, the first failure winning, and closes
-// the socket, as the Rust client drops it.
-func (t *wsTransport) fail(err error) {
+// the socket, as the Rust client drops it. It returns the winning failure.
+func (t *wsTransport) fail(err error) error {
 	t.mu.Lock()
 	closed := t.closed
 	if t.failure == nil {
@@ -288,6 +289,7 @@ func (t *wsTransport) fail(err error) {
 	if !closed {
 		_ = t.feed.CloseWithError(err)
 	}
+	return err
 }
 
 // Close sends a close frame without a payload, as the Rust client does when
