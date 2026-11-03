@@ -234,6 +234,22 @@ func (r Runner) Execute(ctx context.Context, prompt string) (result Result, runE
 	promptAccepted := false
 	defer func() {
 		crashed = release()
+		if (runErr == nil || isWorkError(runErr)) && crashed == nil && !isClosed(connection.Done()) {
+			// As the reference SDK does on a successful run, write what is
+			// still queued for the agent before its stdin closes; a failed
+			// drain fails the run, as it fails connect_with there. A
+			// connection that already stopped is skipped: one the agent
+			// ended with a clean EOF wrote its queued frames before
+			// stopping, and one the supervisor closed after the agent
+			// exited has no reader left.
+			if err := connection.Shutdown(ctx); err != nil {
+				err = fmt.Errorf("shut down ACP v2 connection: %w", err)
+				if runErr != nil {
+					err = errors.Join(runErr, err)
+				}
+				runErr = err
+			}
+		}
 		record := map[string]any{"event": "session_end", "phase": phase, "elapsed": time.Since(started).String()}
 		if runErr != nil {
 			record["error"] = runErr.Error()
@@ -356,4 +372,14 @@ func (cancelPermissions) RequestPermission(context.Context, schema.RequestPermis
 func isWorkError(err error) bool {
 	_, ok := err.(*acpv2.WorkError)
 	return ok
+}
+
+// isClosed reports whether done is closed.
+func isClosed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
 }
