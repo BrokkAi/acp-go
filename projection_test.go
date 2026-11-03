@@ -61,12 +61,12 @@ func TestSessionProjectionCompactionPatchesAndChunks(t *testing.T) {
 		meta    schema.Meta
 	}{
 		// Omitted patch fields keep the stored value; chunks append.
-		{`{"sessionUpdate":"compaction_update","compactionId":"c","status":"in_progress","error":"retrying","_meta":{"a":1}}`, "in_progress", "A", "retrying", schema.Meta{"a": float64(1)}},
-		{`{"sessionUpdate":"compaction_summary_chunk","compactionId":"c","content":` + text("B") + `,"_meta":{"chunk":true}}`, "in_progress", "AB", "retrying", schema.Meta{"a": float64(1)}},
+		{`{"sessionUpdate":"compaction_update","compactionId":"c","status":"in_progress","error":"retrying","_meta":{"z":1,"a":1.0}}`, "in_progress", "A", "retrying", schema.Meta{{Key: "z", Value: int64(1)}, {Key: "a", Value: 1.0}}},
+		{`{"sessionUpdate":"compaction_summary_chunk","compactionId":"c","content":` + text("B") + `,"_meta":{"chunk":true}}`, "in_progress", "AB", "retrying", schema.Meta{{Key: "z", Value: int64(1)}, {Key: "a", Value: 1.0}}},
 		// A concrete summary replaces everything streamed so far, and a
 		// _meta object replaces the stored metadata whole.
-		{`{"sessionUpdate":"compaction_update","compactionId":"c","status":"in_progress","summary":[` + text("S") + `],"_meta":{"b":2}}`, "in_progress", "S", "retrying", schema.Meta{"b": float64(2)}},
-		{`{"sessionUpdate":"compaction_summary_chunk","compactionId":"c","content":` + text("T") + `}`, "in_progress", "ST", "retrying", schema.Meta{"b": float64(2)}},
+		{`{"sessionUpdate":"compaction_update","compactionId":"c","status":"in_progress","summary":[` + text("S") + `],"_meta":{"b":2}}`, "in_progress", "S", "retrying", schema.Meta{{Key: "b", Value: int64(2)}}},
+		{`{"sessionUpdate":"compaction_summary_chunk","compactionId":"c","content":` + text("T") + `}`, "in_progress", "ST", "retrying", schema.Meta{{Key: "b", Value: int64(2)}}},
 		// null clears, including partial output before failure.
 		{`{"sessionUpdate":"compaction_update","compactionId":"c","status":"failed","summary":null,"error":null,"_meta":null}`, "failed", "", "", nil},
 		{`{"sessionUpdate":"compaction_summary_chunk","compactionId":"c","content":` + text("U") + `}`, "failed", "U", "", nil},
@@ -219,20 +219,20 @@ func TestSessionProjectionNotificationsAdapter(t *testing.T) {
 
 func TestSessionClientCapabilitiesAdvertiseNoticesAndCompaction(t *testing.T) {
 	configOptions := ConfigOptionsClientCapabilities(true)
-	configOptions.Meta = schema.Meta{"a": 1}
+	configOptions.Meta = schema.Meta{{Key: "z", Value: 1}, {Key: "a", Value: 1}}
 	capabilities := Capabilities{Session: SessionClientCapabilities(
 		configOptions, nil, SessionNoticesClientCapabilities(), SessionCompactionClientCapabilities(),
-		&schema.ClientSessionCapabilities{Meta: schema.Meta{"b": 2}},
+		&schema.ClientSessionCapabilities{Meta: schema.Meta{{Key: "b", Value: 2}, {Key: "z", Value: 2.0}}},
 	)}
 	encoded, err := json.Marshal(capabilities)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"compaction":{},"configOptions":{"boolean":{}},"notices":{},"_meta":{"a":1,"b":2}},"auth":{"terminal":false}}`
+	want := `{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"compaction":{},"configOptions":{"boolean":{}},"notices":{},"_meta":{"z":2.0,"a":1,"b":2}},"auth":{"terminal":false}}`
 	if string(encoded) != want {
 		t.Fatalf("capabilities = %s, want %s", encoded, want)
 	}
-	if len(configOptions.Meta) != 1 {
+	if len(configOptions.Meta) != 2 {
 		t.Fatalf("a part was modified: %+v", configOptions.Meta)
 	}
 	if encoded, _ := json.Marshal(SessionNoticesClientCapabilities()); string(encoded) != `{"notices":{}}` {
@@ -337,7 +337,7 @@ func TestSessionClientCapabilitiesCopiesEveryField(t *testing.T) {
 		t.Fatalf("schema.ClientSessionCapabilities fields = %v, SessionClientCapabilities copies %v", got, want)
 	}
 	part := schema.ClientSessionCapabilities{
-		Meta:          schema.Meta{"k": "v"},
+		Meta:          schema.Meta{{Key: "k", Value: "v"}},
 		Compaction:    &schema.CompactionCapabilities{},
 		ConfigOptions: &schema.SessionConfigOptionsCapabilities{},
 		Notices:       &schema.NoticeCapabilities{},

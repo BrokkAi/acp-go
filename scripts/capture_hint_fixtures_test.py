@@ -30,13 +30,15 @@ class CaptureHintFixturesTests(unittest.TestCase):
             {"id": "A.x/null", "pkg": "v1", "type": "A", "input": '{"x": null}'},
         ]
         responses = {
-            "A.x/valid": {"id": "A.x/valid", "ok": {"x": 1}, "encoded": '{"x":1}'},
+            "A.x/valid": {"id": "A.x/valid", "encoded": '{"z":1,"x":18446744073709551615}'},
             "A.x/null": {"id": "A.x/null", "error": "invalid type: null"},
         }
         doc = capture.fixtures(header, requests, responses)
         self.assertEqual(doc["pin"], "schema-v1.0.0")
         self.assertEqual(doc["protocol"], "v1")
-        self.assertEqual(doc["cases"]["A.x/valid"], {"input": '{"x": 1}', "ok": {"x": 1}, "encoded": '{"x":1}'})
+        # The encoding stays the string the probe wrote: never re-parsed,
+        # so its member order and numbers are Rust's.
+        self.assertEqual(doc["cases"]["A.x/valid"], {"input": '{"x": 1}', "encoded": '{"z":1,"x":18446744073709551615}'})
         self.assertEqual(doc["cases"]["A.x/null"], {"input": '{"x": null}', "error": "invalid type: null"})
 
     def test_fixtures_reject_types_the_probe_lacks(self):

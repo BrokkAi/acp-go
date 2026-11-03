@@ -172,6 +172,8 @@ func valueCall(typ, dst string, nullOK, itemNullOK, skip bool, cb, itemCB string
 		return fmt.Sprintf("decodeMap(raw, %s, %t, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", dst, nullOK, elem, valueCall(elem, "dst", itemNullOK, false, false, itemCB, itemCB, false))
 	case isAnyType(typ):
 		return fmt.Sprintf("decodeChecked(raw, %s, %t, decode%sUnion)", dst, nullOK, typ)
+	case typ == "Meta":
+		return fmt.Sprintf("decodeMeta(raw, %s, %t)", dst, nullOK)
 	}
 	return fmt.Sprintf("decodeValue(raw, %s, %t, %s)", dst, nullOK, cb)
 }
@@ -1314,6 +1316,17 @@ func decodeTag(raw json.RawMessage, buffered bool, tags []string) (string, bool)
 		}
 	}
 	return "", false
+}
+
+// decodeMeta decodes a Meta as serde_json reads a Map from a Value: null
+// reads as nil where the schema admits it, and anything but an object fails
+// with serde's error.
+func decodeMeta(raw json.RawMessage, dst *Meta, nullOK bool) error {
+	if nullOK && isNull(raw) {
+		*dst = nil
+		return nil
+	}
+	return dst.UnmarshalJSON(raw)
 }
 
 // decodeValue decodes one value, failing on null unless the schema admits it.

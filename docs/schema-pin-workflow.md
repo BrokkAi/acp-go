@@ -156,6 +156,16 @@ Everything else decodes as serde does:
   neither do the decoders.
 - An optional raw JSON field that Rust holds as an `Option<Value>` reads
   `null` as `nil` (None); a patch field keeps it as `json.RawMessage("null")`.
+- A `Meta` (every `_meta`, and the other objects Rust holds as a
+  `serde_json::Map<String, Value>`: the unstable `mcp/message` `params`) is a
+  `jsonvalue.Object` and reads as serde_json reads a `Map` from a `Value`:
+  members in wire order, a repeated key at its first position with its last
+  value, an integer that fits `i64` as an `int64` and a larger one that fits
+  `u64` as a `uint64`, any other number as the `float64` serde_json's
+  inexact parse gives (`-0` and `1.0` are floats), strings decoded, arrays
+  as `[]any`, and nested objects as `jsonvalue.Object`. Anything but an
+  object fails with ``invalid type: X, expected a map``; an optional one
+  reads `null` as `nil`.
 - A tagged union routes on its tag; whatever its tagged variants do not decode
   (a missing, invalid, or unknown tag, or a payload that does not decode) goes
   to its untagged variants in schema order. The open variant takes a string
@@ -223,7 +233,10 @@ decodes through `serde_json::Value` as the SDK does, and writes the outcomes
 to `testdata/hints_rust.json`. `TestDeserializeHints` requires the Go
 decoders to accept and reject the same inputs and, for accepted ones, to
 produce the same value: it decodes the Rust re-encoding with the Go type and
-compares the two Go values field by field. A field one side leaves unset
+compares the two Go values field by field, a `Meta`'s members in order. The
+fixture keeps that re-encoding as the exact string the probe wrote, never
+parsed again, so a `_meta`'s member order and its numbers' digits are
+Rust's. A field one side leaves unset
 equals the other only when the other holds that field's default (the
 schema's, or one Rust omits when encoding, `rustOmittedDefaults`), an empty
 list equals an absent one, and a `Nullable` null equals omission except on
@@ -292,11 +305,21 @@ the struct tags no longer drive encoding.
   escapes `<`, `>`, `&`, U+2028, and U+2029 in any `MarshalJSON` output, as
   it does for every type.
 
-`Meta` and the other untyped values (`any`) are decoded and written by
-`encoding/json`, which sorts map keys and holds every number as a `float64`,
-losing the integers above 2^53; Rust keeps the member order and the integer
-and float forms of a `serde_json::Value`. Their strings and numbers are
-written in serde_json's form.
+- A `Meta` is written as serde_json writes the `Map`: members in order, a
+  key a Go-built `Meta` repeats once at its first position with its last
+  value, integers as they are, a `float64` (decoded or set in Go) as an
+  `f64`, and strings with serde_json's escapes. A `nil` `Meta` is `None`;
+  inside another value it writes `null`. The values Go code puts in a `Meta`
+  are written by `jsonvalue.Append`: any Go integer as an integer, a
+  `json.RawMessage` or `json.Number` as serde_json re-writes that wire text,
+  a `map[string]any` with its keys sorted, and any other value as
+  `encoding/json` encodes it, with its strings and numbers in serde_json's
+  form.
+
+`ApplyMetaUpdate` leaves the members in the order Rust's `apply_meta_update`
+does: a patched key keeps its place, a new key is appended, and a removed
+key's place is taken by the last stored key, since serde_json's `Map::remove`
+is `swap_remove` with `preserve_order` (`jsonvalue.Object.SwapDelete`).
 
 `acp.Connection` writes params and results it encodes from a Go value with
 `serdewire.EncodeTyped`, which only undoes `json.Marshal`'s escapes and
@@ -312,15 +335,23 @@ field set to integral, negative-zero, large, small, subnormal, and inexact
 values, every integer field set to `-0` (which serde_json reads as the f64
 `-0.0` and an integer rejects), every optional list and map set empty, every
 raw JSON field set to a value with a repeated key, floats, and escapes, every
-arm of every union-of-primitives field, a custom elicitation mode carrying
-both scopes, the other members of `McpError`, and a string with every escape
-class, and capture
+arm of every union-of-primitives field, every `Meta` field set to an object
+with unsorted and repeated keys, integers beyond 2^53 and at the `i64` and
+`u64` limits, an integer past `u64`, floats that need serde_json's
+formatting, nesting, and escapes (`metaSample`), a `Meta` itself decoding
+each of `metaSamples` (empty, ordered, repeated, integer, float, nested,
+escaped, large, and whitespace objects, and the non-objects it rejects), a
+custom elicitation mode carrying both scopes, the other members of
+`McpError`, and a string with every escape class, and capture
 `serde_json::to_string` of the Rust value alongside the decode outcome.
 `TestDeserializeHints` requires the frame writer's encoding
 (`serdewire.MarshalTyped`) and the generated `MarshalJSON` of the decoded Go
 value to be byte for byte that string, and `json.Marshal` too wherever it
-holds none of the characters `json.Marshal` escapes. They find no remaining
-differences.
+holds none of the characters `json.Marshal` escapes.
+`TestTypedFramesMatchTheRustEncoding` sends the decoded values of the v1
+types it lists, `Meta` and the session/update notification among them,
+through `acp.Connection` and requires each frame to carry that string. They
+find no remaining differences.
 
 ## Params decoding in the dispatch layers
 

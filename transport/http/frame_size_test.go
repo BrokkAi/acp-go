@@ -29,7 +29,7 @@ func (largeFrameAgent) Initialize(context.Context, agent.Client, schema.Initiali
 	return schema.InitializeResponse{
 		ProtocolVersion: acp.Version,
 		AgentInfo:       &schema.Implementation{Name: "large-frame-agent", Version: "test"},
-		Meta:            schema.Meta{"blob": largeEvent},
+		Meta:            schema.Meta{{Key: "blob", Value: largeEvent}},
 	}, nil
 }
 
@@ -75,7 +75,8 @@ func TestHTTPTransportCarriesFramesOfAnySize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
-	if blob, _ := initialization.Meta["blob"].(string); blob != largeEvent {
+	value, _ := initialization.Meta.Get("blob")
+	if blob, _ := value.(string); blob != largeEvent {
 		t.Fatalf("initialize _meta.blob is %d bytes", len(blob))
 	}
 	session, err := client.NewSession(ctx, t.TempDir())

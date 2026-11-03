@@ -15,10 +15,11 @@ func TestMetaPayloadsRoundTrip(t *testing.T) {
 	original := AuthenticateRequest{
 		MethodID: "api-key",
 		Meta: Meta{
-			"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-			"extension": map[string]any{
-				"nested": []any{"a", float64(2), true},
-			},
+			{Key: "traceparent", Value: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+			{Key: "extension", Value: Meta{
+				{Key: "nested", Value: []any{"a", int64(2), 2.5, true, uint64(18446744073709551615), nil}},
+			}},
+			{Key: "a", Value: int64(-9223372036854775808)},
 		},
 	}
 	encoded, err := json.Marshal(original)

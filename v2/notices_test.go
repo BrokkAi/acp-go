@@ -116,7 +116,7 @@ func TestNoticeAndCompactionConstructorsProduceWireShapes(t *testing.T) {
 			CompactionID: "c", Status: schema.CompactionStatusCancelled,
 			Summary: schema.Nullable[[]schema.ContentBlock]{Set: true, Value: []schema.ContentBlock{}},
 			Error:   schema.Nullable[string]{Set: true, Null: true},
-			Meta:    schema.Nullable[schema.Meta]{Set: true, Value: schema.Meta{"k": nil}},
+			Meta:    schema.Nullable[schema.Meta]{Set: true, Value: schema.Meta{{Key: "k", Value: nil}}},
 		}), `{"sessionId":"s","update":{"sessionUpdate":"compaction_update","compactionId":"c","status":"cancelled","summary":[],"error":null,"_meta":{"k":null}}}`},
 		{NewCompactionSummaryChunkUpdate("s", schema.CompactionSummaryChunk{CompactionID: "c", Content: textBlock("x")}),
 			`{"sessionId":"s","update":{"sessionUpdate":"compaction_summary_chunk","compactionId":"c","content":{"type":"text","text":"x"}}}`},

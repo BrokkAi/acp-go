@@ -38,7 +38,8 @@ func TestRouterReadsFramesOfAnySize(t *testing.T) {
 		t.Fatalf("selected protocol = %d", version)
 	}
 	request := <-requests
-	if blob, _ := request.Meta.Value["blob"].(string); blob != largeFrameData {
+	value, _ := request.Meta.Value.Get("blob")
+	if blob, _ := value.(string); blob != largeFrameData {
 		t.Fatalf("initialize _meta.blob is %d bytes", len(blob))
 	}
 

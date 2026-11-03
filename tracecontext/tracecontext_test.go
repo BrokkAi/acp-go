@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BrokkAi/acp-go/jsonvalue"
 	"github.com/BrokkAi/acp-go/schema"
 	v2schema "github.com/BrokkAi/acp-go/schema/v2"
 	"github.com/BrokkAi/acp-go/tracecontext"
@@ -25,9 +26,12 @@ func sampleContext() tracecontext.Context {
 }
 
 func TestIntoMetaAndFromMetaRoundTrip(t *testing.T) {
-	meta := tracecontext.IntoMeta(map[string]any{"unrelated": 1}, sampleContext())
-	if meta["unrelated"] != 1 {
+	meta := tracecontext.IntoMeta(jsonvalue.Object{{Key: "unrelated", Value: 1}}, sampleContext())
+	if value, _ := meta.Get("unrelated"); value != 1 {
 		t.Fatalf("unrelated key lost: %#v", meta)
+	}
+	if encoded, _ := meta.MarshalJSON(); string(encoded) != `{"unrelated":1,"traceparent":"`+sampleTraceparent+`","tracestate":"`+sampleTracestate+`","baggage":"`+sampleBaggage+`"}` {
+		t.Fatalf("keys are not appended in order: %s", encoded)
 	}
 	got, ok := tracecontext.FromMeta(meta)
 	if !ok {
@@ -40,30 +44,30 @@ func TestIntoMetaAndFromMetaRoundTrip(t *testing.T) {
 
 func TestIntoMetaAllocatesAndSkipsEmptyFields(t *testing.T) {
 	meta := tracecontext.IntoMeta(nil, tracecontext.Context{Traceparent: sampleTraceparent})
-	if meta[tracecontext.TraceparentKey] != sampleTraceparent {
+	if value, _ := meta.Get(tracecontext.TraceparentKey); value != sampleTraceparent {
 		t.Fatalf("traceparent = %#v", meta)
 	}
-	if _, ok := meta[tracecontext.TracestateKey]; ok {
+	if _, ok := meta.Get(tracecontext.TracestateKey); ok {
 		t.Fatal("empty tracestate should not be written")
 	}
-	if _, ok := meta[tracecontext.BaggageKey]; ok {
+	if _, ok := meta.Get(tracecontext.BaggageKey); ok {
 		t.Fatal("empty baggage should not be written")
 	}
 
-	untouched := map[string]any{"keep": true}
+	untouched := jsonvalue.Object{{Key: "keep", Value: true}}
 	if result := tracecontext.IntoMeta(untouched, tracecontext.Context{}); len(result) != 1 {
 		t.Fatalf("empty context changed meta: %#v", result)
 	}
 }
 
 func TestFromMetaIgnoresNonStringAndAbsentKeys(t *testing.T) {
-	if _, ok := tracecontext.FromMeta(map[string]any{tracecontext.TraceparentKey: 42}); ok {
+	if _, ok := tracecontext.FromMeta(jsonvalue.Object{{Key: tracecontext.TraceparentKey, Value: 42}}); ok {
 		t.Fatal("non-string traceparent treated as present")
 	}
 	if _, ok := tracecontext.FromMeta(nil); ok {
 		t.Fatal("nil meta reported a trace context")
 	}
-	partial, ok := tracecontext.FromMeta(map[string]any{tracecontext.BaggageKey: sampleBaggage})
+	partial, ok := tracecontext.FromMeta(jsonvalue.Object{{Key: tracecontext.BaggageKey, Value: sampleBaggage}})
 	if !ok || partial.Baggage != sampleBaggage || partial.Traceparent != "" {
 		t.Fatalf("partial extraction = %#v, %v", partial, ok)
 	}

@@ -217,6 +217,24 @@ tests, so tracking a new schema release is a reviewed regeneration rather
 than hand transcription. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
 update workflow.
 
+`_meta` is a `schema.Meta`, a `jsonvalue.Object` from
+`github.com/BrokkAi/acp-go/jsonvalue`, which holds untyped JSON exactly as the
+reference SDK's `serde_json::Value` does: an object keeps its members in wire
+order (a repeated key once, at its first position, with its last value),
+integers that fit `u64` or `i64` stay exact `int64` or `uint64` values, and
+other numbers are `float64` values written in serde_json's form (`1.0` stays
+`1.0`). Decoding a `_meta` and encoding it again writes exactly what Rust
+writes. Build one with `schema.NewMeta`, which sorts a map's keys, or as a
+literal to choose the order, and read it with `Get`:
+
+```go
+meta := schema.Meta{{Key: "traceparent", Value: traceparent}}
+meta.Set("acme.dev/attempt", 2)
+if attempt, ok := request.Meta.Get("acme.dev/attempt"); ok {
+	_ = attempt.(int64) // decoded integers are int64, or uint64 above i64
+}
+```
+
 acp-go exposes ACP's optional ("unstable") features through opt-in packages,
 not through the stable surface. `schema/unstable` and `schema/v2/unstable` are
 generated from Rust schema crate 1.15.1's unstable artifacts and carry the
@@ -249,7 +267,7 @@ expose any of it. See [docs/unstable-facades.md](docs/unstable-facades.md).
 extensibility conventions reserve for W3C Trace Context, so MCP and
 OpenTelemetry integrations can correlate ACP requests, responses, and
 notifications with the surrounding trace. `IntoMeta` and `FromMeta` operate on
-the generated `schema.Meta` and `v2.Meta` maps (and the `Nullable[Meta]`
+the generated `schema.Meta` and `v2.Meta` objects (and the `Nullable[Meta]`
 fields that wrap them in draft v2 and in v1 `compaction_update`), while
 `ValidTraceparent` checks the
 fixed W3C grammar without parsing the opaque `tracestate` or `baggage` values.
@@ -286,7 +304,8 @@ that applies a later update to stored entity state: omitted fields are
 unchanged, `null` clears, and values replace. Their top-level `_meta` is a
 metadata patch applied by `schema.ApplyMetaUpdate`: `null` clears it, and an
 object patches it by top-level key, removing keys set to `null` and replacing
-the others whole without merging nested objects. v1 is unchanged: there a
+the others whole without merging nested objects, and leaves its members in the
+order Rust's `apply_meta_update` does. v1 is unchanged: there a
 `_meta` object still replaces the stored metadata as a whole.
 `acpv2.UpdateProjection` uses these helpers to store messages, thoughts, tool
 calls, terminals, compactions, session info, and usage by kind and ID,

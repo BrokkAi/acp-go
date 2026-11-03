@@ -84,7 +84,7 @@ func TestMessageCallCarriesRequestAndReturnsResult(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outcome, err := fixture.client.Call(context.Background(), "tools", "req-1", "tools/call", map[string]any{"name": "echo"}, nil)
+	outcome, err := fixture.client.Call(context.Background(), "tools", "req-1", "tools/call", schema.Meta{{Key: "name", Value: "echo"}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestMessageCallCarriesRequestAndReturnsResult(t *testing.T) {
 	if request.ServerID != "tools" || request.RequestID != "req-1" || request.Method != "tools/call" {
 		t.Fatalf("request = %+v", request)
 	}
-	if request.Params["name"] != "echo" {
+	if param(request.Params, "name") != "echo" {
 		t.Fatalf("params = %v", request.Params)
 	}
 }
@@ -129,13 +129,13 @@ func TestMessageCallKeepsInnerErrorsInsideTheOutcome(t *testing.T) {
 
 func TestMessageNotificationsAreOrderedAndRequestScoped(t *testing.T) {
 	fixture := newMessageFixture(t)
-	var afterCall func(string, map[string]any) error
+	var afterCall func(string, schema.Meta) error
 	if err := fixture.router.Register("tools", mcp.MessageServiceFunc(func(_ context.Context, request mcp.MessageRequest) (mcp.MessageOutcome, error) {
 		afterCall = request.Notify
-		if err := request.Notify("notifications/progress", map[string]any{"progress": 1}); err != nil {
+		if err := request.Notify("notifications/progress", schema.Meta{{Key: "progress", Value: 1}}); err != nil {
 			return mcp.MessageOutcome{}, err
 		}
-		if err := request.Notify("notifications/progress", map[string]any{"progress": 2}); err != nil {
+		if err := request.Notify("notifications/progress", schema.Meta{{Key: "progress", Value: 2}}); err != nil {
 			return mcp.MessageOutcome{}, err
 		}
 		return mcp.MessageOutcome{Result: json.RawMessage(`null`)}, nil
@@ -163,7 +163,7 @@ func TestMessageNotificationsAreOrderedAndRequestScoped(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("notifications = %+v", got)
 	}
-	if got[0].RequestID != "req-notify" || got[0].Method != "notifications/progress" || got[1].Params["progress"] != float64(2) {
+	if got[0].RequestID != "req-notify" || got[0].Method != "notifications/progress" || param(got[1].Params, "progress") != int64(2) {
 		t.Fatalf("notifications = %+v", got)
 	}
 
@@ -173,7 +173,7 @@ func TestMessageNotificationsAreOrderedAndRequestScoped(t *testing.T) {
 		ServerID:  schema.McpServerAcpId("tools"),
 		RequestID: schema.McpRequestId("req-notify"),
 		Method:    "notifications/progress",
-		Params:    map[string]any{"progress": 3},
+		Params:    schema.Meta{{Key: "progress", Value: 3}},
 	}
 	if err := fixture.providerConn.Notify(context.Background(), schema.McpMessageMethodName, late); err != nil {
 		t.Fatal(err)
@@ -187,7 +187,7 @@ func TestMessageNotificationsAreOrderedAndRequestScoped(t *testing.T) {
 	if stillTwo != 2 {
 		t.Fatalf("late notification was delivered: %+v", notifications)
 	}
-	if err := afterCall("notifications/progress", map[string]any{"progress": 4}); err == nil {
+	if err := afterCall("notifications/progress", schema.Meta{{Key: "progress", Value: 4}}); err == nil {
 		t.Fatal("notify after completion was accepted")
 	}
 }
@@ -344,4 +344,10 @@ func assertRPCError(t *testing.T, err error, code int) {
 	if rpcErr.Code != code {
 		t.Fatalf("error code = %d, want %d (%v)", rpcErr.Code, code, err)
 	}
+}
+
+// param returns the value of the member named key.
+func param(params schema.Meta, key string) any {
+	value, _ := params.Get(key)
+	return value
 }

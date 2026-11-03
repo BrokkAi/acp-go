@@ -477,7 +477,8 @@ func fieldHintCases(r *ir, def, owner, base string, f field) ([]hintCase, error)
 		}
 		cases = append(cases, variantCase{"null-item", "[null, " + item + "]"})
 	}
-	if strings.HasPrefix(f.GoType, "map[") {
+	// The values of a _meta are covered by its encode cases (metaSamples).
+	if strings.HasPrefix(f.GoType, "map[") || (f.GoType == "Meta" && f.JSONName != "_meta") {
 		cases = append(cases, variantCase{"null-value", `{"k": null}`})
 	}
 	if f.Required || hinted {
@@ -675,6 +676,43 @@ func integerType(typ string) bool {
 // rawSample is the value the encode cases put in every raw JSON field.
 const rawSample = `{"z": 1.0, "a": [1e2, -0, 0.10, 12345678901234567890, 123456789.123456789, 0.9405161066866751], "z": {"y": null, "x": "\u0041\/"}}`
 
+// metaSample is the value the encode cases put in every Meta field: Rust
+// holds it as a serde_json::Map, which keeps member order, merges a repeated
+// key, keeps integers that fit u64 or i64 exact, and writes other numbers as
+// the f64 its inexact parse reads.
+const metaSample = `{"z": 1, "a": {"y": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], "x": null}, "z": 9007199254740993, "u": 18446744073709551615, "i": -9223372036854775808, "h": 12345678901234567890, "o": 18446744073709551616, "\u0041\/": "\ud83d\ude00\u2028\"\\\u0001<&>"}`
+
+// metaSamples are the values the Meta cases decode as a Meta itself, Rust's
+// serde_json::Map<String, Value>.
+var metaSamples = []struct{ name, value string }{
+	{"empty", `{}`},
+	{"order", `{"z": 1, "a": 2, "m": {"y": 1, "b": 2}, "b": [3, 1, 2]}`},
+	{"repeated", `{"z": 1, "a": 2, "z": {"y": 1, "x": 2, "y": 3}, "a": null}`},
+	{"integers", `{"safe": 9007199254740991, "unsafe": 9007199254740993, "i64max": 9223372036854775807, "i64min": -9223372036854775808, "above": 9223372036854775808, "u64max": 18446744073709551615, "over": 18446744073709551616, "under": -9223372036854775809, "long": 12345678901234567890, "zero": 0, "negzero": -0, "neg": -1}`},
+	{"floats", `{"one": 1.0, "negzero": -0.0, "e2": 1e2, "E2": 1E+2, "e20": 1e20, "e300": 1e300, "small": 1e-7, "tenth": 0.10, "subnormal": 5e-324, "max": 1.7976931348623157e308, "inexact": 7.2e-300, "rounded": 9007199254740993.0, "shortest": 0.9405161066866751, "long": 123456789.123456789, "pi": 3.141592653589793}`},
+	{"nested", `{"a": [{"b": [1, [2.5, {"c": null, "a": true}]], "a": {}}, [], {}, [[[]]]], "t": true, "f": false, "n": null, "s": ""}`},
+	{"escapes", `{"\u0041\/key": ` + escapeSample + `, "\u00e9": "\ud83d\ude00", "\"\\": "\u001f"}`},
+	{"large", largeMetaSample()},
+	{"whitespace", " {\n\t\"b\" : [ 1 , 2 ] ,\n \"a\" : { } } "},
+	{"null", `null`},
+	{"bool", `true`},
+	{"integer", `5`},
+	{"float", `1.5`},
+	{"string", `"s"`},
+	{"array", `[1]`},
+}
+
+// largeMetaSample is an object with more members than parsing scans for a
+// repeated key, in reverse key order, with keys repeated near both ends.
+func largeMetaSample() string {
+	var members []string
+	for i := 24; i >= 0; i-- {
+		members = append(members, fmt.Sprintf(`"k%02d": %d`, i, i))
+	}
+	members = append(members, `"k24": "first again"`, `"k03": [3]`, `"k00": {"zero": 0.0}`)
+	return "{" + strings.Join(members, ", ") + "}"
+}
+
 // encodeCases derives the cases that check encoding: every def's minimal and
 // full documents, every union variant's full document, and each f64 field
 // set to the floatSamples. The generated test requires json.Marshal of the
@@ -749,6 +787,14 @@ func encodeCases(r *ir) ([]hintCase, error) {
 					return err
 				}
 				out = append(out, hintCase{name: name + "." + f.JSONName + "/encode-raw", def: def, input: input})
+			}
+			// A Meta, which Rust holds as a serde_json::Map.
+			if f.GoType == "Meta" {
+				input, err := withMember(doc, f.JSONName, metaSample)
+				if err != nil {
+					return err
+				}
+				out = append(out, hintCase{name: name + "." + f.JSONName + "/encode-meta", def: def, input: input})
 			}
 			// -0, which serde_json reads as the f64 -0.0 that an integer
 			// rejects.
@@ -854,6 +900,10 @@ func encodeCases(r *ir) ([]hintCase, error) {
 				return nil, err
 			}
 		}
+	}
+	// Meta itself, Rust's serde_json::Map<String, Value>.
+	for _, s := range metaSamples {
+		out = append(out, hintCase{name: "Meta/" + s.name, def: "Meta", input: s.value})
 	}
 	return out, nil
 }

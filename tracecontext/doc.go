@@ -5,12 +5,12 @@ The ACP extensibility conventions reserve the root-level _meta keys
 "traceparent", "tracestate", and "baggage" for W3C Trace Context, so MCP and
 OpenTelemetry integrations can correlate ACP requests, responses, and
 notifications with the surrounding distributed trace. The helpers here set and
-extract those keys on the generated metadata maps (schema.Meta and v2.Meta)
+extract those keys on the generated metadata objects (schema.Meta and v2.Meta,
+both a jsonvalue.Object)
 without adding dependencies; the values themselves are opaque strings that the
 package never parses except where ValidTraceparent is called.
 
-v1 messages carry _meta directly as schema.Meta, which is assignable to and
-from map[string]any:
+v1 messages carry _meta directly as schema.Meta:
 
 	meta := tracecontext.IntoMeta(notification.Meta, tracecontext.Context{Traceparent: traceparent})
 	notification.Meta = meta

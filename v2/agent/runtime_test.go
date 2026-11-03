@@ -230,7 +230,7 @@ func TestRuntimeAcceptsNewerVersionAsV2(t *testing.T) {
 				if request.Info.Name != "future-client" || request.Info.Version != "3.0.0" {
 					t.Fatalf("info = %+v", request.Info)
 				}
-				if !request.Meta.Set || request.Meta.Value["kept"] != true {
+				if kept, _ := request.Meta.Value.Get("kept"); !request.Meta.Set || kept != true {
 					t.Fatalf("_meta = %+v", request.Meta)
 				}
 			},

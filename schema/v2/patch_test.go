@@ -229,16 +229,19 @@ func TestApplyMetaUpdate(t *testing.T) {
 		return value
 	}
 	encode := func(value Nullable[Meta]) string {
-		encoded, err := json.Marshal(value)
+		encoded, err := value.Value.MarshalJSON()
 		if err != nil {
 			t.Fatal(err)
 		}
-		return canonical(t, string(encoded))
+		return string(encoded)
 	}
 
+	// The member order is Rust's: a patched key keeps its place, a new key
+	// is appended, and a removed key's place is taken by the last stored
+	// key (serde_json's Map::remove is swap_remove with preserve_order).
 	stored := meta(`{"zed.dev/kept":1,"zed.dev/removed":true,"acme.dev/nested":{"a":1,"b":2},"acme.dev/list":[1,2]}`)
-	ApplyMetaUpdate(&stored, meta(`{"zed.dev/removed":null,"zed.dev/absent":null,"acme.dev/nested":{"b":3,"c":null},"acme.dev/list":[3],"acme.dev/added":[]}`))
-	if got, want := encode(stored), canonical(t, `{"zed.dev/kept":1,"acme.dev/nested":{"b":3,"c":null},"acme.dev/list":[3],"acme.dev/added":[]}`); got != want {
+	ApplyMetaUpdate(&stored, meta(`{"zed.dev/removed":null,"zed.dev/absent":null,"acme.dev/nested":{"b":3,"c":null},"acme.dev/list":[3],"acme.dev/added":[],"acme.dev/big":18446744073709551615,"acme.dev/float":1.0}`))
+	if got, want := encode(stored), `{"zed.dev/kept":1,"acme.dev/list":[3],"acme.dev/nested":{"b":3,"c":null},"acme.dev/added":[],"acme.dev/big":18446744073709551615,"acme.dev/float":1.0}`; got != want {
 		t.Fatalf("patched = %s, want %s", got, want)
 	}
 
@@ -260,36 +263,43 @@ func TestApplyMetaUpdate(t *testing.T) {
 	for _, initial := range []Nullable[Meta]{{}, {Set: true, Null: true}} {
 		stored := initial
 		ApplyMetaUpdate(&stored, meta(`{"zed.dev/added":1,"zed.dev/removed":null}`))
-		if got := encode(stored); got != canonical(t, `{"zed.dev/added":1}`) {
+		if got := encode(stored); got != `{"zed.dev/added":1}` {
 			t.Fatalf("patch from %+v = %s", initial, got)
 		}
 	}
 }
 
 // A patch built in Go behaves like the same patch decoded from the wire: any
-// value that encodes as JSON null removes its key. Neither map is modified.
+// value that encodes as JSON null removes its key. Neither object is
+// modified.
 func TestApplyMetaUpdateGoValues(t *testing.T) {
-	storedMap := Meta{"nil": 1, "slice": 2, "map": 3, "pointer": 4, "raw": 5, "kept": 6}
-	stored := Nullable[Meta]{Set: true, Value: storedMap}
+	storedMeta := Meta{{Key: "nil", Value: 1}, {Key: "slice", Value: 2}, {Key: "map", Value: 3}, {Key: "pointer", Value: 4}, {Key: "raw", Value: 5}, {Key: "object", Value: 6}, {Key: "kept", Value: 7}}
+	before := storedMeta.Clone()
+	stored := Nullable[Meta]{Set: true, Value: storedMeta}
 	patch := Meta{
-		"nil":     nil,
-		"slice":   []string(nil),
-		"map":     map[string]int(nil),
-		"pointer": (*int)(nil),
-		"raw":     json.RawMessage(" null "),
-		"nested":  map[string]any{"x": nil},
-		"empty":   []string{},
+		{Key: "nil", Value: nil},
+		{Key: "slice", Value: []string(nil)},
+		{Key: "map", Value: map[string]int(nil)},
+		{Key: "pointer", Value: (*int)(nil)},
+		{Key: "raw", Value: json.RawMessage(" null ")},
+		{Key: "object", Value: Meta(nil)},
+		{Key: "nested", Value: map[string]any{"x": nil}},
+		{Key: "empty", Value: []string{}},
+		// A repeated key means its last value, as on the wire.
+		{Key: "repeated", Value: 1},
+		{Key: "repeated", Value: nil},
 	}
+	patchBefore := patch.Clone()
 	ApplyMetaUpdate(&stored, Nullable[Meta]{Set: true, Value: patch})
 
-	if len(storedMap) != 6 || len(patch) != 7 {
-		t.Fatalf("inputs modified: stored %v, patch %v", storedMap, patch)
+	if !reflect.DeepEqual(storedMeta, before) || !reflect.DeepEqual(patch, patchBefore) {
+		t.Fatalf("inputs modified: stored %v, patch %v", storedMeta, patch)
 	}
 	encoded, err := json.Marshal(stored)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := canonical(t, string(encoded)), canonical(t, `{"kept":6,"nested":{"x":null},"empty":[]}`); got != want {
+	if got, want := string(encoded), `{"kept":7,"nested":{"x":null},"empty":[]}`; got != want {
 		t.Fatalf("patched = %s, want %s", got, want)
 	}
 }

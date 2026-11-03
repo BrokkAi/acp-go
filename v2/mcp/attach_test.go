@@ -71,12 +71,12 @@ func toolServer(t *testing.T, name string) *mcp.Server {
 	return mcp.NewToolServer(name, "2.0.0", registry)
 }
 
-func modernParams(params map[string]any) map[string]any {
+func modernParams(params map[string]any) schema.Meta {
 	params["_meta"] = map[string]any{
 		"io.modelcontextprotocol/protocolVersion":    "2026-07-28",
 		"io.modelcontextprotocol/clientCapabilities": map[string]any{},
 	}
-	return params
+	return schema.NewMeta(params)
 }
 
 func lastDeclaration(t *testing.T, params json.RawMessage) map[string]any {

@@ -140,7 +140,7 @@ func optionalString(value *string) string {
 }
 
 func terminalOutputDelta(meta schema.Meta) string {
-	value, ok := meta["terminal_output_delta"]
+	value, ok := meta.Get("terminal_output_delta")
 	if !ok {
 		return ""
 	}
