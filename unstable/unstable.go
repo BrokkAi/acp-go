@@ -1,9 +1,10 @@
 /*
 Package unstable exposes narrow, opt-in typed facades for ACP's optional
 ("unstable") methods: agent provider configuration, session fork, session
-archive, status, and title, and the session lifecycle requests that carry a
-client-provided system prompt (NewSession, LoadSession, ResumeSession, and
-ForkSession).
+archive, status, and title, auth status (AuthStatus, with AuthStatusUpdates
+for the auth/status_update notification), and the session lifecycle requests
+that carry a client-provided system prompt (NewSession, LoadSession,
+ResumeSession, and ForkSession).
 
 Every method here lives behind its own package import because the ACP release
 marks the surface unstable and may change or remove it. Nothing in this package

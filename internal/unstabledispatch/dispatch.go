@@ -67,6 +67,9 @@ func Route[H, Request, Response any](method func(H, context.Context, Request) (R
 // InvalidParams, for values the reference SDK refuses to deserialize but
 // encoding/json accepts; and accept on the decoded request before the
 // handler, whose error is answered as it is.
+//
+// Absent params are null, as the reference SDK's JSON-RPC layer hands them
+// to every request: both decode (and fail) alike, and an error echoes null.
 func RouteChecked[H, Request, Response any](method func(H, context.Context, Request) (Response, error), strict func(json.RawMessage) error, accept func(context.Context, Request) error, check func(Response) error) Binding {
 	return func(handler any) acp.Handler {
 		implementation, ok := handler.(H)
@@ -74,6 +77,9 @@ func RouteChecked[H, Request, Response any](method func(H, context.Context, Requ
 			return nil
 		}
 		return func(ctx context.Context, _ string, raw json.RawMessage) (any, error) {
+			if len(raw) == 0 {
+				raw = json.RawMessage("null")
+			}
 			if strict != nil {
 				if err := strict(raw); err != nil {
 					return nil, InvalidParams(err, raw)

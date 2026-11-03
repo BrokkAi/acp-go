@@ -154,10 +154,13 @@ only remaining work.
   - client-provided system prompts on the session lifecycle requests, with
     capability-gated client facades and agent-side handlers that `Install`
     serves through runtime overrides (#58),
+  - auth status (`auth/status` and the `auth/status_update` notification),
+    with a capability-gated client facade, a notification adapter, and an
+    agent-side handler and sender (#72),
   - MCP-over-ACP (session options and the request-scoped `mcp/message` mover),
   - end-turn token usage,
   - bidirectional `mcp/message` request/notification registry metadata,
-  - generated types, without facades yet, for subagents, auth status, and
+  - generated types, without facades yet, for subagents and
     proxy chains (`proxy/initialize` and `proxy/successor`, registered as
     `SideProxy`).
 - Session notices and compaction on the stable surfaces (#57): v1 client
@@ -189,7 +192,8 @@ only remaining work.
 The typed facade surface is delivered: client facades and agent dispatch for
 providers and session fork on v1 and draft v2 (#61), session
 archive/status/title on v1 and draft v2 (#71), client-provided system prompts
-on every session lifecycle request (#58), the session-update
+on every session lifecycle request (#58), auth status on v1 and draft v2
+(#72), the session-update
 projection helper, and the MCP session options, including the draft-v2 MCP
 fork, all live in [docs/unstable-facades.md](docs/unstable-facades.md)'s
 packages (`unstable`, `v2/unstable`, `mcp`, `v2/mcp`). Agents serve the
@@ -232,10 +236,10 @@ standard-library-only and behind its own package or command.
 
 The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
 them is tracked separately: subagents (#60), the proxy-chain method rename
-(#69), v2 background work and `tool_call/cancel`/`terminal/cancel` (#70), and
-unstable auth status (#72). Unstable session archive/status/title (#71),
-client-provided system prompts (#58), and `-32022` version negotiation (#62)
-are delivered.
+(#69), and v2 background work with `tool_call/cancel`/`terminal/cancel`
+(#70). Unstable session archive/status/title (#71), client-provided system
+prompts (#58), `-32022` version negotiation (#62), and unstable auth status
+(#72) are delivered.
 
 ## Guardrails
 
