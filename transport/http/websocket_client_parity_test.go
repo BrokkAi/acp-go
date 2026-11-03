@@ -326,6 +326,62 @@ func normalizeWSClientRecord(record []string) []string {
 	return append(headers, out...)
 }
 
+// serverFailedFirst reports a Rust record in which the scripted server ended
+// the transport, with a protocol violation, a close frame or the end of the
+// socket, before the client sent any of the case's lines. In those cases the
+// server's bytes go out 50 ms after the 101 and the probe writes its first
+// line 100 ms after connecting, and the Rust driver's reader and writer are
+// independent futures raced by futures::future::select, so whether a line
+// reaches the wire before the reader fails the transport is decided by that
+// margin alone: run with the server's bytes sent after the first line, the
+// Rust client sends the line's text frame and ends with the same error. The
+// Rust probe never lost the race (hundreds of runs, idle and under CPU
+// load), but the Go transport, whose reader is a goroutine, can under load.
+func serverFailedFirst(want []string) bool {
+	for _, line := range want {
+		if strings.HasPrefix(line, "FRAME op=1 ") {
+			return false
+		}
+	}
+	result := want[len(want)-1]
+	return strings.HasPrefix(result, `RESULT Err Internal error: "ws recv: `) ||
+		strings.HasPrefix(result, `RESULT Err Internal error: "WebSocket closed by peer: `)
+}
+
+// dropRacedLineFrames removes from got the text frames of a leading run of
+// lines, in order, that the client may have sent before the server's failure
+// reached its reader (see serverFailedFirst). Every other frame, and the
+// order of what is left, is still compared.
+func dropRacedLineFrames(got, lines []string) []string {
+	out := make([]string, 0, len(got))
+	next := 0
+	for _, line := range got {
+		if next < len(lines) && line == wsClientTextFrameLine(lines[next]) {
+			next++
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// wsClientTextFrameLine is the record line of the masked text frame the Go
+// transport sends for line.
+func wsClientTextFrameLine(line string) string {
+	payload := []byte(line)
+	if parsed, ok := parseMessage(payload); ok {
+		payload = parsed.encode()
+	}
+	form := 7
+	switch {
+	case len(payload) > 0xffff:
+		form = 64
+	case len(payload) > 125:
+		form = 16
+	}
+	return fmt.Sprintf("FRAME op=1 fin=1 rsv=0 mask=1 len%d=%d %s", form, len(payload), wsShowBytes(payload))
+}
+
 func TestWebSocketClientMatchesRustClient(t *testing.T) {
 	data, err := os.ReadFile("testdata/websocket_rust_client.json")
 	if err != nil {
@@ -340,6 +396,9 @@ func TestWebSocketClientMatchesRustClient(t *testing.T) {
 			t.Parallel()
 			got := normalizeWSClientRecord(runWSClientCase(t, c))
 			want := normalizeWSClientRecord(c.Rust)
+			if serverFailedFirst(want) {
+				got = dropRacedLineFrames(got, c.Lines)
+			}
 			if !bytes.Equal([]byte(strings.Join(got, "\n")), []byte(strings.Join(want, "\n"))) {
 				t.Errorf("got\n  %s\nwant\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
 			}

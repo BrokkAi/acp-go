@@ -274,7 +274,7 @@ func rustDebug(s string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`, "\t", `\t`).Replace(s) + `"`
 }
 
-func runWSServerCase(t *testing.T, c wsServerCase, wantAgentLines int) []string {
+func runWSServerCase(t *testing.T, c wsServerCase, wantAgentLines, wantFrames int, wantEnded bool) []string {
 	agent := &wsLinesAgent{}
 	options := acphttp.ServerOptions{}
 	switch {
@@ -340,6 +340,42 @@ func runWSServerCase(t *testing.T, c wsServerCase, wantAgentLines int) []string 
 		t.Fatal(err)
 	}
 	time.Sleep(150 * time.Millisecond)
+	// The Rust server answered every case within the probe's 150 ms; a
+	// loaded host can take longer, and the HTTP steps need the connection
+	// id from the answer, so the steps wait for its head.
+	for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		mu.Lock()
+		answered := bytes.Contains(received, []byte("\r\n\r\n")) || end != "OPEN"
+		mu.Unlock()
+		if answered {
+			break
+		}
+	}
+	// settled waits until the agent has read every line and the client has
+	// received every frame of the Rust record. A DELETE shuts the
+	// connection down, dropping what the server has not yet read from the
+	// socket and what the agent has not yet answered, in the Rust server as
+	// here, so the Rust record shows what had arrived in the 100 ms the
+	// probe waited before its DELETE; a loaded host can need longer.
+	// Waiting for what the record shows, and no more, leaves a server that
+	// never gets there to fail the comparison once the deadline passes.
+	settled := func() {
+		for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			mu.Lock()
+			frames := 0
+			if _, rest, ok := bytes.Cut(received, []byte("\r\n\r\n")); ok {
+				for _, line := range wsRenderFrames(rest) {
+					if strings.HasPrefix(line, "FRAME ") {
+						frames++
+					}
+				}
+			}
+			mu.Unlock()
+			if frames >= wantFrames && len(agent.seen()) >= wantAgentLines {
+				return
+			}
+		}
+	}
 	connectionID := ""
 	mu.Lock()
 	if head, _, ok := strings.Cut(string(received), "\r\n\r\n"); ok {
@@ -388,6 +424,7 @@ func runWSServerCase(t *testing.T, c wsServerCase, wantAgentLines int) []string 
 		case step.Get != nil:
 			httpLog = append(httpLog, wsRawHTTP(t, addr, "GET", connectionID, step.Get.Session, nil))
 		case step.Delete:
+			settled()
 			httpLog = append(httpLog, wsRawHTTP(t, addr, "DELETE", connectionID, nil, nil))
 		}
 	}
@@ -396,6 +433,17 @@ func runWSServerCase(t *testing.T, c wsServerCase, wantAgentLines int) []string 
 	// waited, under the race detector in particular.
 	for deadline := time.Now().Add(60 * time.Second); len(agent.seen()) < wantAgentLines && time.Now().Before(deadline); {
 		time.Sleep(50 * time.Millisecond)
+	}
+	// Likewise, a server that ends the socket after reading 64 MiB, as in
+	// too-big-message, can take longer than the probe's fixed sleeps to get
+	// there on a loaded host, so when the Rust server ended the socket the
+	// record waits for the end itself. A socket the Go server leaves open
+	// still records OPEN once the deadline passes.
+	if wantEnded {
+		select {
+		case <-readDone:
+		case <-time.After(60 * time.Second):
+		}
 	}
 	mu.Lock()
 	data := append([]byte(nil), received...)
@@ -491,13 +539,18 @@ func TestWebSocketServerMatchesRustServer(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
 			t.Parallel()
-			agentLines := 0
+			agentLines, frames, ended := 0, 0, false
 			for _, line := range c.Rust {
-				if strings.HasPrefix(line, "AGENT ") {
+				switch {
+				case strings.HasPrefix(line, "AGENT "):
 					agentLines++
+				case strings.HasPrefix(line, "FRAME "):
+					frames++
+				case strings.HasPrefix(line, "END ") && line != "END OPEN":
+					ended = true
 				}
 			}
-			got := normalizeWSRecord(runWSServerCase(t, c, agentLines))
+			got := normalizeWSRecord(runWSServerCase(t, c, agentLines, frames, ended))
 			want := normalizeWSRecord(c.Rust)
 			if strings.Join(got, "\n") != strings.Join(want, "\n") {
 				t.Errorf("got\n  %s\nwant\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
