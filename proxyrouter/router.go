@@ -1,16 +1,17 @@
 // Package proxyrouter selects an explicit ACP v1 or draft-v2 proxy
-// implementation from the first _proxy/initialize request. It negotiates
-// _proxy/initialize exactly as the agent router negotiates initialize, like
+// implementation from the first proxy/initialize request. It negotiates
+// proxy/initialize exactly as the agent router negotiates initialize, like
 // the reference Rust SDK's proxy protocol router: it selects the highest
 // configured version at or below the requested one, hands a request for
 // exactly that version over unchanged after validating it, and rewrites a
 // request for another version to keep what parses under the selected one.
 // When a v1 proxy is configured, everything that does not select v2 is handed
 // to it. A request no configured version can serve gets -32022 (Unsupported
-// protocol version). A rejected frame leaves the connection uninitialized and
-// the router keeps reading; responses and unanswered notifications before
-// initialization are ignored. The router never converts traffic after
-// selection.
+// protocol version), listing the configured versions; a router with none
+// configured answers every proxy/initialize that way. A rejected frame leaves
+// the connection uninitialized and the router keeps reading; responses and
+// unanswered notifications before initialization are ignored. The router
+// never converts traffic after selection.
 package proxyrouter
 
 import (
@@ -20,14 +21,15 @@ import (
 	"io"
 
 	"github.com/BrokkAi/acp-go/internal/negotiate"
+	unstable "github.com/BrokkAi/acp-go/schema/unstable"
 )
 
-// proxyInitialize is the proxy initialization method. The proxy-chain rename
-// to proxy/initialize (#69) changes only this constant.
-const proxyInitialize = "_proxy/initialize"
+// proxyInitialize is the proxy-chains RFD's proxy initialization method, as
+// the pinned unstable schema names it.
+const proxyInitialize = unstable.ProxyInitializeMethodName
 
 // Proxy serves one selected protocol implementation. The initial
-// _proxy/initialize frame is replayed to Serve: unchanged when it requests
+// proxy/initialize frame is replayed to Serve: unchanged when it requests
 // exactly the selected version, otherwise with its params normalized for it.
 type Proxy interface {
 	Serve(context.Context, io.ReadCloser, io.WriteCloser) error
@@ -51,9 +53,6 @@ func (r *Router) WithV2(implementation Proxy) *Router {
 }
 
 func (r *Router) Serve(ctx context.Context, in io.ReadCloser, out io.WriteCloser) error {
-	if r.v1 == nil && r.v2 == nil {
-		return errors.New("proxy protocol router has no configured implementations")
-	}
 	supported := negotiate.Supported{V1: r.v1 != nil, V2: r.v2 != nil}
 	reader := bufio.NewReaderSize(in, 64<<10)
 	for {
@@ -67,7 +66,7 @@ func (r *Router) Serve(ctx context.Context, in io.ReadCloser, out io.WriteCloser
 		route := negotiate.Select(line, proxyInitialize, supported)
 		if route.Answer != nil {
 			// A rejected frame selects nothing: the conductor may send
-			// _proxy/initialize again.
+			// proxy/initialize again.
 			if _, err := out.Write(append(route.Answer, '\n')); err != nil {
 				return err
 			}

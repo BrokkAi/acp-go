@@ -414,11 +414,14 @@ client-side selection. It starts the highest configured implementation and
 follows the Rust fallback rules: reuse an existing v1-negotiated agent
 connection only for losslessly identical initialization, otherwise reconnect
 with fresh factories, and never turn a v2 rejection into a silent v1 retry.
-`github.com/BrokkAi/acp-go/proxyrouter` negotiates `_proxy/initialize` the same
+`github.com/BrokkAi/acp-go/proxyrouter` negotiates `proxy/initialize` the same
 way as the agent router: the highest configured version at or below the
 requested one, the exact-version frame handed over unchanged, any other
 normalized, `-32022` when no configured version fits, and no cross-version
-conversion after selection.
+conversion after selection. It uses the proxy-chains RFD's method names, as
+Rust `agent-client-protocol` 5.0.0 does: a conductor sends `proxy/initialize`
+and wraps successor traffic in `proxy/successor`; the pre-RFD
+underscore-prefixed names are not accepted.
 
 Draft-v2 sessions can use `acpv2.NewSessionHandle` for Rust-shaped prompt,
 configuration, cancellation, and close commands. `acpv2.SessionTracker` owns

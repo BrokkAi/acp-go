@@ -178,21 +178,22 @@
 //
 // # Proxy components
 //
-// The reference conductor chains proxies between a client and an agent. It
-// initializes each proxy with _proxy/initialize, whose parameters and result
-// are the v1 initialize request and response, and delivers client traffic
-// unwrapped. Traffic to and from a proxy's successor travels inside
-// _proxy/successor envelopes carrying the inner method and params. Like the
-// reference conductor, the recipe neither sets nor forwards the envelope's own
-// _meta; the params, including their _meta, pass through unchanged.
-// The recipe hand-models the envelope under the _proxy/* names of the Rust
-// SDK 2.2.0 conductor. The pinned unstable schema (crate 1.15.1) now defines
-// the renamed proxy/initialize and proxy/successor methods and their
-// envelopes in schema/unstable; moving this recipe and proxyrouter to them is
-// tracked in #69. The conductor itself is recorded as won't port (#24). Run a Go proxy under the
-// reference agent-client-protocol-conductor.
+// The reference conductor chains proxies between a client and an agent, using
+// the methods of the ACP proxy-chains RFD. It initializes each proxy with
+// proxy/initialize, whose parameters and result are the version's initialize
+// request and response, and delivers client traffic unwrapped. Traffic to and
+// from a proxy's successor travels inside proxy/successor envelopes carrying
+// the inner method and params. The recipe reads and writes those envelopes
+// with the generated types in [github.com/BrokkAi/acp-go/schema/unstable]
+// (ProxySuccessorRequest and ProxySuccessorNotification). An envelope's params
+// may be omitted or null; the recipe sends null when the inner message has
+// none, as the reference SDK does. The envelope's own _meta is hop-local, so
+// the recipe neither sets nor forwards it; the inner params, including their
+// _meta, pass through unchanged, and so do a forwarded request's result and
+// error. The conductor itself is recorded as won't port (#24); run a Go proxy
+// under the reference agent-client-protocol-conductor.
 //
-// [github.com/BrokkAi/acp-go/proxyrouter.Router] negotiates _proxy/initialize
+// [github.com/BrokkAi/acp-go/proxyrouter.Router] negotiates proxy/initialize
 // like the agent router negotiates initialize: it hands each connection to the
 // highest configured implementation at or below the requested version,
 // replays a request for exactly that version unchanged and normalizes any
@@ -206,11 +207,16 @@
 // response or a request in either direction, it flushes the queue for that
 // direction. A v1 client therefore receives every session/update of a turn
 // before the turn's response, and a successor sees a client's session/cancel
-// before the client's cancelled permission outcome. A cancelled client request cancels the forwarded call, which
-// sends its own $/cancel_request for that hop. acp-go runs inbound requests
-// concurrently, so a notification that follows a request, such as
-// session/cancel right after session/prompt, can overtake it on its way to the
-// successor.
+// before the client's cancelled permission outcome. A cancelled request
+// cancels the forwarded call, which sends a plain $/cancel_request naming the
+// request on the next hop, as the RFD specifies. The connection also accepts
+// a $/cancel_request wrapped in proxy/successor, which the reference SDK still
+// accepts. Either form cancels the request on its own hop and then reaches
+// the notification callback, which drops it instead of forwarding it, because
+// its requestId means nothing on the next hop.
+// acp-go runs inbound requests concurrently, so a notification that follows a
+// request, such as session/cancel right after session/prompt, can overtake it
+// on its way to the successor.
 //
 // The example's testConductor only exists so the recipe runs under go test.
 //

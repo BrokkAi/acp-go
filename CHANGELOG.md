@@ -8,6 +8,11 @@ series, minor releases may contain breaking API changes.
 
 ### Added
 
+- `acp.IsCancelRequestNotification`, the reference SDK's
+  `is_cancel_request_notification`: whether a notification is a
+  `$/cancel_request`, plain or wrapped in any number of `proxy/successor`
+  envelopes, so forwarding code can drop it instead of relaying a
+  connection-scoped id (#69).
 - A standard-library MCP server framework in `mcp` and `v2/mcp`, mirroring
   Rust `agent-client-protocol` 5.0.0's `mcp_server` module and the tool-call
   rules of `agent-client-protocol-rmcp`'s `rmcp_3` builder (#63). The types are
@@ -452,6 +457,59 @@ series, minor releases may contain breaking API changes.
 
 ### Changed
 
+- **Breaking (wire):** the proxy-chain methods use the names in the ACP
+  proxy-chains RFD and the pinned unstable schema, like Rust
+  `agent-client-protocol` 5.0.0 (#69): `_proxy/initialize` is now
+  `proxy/initialize` and `_proxy/successor` is now `proxy/successor`. The old
+  names are neither sent nor accepted, so a proxy built on this release works
+  with a Rust 5.0 conductor and not with an earlier one; upgrade every
+  component of a chain together.
+  - `proxyrouter` routes only `proxy/initialize`. A v2-only router answers
+    `_proxy/initialize` with ``-32600 "first ACP request must be
+    `proxy/initialize`"`` and keeps reading; with a v1 proxy configured, the
+    v1 proxy receives it like any other first message.
+  - `proxyrouter` and `agentrouter` with no configured implementation no
+    longer fail `Serve` immediately: like Rust's routers, they answer each
+    `proxy/initialize` or `initialize` with `-32022` and `"supported": []`,
+    keep reading, and return at the end of input.
+  - A `$/cancel_request` wrapped in `proxy/successor` (at any depth) cancels
+    the inbound request it names on any `acp.Connection`, as the reference
+    SDK accepts that form.
+  - The cookbook proxy recipe uses the generated
+    `schema/unstable.ProxySuccessorRequest` and `ProxySuccessorNotification`
+    envelopes instead of a hand-modeled one: it accepts an envelope whose
+    `params` is omitted or `null`, reads `_meta` (not `meta`) and keeps it on
+    its hop, writes the envelope's `params` as `null` when the wrapped message
+    has none (as Rust does), cancels a forwarded request with a plain
+    `$/cancel_request` naming the `proxy/successor` request, drops plain and
+    wrapped cancellations instead of forwarding them, and passes results and
+    errors through unchanged.
+- **Breaking (wire):** `acp.Connection` serializes outgoing requests and
+  notifications as the reference SDK does. The protocol guards (the v1 and
+  v2 runtimes' and clients' initialization and version checks) see the
+  message first; then params that encode as `null` (including nil) are
+  omitted from the frame instead of written as `"params":null`, and params
+  that are not an object, an array, or `null` cannot be sent: a `Call` fails
+  with `-32602` (data `"JSON-RPC params must be an object or array"`), and
+  is settled like an abandoned call when a guard had admitted it, while a
+  notification send succeeds, writes nothing, and reports the `-32602` to
+  the `WithErrorHandler` hook, as the reference SDK's outgoing actor drops
+  the frame. The `proxy/successor` envelope's own `params` member is a
+  schema field and is still written as `null`.
+- **Breaking (wire):** JSON-RPC ids are compared and echoed as the reference
+  SDK decodes them: an inbound request id is re-serialized, so a response to
+  `"id":"\u0062"` carries `"id":"b"`, a `$/cancel_request` naming `"\u0061"`
+  cancels the request `"a"`, and a response id is matched to its call the
+  same way. Previously ids were compared and echoed byte for byte.
+- **Breaking:** a plain `$/cancel_request` now reaches the `Notifications`
+  handler after it cancels the request it names, as the reference SDK
+  dispatches it, matching the wrapped form. The positional params form
+  (`[requestId, _meta]`) cancels too. A `$/cancel_request`, plain or
+  wrapped, whose params do not parse as a `CancelRequestNotification` cancels
+  nothing and is dropped without reaching the handler. A handler that relays
+  every notification to another connection should drop one, using
+  `acp.IsCancelRequestNotification`, because its `requestId` is scoped to its
+  own connection.
 - **Breaking:** the v1 agent runtime's `Client.Notify` gates
   `session/update` params of every type, not only `acp.Update`: a typed
   `schema/unstable.SessionNotification`, raw JSON, or any value that encodes
@@ -952,7 +1010,7 @@ series, minor releases may contain breaking API changes.
     them, are ignored. A JSON object that is not a JSON-RPC message gets
     `-32600` with `id: null`, and a v2-selecting request with a `null` id gets
     `-32600`.
-  - `proxyrouter` negotiates `_proxy/initialize` the same way, like Rust's
+  - `proxyrouter` negotiates `proxy/initialize` the same way, like Rust's
     proxy protocol router, instead of requiring the exact configured version:
     it selects the highest configured version at or below the requested one,
     replays an exact-version frame unchanged, normalizes any other, answers an
@@ -1162,7 +1220,7 @@ series, minor releases may contain breaking API changes.
   `$/cancel_request` entries cancel nothing, and response entries complete no
   pending call. The connection keeps serving later single messages.
 - **Breaking:** `agentrouter` and `proxyrouter` answer a batched first frame,
-  including one that holds `initialize` or `_proxy/initialize`, with that same
+  including one that holds `initialize` or `proxy/initialize`, with that same
   error and keep reading, so a following single initialize is routed
   normally. Previously they validated and dispatched the batch.
 - **Breaking:** the draft HTTP transport answers a JSON array `POST` body with

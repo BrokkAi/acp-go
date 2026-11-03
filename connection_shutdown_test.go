@@ -257,7 +257,7 @@ func TestShutdownSendsNothingNew(t *testing.T) {
 	// A call the peer has received but not answered.
 	callDone := make(chan error, 1)
 	go func() { callDone <- p.connection.Call(context.Background(), "test/call", nil, nil) }()
-	if got, want := p.readLine(), `{"jsonrpc":"2.0","id":1,"method":"test/call","params":null}`; got != want {
+	if got, want := p.readLine(), `{"jsonrpc":"2.0","id":1,"method":"test/call"}`; got != want {
 		t.Fatalf("call frame = %s, want %s", got, want)
 	}
 	// An incoming request whose handler is running.
@@ -320,7 +320,7 @@ func TestShutdownKeepsCallFrameWhoseCallerCancels(t *testing.T) {
 	}
 	// The call gave up after the 250ms a cancelled caller otherwise allows a
 	// queued frame before stopping the connection; the drain still owns it.
-	want := notificationLines(1)[0] + "\n" + `{"jsonrpc":"2.0","id":1,"method":"test/call","params":null}`
+	want := notificationLines(1)[0] + "\n" + `{"jsonrpc":"2.0","id":1,"method":"test/call"}`
 	if got := strings.Join(p.readAll(), "\n"); got != want {
 		t.Fatalf("peer received:\n%s\nwant:\n%s", got, want)
 	}

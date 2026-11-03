@@ -19,6 +19,8 @@ func TestSuccessorEnclosesInitializeMatchesTheReferenceSDK(t *testing.T) {
 		{"proxy/successor", `{"method":5}`, false},
 		{"proxy/successor", `[]`, false},
 		{"initialize", `{}`, false},
+		{"proxy/successor", `{"method":"proxy/successor","params":{"method":"proxy/initialize"}}`, true},
+		// The pre-RFD name is an ordinary method, not an envelope.
 		{"_proxy/successor", `{"method":"initialize"}`, false},
 	} {
 		if got := SuccessorEnclosesInitialize(test.method, json.RawMessage(test.params)); got != test.want {

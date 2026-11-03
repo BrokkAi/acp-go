@@ -11,7 +11,9 @@
 // other first message, so a v1 client sees exactly the v1 implementation. A
 // v2 initialize request is normalized to v1's shape when only v1 is
 // configured. A v2-only endpoint answers a request below v2 with -32022
-// (Unsupported protocol version) and data {"requested", "supported": [2]}.
+// (Unsupported protocol version) and data {"requested", "supported": [2]}. A
+// router with no configured implementation answers every initialize with
+// -32022 and "supported": [], as the reference SDK's router does.
 //
 // A rejected frame leaves the connection uninitialized and the router keeps
 // reading, so the client may initialize again. Responses, and notifications
@@ -52,9 +54,6 @@ func (r *Agent) WithV2(implementation agent2.Agent) *Agent {
 }
 
 func (r *Agent) Serve(ctx context.Context, in io.ReadCloser, out io.WriteCloser) error {
-	if r.v1 == nil && r.v2 == nil {
-		return errors.New("agent protocol router has no configured implementations")
-	}
 	supported := negotiate.Supported{V1: r.v1 != nil, V2: r.v2 != nil}
 	reader := bufio.NewReaderSize(in, 64<<10)
 	for {

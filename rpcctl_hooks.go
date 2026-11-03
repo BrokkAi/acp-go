@@ -45,13 +45,10 @@ func (c *Connection) queueNotification(ctx context.Context, method string, param
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	w, _, err := c.queue(ctx, func() (any, error) {
-		guarded, err := c.guardOutgoing(method, encoded, true)
-		if err != nil {
-			return nil, err
-		}
-		return packet{Version: "2.0", Method: method, Params: guarded}, nil
-	})
+	w, _, err := c.queue(ctx, c.buildNotification(method, encoded))
+	if c.droppedNotification(method, err) {
+		return func(context.Context) error { return nil }, nil
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -150,11 +150,18 @@ only remaining work.
   - reconnect with fresh factories when parameters differ,
   - surface v2 rejection without silently retrying as v1.
 - Negotiating proxy protocol router (Rust #464):
-  - negotiate `_proxy/initialize` exactly as the agent router negotiates
+  - negotiate `proxy/initialize` exactly as the agent router negotiates
     `initialize`,
   - validate an exact-version request and hand its complete initial frame
     over unchanged,
-  - normalize a request for another version for the selected implementation.
+  - normalize a request for another version for the selected implementation,
+  - answer a rejected first message, or any request when nothing is
+    configured, and keep reading.
+- Proxy-chain method names from the proxy-chains RFD and the pinned unstable
+  schema (#69): `proxy/initialize` and `proxy/successor`, with no fallback to
+  the pre-RFD underscore-prefixed names; a `$/cancel_request` wrapped in
+  `proxy/successor` cancels like a plain one; the cookbook proxy uses the
+  generated envelopes.
 - Unstable schema surfaces from the exact Rust schema crate 1.15.1 unstable
   artifacts:
   - v1 and v2 generated bindings in explicit import-only packages,
@@ -176,8 +183,9 @@ only remaining work.
     `SubagentTree` with the restricted-child allowlist, single-child cancel,
     and restore, close, and connection-loss invalidation, agent-side update
     senders, and the v1 runtime's capability gate (#60),
-  - generated types, without facades yet, for proxy chains
-    (`proxy/initialize` and `proxy/successor`, registered as `SideProxy`).
+  - generated proxy-chain types (`proxy/initialize` and `proxy/successor`,
+    registered as `SideProxy`), whose method names `proxyrouter` uses and
+    whose envelopes the cookbook proxy uses (#69).
 - Session notices and compaction on the stable surfaces (#57): v1 client
   capability helpers, update constructors, `acp.SessionProjection`, and the
   agent runtime's capability gate; draft-v2 constructors and notice and
@@ -242,19 +250,19 @@ per crate. Every port is done: the test harness (`acptest`), the trace viewer
 
 Two crates are recorded as won't port: the `agent-client-protocol-rmcp` bridge,
 which needs a third-party MCP SDK, and the proxy-chain conductor, which is an
-application with no Go consumer. The pinned unstable schema now models the
-proxy-chain wire shape as `proxy/initialize` and `proxy/successor`; moving
-`proxyrouter` off the old `_proxy/*` names is tracked in #69. Every port stays
+application with no Go consumer. The pinned unstable schema models the
+proxy-chain wire shape, and `proxyrouter` and the cookbook proxy speak it
+(#69), so a Go proxy runs under the reference conductor. Every port stays
 standard-library-only and behind its own package or command.
 
 ### 3. Schema crate 1.15.1 follow-ups
 
 The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
-them is tracked separately: the proxy-chain method rename (#69) and v2
-background work with `tool_call/cancel`/`terminal/cancel` (#70). Unstable
-session archive/status/title (#71), client-provided system prompts (#58),
-`-32022` version negotiation (#62), unstable auth status (#72), and subagent
-sessions (#60) are delivered.
+them is tracked separately: v2 background work with
+`tool_call/cancel`/`terminal/cancel` (#70). Unstable session archive/status/title
+(#71), client-provided system prompts (#58), `-32022` version negotiation
+(#62), unstable auth status (#72), subagent sessions (#60), and the proxy-chain
+method rename (#69) are delivered.
 
 ## Guardrails
 

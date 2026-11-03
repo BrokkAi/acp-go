@@ -15,7 +15,9 @@ generates or wraps them.
 
 One unstable surface in the 1.15.1 pin is generated but has no facade yet:
 proxy chains (`proxy/initialize`, `proxy/successor`, registered with
-`SideProxy`; #69).
+`SideProxy`). `proxyrouter` routes `proxy/initialize` by its generated name,
+and the cookbook proxy recipe reads and writes the generated `proxy/successor`
+envelopes (#69).
 
 ## Why a separate import
 

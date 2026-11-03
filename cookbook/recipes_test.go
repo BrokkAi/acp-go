@@ -148,7 +148,7 @@ func TestProxyServeReportsProtocolErrors(t *testing.T) {
 	}
 	select {
 	case err := <-reported:
-		if !strings.Contains(err.Error(), "invalid _proxy/successor envelope") {
+		if !strings.Contains(err.Error(), "invalid proxy/successor envelope") {
 			t.Fatalf("reported %v", err)
 		}
 	case <-ctx.Done():

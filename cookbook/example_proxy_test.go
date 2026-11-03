@@ -15,25 +15,42 @@ import (
 	"github.com/BrokkAi/acp-go/agent"
 	"github.com/BrokkAi/acp-go/proxyrouter"
 	"github.com/BrokkAi/acp-go/schema"
+	unstable "github.com/BrokkAi/acp-go/schema/unstable"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
 )
 
+// The proxy-chains RFD's methods, from the pinned unstable schema.
 const (
-	proxyInitializeMethod = "_proxy/initialize"
-	proxySuccessorMethod  = "_proxy/successor"
+	proxyInitializeMethod = unstable.ProxyInitializeMethodName
+	proxySuccessorMethod  = unstable.ProxySuccessorMethodName
 )
 
-// successorMessage is the conductor's envelope for traffic between a proxy and
-// its successor under the Rust SDK 2.2.0 _proxy/successor name; it mirrors
-// that SDK's SuccessorMessage. The pinned unstable schema now defines the
-// renamed proxy/successor envelope (schema/unstable.ProxySuccessorRequest);
-// moving to it is tracked in #69. Like the
-// reference conductor, the proxy sets no envelope _meta and does not forward
-// it; the inner params, including their own _meta, pass through unchanged.
-type successorMessage struct {
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
-	Meta   json.RawMessage `json:"_meta,omitempty"`
+// wrap builds the proxy/successor envelope for a message to or from a
+// proxy's successor. Like the reference SDK, it always sends the wrapped
+// params, as null when the message has none (the schema treats null and an
+// omitted params the same), and sets no envelope _meta. The wrapped params,
+// including their own _meta, pass through unchanged.
+func wrap(method string, params json.RawMessage) unstable.ProxySuccessorRequest {
+	if len(params) == 0 {
+		params = json.RawMessage("null")
+	}
+	return unstable.ProxySuccessorRequest{Method: method, Params: params}
+}
+
+// unwrap reads a proxy/successor envelope with the schema's decoder: the
+// envelope's own _meta is hop-local and is not forwarded, and an omitted or
+// null params means the wrapped message has none. The wrapped request and
+// notification envelopes have the same fields.
+func unwrap(params json.RawMessage) (string, json.RawMessage, error) {
+	var envelope unstable.ProxySuccessorNotification
+	if err := json.Unmarshal(params, &envelope); err != nil {
+		return "", nil, fmt.Errorf("invalid proxy/successor envelope: %w", err)
+	}
+	inner := envelope.Params
+	if string(inner) == "null" {
+		inner = nil
+	}
+	return envelope.Method, inner, nil
 }
 
 // toolsProxy is a stable-v1 proxy component that adds one MCP server to every
@@ -79,7 +96,7 @@ func (p toolsProxy) Serve(ctx context.Context, in io.ReadCloser, out io.WriteClo
 }
 
 // proxyLink is one conductor connection. The conductor delivers client traffic
-// unwrapped and successor traffic inside _proxy/successor envelopes; the proxy
+// unwrapped and successor traffic inside proxy/successor envelopes; the proxy
 // answers in kind.
 type proxyLink struct {
 	server      schema.McpServer
@@ -97,28 +114,32 @@ func (l *proxyLink) request(ctx context.Context, method string, params json.RawM
 	}
 	switch method {
 	case proxyInitializeMethod:
-		// The conductor initializes a proxy with _proxy/initialize. The proxy
-		// initializes its successor with a plain initialize, which the
-		// conductor turns back into _proxy/initialize if the successor is
-		// itself a proxy.
+		// The conductor initializes a proxy with proxy/initialize, whose
+		// params are the version's initialize request
+		// (unstable.InitializeProxyRequest). The proxy initializes its
+		// successor with a plain initialize, which the conductor turns back
+		// into proxy/initialize if the successor is itself a proxy.
 		return l.forwardToSuccessor(ctx, schema.InitializeMethodName, params)
 	case proxySuccessorMethod:
 		// A successor request, such as session/request_permission, goes to
 		// the client unchanged, behind the updates that preceded it.
-		var message successorMessage
-		if err := json.Unmarshal(params, &message); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: "invalid _proxy/successor envelope"}
+		innerMethod, innerParams, err := unwrap(params)
+		if err != nil {
+			data, _ := json.Marshal(err.Error())
+			return nil, &acp.RPCError{Code: -32602, Message: "Invalid params", Data: data}
 		}
 		l.toClient.flush(ctx)
 		var result json.RawMessage
-		err := l.connection.Call(ctx, message.Method, message.Params, &result)
+		err = l.connection.Call(ctx, innerMethod, innerParams, &result)
 		// Client notifications sent before the client's answer, such as a
 		// session/cancel before a cancelled permission outcome, stay ahead of
 		// it on the way back to the successor.
 		l.toSuccessor.flush(ctx)
 		if err != nil {
+			// An *acp.RPCError reaches the successor unchanged.
 			return nil, err
 		}
+		// The result reaches the successor unchanged.
 		return result, nil
 	case schema.SessionNewMethodName, schema.SessionLoadMethodName:
 		withServer, err := addMCPServer(params, l.server)
@@ -135,7 +156,10 @@ func (l *proxyLink) forwardToSuccessor(ctx context.Context, method string, param
 	// Client notifications queued before this request stay ahead of it.
 	l.toSuccessor.flush(ctx)
 	var result json.RawMessage
-	err := l.connection.Call(ctx, proxySuccessorMethod, successorMessage{Method: method, Params: params}, &result)
+	// If the client cancels its request, ctx ends and the connection sends
+	// the successor a plain $/cancel_request naming this proxy/successor
+	// request, as the proxy-chains RFD specifies.
+	err := l.connection.Call(ctx, proxySuccessorMethod, wrap(method, params), &result)
 	// Updates the successor sent before its response were queued while Call
 	// waited. Deliver them first: a v1 client expects every session/update of
 	// a prompt turn before the turn's response.
@@ -150,18 +174,26 @@ func (l *proxyLink) forwardToSuccessor(ctx context.Context, method string, param
 // notification runs on the connection's reader, so it only queues: a
 // notification callback must not write to its own connection.
 func (l *proxyLink) notification(method string, params json.RawMessage) error {
-	if method == proxySuccessorMethod {
-		var message successorMessage
-		if err := json.Unmarshal(params, &message); err != nil {
-			return fmt.Errorf("invalid _proxy/successor envelope: %w", err)
-		}
-		l.toClient.push(queuedNotification{method: message.Method, params: message.Params})
+	if acp.IsCancelRequestNotification(method, params) {
+		// A cancellation, plain or wrapped in any number of envelopes,
+		// names a request on this hop. The connection has already cancelled
+		// it, which cancels the forwarded call, so it is not forwarded, as
+		// the reference SDK's proxy routing drops it.
 		return nil
 	}
-	// Client notifications, such as session/cancel, go to the successor.
+	if method == proxySuccessorMethod {
+		innerMethod, innerParams, err := unwrap(params)
+		if err != nil {
+			return err
+		}
+		l.toClient.push(queuedNotification{method: innerMethod, params: innerParams})
+		return nil
+	}
+	// Other client notifications, such as session/cancel, go to the
+	// successor.
 	l.toSuccessor.push(queuedNotification{
 		method: proxySuccessorMethod,
-		params: successorMessage{Method: method, Params: params},
+		params: wrap(method, params),
 	})
 	return nil
 }
@@ -253,7 +285,7 @@ func (q *notifyQueue) flush(ctx context.Context) {
 
 // testConductor stands in for the reference conductor so this recipe runs
 // under go test: it plays the client toward the proxy and relays the proxy's
-// _proxy/successor traffic to and from one agent. It is test scaffolding, not
+// proxy/successor traffic to and from one agent. It is test scaffolding, not
 // a conductor; see #24.
 type testConductor struct {
 	proxy *acp.Connection
@@ -267,12 +299,12 @@ func (c *testConductor) fromProxy(ctx context.Context, method string, params jso
 	if method != proxySuccessorMethod {
 		return nil, &acp.RPCError{Code: -32601, Message: "client method not supported: " + method}
 	}
-	var message successorMessage
-	if err := json.Unmarshal(params, &message); err != nil {
+	innerMethod, innerParams, err := unwrap(params)
+	if err != nil {
 		return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
 	}
 	var result json.RawMessage
-	if err := c.agent.Call(ctx, message.Method, message.Params, &result); err != nil {
+	if err := c.agent.Call(ctx, innerMethod, innerParams, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -280,11 +312,11 @@ func (c *testConductor) fromProxy(ctx context.Context, method string, params jso
 
 func (c *testConductor) proxyNotification(method string, params json.RawMessage) error {
 	if method == proxySuccessorMethod {
-		var message successorMessage
-		if err := json.Unmarshal(params, &message); err != nil {
+		innerMethod, innerParams, err := unwrap(params)
+		if err != nil {
 			return err
 		}
-		return c.agent.Notify(context.Background(), message.Method, message.Params)
+		return c.agent.Notify(context.Background(), innerMethod, innerParams)
 	}
 	return acp.SessionUpdates(func(update acp.Update) error {
 		if chunk := update.Update.AgentMessageChunk; chunk != nil && chunk.Content.Text != nil {
@@ -298,7 +330,7 @@ func (c *testConductor) proxyNotification(method string, params json.RawMessage)
 
 func (c *testConductor) fromAgent(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	var result json.RawMessage
-	if err := c.proxy.Call(ctx, proxySuccessorMethod, successorMessage{Method: method, Params: params}, &result); err != nil {
+	if err := c.proxy.Call(ctx, proxySuccessorMethod, wrap(method, params), &result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -307,7 +339,11 @@ func (c *testConductor) fromAgent(ctx context.Context, method string, params jso
 // agentNotification wraps agent updates synchronously, so they reach the
 // proxy before the agent's response is relayed.
 func (c *testConductor) agentNotification(method string, params json.RawMessage) error {
-	return c.proxy.Notify(context.Background(), proxySuccessorMethod, successorMessage{Method: method, Params: params})
+	if acp.IsCancelRequestNotification(method, params) {
+		// Cancellations are per hop; the reference conductor drops them too.
+		return nil
+	}
+	return c.proxy.Notify(context.Background(), proxySuccessorMethod, wrap(method, params))
 }
 
 // toolsRecordingAgent is the test agent, reporting the MCP servers each
@@ -325,7 +361,7 @@ func (a *toolsRecordingAgent) NewSession(ctx context.Context, client agent.Clien
 func Example_proxyComponent() {
 	ctx := context.Background()
 	// The router hands a connection to the v1 proxy for any
-	// _proxy/initialize, normalizing a newer request to v1; it never converts
+	// proxy/initialize, normalizing a newer request to v1; it never converts
 	// traffic after selection.
 	router := proxyrouter.New().WithV1(toolsProxy{
 		server: acp.NewStdioMCPServer("docs", "/usr/local/bin/docs-mcp", []string{"--stdio"}, nil),

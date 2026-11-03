@@ -83,29 +83,32 @@ default. Delivered as `github.com/BrokkAi/acp-go/traceviewer` (#23).
 ## `agent-client-protocol-conductor` — won't port
 
 A binary that spawns a chain of proxy components plus the base agent, routes
-`_proxy/successor` envelopes between them, and presents the chain to the editor
+`proxy/successor` envelopes between them, and presents the chain to the editor
 as a single ACP agent.
 
-It is an application, not a library. Its only consumer is an editor pointed at a
-binary, and no Go proxy components or Go proxy-chain users exist to consume one.
-The wire shape is also untrackable here: `_proxy/*` appears nowhere in the
-pinned schema (`schema/unstable`, `schema/v2/unstable`, or their method
-registries), the Rust `SuccessorMessage` lives in that crate's own
-`schema/proxy_protocol.rs`, and the reference design document is explicitly
-historical. A Go conductor would hand-model a shape the pin-and-regenerate
-discipline cannot keep in sync.
+The wire shape is not the obstacle. Schema crate 1.15 publishes the
+proxy-chain messages behind its `unstable_proxy_chains` feature, and the
+pinned unstable artifacts generate them in `schema/unstable` and
+`schema/v2/unstable`: `InitializeProxyRequest`/`Response`, the
+`ProxySuccessor*` envelopes, and the `Proxy*` unions, registered with
+`SideProxy` as `proxy/initialize` and `proxy/successor`. A Go conductor would
+not have to hand-model anything.
 
-Schema crate 1.15 changed the wire-shape part of that reasoning: the unstable
-artifacts now publish the proxy-chain methods as `proxy/initialize` and
-`proxy/successor`, generated in `schema/unstable` and `schema/v2/unstable`
-with `SideProxy`. Moving `proxyrouter` to them is tracked in #69. The conductor
-is still an application without a Go consumer, so the decision stands.
+The conductor is still an application, not a library, and the spec does not
+require one per SDK. The proxy-chains RFD defines the conductor as the
+component that spawns and manages proxies and appears to the editor as an
+ordinary agent, and it names the Rust `agent-client-protocol-conductor` as the
+canonical implementation that editors use directly. A component SDK only has
+to speak the proxy side of the protocol, which `acp-go` does: `proxyrouter`
+negotiates `proxy/initialize` like Rust 5.0.0's proxy protocol router, and the
+cookbook proxy recipe shows a Go proxy built on the generated envelopes, so a
+Go proxy runs under the reference conductor (#69). A Go conductor's only
+consumer would be an editor pointed at a binary, and no Go proxy-chain user
+exists to drive its design.
 
-`acp-go` already ships the producer side: `proxyrouter` lets an application write
-a Go proxy that the reference conductor can orchestrate. If a concrete Go
-consumer for proxy chains appears, revisit with a library helper in
-`proxyrouter` for `_proxy/successor` routing, driven by that consumer, rather
-than a speculative CLI. Recorded as not planned in #24.
+If a concrete Go consumer for proxy chains appears, revisit with a library
+helper in `proxyrouter` for `proxy/successor` routing, driven by that consumer,
+rather than a speculative CLI. Recorded as not planned in #24.
 
 ## `agent-client-protocol-rmcp` — won't port
 

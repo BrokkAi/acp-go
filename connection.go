@@ -47,6 +47,13 @@ type Handler func(context.Context, string, json.RawMessage) (any, error)
 // A notification has no response, so an error a Notifications function
 // returns does not close the connection, as in the reference SDK: it goes to
 // the WithErrorHandler hook, or is dropped when there is none.
+//
+// A $/cancel_request, plain or wrapped in proxy/successor, first cancels the
+// inbound request it names and is then delivered like any other
+// notification, as the reference SDK dispatches it; a forwarding handler
+// must not relay it (see IsCancelRequestNotification), because its requestId
+// means nothing on another connection. One whose params do not parse is
+// dropped.
 type Notifications func(string, json.RawMessage) error
 
 type Connection struct {
@@ -454,19 +461,60 @@ func (c *Connection) sentOr(w outgoing) error {
 }
 
 // guardOutgoing runs the internal outgoing guard, returning the params to
-// send.
-func (c *Connection) guardOutgoing(method string, params json.RawMessage, notification bool) (json.RawMessage, error) {
-	if c.outGuard == nil {
-		return params, nil
+// send. As in the reference SDK, the guard sees the message first; the params
+// it admits are then serialized as a JSON-RPC frame, where they must be an
+// object, an array, or null, and null params are omitted. admitted reports
+// whether the guard admitted the message, so a caller can settle what the
+// guard began when the params cannot be sent.
+func (c *Connection) guardOutgoing(method string, params json.RawMessage, notification bool) (json.RawMessage, bool, error) {
+	if c.outGuard != nil {
+		rewritten, err := c.outGuard(method, params, notification)
+		if err != nil {
+			return nil, false, err
+		}
+		if rewritten != nil {
+			params = rewritten
+		}
 	}
-	rewritten, err := c.outGuard(method, params, notification)
-	if err != nil {
-		return nil, err
+	if err := checkWireParams(params); err != nil {
+		return nil, true, err
 	}
-	if rewritten != nil {
-		return rewritten, nil
+	return wireParams(params), true, nil
+}
+
+// errDroppedNotification marks a notification whose params cannot be sent.
+// As in the reference SDK, whose outgoing actor logs and drops such a frame
+// after the send already succeeded, the send reports success and the error
+// goes to the WithErrorHandler hook.
+type errDroppedNotification struct{ err error }
+
+func (e errDroppedNotification) Error() string { return e.err.Error() }
+
+// buildNotification is the frame builder of Notify and queueNotification.
+func (c *Connection) buildNotification(method string, params json.RawMessage) func() (any, error) {
+	return func() (any, error) {
+		guarded, admitted, err := c.guardOutgoing(method, params, true)
+		if err != nil {
+			if admitted {
+				return nil, errDroppedNotification{err}
+			}
+			return nil, err
+		}
+		return packet{Version: "2.0", Method: method, Params: guarded}, nil
 	}
-	return params, nil
+}
+
+// droppedNotification reports a notification dropped for its params and
+// reports whether err was one.
+func (c *Connection) droppedNotification(method string, err error) bool {
+	dropped, ok := err.(errDroppedNotification)
+	if !ok {
+		return false
+	}
+	if c.onError != nil {
+		c.report(fmt.Errorf("acp: dropped %s notification: %w", method, dropped.err))
+	}
+	return true
 }
 
 func (c *Connection) Notify(ctx context.Context, method string, params any) error {
@@ -474,13 +522,10 @@ func (c *Connection) Notify(ctx context.Context, method string, params any) erro
 	if err != nil {
 		return err
 	}
-	w, _, err := c.queue(ctx, func() (any, error) {
-		guarded, err := c.guardOutgoing(method, b, true)
-		if err != nil {
-			return nil, err
-		}
-		return packet{Version: "2.0", Method: method, Params: guarded}, nil
-	})
+	w, _, err := c.queue(ctx, c.buildNotification(method, b))
+	if c.droppedNotification(method, err) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -613,15 +658,20 @@ func (c *Connection) Call(ctx context.Context, method string, params, result any
 			c.settle(call, nil, err)
 		}
 	}
+	// admitted is set when the guard admitted the request, even if its
+	// params then cannot be sent: the call is settled, not forgotten, so
+	// what the guard began does not stay in progress.
+	admitted := false
 	w, built, err := c.queue(ctx, func() (any, error) {
-		guarded, err := c.guardOutgoing(method, b, false)
+		guarded, ok, err := c.guardOutgoing(method, b, false)
+		admitted = ok
 		if err != nil {
 			return nil, err
 		}
 		return packet{Version: "2.0", ID: json.RawMessage(id), Method: method, Params: guarded}, nil
 	})
 	if err != nil {
-		if built {
+		if built || admitted {
 			abandon(err)
 		} else {
 			forget()
@@ -726,14 +776,18 @@ func (c *Connection) readLoop() {
 			if c.notifyGuard != nil && !c.admitNotification(p.Method) {
 				continue
 			}
-			if p.Method == "$/cancel_request" {
-				var v struct {
-					ID json.RawMessage `json:"requestId"`
-				}
-				if json.Unmarshal(p.Params, &v) == nil {
-					c.cancelInbound(string(v.ID))
-				}
-			} else if c.onNotify != nil {
+			// As in the reference SDK, a $/cancel_request, plain or wrapped
+			// in proxy/successor, cancels the request it names and then
+			// reaches the handler like any notification; one whose params do
+			// not parse cancels nothing and is dropped.
+			id, kind := cancelRequestID(p.Method, p.Params)
+			if kind == malformedCancellation {
+				continue
+			}
+			if kind == cancelsRequest {
+				c.cancelInbound(string(id))
+			}
+			if c.onNotify != nil {
 				c.notify(p.Method, p.Params)
 			}
 		case requestMessage:
@@ -870,6 +924,8 @@ func decodeMessage(line []byte) (packet, messageKind) {
 			return packet{}, malformedCall
 		}
 		if hasID {
+			// Ids are compared and echoed as the reference SDK decodes them.
+			p.ID = canonicalID(id)
 			return p, requestMessage
 		}
 		return p, notificationMessage
@@ -877,6 +933,7 @@ func decodeMessage(line []byte) (packet, messageKind) {
 		if !validVersion || !validRequestID(id) {
 			return packet{}, malformedResponse
 		}
+		p.ID = canonicalID(id)
 		p.Params = nil
 		if hasResult {
 			p.Result = result
