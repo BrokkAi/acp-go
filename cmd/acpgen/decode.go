@@ -37,6 +37,13 @@ import (
 // untagged variants, or in a flattened union) it also reads a non-negative
 // integer tag as the index of a tagged variant; the generated decoders track
 // that context as the buffered flag.
+//
+// A failure carries serde's exact error text, which the agent runtimes send
+// to peers in -32602 answers: no field path, the first value that does not
+// decode in wire order before the first required field missing in Rust
+// declaration order, values quoted as serde's Unexpected quotes them, and
+// what the Rust type expects (a u16, a path string, struct X, an untagged
+// enum X), so the text never names a Go type.
 
 // decl describes the generated decode methods of a type.
 type declKind int
@@ -128,9 +135,12 @@ func (f field) defaultExpr() string {
 
 // valueCall renders the call that decodes raw into dst, a pointer to a value
 // of Go type typ. itemNullOK applies to list items and map values, skip to
-// list items, and cb is the buffered expression for the value.
-func valueCall(typ, dst string, nullOK, itemNullOK, skip bool, cb, itemCB string) string {
+// list items, and cb is the buffered expression for the value. path marks a
+// string, or the strings of a list, Rust decodes as a path.
+func valueCall(typ, dst string, nullOK, itemNullOK, skip bool, cb, itemCB string, path bool) string {
 	switch {
+	case path && !strings.HasPrefix(typ, "[]"):
+		return fmt.Sprintf("decodePath(raw, %s, %t)", dst, nullOK)
 	case strings.HasPrefix(typ, "*"):
 		elem := typ[1:]
 		switch {
@@ -142,10 +152,10 @@ func valueCall(typ, dst string, nullOK, itemNullOK, skip bool, cb, itemCB string
 		return fmt.Sprintf("decodeValue(raw, %s, %t, %s)", dst, nullOK, cb)
 	case strings.HasPrefix(typ, "[]"):
 		elem := typ[2:]
-		return fmt.Sprintf("decodeList(raw, %s, %t, %t, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", dst, nullOK, skip, elem, valueCall(elem, "dst", itemNullOK, false, false, itemCB, itemCB))
+		return fmt.Sprintf("decodeList(raw, %s, %t, %t, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", dst, nullOK, skip, elem, valueCall(elem, "dst", itemNullOK, false, false, itemCB, itemCB, path))
 	case strings.HasPrefix(typ, "map[") && typ != "map[string]any":
 		elem := typ[strings.Index(typ, "]")+1:]
-		return fmt.Sprintf("decodeMap(raw, %s, %t, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", dst, nullOK, elem, valueCall(elem, "dst", itemNullOK, false, false, itemCB, itemCB))
+		return fmt.Sprintf("decodeMap(raw, %s, %t, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", dst, nullOK, elem, valueCall(elem, "dst", itemNullOK, false, false, itemCB, itemCB, false))
 	case isAnyType(typ):
 		return fmt.Sprintf("decodeChecked(raw, %s, %t, valid%s)", dst, nullOK, typ)
 	}
@@ -167,17 +177,19 @@ func fieldCall(f field, buffered string) string {
 	case f.Nullable && f.NonZero:
 		return fmt.Sprintf("decodeNullable(raw, %s, func(raw json.RawMessage, dst *%s) error {\n\t\treturn decodeNonZero(raw, dst)\n\t})", dst, f.GoType)
 	case f.Nullable:
-		return fmt.Sprintf("decodeNullable(raw, %s, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", dst, f.GoType, valueCall(f.GoType, "dst", false, f.ItemNullOK, f.SkipInvalid, cb, itemCB))
+		return fmt.Sprintf("decodeNullable(raw, %s, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", dst, f.GoType, valueCall(f.GoType, "dst", false, f.ItemNullOK, f.SkipInvalid, cb, itemCB, f.Path))
 	case f.NonZero && f.pointer():
 		return fmt.Sprintf("func() error {\n\t\tif isNull(raw) {\n\t\t\treturn nil\n\t\t}\n\t\tv.%s = new(%s)\n\t\treturn decodeNonZero(raw, v.%s)\n\t}()", f.GoName, f.GoType, f.GoName)
 	case f.NonZero:
 		return fmt.Sprintf("decodeNonZero(raw, %s)", dst)
 	}
-	return valueCall(f.declType(), dst, f.NullOK, f.ItemNullOK, f.SkipInvalid, cb, itemCB)
+	return valueCall(f.declType(), dst, f.NullOK, f.ItemNullOK, f.SkipInvalid, cb, itemCB, f.Path)
 }
 
-// emitFieldValue writes the decoding of raw (in scope) into field f of v.
-func emitFieldValue(b *strings.Builder, owner string, f field, buffered string) {
+// emitFieldValue writes the decoding of raw (in scope) into field f of v. A
+// failure returns the value's own error, as serde reports it, without the
+// field's path.
+func emitFieldValue(b *strings.Builder, f field, buffered string) {
 	if f.DefaultOnNull && !f.Nullable {
 		fmt.Fprintf(b, "\t\tif isNull(raw) {\n\t\t\tv.%s = %s\n\t\t} else if err := %s; err != nil {\n", f.GoName, f.defaultExpr(), fieldCall(f, buffered))
 	} else {
@@ -186,31 +198,40 @@ func emitFieldValue(b *strings.Builder, owner string, f field, buffered string) 
 	if f.DefaultOnError {
 		fmt.Fprintf(b, "\t\t\tv.%s = %s\n", f.GoName, f.defaultExpr())
 	} else {
-		fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(\"%s.%s: %%w\", err)\n", owner, f.JSONName)
+		b.WriteString("\t\t\treturn err\n")
 	}
 	b.WriteString("\t\t}\n")
 }
 
 // emitFieldDecode writes the decoding of field f from raws into v.
-func emitFieldDecode(b *strings.Builder, owner string, f field, buffered string) {
+func emitFieldDecode(b *strings.Builder, f field, buffered string) {
 	fmt.Fprintf(b, "\tif raw, ok := raws.get(%q); ok {\n", f.JSONName)
-	emitFieldValue(b, owner, f, buffered)
+	emitFieldValue(b, f, buffered)
 	b.WriteString("\t}")
 	if f.Required {
-		fmt.Fprintf(b, " else {\n\t\treturn missingField(%q, %q)\n\t}", owner, f.JSONName)
+		fmt.Fprintf(b, " else {\n\t\treturn missingField(%q)\n\t}", f.JSONName)
 	}
 	b.WriteString("\n")
 }
 
 // emitDecodeEntry writes UnmarshalJSON and decodeJSON of a struct or tagged
 // union, which reads an object, or an array when the type reads from one.
-func emitDecodeEntry(b *strings.Builder, typeName string, seq bool) {
+// With rejectNull set, null fails as serde fails a struct read from null;
+// otherwise it reads as an empty object, as the reference SDK's
+// default_on_null structs read it.
+//
+// notObject renders the error for any other value: serde's, naming what the
+// Rust type expects.
+func emitDecodeEntry(b *strings.Builder, typeName string, seq, rejectNull bool, notObject string) {
 	fmt.Fprintf(b, "func (v *%s) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }\n\n", typeName)
 	fmt.Fprintf(b, "func (v *%s) decodeJSON(data []byte, buffered bool) error {\n", typeName)
+	if rejectNull {
+		b.WriteString("\tif isNull(data) {\n\t\treturn v.nullError()\n\t}\n")
+	}
 	if seq {
 		b.WriteString("\tif isArray(data) {\n\t\titems, err := splitArray(data)\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\treturn v.decodeSeq(items, buffered)\n\t}\n")
 	}
-	b.WriteString("\traws, err := splitObject(data)\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn v.decodeFields(data, raws, buffered)\n}\n\n")
+	fmt.Fprintf(b, "\traws, err := splitObject(data)\n\tif err != nil {\n\t\treturn %s\n\t}\n\treturn v.decodeFields(data, raws, buffered)\n}\n\n", notObject)
 }
 
 // emitStructDecode writes the decoders of a struct (or of an inline union
@@ -219,20 +240,29 @@ func emitStructDecode(b *strings.Builder, td *typeDef, typeName string, fields [
 	if len(fields) == 0 {
 		return
 	}
+	// serde's errors name the Rust struct, which is the def's, except for
+	// the default_on_null! payloads, which deserialize through a struct Wire.
+	rustName := typeName
 	var fl *flattenInfo
 	if td != nil {
 		fl = td.Flatten
-	}
-	emitDecodeEntry(b, typeName, seqOrder != nil)
-	fmt.Fprintf(b, "func (v *%s) decodeFields(data []byte, raws rawObject, buffered bool) error {\n\t*v = %s{}\n", typeName, typeName)
-	for _, f := range fields {
-		if f.Variant != "" || (fl != nil && f.JSONName == fl.TagJSON) {
-			continue
+		if td.DefaultOnNull {
+			rustName = "Wire"
 		}
-		emitFieldDecode(b, typeName, f, "buffered")
 	}
+	fmt.Fprintf(b, "func (*%s) nullError() error { return errors.New(\"invalid type: null, expected struct %s\") }\n\n", typeName, rustName)
+	emitDecodeEntry(b, typeName, seqOrder != nil, requiresFields(fields), fmt.Sprintf("invalidType(data, %q)", "struct "+rustName))
+	fmt.Fprintf(b, "func (v *%s) decodeFields(data []byte, raws rawObject, buffered bool) error {\n\t*v = %s{}\n", typeName, typeName)
 	if fl != nil {
+		for _, f := range fields {
+			if f.Variant != "" || f.JSONName == fl.TagJSON {
+				continue
+			}
+			emitFieldDecode(b, f, "buffered")
+		}
 		emitFlattenedDecode(b, td)
+	} else {
+		emitMapVisit(b, fields, seqOrder)
 	}
 	b.WriteString("\treturn nil\n}\n\n")
 	if seqOrder != nil {
@@ -240,6 +270,58 @@ func emitStructDecode(b *strings.Builder, td *typeDef, typeName string, fields [
 	}
 	if fl != nil {
 		emitFlattenedVariantDecode(b, td)
+	}
+}
+
+// requiresFields reports whether a struct has a required field, so that serde
+// cannot read it from null.
+func requiresFields(fields []field) bool {
+	for _, f := range fields {
+		if f.Required {
+			return true
+		}
+	}
+	return false
+}
+
+// emitMapVisit writes the body of a struct's decodeFields as serde's derived
+// visit_map reads the reference SDK's serde_json::Value: each member, in the
+// order it first appears and with its last value (splitObject has already
+// merged repeated keys), decodes into its field,
+// the first that fails ending the decode; then the first required field
+// absent, in Rust declaration order, fails as missing. Unknown members are
+// ignored.
+func emitMapVisit(b *strings.Builder, fields []field, order []string) {
+	b.WriteString("\tfor _, m := range raws {\n\t\traw := m.raw\n\t\tswitch string(m.key) {\n")
+	for _, f := range fields {
+		fmt.Fprintf(b, "\t\tcase %q:\n", f.JSONName)
+		var body strings.Builder
+		emitFieldValue(&body, f, "buffered")
+		for _, line := range strings.SplitAfter(body.String(), "\n") {
+			if line != "" {
+				b.WriteString("\t" + line)
+			}
+		}
+	}
+	b.WriteString("\t\t}\n\t}\n")
+	byName := map[string]field{}
+	for _, f := range fields {
+		byName[f.JSONName] = f
+	}
+	var keys []string
+	seen := map[string]bool{}
+	for _, key := range order {
+		if f, ok := byName[key]; ok && f.Required && !seen[key] {
+			keys, seen[key] = append(keys, key), true
+		}
+	}
+	for _, f := range fields {
+		if f.Required && !seen[f.JSONName] {
+			keys, seen[f.JSONName] = append(keys, f.JSONName), true
+		}
+	}
+	for _, key := range keys {
+		fmt.Fprintf(b, "\tif _, ok := raws.get(%q); !ok {\n\t\treturn missingField(%q)\n\t}\n", key, key)
 	}
 }
 
@@ -258,7 +340,7 @@ func emitSeqDecode(b *strings.Builder, typeName string, fields []field, order []
 			panic(fmt.Sprintf("%s: positional field %q is not a field", typeName, key))
 		}
 		fmt.Fprintf(b, "\tif len(items) > %d {\n\t\traw := items[%d]\n", i, i)
-		emitFieldValue(b, typeName, f, "buffered")
+		emitFieldValue(b, f, "buffered")
 		b.WriteString("\t}")
 		if f.Required {
 			fmt.Fprintf(b, " else {\n\t\treturn seqTooShort(%q, %d, %d)\n\t}", typeName, i, len(order))
@@ -303,7 +385,7 @@ func emitFlattenedVariantDecode(b *strings.Builder, td *typeDef) {
 		fmt.Fprintf(b, "\tcase %q:\n", known)
 		for _, f := range td.Fields {
 			if f.Variant == known {
-				emitFieldDecode(b, td.Name, f, "true")
+				emitFieldDecode(b, f, "true")
 			}
 		}
 	}
@@ -378,7 +460,29 @@ func emitTaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
 	sort.SliceStable(untagged, func(i, j int) bool { return untagged[i].Rank < untagged[j].Rank })
 	seq := len(td.Fields) == 0
 	fmt.Fprintf(b, "var %s = []string{%s}\n\n", tagsVar(td.Name), quoteList(known))
-	emitDecodeEntry(b, td.Name, seq)
+	// Rust reads a union with untagged variants as an untagged enum, every
+	// failure of which is the same error; it flattens one with shared fields
+	// beside them, and names that enum (flattenedEnums).
+	enumName := td.Name
+	if len(td.Fields) > 0 && len(untagged) > 0 {
+		var ok bool
+		if enumName, ok = flattenedEnums[td.Name]; !ok {
+			panic(fmt.Sprintf("%s: flattenedEnums does not name the Rust enum of this union", td.Name))
+		}
+	}
+	// With shared fields, Rust's type is a struct flattening the enum.
+	notObject := fmt.Sprintf("invalidType(data, %q)", "internally tagged enum "+td.Name)
+	switch {
+	case len(td.Fields) > 0:
+		notObject = fmt.Sprintf("invalidType(data, %q)", "struct "+td.Name)
+		fmt.Fprintf(b, "func (*%s) nullError() error { return errors.New(\"invalid type: null, expected struct %s\") }\n\n", td.Name, td.Name)
+	case len(untagged) > 0:
+		notObject = untaggedError(enumName)
+		fmt.Fprintf(b, "func (*%s) nullError() error { return %s }\n\n", td.Name, notObject)
+	default:
+		fmt.Fprintf(b, "func (*%s) nullError() error {\n\treturn errors.New(\"invalid type: null, expected internally tagged enum %s\")\n}\n\n", td.Name, td.Name)
+	}
+	emitDecodeEntry(b, td.Name, seq, requiresFields(td.Fields), notObject)
 
 	for _, form := range []string{"fields", "seq"} {
 		if form == "seq" && !seq {
@@ -393,8 +497,8 @@ func emitTaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
 			b.WriteString("\tbuffered = true\n")
 		}
 		if form == "fields" {
-			for _, f := range td.Fields {
-				emitFieldDecode(b, td.Name, f, "buffered")
+			if len(td.Fields) > 0 {
+				emitMapVisit(b, td.Fields, td.FieldOrder)
 			}
 			if len(td.Fields) > 0 {
 				// Rust flattens the enum beside the shared fields, so it
@@ -406,15 +510,21 @@ func emitTaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
 			b.WriteString("\tpresent := len(items) > 0\n\tvar raw json.RawMessage\n\tif present {\n\t\traw = items[0]\n\t}\n")
 		}
 		if len(untagged) == 0 {
-			fmt.Fprintf(b, "\tif !present {\n\t\treturn missingField(%q, %q)\n\t}\n", td.Name, td.TagJSON)
+			fmt.Fprintf(b, "\tif !present {\n\t\treturn missingField(%q)\n\t}\n", td.TagJSON)
 		}
 		tagBuffered := "buffered"
 		if td.StringTag {
 			tagBuffered = "false"
+			if form == "fields" {
+				for _, key := range td.StringTagRule.Required {
+					fmt.Fprintf(b, "\tif _, ok := raws.get(%q); !ok {\n\t\treturn missingField(%q)\n\t}\n", key, key)
+				}
+				fmt.Fprintf(b, "\tif jsonKind(raw) != '\"' {\n\t\treturn errors.New(%q)\n\t}\n", "`"+td.TagJSON+"` must be a string")
+			}
 		}
 		fmt.Fprintf(b, "\ttag, tagged := \"\", false\n\tif present {\n\t\ttag, tagged = decodeTag(raw, %s, %s)\n\t}\n", tagBuffered, tagsVar(td.Name))
 		if len(untagged) == 0 {
-			fmt.Fprintf(b, "\tif !tagged {\n\t\treturn fmt.Errorf(\"%s: invalid %s tag %%s\", raw)\n\t}\n", td.Name, td.TagJSON)
+			fmt.Fprintf(b, "\tif !tagged {\n\t\treturn invalidType(raw, \"variant identifier\")\n\t}\n")
 		}
 		b.WriteString("\tvar err error\n\tif tagged {\n\t\tswitch tag {\n")
 		for _, v := range consts {
@@ -433,9 +543,12 @@ func emitTaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
 				call = payloadSeqCall(v, pt, "payload", "items[1:]")
 			}
 			fmt.Fprintf(b, "\t\tcase %q:\n\t\t\tpayload := new(%s)\n\t\t\tif err = %s; err == nil {\n\t\t\t\tv.Kind, v.%s = %s%s, payload\n\t\t\t\treturn nil\n\t\t\t}\n", v.Const, pt, call, v.GoName, kindType, pascal(v.Const))
+			if prefix, ok := td.StringTagRule.Payload[v.Const]; ok && form == "fields" {
+				fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(\"%%s: %%w\", %q, err)\n", prefix)
+			}
 		}
 		if len(untagged) == 0 {
-			fmt.Fprintf(b, "\t\tdefault:\n\t\t\treturn fmt.Errorf(\"%s: unknown %s tag %%q\", tag)\n\t\t}\n\t}\n\treturn err\n}\n\n", td.Name, td.TagJSON)
+			fmt.Fprintf(b, "\t\tdefault:\n\t\t\treturn unknownVariant(tag, %s)\n\t\t}\n\t}\n\treturn err\n}\n\n", tagsVar(td.Name))
 			continue
 		}
 		b.WriteString("\t\t}\n\t}\n")
@@ -450,7 +563,7 @@ func emitTaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
 				}
 				b.WriteString(" {\n")
 				if len(v.Inline) > 0 {
-					fmt.Fprintf(b, "\t\tif e := new(%s).decodeFields(data, raws, true); e != nil {\n\t\t\treturn fmt.Errorf(\"%s: data matches no variant: %%w\", e)\n\t\t}\n", otherFieldsType(td), td.Name)
+					fmt.Fprintf(b, "\t\tif new(%s).decodeFields(data, raws, true) != nil {\n\t\t\treturn %s\n\t\t}\n", otherFieldsType(td), untaggedError(enumName))
 				}
 				if len(v.OpenAnyOf) > 0 {
 					// The open value must also match one of the arms (exactly
@@ -463,7 +576,7 @@ func emitTaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
 					if v.OpenOneOf {
 						cond = "matched != 1"
 					}
-					fmt.Fprintf(b, "\t\tif %s {\n\t\t\treturn fmt.Errorf(\"%s: data matches no variant\")\n\t\t}\n", cond, td.Name)
+					fmt.Fprintf(b, "\t\tif %s {\n\t\t\treturn %s\n\t\t}\n", cond, untaggedError(enumName))
 				}
 				fmt.Fprintf(b, "\t\tv.Kind = %s(tag)\n\t\tv.Other = &%sOther{Raw: objectData(data, raws)}\n\t\treturn nil\n\t}\n", kindType, td.Name)
 				continue
@@ -475,10 +588,14 @@ func emitTaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
 			}
 			fmt.Fprintf(b, "\tpayload%s := new(%s)\n\tif e := %s; e == nil {\n\t\tv.%s = payload%s\n\t\treturn nil\n\t} else if err == nil {\n\t\terr = e\n\t}\n", v.GoName, pt, call, v.GoName, v.GoName)
 		}
-		fmt.Fprintf(b, "\tif err != nil {\n\t\treturn fmt.Errorf(\"%s: data matches no variant: %%w\", err)\n\t}\n", td.Name)
-		fmt.Fprintf(b, "\tif !present {\n\t\treturn missingField(%q, %q)\n\t}\n", td.Name, td.TagJSON)
-		fmt.Fprintf(b, "\treturn fmt.Errorf(\"%s: unknown %s tag %%s\", raw)\n}\n\n", td.Name, td.TagJSON)
+		fmt.Fprintf(b, "\t_ = err\n\treturn %s\n}\n\n", untaggedError(enumName))
 	}
+}
+
+// untaggedError renders serde's error for an untagged enum that no variant
+// decodes.
+func untaggedError(name string) string {
+	return fmt.Sprintf("errors.New(\"data did not match any variant of untagged enum %s\")", name)
 }
 
 // otherFieldsType names the unexported struct that checks the fields of a
@@ -505,13 +622,14 @@ func emitOtherFields(b *strings.Builder, td *typeDef) {
 // emitUntaggedUnionDecode writes the decoder of an untagged union, which
 // serde decodes from buffered content, trying each variant in order.
 func emitUntaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
+	fmt.Fprintf(b, "func (*%s) nullError() error { return %s }\n\n", td.Name, untaggedError(td.Name))
 	fmt.Fprintf(b, "func (v *%s) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }\n\n", td.Name)
 	fmt.Fprintf(b, "func (v *%s) decodeJSON(data []byte, buffered bool) error {\n\t*v = %s{}\n", td.Name, td.Name)
 	b.WriteString("\traws, err := splitObject(data)\n\tobject := err == nil && raws != nil\n")
 	if len(td.Fields) > 0 {
 		fmt.Fprintf(b, "\tif !object {\n\t\treturn fmt.Errorf(\"%s: expected an object\")\n\t}\n", td.Name)
 		for _, f := range td.Fields {
-			emitFieldDecode(b, td.Name, f, "buffered")
+			emitFieldDecode(b, f, "buffered")
 		}
 	}
 	b.WriteString("\terr = nil\n")
@@ -525,7 +643,7 @@ func emitUntaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
 		switch {
 		case strings.HasPrefix(v.Payload, "[]"):
 			elem := strings.TrimPrefix(v.Payload, "[]")
-			call = fmt.Sprintf("decodeList(data, payload, false, false, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", elem, valueCall(elem, "dst", false, false, false, "true", "true"))
+			call = fmt.Sprintf("decodeList(data, payload, false, false, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", elem, valueCall(elem, "dst", false, false, false, "true", "true", false))
 		case declOf(pt) == declFields:
 			call = fmt.Sprintf("func() error {\n\t\tif object {\n\t\t\treturn payload.decodeFields(data, raws, true)\n\t\t}\n\t\treturn payload.decodeJSON(data, true)\n\t}()")
 		case declOf(pt) == declJSON:
@@ -548,7 +666,7 @@ func emitUntaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
 		fmt.Fprintf(b, "\tv.Other = &%sOther{Raw: append(json.RawMessage(nil), data...)}\n\treturn nil\n}\n\n", td.Name)
 		return
 	}
-	fmt.Fprintf(b, "\tif err != nil {\n\t\treturn fmt.Errorf(\"%s: payload matches no variant: %%w\", err)\n\t}\n\treturn fmt.Errorf(\"%s: payload matches no variant\")\n}\n\n", td.Name, td.Name)
+	fmt.Fprintf(b, "\t_ = err\n\treturn %s\n}\n\n", untaggedError(td.Name))
 }
 
 // untaggedProbe renders the shape test guarding one untagged variant read
@@ -598,15 +716,26 @@ func emitEnumDecode(b *strings.Builder, td *typeDef) {
 	default:
 		b.WriteString("// UnmarshalJSON reads a member as a string or in the map form\n// {\"variant\": null}, and rejects any other value, as Rust's closed enum does.\n")
 	}
-	fmt.Fprintf(b, "func (v *%s) UnmarshalJSON(data []byte) error {\n\ts, mapForm, err := enumValue(data)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"%s: %%w\", err)\n\t}\n", td.Name, td.Name)
+	names := make([]string, 0, len(td.Variants))
+	for _, v := range td.Variants {
+		names = append(names, v.Const)
+	}
+	if td.OpenEnum {
+		fmt.Fprintf(b, "func (*%s) nullError() error { return %s }\n\n", td.Name, untaggedError(td.Name))
+		fmt.Fprintf(b, "func (v *%s) UnmarshalJSON(data []byte) error {\n\ts, mapForm, err := enumValue(data)\n\tif err != nil {\n\t\treturn %s\n\t}\n", td.Name, untaggedError(td.Name))
+	} else {
+		fmt.Fprintf(b, "func (*%s) nullError() error {\n\treturn errors.New(\"invalid type: null, expected string or map\")\n}\n\n", td.Name)
+		fmt.Fprintf(b, "var %s = []string{%s}\n\n", unexport(td.Name)+"Variants", quoteList(names))
+		fmt.Fprintf(b, "func (v *%s) UnmarshalJSON(data []byte) error {\n\ts, mapForm, err := enumValue(data)\n\tif err != nil {\n\t\treturn err\n\t}\n", td.Name)
+	}
 	fmt.Fprintf(b, "\tswitch %s(s) {\n\tcase %s:\n\t\t*v = %s(s)\n\tdefault:\n", td.Name, strings.Join(cases, ", "), td.Name)
 	switch {
 	case td.Fallback != "":
 		fmt.Fprintf(b, "\t\t*v = %q\n", td.Fallback)
 	case td.OpenEnum:
-		fmt.Fprintf(b, "\t\tif mapForm {\n\t\t\treturn fmt.Errorf(\"%s: unknown variant %%q\", s)\n\t\t}\n\t\t*v = %s(s)\n", td.Name, td.Name)
+		fmt.Fprintf(b, "\t\tif mapForm {\n\t\t\treturn %s\n\t\t}\n\t\t*v = %s(s)\n", untaggedError(td.Name), td.Name)
 	default:
-		fmt.Fprintf(b, "\t\treturn fmt.Errorf(\"%s: unknown variant %%q\", s)\n", td.Name)
+		fmt.Fprintf(b, "\t\treturn unknownVariant(s, %s)\n", unexport(td.Name)+"Variants")
 	}
 	b.WriteString("\t}\n")
 	if !td.OpenEnum {
@@ -639,11 +768,11 @@ func emitAnyValidator(b *strings.Builder, td *typeDef) {
 		case "integer":
 			cond = fmt.Sprintf("!isNull(raw) && json.Unmarshal(raw, new(%s)) == nil", arm.GoType)
 		case "array":
-			cond = fmt.Sprintf("decodeList(raw, new([]%s), false, false, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t}) == nil", arm.GoType, arm.GoType, valueCall(arm.GoType, "dst", arm.ItemNullOK, false, false, "true", "true"))
+			cond = fmt.Sprintf("decodeList(raw, new([]%s), false, false, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t}) == nil", arm.GoType, arm.GoType, valueCall(arm.GoType, "dst", arm.ItemNullOK, false, false, "true", "true", false))
 		}
 		fmt.Fprintf(b, "\tif %s {\n\t\treturn nil\n\t}\n", cond)
 	}
-	fmt.Fprintf(b, "\treturn fmt.Errorf(\"%s: data did not match any variant\")\n}\n\n", td.Name)
+	fmt.Fprintf(b, "\treturn %s\n}\n\n", untaggedError(td.Name))
 }
 
 // emitFlattenedCodec writes the encoder of a struct carrying a flattened
@@ -720,8 +849,21 @@ type decoder interface {
 	decodeJSON(data []byte, buffered bool) error
 }
 
-// errNull reports a null where the schema does not admit one.
-var errNull = fmt.Errorf("null is not allowed here")
+// nullRejecter is implemented by the generated types, which reject null
+// the way their Rust type does.
+type nullRejecter interface {
+	nullError() error
+}
+
+// nullError reports a null where the schema does not admit one, as serde
+// reports it for a T. It takes the type, not the value, so that decoding
+// into a local does not move it to the heap.
+func nullError[T any]() error {
+	if r, ok := any((*T)(nil)).(nullRejecter); ok {
+		return r.nullError()
+	}
+	return fmt.Errorf("invalid type: null, expected %s", expecting(reflect.TypeFor[T]()))
+}
 
 // errSeq reports an array where only an object decodes.
 var errSeq = fmt.Errorf("invalid type: sequence, expected an object")
@@ -742,11 +884,14 @@ func jsonKind(raw []byte) byte {
 
 func isArray(data []byte) bool { return jsonKind(data) == '[' }
 
-func missingField(owner, key string) error {
-	return fmt.Errorf("%s: missing field %q", owner, key)
+func missingField(key string) error {
+	return fmt.Errorf("missing field \x60%s\x60", key)
 }
 
 func seqTooShort(owner string, n, want int) error {
+	if want == 1 {
+		return fmt.Errorf("invalid length %d, expected struct %s with 1 element", n, owner)
+	}
 	return fmt.Errorf("invalid length %d, expected struct %s with %d elements", n, owner, want)
 }
 
@@ -762,7 +907,9 @@ func seqTooLong(n int) error {
 	return fmt.Errorf("invalid length %d, expected fewer elements in array", n)
 }
 
-// rawObject holds the members of a JSON object in wire order. The values are
+// rawObject holds the members of a JSON object in wire order, each key once:
+// a repeated key keeps its first position with its last value, as the
+// reference SDK's serde_json::Value (preserve_order) does. The values are
 // slices of the decoded document, not copies.
 type rawObject []rawMember
 
@@ -771,15 +918,50 @@ type rawMember struct {
 	raw json.RawMessage
 }
 
-// get returns the value of key; a duplicate key keeps its last value, as
-// the Rust SDK's serde_json::Value does.
+// get returns the value of key.
 func (o rawObject) get(key string) (json.RawMessage, bool) {
-	for i := len(o) - 1; i >= 0; i-- {
+	for i := range o {
 		if string(o[i].key) == key {
 			return o[i].raw, true
 		}
 	}
 	return nil, false
+}
+
+// smallObject is the member count up to which mergeRepeated compares keys
+// pairwise instead of indexing them.
+const smallObject = 16
+
+// mergeRepeated merges the repeated keys of o in place, in time linear in
+// its size: each key keeps its first position with its last value.
+func mergeRepeated(o rawObject) rawObject {
+	if len(o) <= smallObject {
+		n := 0
+	small:
+		for _, m := range o {
+			for j := range o[:n] {
+				if string(o[j].key) == string(m.key) {
+					o[j].raw = m.raw
+					continue small
+				}
+			}
+			o[n] = m
+			n++
+		}
+		return o[:n]
+	}
+	index := make(map[string]int, len(o))
+	n := 0
+	for _, m := range o {
+		if j, ok := index[string(m.key)]; ok {
+			o[j].raw = m.raw
+			continue
+		}
+		index[string(m.key)] = n
+		o[n] = m
+		n++
+	}
+	return o[:n]
 }
 
 // hasKeys reports whether every key is present.
@@ -828,7 +1010,7 @@ func splitObject(data []byte) (rawObject, error) {
 		return nil, nil
 	}
 	if i >= len(data) || data[i] != '{' {
-		return nil, fmt.Errorf("invalid type: %s, expected a map", serdeKind(data))
+		return nil, invalidType(data, "a map")
 	}
 	var out rawObject
 	i = skipSpace(data, i+1)
@@ -864,7 +1046,7 @@ func splitObject(data []byte) (rawObject, error) {
 			continue
 		}
 		if i < len(data) && data[i] == '}' {
-			return out, nil
+			return mergeRepeated(out), nil
 		}
 		break
 	}
@@ -878,7 +1060,7 @@ func splitArray(data []byte) ([]json.RawMessage, error) {
 		return nil, nil
 	}
 	if i >= len(data) || data[i] != '[' {
-		return nil, fmt.Errorf("invalid type: %s, expected a sequence", serdeKind(data))
+		return nil, invalidType(data, "a sequence")
 	}
 	out := []json.RawMessage{}
 	i = skipSpace(data, i+1)
@@ -1018,30 +1200,83 @@ func enumValue(data []byte) (string, bool, error) {
 			return "", false, fmt.Errorf("invalid value: map, expected map with a single key")
 		}
 		if !isNull(members[0].raw) {
-			return "", false, fmt.Errorf("invalid type: %s, expected unit", serdeKind(members[0].raw))
+			return "", false, invalidType(members[0].raw, "unit")
 		}
 		return string(members[0].key), true, nil
 	}
-	return "", false, fmt.Errorf("invalid type: %s, expected a variant", serdeKind(data))
+	return "", false, invalidType(data, "string or map")
 }
 
-// serdeKind names the kind of a JSON value the way serde's errors do.
-func serdeKind(data []byte) string {
-	switch c := jsonKind(data); {
-	case c == '{':
-		return "map"
-	case c == '[':
-		return "sequence"
-	case c == '"':
-		return "string"
-	case c == 't' || c == 'f':
-		return "boolean"
-	case c == 'n':
-		return "null"
-	case c == '-' || (c >= '0' && c <= '9'):
-		return "number"
+// unknownVariant is serde's error for a variant name an enum does not know,
+// listing the variants it does in declaration order.
+func unknownVariant(name string, variants []string) error {
+	quoted := make([]string, len(variants))
+	for i, v := range variants {
+		quoted[i] = "\x60" + v + "\x60"
 	}
-	return "value"
+	switch len(quoted) {
+	case 0:
+		return fmt.Errorf("unknown variant \x60%s\x60, there are no variants", name)
+	case 1:
+		return fmt.Errorf("unknown variant \x60%s\x60, expected %s", name, quoted[0])
+	case 2:
+		return fmt.Errorf("unknown variant \x60%s\x60, expected %s or %s", name, quoted[0], quoted[1])
+	}
+	return fmt.Errorf("unknown variant \x60%s\x60, expected one of %s", name, strings.Join(quoted, ", "))
+}
+
+// unexpected describes a JSON value as serde's de::Unexpected does: its kind,
+// and the value of a scalar.
+func unexpected(data []byte) string {
+	value, err := serdejson.ParseAnyDepth(data)
+	if err != nil {
+		return "value"
+	}
+	return serdejson.Unexpected(value)
+}
+
+// invalidType is serde's invalid-type error for data where expected was
+// expected.
+func invalidType(data []byte, expected string) error {
+	return fmt.Errorf("invalid type: %s, expected %s", unexpected(data), expected)
+}
+
+// expecting is what serde's deserializer for the Go type's Rust counterpart
+// expects, as its errors word it.
+func expecting(t reflect.Type) string {
+	switch t.Kind() {
+	case reflect.String:
+		return "a string"
+	case reflect.Bool:
+		return "a boolean"
+	case reflect.Int8:
+		return "i8"
+	case reflect.Int16:
+		return "i16"
+	case reflect.Int32:
+		return "i32"
+	case reflect.Int, reflect.Int64:
+		return "i64"
+	case reflect.Uint8:
+		return "u8"
+	case reflect.Uint16:
+		return "u16"
+	case reflect.Uint32:
+		return "u32"
+	case reflect.Uint, reflect.Uint64:
+		return "u64"
+	case reflect.Float32:
+		return "f32"
+	case reflect.Float64:
+		return "f64"
+	case reflect.Map, reflect.Struct:
+		return "a map"
+	case reflect.Slice, reflect.Array:
+		return "a sequence"
+	case reflect.Pointer:
+		return expecting(t.Elem())
+	}
+	return "a value"
 }
 
 // decodeTag reads a union tag: a string or, from buffered content, a
@@ -1076,7 +1311,7 @@ func decodeTag(raw json.RawMessage, buffered bool, tags []string) (string, bool)
 // decodeValue decodes one value, failing on null unless the schema admits it.
 func decodeValue[T any](raw json.RawMessage, dst *T, nullOK, buffered bool) error {
 	if !nullOK && isNull(raw) {
-		return errNull
+		return nullError[T]()
 	}
 	if d, ok := any(dst).(decoder); ok {
 		return d.decodeJSON(raw, buffered)
@@ -1094,37 +1329,40 @@ func typeError(err error, raw []byte) error {
 	if !errors.As(err, &te) {
 		return err
 	}
-	expected := "a value"
-	switch te.Type.Kind() {
-	case reflect.String:
-		expected = "a string"
-	case reflect.Bool:
-		expected = "a boolean"
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		expected = "an integer"
-	case reflect.Float32, reflect.Float64:
-		expected = "a number"
-	case reflect.Map, reflect.Struct:
-		expected = "a map"
-	case reflect.Slice, reflect.Array:
-		expected = "a sequence"
+	expected := expecting(te.Type)
+	described := unexpected(raw)
+	if strings.HasPrefix(described, "integer ") && expected[0] != 'a' {
+		// An integer out of the target's range.
+		return fmt.Errorf("invalid value: %s, expected %s", described, expected)
 	}
-	kind := serdeKind(raw)
-	if kind == "number" && strings.Contains(expected, "integer") {
-		return fmt.Errorf("invalid value: %s, expected %s", raw, expected)
+	return fmt.Errorf("invalid type: %s, expected %s", described, expected)
+}
+
+// decodePath decodes a string, or an optional one, that Rust decodes as a
+// path, failing as serde's PathBuf does.
+func decodePath(raw json.RawMessage, dst any, nullOK bool) error {
+	if isNull(raw) && !nullOK {
+		return errors.New("invalid type: null, expected path string")
 	}
-	return fmt.Errorf("invalid type: %s, expected %s", kind, expected)
+	if err := json.Unmarshal(raw, dst); err != nil {
+		var te *json.UnmarshalTypeError
+		if errors.As(err, &te) {
+			return invalidType(raw, "path string")
+		}
+		return err
+	}
+	return nil
 }
 
 // decodePtr decodes an optional struct or union.
 func decodePtr[T any, P interface {
 	*T
 	decoder
+	nullRejecter
 }](raw json.RawMessage, dst **T, nullOK, buffered bool) error {
 	if isNull(raw) {
 		if !nullOK {
-			return errNull
+			return P(nil).nullError()
 		}
 		*dst = nil
 		return nil
@@ -1140,7 +1378,10 @@ func decodePtr[T any, P interface {
 // decodeChecked decodes a union of primitives after check accepts it.
 func decodeChecked[T any](raw json.RawMessage, dst *T, nullOK bool, check func(json.RawMessage) error) error {
 	if isNull(raw) && !nullOK {
-		return errNull
+		if err := check(raw); err != nil {
+			return err
+		}
+		return nullError[T]()
 	}
 	if !isNull(raw) {
 		if err := check(raw); err != nil {
@@ -1156,7 +1397,7 @@ func decodeChecked[T any](raw json.RawMessage, dst *T, nullOK bool, check func(j
 func decodeList[T any](raw json.RawMessage, dst *[]T, nullOK, skip bool, item func(json.RawMessage, *T) error) error {
 	if isNull(raw) {
 		if !nullOK {
-			return errNull
+			return nullError[[]T]()
 		}
 		*dst = nil
 		return nil
@@ -1166,13 +1407,13 @@ func decodeList[T any](raw json.RawMessage, dst *[]T, nullOK, skip bool, item fu
 		return err
 	}
 	out := make([]T, 0, len(items))
-	for i, raw := range items {
+	for _, raw := range items {
 		var value T
 		if err := item(raw, &value); err != nil {
 			if skip {
 				continue
 			}
-			return fmt.Errorf("item %d: %w", i, err)
+			return err
 		}
 		out = append(out, value)
 	}
@@ -1184,7 +1425,7 @@ func decodeList[T any](raw json.RawMessage, dst *[]T, nullOK, skip bool, item fu
 func decodeMap[M ~map[string]V, V any](raw json.RawMessage, dst *M, nullOK bool, value func(json.RawMessage, *V) error) error {
 	if isNull(raw) {
 		if !nullOK {
-			return errNull
+			return nullError[M]()
 		}
 		*dst = nil
 		return nil
@@ -1197,7 +1438,7 @@ func decodeMap[M ~map[string]V, V any](raw json.RawMessage, dst *M, nullOK bool,
 	for _, entry := range entries {
 		var v V
 		if err := value(entry.raw, &v); err != nil {
-			return fmt.Errorf("%q: %w", entry.key, err)
+			return err
 		}
 		out[string(entry.key)] = v
 	}

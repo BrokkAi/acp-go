@@ -517,7 +517,7 @@ func TestHandleSessionSetupAppendsToRawParams(t *testing.T) {
 		forwarded = params
 		return nil, nil
 	})
-	params := json.RawMessage(`{"cwd":"/w","mcpServers":[{"name":"tools","type":"http","url":"https://example.com"}],"futureField":{"kept":[1,2.50]},"_meta":{"x":true}}`)
+	params := json.RawMessage(`{"sessionId":"s","cwd":"/w","mcpServers":[{"name":"tools","type":"http","url":"https://example.com","headers":[]}],"futureField":{"kept":[1,2.50]},"_meta":{"x":true}}`)
 	for _, method := range []string{"session/new", "session/load", "session/resume", "session/fork"} {
 		if _, err := handler(context.Background(), method, params); err != nil {
 			t.Fatalf("%s: %v", method, err)

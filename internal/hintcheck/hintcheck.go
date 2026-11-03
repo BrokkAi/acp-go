@@ -6,8 +6,9 @@
 // array form of structs (hints_gen_test.go). scripts/capture_hint_fixtures.py
 // runs those cases through a probe built on the Rust schema crate and records
 // each outcome in the package's testdata/hints_rust.json. Run decodes every
-// case with the Go type and requires the same outcome: an error where Rust
-// fails, and otherwise the same value.
+// case with the Go type and requires the same outcome: where Rust fails, an
+// error with serde's exact text, which the agent runtimes send to peers in
+// -32602 answers; otherwise the same value.
 package hintcheck
 
 import (
@@ -116,8 +117,9 @@ func Run(t *testing.T, s Suite) {
 	}
 }
 
-// check decodes the input and, where Rust accepts it, also the Rust
-// re-encoding, and requires the two Go values to be the same.
+// check decodes the input and, where Rust rejects it, requires Rust's error.
+// Where Rust accepts it, it also decodes the Rust re-encoding and requires the
+// two Go values to be the same.
 func (s Suite) check(t *testing.T, c Case, want Outcome) {
 	got := reflect.New(c.Type)
 	err := json.Unmarshal([]byte(c.Input), got.Interface())
@@ -125,6 +127,9 @@ func (s Suite) check(t *testing.T, c Case, want Outcome) {
 		if err == nil {
 			encoded, _ := json.Marshal(got.Interface())
 			t.Fatalf("Go accepted what Rust rejects (%s)\ninput: %s\n   go: %s", want.Error, c.Input, encoded)
+		}
+		if err.Error() != want.Error {
+			t.Fatalf("Go rejected with a different error\ninput: %s\n   go: %s\n rust: %s", c.Input, err, want.Error)
 		}
 		return
 	}

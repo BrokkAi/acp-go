@@ -123,8 +123,11 @@ func decode(decoder *json.Decoder) (*Value, error) {
 			return result, err
 		case '{':
 			result := &Value{Kind: Object}
+			// Set scans the members; a large object is indexed instead, so
+			// parsing stays linear in its size.
+			var index map[string]int
 			for decoder.More() {
-				key, err := decoder.Token()
+				token, err := decoder.Token()
 				if err != nil {
 					return nil, err
 				}
@@ -132,7 +135,29 @@ func decode(decoder *json.Decoder) (*Value, error) {
 				if err != nil {
 					return nil, err
 				}
-				result.Set(key.(string), item)
+				key := token.(string)
+				switch {
+				case index != nil:
+					if i, ok := index[key]; ok {
+						result.Members[i].Value = item
+					} else {
+						index[key] = len(result.Members)
+						result.Members = append(result.Members, Member{Key: key, Value: item})
+					}
+				case len(result.Members) < indexedObject:
+					result.Set(key, item)
+				default:
+					index = make(map[string]int, 2*len(result.Members))
+					for i, member := range result.Members {
+						index[member.Key] = i
+					}
+					if i, ok := index[key]; ok {
+						result.Members[i].Value = item
+					} else {
+						index[key] = len(result.Members)
+						result.Members = append(result.Members, Member{Key: key, Value: item})
+					}
+				}
 			}
 			_, err := decoder.Token()
 			return result, err
@@ -140,6 +165,10 @@ func decode(decoder *json.Decoder) (*Value, error) {
 	}
 	return nil, ErrInvalid
 }
+
+// indexedObject is the member count from which parsing indexes an object's
+// keys rather than scanning them.
+const indexedObject = 16
 
 // number reads a JSON number token as serde_json does.
 func number(text string) (*Value, error) {

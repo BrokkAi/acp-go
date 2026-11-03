@@ -54,6 +54,9 @@ type field struct {
 	// Variant names the flattened tag value this lifted payload field
 	// belongs to; it is decoded and encoded only alongside that value.
 	Variant string
+	// Path marks a string field Rust decodes as a path (see pathFields),
+	// which serde's errors name "path string".
+	Path bool
 }
 
 // flattenInfo describes a tagged union flattened into its parent struct.
@@ -114,8 +117,15 @@ type typeDef struct {
 	OpenEnum bool
 	Fallback string
 	// StringTag is set on a tagged union whose tag must be a string (see
-	// stringTagUnions).
-	StringTag bool
+	// stringTagUnions), and StringTagRule to its entry.
+	StringTag     bool
+	StringTagRule stringTagRule
+	// DefaultOnNull is set on a method payload the Rust crate wraps in
+	// default_on_null! (see defaultOnNullPayloads).
+	DefaultOnNull bool
+	// FieldOrder lists a tagged union's shared fields in Rust declaration
+	// order, the order serde reports the first missing one in.
+	FieldOrder []string
 	// SeqOrder lists a struct's wire keys in Rust declaration order, the
 	// order serde reads a struct from a JSON array.
 	SeqOrder []string
@@ -275,6 +285,7 @@ func (r *ir) checkDefaultOnNull(protocol int) error {
 			return fmt.Errorf("%s: a method payload without required fields is not in defaultOnNullPayloads", td.Name)
 		}
 		delete(want, td.Name)
+		td.DefaultOnNull = true
 	}
 	missing := make([]string, 0, len(want))
 	for n := range want {
@@ -291,9 +302,85 @@ func (r *ir) checkDefaultOnNull(protocol int) error {
 // and requires a string tag, keyed by def, with the protocol version: serde
 // would otherwise read an integer tag as a variant index from buffered
 // content (v2 SessionConfigOptionValue, flattened into
-// SetSessionConfigOptionRequest).
-var stringTagUnions = map[string]int{
-	"SetSessionConfigOptionRequest": 2,
+// SetSessionConfigOptionRequest). The hand-written Deserialize also words
+// its own errors: it requires the members in Required, in that order, then
+// a string tag ("`type` must be a string"), and prefixes the error of a
+// known tag's payload with that tag's Payload text.
+var stringTagUnions = map[string]stringTagRule{
+	"SetSessionConfigOptionRequest": {
+		Since:    2,
+		Required: []string{"value", "type"},
+		Payload: map[string]string{
+			"id":      "`value` must be a string for `type: id`",
+			"boolean": "`value` must be a boolean for `type: boolean`",
+		},
+	},
+}
+
+// stringTagRule describes a stringTagUnions entry.
+type stringTagRule struct {
+	Since    int
+	Required []string
+	Payload  map[string]string
+}
+
+// pathFields are the v1 string fields Rust decodes as a PathBuf, keyed by def
+// and field: serde's errors for them expect a "path string" rather than "a
+// string". The schema records a path as a plain string. v2 names the type
+// AbsolutePath, so its path fields need no table. A listed field present in
+// the pin that is not a string or a list of strings fails generation.
+var pathFields = map[string]bool{
+	"CreateTerminalRequest.cwd": true,
+	"Diff.path":                 true,
+	"ForkSessionRequest.additionalDirectories":   true,
+	"ForkSessionRequest.cwd":                     true,
+	"ListSessionsRequest.cwd":                    true,
+	"LoadSessionRequest.additionalDirectories":   true,
+	"LoadSessionRequest.cwd":                     true,
+	"McpServerStdio.command":                     true,
+	"NewSessionRequest.additionalDirectories":    true,
+	"NewSessionRequest.cwd":                      true,
+	"ReadTextFileRequest.path":                   true,
+	"ResumeSessionRequest.additionalDirectories": true,
+	"ResumeSessionRequest.cwd":                   true,
+	"SessionInfo.additionalDirectories":          true,
+	"SessionInfo.cwd":                            true,
+	"SubagentUpdate.additionalDirectories":       true,
+	"SubagentUpdate.cwd":                         true,
+	"ToolCallLocation.path":                      true,
+	"WriteTextFileRequest.path":                  true,
+}
+
+// flattenedEnums names the Rust enum of each union with shared fields that
+// has untagged variants, keyed by def: Rust flattens that enum, which serde
+// reads as untagged, beside the shared fields, so an object no variant
+// decodes fails naming it. The schema inlines the enum without its name. An
+// unlisted union of that shape fails generation.
+var flattenedEnums = map[string]string{
+	"CreateElicitationRequest":      "ElicitationMode",
+	"CreateElicitationResponse":     "ElicitationAction",
+	"DiffChange":                    "DiffChangeOperation",
+	"SessionConfigOption":           "SessionConfigKind",
+	"SetSessionConfigOptionRequest": "SessionConfigOptionValue",
+}
+
+// applyPathFields marks the def's path fields: the v1 pathFields, and in v2
+// every field of type AbsolutePath.
+func applyPathFields(td *typeDef, protocol int) error {
+	for i := range td.Fields {
+		f := &td.Fields[i]
+		elem := strings.TrimPrefix(strings.TrimPrefix(f.GoType, "[]"), "*")
+		switch {
+		case protocol == 1 && pathFields[td.Name+"."+f.JSONName]:
+			if elem != "string" {
+				return fmt.Errorf("%s.%s: path field is not a string", td.Name, f.JSONName)
+			}
+			f.Path = true
+		case protocol >= 2 && elem == "AbsolutePath":
+			f.Path = true
+		}
+	}
+	return nil
 }
 
 // applyDecodeTables applies enumFallbacks and mapOnlyStructs to a def.
@@ -320,11 +407,41 @@ func applyDecodeTables(td *typeDef, protocol int) error {
 	if td.Flatten != nil {
 		td.ObjectOnly = true
 	}
-	if since, ok := stringTagUnions[td.Name]; ok && protocol >= since {
+	if rule, ok := stringTagUnions[td.Name]; ok && protocol >= rule.Since {
 		if td.Kind != kindTaggedUnion {
 			return fmt.Errorf("%s: string-tag union is not a tagged union", td.Name)
 		}
-		td.StringTag = true
+		if err := checkStringTagRule(td, rule); err != nil {
+			return err
+		}
+		td.StringTag, td.StringTagRule = true, rule
+	}
+	return nil
+}
+
+// checkStringTagRule fails when a stringTagUnions entry names a member the
+// union does not have: each Required key must be its tag or a field of one
+// of its variants, and each Payload key one of its tag values.
+func checkStringTagRule(td *typeDef, rule stringTagRule) error {
+	keys := map[string]bool{td.TagJSON: true}
+	tags := map[string]bool{}
+	for _, v := range td.Variants {
+		if v.Const != "" {
+			tags[v.Const] = true
+		}
+		for _, f := range v.Inline {
+			keys[f.JSONName] = true
+		}
+	}
+	for _, key := range rule.Required {
+		if !keys[key] {
+			return fmt.Errorf("%s: stringTagUnions requires %q, which is not the tag or a variant field", td.Name, key)
+		}
+	}
+	for tag := range rule.Payload {
+		if !tags[tag] {
+			return fmt.Errorf("%s: stringTagUnions words the payload of %q, which is not a tag value", td.Name, tag)
+		}
 	}
 	return nil
 }
@@ -416,6 +533,9 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 			return nil, err
 		}
 		if err := applyDecodeTables(td, meta.ProtocolVersion); err != nil {
+			return nil, err
+		}
+		if err := applyPathFields(td, meta.ProtocolVersion); err != nil {
 			return nil, err
 		}
 		for _, f := range td.Fields {
@@ -833,6 +953,7 @@ func classifyUnionShape(name string, def *rawSchema, variants []*rawSchema, root
 		if td.Fields, err = sharedFields(name, def, tagged.tag, root, preserveNull); err != nil {
 			return nil, err
 		}
+		td.FieldOrder = def.propOrder()
 		return td, nil
 	}
 

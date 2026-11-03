@@ -9,9 +9,11 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	"github.com/BrokkAi/acp-go/internal/initresult"
 	"github.com/BrokkAi/acp-go/internal/negotiate"
 	"github.com/BrokkAi/acp-go/internal/rpcctl"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 	"github.com/BrokkAi/acp-go/schema"
 	unstableschema "github.com/BrokkAi/acp-go/schema/unstable"
 )
@@ -131,13 +133,13 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.AuthenticateRequest](raw)
+		request, err := rpcparams.Decode[schema.AuthenticateRequest](raw)
 		if err != nil {
 			return nil, err
 		}
 		return implementation.Authenticate(ctx, s.client, request)
 	case schema.SessionNewMethodName:
-		request, err := decodeRequest[schema.NewSessionRequest](raw)
+		request, err := rpcparams.Decode[schema.NewSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -147,7 +149,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.LoadSessionRequest](raw)
+		request, err := rpcparams.Decode[schema.LoadSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +159,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.ResumeSessionRequest](raw)
+		request, err := rpcparams.Decode[schema.ResumeSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +169,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.CloseSessionRequest](raw)
+		request, err := rpcparams.Decode[schema.CloseSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -177,7 +179,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.ListSessionsRequest](raw)
+		request, err := rpcparams.Decode[schema.ListSessionsRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -187,7 +189,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.DeleteSessionRequest](raw)
+		request, err := rpcparams.Decode[schema.DeleteSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -199,7 +201,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.SetSessionModeRequest](raw)
+		request, err := rpcparams.Decode[schema.SetSessionModeRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -209,7 +211,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.SetSessionConfigOptionRequest](raw)
+		request, err := rpcparams.Decode[schema.SetSessionConfigOptionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -219,7 +221,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.LogoutRequest](raw)
+		request, err := rpcparams.Decode[schema.LogoutRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -245,7 +247,7 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 	if err != nil {
 		return nil, err
 	}
-	request, err := decodeRequest[schema.InitializeRequest](params)
+	request, err := rpcparams.Decode[schema.InitializeRequest](params)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +368,7 @@ func (s *server) advertisesMethod(method string) bool {
 }
 
 func (s *server) prompt(parent context.Context, raw json.RawMessage) (any, error) {
-	request, err := decodeRequest[schema.PromptRequest](raw)
+	request, err := rpcparams.Decode[schema.PromptRequest](raw)
 	if err != nil {
 		return nil, err
 	}
@@ -385,7 +387,7 @@ func (s *server) notification(method string, raw json.RawMessage) error {
 		return nil
 	}
 	var notification schema.CancelNotification
-	if err := json.Unmarshal(raw, &notification); err != nil {
+	if err := castparams.Unmarshal(raw, &notification); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -447,14 +449,8 @@ func (u *promptUpdater) Update(update schema.SessionUpdate) error {
 	})
 }
 
-func decodeRequest[T any](raw json.RawMessage) (T, error) {
-	var request T
-	if err := json.Unmarshal(raw, &request); err != nil {
-		return request, &acp.RPCError{Code: -32602, Message: err.Error()}
-	}
-	return request, nil
-}
-
+// methodNotFound answers a request the agent does not serve as the
+// reference SDK does.
 func methodNotFound(method string) error {
-	return &acp.RPCError{Code: -32601, Message: "agent does not implement method: " + method}
+	return rpcparams.MethodNotFound(method)
 }

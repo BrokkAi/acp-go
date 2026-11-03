@@ -2,7 +2,6 @@ package schema
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -163,21 +162,26 @@ func TestDeserializeHintExamples(t *testing.T) {
 	}
 }
 
-// TestDecodeErrorsNameNoGoTypes keeps decode errors in serde's words: they
-// reach peers in -32602 answers, so they must not leak Go type names.
+// TestDecodeErrorsNameNoGoTypes keeps decode errors in serde's words, exactly
+// as the Rust schema crate words them: they reach peers in -32602 answers,
+// so they must not leak Go type names. The wants are serde_json::from_value
+// errors of the 1.15.1 crate; every rejected hint fixture case is checked
+// the same way by TestDeserializeHints.
 func TestDecodeErrorsNameNoGoTypes(t *testing.T) {
 	for _, tc := range []struct {
 		value any
 		input string
 		want  string
 	}{
-		{new(ToolCallUpdate), `["t"]`, "invalid type: sequence, expected a map"},
-		{new(SessionInfo), `{"sessionId":5,"cwd":"/w"}`, "invalid type: number, expected a string"},
-		{new(ReadTextFileRequest), `{"sessionId":"s","path":"/p","line":-1}`, "invalid value: -1, expected an integer"},
-		{new(Role), `null`, "invalid type: null, expected a variant"},
+		{new(ToolCallUpdate), `["t"]`, "invalid type: sequence, expected struct ToolCallUpdate"},
+		{new(SessionInfo), `{"sessionId":5,"cwd":"/w"}`, "invalid type: integer `5`, expected a string"},
+		{new(ReadTextFileRequest), `{"sessionId":"s","path":"/p","line":-1}`, "invalid value: integer `-1`, expected u32"},
+		{new(Role), `null`, "invalid type: null, expected string or map"},
+		{new(Role), `5`, "invalid type: integer `5`, expected string or map"},
+		{new(Role), `"bogus"`, "unknown variant `bogus`, expected `assistant` or `user`"},
 	} {
 		err := json.Unmarshal([]byte(tc.input), tc.value)
-		if err == nil || !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), "Go ") || strings.Contains(err.Error(), "map[") {
+		if err == nil || err.Error() != tc.want {
 			t.Errorf("%s: error = %v, want %q", tc.input, err, tc.want)
 		}
 	}

@@ -136,7 +136,7 @@ func TestUntaggedUnionLiftsSharedProperties(t *testing.T) {
 		"`json:\"note,omitempty\"`",
 		"type urlModeShadow UrlMode",
 		"if raw, ok := raws.get(\"url\"); ok {",
-		"return missingField(\"UrlMode\", \"url\")",
+		"return missingField(\"url\")",
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("generated source missing %q:\n%s", want, src)

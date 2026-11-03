@@ -9,9 +9,11 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	"github.com/BrokkAi/acp-go/internal/initresult"
 	"github.com/BrokkAi/acp-go/internal/negotiate"
 	"github.com/BrokkAi/acp-go/internal/rpcctl"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -145,7 +147,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.LoginAuthRequest](raw)
+		request, err := rpcparams.Decode[schema.LoginAuthRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -155,31 +157,31 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.LogoutAuthRequest](raw)
+		request, err := rpcparams.Decode[schema.LogoutAuthRequest](raw)
 		if err != nil {
 			return nil, err
 		}
 		return implementation.AuthLogout(ctx, s.client, request)
 	case schema.SessionNewMethodName:
-		request, err := decodeRequest[schema.NewSessionRequest](raw)
+		request, err := rpcparams.Decode[schema.NewSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
 		return s.agent.NewSession(ctx, s.client, request)
 	case schema.SessionResumeMethodName:
-		request, err := decodeRequest[schema.ResumeSessionRequest](raw)
+		request, err := rpcparams.Decode[schema.ResumeSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
 		return s.agent.ResumeSession(ctx, s.client, request)
 	case schema.SessionCloseMethodName:
-		request, err := decodeRequest[schema.CloseSessionRequest](raw)
+		request, err := rpcparams.Decode[schema.CloseSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
 		return s.agent.CloseSession(ctx, s.client, request)
 	case schema.SessionListMethodName:
-		request, err := decodeRequest[schema.ListSessionsRequest](raw)
+		request, err := rpcparams.Decode[schema.ListSessionsRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -189,13 +191,13 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.DeleteSessionRequest](raw)
+		request, err := rpcparams.Decode[schema.DeleteSessionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
 		return implementation.DeleteSession(ctx, s.client, request)
 	case schema.SessionPromptMethodName:
-		request, err := decodeRequest[schema.PromptRequest](raw)
+		request, err := rpcparams.Decode[schema.PromptRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -213,7 +215,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if !ok {
 			return nil, methodNotFound(method)
 		}
-		request, err := decodeRequest[schema.SetSessionConfigOptionRequest](raw)
+		request, err := rpcparams.Decode[schema.SetSessionConfigOptionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -355,7 +357,7 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 	if err != nil {
 		return nil, err
 	}
-	request, err := decodeRequest[schema.InitializeRequest](params)
+	request, err := rpcparams.Decode[schema.InitializeRequest](params)
 	if err != nil {
 		return nil, err
 	}
@@ -421,7 +423,7 @@ func (s *server) notification(method string, raw json.RawMessage) error {
 		return nil
 	}
 	var notification schema.CancelSessionNotification
-	if err := json.Unmarshal(raw, &notification); err != nil {
+	if err := castparams.Unmarshal(raw, &notification); err != nil {
 		return err
 	}
 	return s.agent.CancelSession(notification)
@@ -444,7 +446,7 @@ func (s *server) gate(method string) error {
 		}
 	case schema.SessionNewMethodName, schema.SessionResumeMethodName, schema.SessionCloseMethodName,
 		schema.SessionListMethodName, schema.SessionPromptMethodName:
-		return s.requireSessions()
+		return s.requireSessions(method)
 	case schema.SessionDeleteMethodName:
 		if !s.advertisesDelete() {
 			return methodNotFound(method)
@@ -453,20 +455,20 @@ func (s *server) gate(method string) error {
 	return nil
 }
 
-func (s *server) requireSessions() error {
-	if _, err := s.sessionCaps(); err != nil {
-		return err
+func (s *server) requireSessions(method string) error {
+	if _, ok := s.sessionCaps(); !ok {
+		return methodNotFound(method)
 	}
 	return nil
 }
 
-func (s *server) sessionCaps() (*schema.SessionCapabilities, error) {
+func (s *server) sessionCaps() (*schema.SessionCapabilities, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.caps == nil || s.caps.Session == nil {
-		return nil, methodNotFound(schema.SessionNewMethodName)
+		return nil, false
 	}
-	return s.caps.Session, nil
+	return s.caps.Session, true
 }
 
 func (s *server) advertisesAuth() bool {
@@ -476,8 +478,8 @@ func (s *server) advertisesAuth() bool {
 }
 
 func (s *server) advertisesDelete() bool {
-	caps, err := s.sessionCaps()
-	return err == nil && caps.Delete != nil
+	caps, ok := s.sessionCaps()
+	return ok && caps.Delete != nil
 }
 
 type sessionUpdater struct {
@@ -492,14 +494,8 @@ func (u *sessionUpdater) Update(update schema.SessionUpdate) error {
 	})
 }
 
-func decodeRequest[T any](raw json.RawMessage) (T, error) {
-	var request T
-	if err := json.Unmarshal(raw, &request); err != nil {
-		return request, &acp.RPCError{Code: -32602, Message: err.Error()}
-	}
-	return request, nil
-}
-
+// methodNotFound answers a request the agent does not serve as the
+// reference SDK does.
 func methodNotFound(method string) error {
-	return &acp.RPCError{Code: -32601, Message: "agent does not implement method: " + method}
+	return rpcparams.MethodNotFound(method)
 }

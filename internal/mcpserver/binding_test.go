@@ -85,7 +85,8 @@ func TestBindingOuterErrorsMatchTheReference(t *testing.T) {
 	ctx := context.Background()
 
 	_, err = binding.Handle(ctx, json.RawMessage(`{"serverId":7}`))
-	wantRPCError(t, err, `{"code":-32602,"message":"Invalid params","data":"json: cannot unmarshal number into Go struct field .serverId of type string"}`)
+	// An envelope that does not decode answers json_cast_params' -32602.
+	wantRPCError(t, err, `{"code":-32602,"message":"Invalid params","data":{"error":"json: cannot unmarshal number into Go struct field .serverId of type string","json":{"serverId":7},"phase":"deserialization"}}`)
 	_, err = binding.Handle(ctx, envelope("nobody", "a", "tools/list", nil))
 	wantRPCError(t, err, `{"code":-33001,"message":"MCP server registration unavailable"}`)
 	_, err = binding.Handle(ctx, envelope("tools", "c", "raw/canceled", nil))

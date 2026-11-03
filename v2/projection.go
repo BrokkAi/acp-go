@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -148,7 +149,7 @@ func (t *SessionTracker) TrackerNotifications(next acp.Notifications) acp.Notifi
 	return func(method string, raw json.RawMessage) error {
 		if method == schema.SessionUpdateMethodName {
 			var update Update
-			if err := json.Unmarshal(raw, &update); err != nil {
+			if err := castparams.Unmarshal(raw, &update); err != nil {
 				return err
 			}
 			t.Observe(update)
@@ -170,7 +171,7 @@ func (t *SessionTracker) TrackerRequests(next acp.RequestObserver) acp.RequestOb
 	return func(method string, raw json.RawMessage) {
 		if method == schema.SessionRequestPermissionMethodName {
 			var request schema.RequestPermissionRequest
-			if json.Unmarshal(raw, &request) == nil {
+			if castparams.Unmarshal(raw, &request) == nil {
 				t.Projection(request.SessionID).ApplyPermissionRequest(request)
 			}
 		}

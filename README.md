@@ -151,7 +151,15 @@ requests until the first `initialize` succeeds: every `initialize`, including
 a repeat or a concurrent one, reaches the agent, and the latest successful one
 sets the advertised capabilities. Lifecycle refusals use the reference SDK's
 shape: `-32600`, message `Invalid request`, and the explanation as a JSON
-string in `data`.
+string in `data`. As in the reference SDK, absent params read as `null`, and
+params that do not decode get `-32602` with
+`data: {"error": <serde's message>, "json": <params>, "phase": "deserialization"}`;
+both runtimes and the client hosts answer the same way. A request no handler
+serves, an unknown or extension method or an optional method the agent does
+not implement or advertise, gets the reference SDK's `-32601`
+(`Method not found`, with the method name as data), and an unknown
+notification is ignored (see
+[Params decoding in the dispatch layers](docs/schema-pin-workflow.md#params-decoding-in-the-dispatch-layers)).
 
 The same package gives agents typed `agent.Client` methods for filesystem,
 permission, terminal, and elicitation callbacks. Client applications can compose

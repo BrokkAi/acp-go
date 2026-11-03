@@ -12,6 +12,7 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/osrun"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -28,9 +29,9 @@ func (t *commandTerminal) kill() { t.once.Do(func() { _ = osrun.Kill(t.command) 
 func (h *Host) terminal(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 	switch method {
 	case schema.TerminalCreateMethodName:
-		var request schema.CreateTerminalRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
+		request, err := rpcparams.Decode[schema.CreateTerminalRequest](raw)
+		if err != nil {
+			return nil, err
 		}
 		if !h.validSession(request.SessionID) {
 			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
@@ -43,36 +44,36 @@ func (h *Host) terminal(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return h.createTerminal(request)
 	case schema.TerminalOutputMethodName:
-		var request schema.TerminalOutputRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
+		request, err := rpcparams.Decode[schema.TerminalOutputRequest](raw)
+		if err != nil {
+			return nil, err
 		}
 		if !h.validSession(request.SessionID) {
 			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
 		}
 		return h.terminalOutput(request)
 	case schema.TerminalWaitForExitMethodName:
-		var request schema.WaitForTerminalExitRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
+		request, err := rpcparams.Decode[schema.WaitForTerminalExitRequest](raw)
+		if err != nil {
+			return nil, err
 		}
 		if !h.validSession(request.SessionID) {
 			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
 		}
 		return h.waitForTerminal(ctx, request)
 	case schema.TerminalKillMethodName:
-		var request schema.KillTerminalRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
+		request, err := rpcparams.Decode[schema.KillTerminalRequest](raw)
+		if err != nil {
+			return nil, err
 		}
 		if !h.validSession(request.SessionID) {
 			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
 		}
 		return h.killTerminal(request)
 	case schema.TerminalReleaseMethodName:
-		var request schema.ReleaseTerminalRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
+		request, err := rpcparams.Decode[schema.ReleaseTerminalRequest](raw)
+		if err != nil {
+			return nil, err
 		}
 		if !h.validSession(request.SessionID) {
 			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}

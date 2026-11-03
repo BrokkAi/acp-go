@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/BrokkAi/acp-go/internal/acpvalidate"
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -249,7 +250,7 @@ func SessionUpdates(handler func(Update) error) Notifications {
 			return nil
 		}
 		var update Update
-		if err := json.Unmarshal(raw, &update); err != nil {
+		if err := castparams.Unmarshal(raw, &update); err != nil {
 			return err
 		}
 		return handler(update)

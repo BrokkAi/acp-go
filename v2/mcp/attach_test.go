@@ -174,7 +174,7 @@ func TestV2HandleSessionSetupIsGlobalAttachment(t *testing.T) {
 		forwarded = params
 		return nil, nil
 	})
-	params := json.RawMessage(`{"cwd":"/w","_futureSessionField":{"must":["remain"]},"mcpServers":[{"type":"_future_transport","name":"other","futureOption":{"nested":true}}]}`)
+	params := json.RawMessage(`{"sessionId":"s","cwd":"/w","_futureSessionField":{"must":["remain"]},"mcpServers":[{"type":"_future_transport","name":"other","futureOption":{"nested":true}}]}`)
 	for _, method := range []string{"session/new", "session/resume", "session/fork"} {
 		if _, err := handler(context.Background(), method, params); err != nil {
 			t.Fatalf("%s: %v", method, err)

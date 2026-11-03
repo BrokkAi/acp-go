@@ -16,6 +16,7 @@ import (
 	"sort"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 )
 
 // MergeOverrides binds handler to each of overrides, the stable runtime
@@ -64,9 +65,9 @@ func Route[H, Request, Response any](method func(H, context.Context, Request) (R
 
 // RouteChecked is Route with two more checks, each run when non-nil: strict
 // on the raw params before they are decoded, whose error answers as
-// InvalidParams, for values the reference SDK refuses to deserialize but
-// encoding/json accepts; and accept on the decoded request before the
-// handler, whose error is answered as it is.
+// rpcparams.InvalidParams, for values the reference SDK refuses to
+// deserialize but encoding/json accepts; and accept on the decoded request
+// before the handler, whose error is answered as it is.
 //
 // Absent params are null, as the reference SDK's JSON-RPC layer hands them
 // to every request: both decode (and fail) alike, and an error echoes null.
@@ -82,12 +83,12 @@ func RouteChecked[H, Request, Response any](method func(H, context.Context, Requ
 			}
 			if strict != nil {
 				if err := strict(raw); err != nil {
-					return nil, InvalidParams(err, raw)
+					return nil, rpcparams.InvalidParams(err, raw)
 				}
 			}
 			var request Request
 			if err := json.Unmarshal(raw, &request); err != nil {
-				return nil, InvalidParams(err, raw)
+				return nil, rpcparams.InvalidParams(err, raw)
 			}
 			if accept != nil {
 				if err := accept(ctx, request); err != nil {
@@ -110,7 +111,7 @@ func RouteChecked[H, Request, Response any](method func(H, context.Context, Requ
 
 // Handle serves each method in routes that handler implements and passes
 // every other request, including a routed method handler does not implement,
-// to next. With no next, those requests answer MethodNotFound.
+// to next. With no next, those requests answer rpcparams.MethodNotFound.
 func Handle(next acp.Handler, handler any, routes map[string]Binding) acp.Handler {
 	bound := make(map[string]acp.Handler, len(routes))
 	for method, bind := range routes {
@@ -125,31 +126,8 @@ func Handle(next acp.Handler, handler any, routes map[string]Binding) acp.Handle
 		if next != nil {
 			return next(ctx, method, raw)
 		}
-		return nil, MethodNotFound(method)
+		return nil, rpcparams.MethodNotFound(method)
 	}
-}
-
-// MethodNotFound is the reference SDK's -32601: the generic message, with the
-// method name as data.
-func MethodNotFound(method string) error {
-	data, _ := json.Marshal(method)
-	return &acp.RPCError{Code: -32601, Message: "Method not found", Data: data}
-}
-
-// InvalidParams is the reference SDK's -32602 for params that do not decode
-// (json_cast_params): data carries the decode error, the received params (null
-// when absent), and the failing phase.
-func InvalidParams(err error, raw json.RawMessage) error {
-	params := json.RawMessage("null")
-	if len(raw) > 0 {
-		params = raw
-	}
-	data, _ := json.Marshal(struct {
-		Error string          `json:"error"`
-		JSON  json.RawMessage `json:"json"`
-		Phase string          `json:"phase"`
-	}{err.Error(), params, "deserialization"})
-	return &acp.RPCError{Code: -32602, Message: "Invalid params", Data: data}
 }
 
 // InternalError is the reference SDK's -32603: the generic message, with the

@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -65,7 +66,7 @@ func (p *SessionProjection) Notifications(next Notifications) Notifications {
 	return func(method string, raw json.RawMessage) error {
 		if method == schema.SessionUpdateMethodName {
 			var update Update
-			if err := json.Unmarshal(raw, &update); err != nil {
+			if err := castparams.Unmarshal(raw, &update); err != nil {
 				return err
 			}
 			p.Observe(update.SessionID, update.Update)

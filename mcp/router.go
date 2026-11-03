@@ -9,7 +9,9 @@ import (
 	"math"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	"github.com/BrokkAi/acp-go/internal/mcpserver"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 	schema "github.com/BrokkAi/acp-go/schema/unstable"
 )
 
@@ -113,7 +115,7 @@ func (r *MessageRouter) Handle(next acp.Handler) acp.Handler {
 			if next != nil {
 				return next(ctx, method, raw)
 			}
-			return nil, &acp.RPCError{Code: -32601, Message: "unsupported method: " + method}
+			return nil, rpcparams.MethodNotFound(method)
 		}
 		return r.binding.Handle(ctx, raw)
 	}
@@ -157,13 +159,13 @@ var codec = mcpserver.Codec{
 	Method: schema.McpMessageMethodName,
 	Decode: func(raw json.RawMessage) (mcpserver.Envelope, error) {
 		var request schema.MessageMcpRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
+		if err := castparams.Unmarshal(raw, &request); err != nil {
 			return mcpserver.Envelope{}, err
 		}
 		var params struct {
 			Params json.RawMessage `json:"params"`
 		}
-		if err := json.Unmarshal(raw, &params); err != nil {
+		if err := castparams.Unmarshal(raw, &params); err != nil {
 			return mcpserver.Envelope{}, err
 		}
 		inner := bytes.TrimSpace(params.Params)

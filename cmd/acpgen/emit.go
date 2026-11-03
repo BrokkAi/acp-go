@@ -148,7 +148,7 @@ func (v Nullable[T]) IsZero() bool { return !v.Set }
 func emitTypes(r *ir, pin, packageName string) []byte {
 	var b strings.Builder
 	b.WriteString(header(pin, "wire types"))
-	b.WriteString("package " + packageName + "\n\nimport (\n\t\"encoding/json\"\n\t\"errors\"\n\t\"fmt\"\n\t\"reflect\"\n\t\"strings\"\n)\n\n")
+	b.WriteString("package " + packageName + "\n\nimport (\n\t\"encoding/json\"\n\t\"errors\"\n\t\"fmt\"\n\t\"reflect\"\n\t\"strings\"\n\n\t\"github.com/BrokkAi/acp-go/internal/serdejson\"\n)\n\n")
 	b.WriteString("// Meta is the reserved _meta channel for extension data.\ntype Meta map[string]any\n\n")
 	// Shared helpers are written once per generated file.
 	unchangedEmitted = false
