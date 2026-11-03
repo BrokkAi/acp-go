@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -42,16 +43,16 @@ func HandleElicitation(next Handler, elicitation ElicitationHandler) Handler {
 	return func(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 		if method != schema.ElicitationCreateMethodName {
 			if next == nil {
-				return nil, &RPCError{Code: -32601, Message: "unsupported method: " + method}
+				return nil, methodNotFound(method)
 			}
 			return next(ctx, method, raw)
 		}
 		if elicitation == nil {
-			return nil, &RPCError{Code: -32601, Message: "elicitation support is not configured"}
+			return nil, methodNotFound(method)
 		}
 		var request schema.CreateElicitationRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &RPCError{Code: -32602, Message: err.Error()}
+		if err := castparams.Unmarshal(raw, &request); err != nil {
+			return nil, invalidParams(err, raw)
 		}
 		return elicitation(ctx, request)
 	}
@@ -65,7 +66,7 @@ func ElicitationComplete(handler func(schema.CompleteElicitationNotification) er
 			return nil
 		}
 		var notification schema.CompleteElicitationNotification
-		if err := json.Unmarshal(raw, &notification); err != nil {
+		if err := castparams.Unmarshal(raw, &notification); err != nil {
 			return err
 		}
 		if notification.ElicitationID == "" {
@@ -89,4 +90,19 @@ func CombineNotifications(callbacks ...Notifications) Notifications {
 		}
 		return nil
 	}
+}
+
+// invalidParams is the reference SDK's json_cast_params -32602 for params
+// that do not deserialize: the error internal/rpcparams builds for the
+// packages that import this one.
+func invalidParams(err error, raw json.RawMessage) *RPCError {
+	return &RPCError{Code: castparams.Code, Message: castparams.Message, Data: castparams.Data(err, raw)}
+}
+
+// methodNotFound is the reference SDK's answer to a request no handler
+// serves: the error internal/rpcparams builds for the packages that import
+// this one.
+func methodNotFound(method string) *RPCError {
+	data, _ := json.Marshal(method)
+	return &RPCError{Code: -32601, Message: "Method not found", Data: data}
 }

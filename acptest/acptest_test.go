@@ -121,3 +121,33 @@ func TestCommandPromptRoundTrip(t *testing.T) {
 		t.Fatalf("plain prompt = %+v", plain)
 	}
 }
+
+// TestAgentHandlerAnswersAsTheReferenceSDK requires the fake agent to fail
+// malformed initialize params with the reference SDK's json_cast_params
+// -32602 and an unknown method with its -32601. The wants are captured from
+// agent-client-protocol 5.0.0 with agent-client-protocol-schema 1.15.1.
+func TestAgentHandlerAnswersAsTheReferenceSDK(t *testing.T) {
+	for _, tc := range []struct {
+		protocol uint16
+		method   string
+		params   string
+		want     string
+	}{
+		{1, "initialize", `{}`, "{\"code\":-32602,\"message\":\"Invalid params\",\"data\":{\"error\":\"missing field `protocolVersion`\",\"json\":{},\"phase\":\"deserialization\"}}"},
+		{1, "initialize", `["s"]`, `{"code":-32602,"message":"Invalid params","data":{"error":"invalid type: string \"s\", expected u16","json":["s"],"phase":"deserialization"}}`},
+		{2, "initialize", ``, `{"code":-32602,"message":"Invalid params","data":{"error":"invalid type: null, expected struct InitializeRequest","json":null,"phase":"deserialization"}}`},
+		{2, "initialize", `{"protocolVersion":2,"info":5}`, "{\"code\":-32602,\"message\":\"Invalid params\",\"data\":{\"error\":\"invalid type: integer `5`, expected struct Implementation\",\"json\":{\"protocolVersion\":2,\"info\":5},\"phase\":\"deserialization\"}}"},
+		{1, "_ext/thing", `{}`, `{"code":-32601,"message":"Method not found","data":"_ext/thing"}`},
+		{2, "foo/bar", `{}`, `{"code":-32601,"message":"Method not found","data":"foo/bar"}`},
+	} {
+		_, err := acptest.AgentHandler(tc.protocol)(context.Background(), tc.method, json.RawMessage(tc.params))
+		rpcErr, ok := err.(*acp.RPCError)
+		if !ok {
+			t.Fatalf("v%d %s %s: error = %v", tc.protocol, tc.method, tc.params, err)
+		}
+		got, _ := json.Marshal(rpcErr)
+		if string(got) != tc.want {
+			t.Fatalf("v%d %s %s:\n got %s\nwant %s", tc.protocol, tc.method, tc.params, got, tc.want)
+		}
+	}
+}

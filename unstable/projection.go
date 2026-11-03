@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	stableschema "github.com/BrokkAi/acp-go/schema"
 	schema "github.com/BrokkAi/acp-go/schema/unstable"
 )
@@ -79,7 +80,7 @@ func (p *Projection) Notifications() acp.Notifications {
 			return nil
 		}
 		var notification schema.SessionNotification
-		if err := json.Unmarshal(raw, &notification); err != nil {
+		if err := castparams.Unmarshal(raw, &notification); err != nil {
 			return err
 		}
 		return p.observe(string(notification.SessionID), notification.Update)

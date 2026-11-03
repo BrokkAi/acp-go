@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/BrokkAi/acp-go"
-	"github.com/BrokkAi/acp-go/internal/jsonline"
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	"github.com/BrokkAi/acp-go/internal/serdejson"
 )
 
@@ -39,13 +39,7 @@ func CheckV2Response(result json.RawMessage) error {
 		return parseError("invalid initialize response")
 	}
 	if detail := implementationError(value); detail != "" {
-		var data []byte
-		data = append(data, `{"error":`...)
-		data = append(data, jsonline.Quote([]byte(detail))...)
-		data = append(data, `,"json":`...)
-		data = append(data, serdejson.Encode(value)...)
-		data = append(data, `,"phase":"deserialization"}`...)
-		return &acp.RPCError{Code: -32700, Message: "Parse error", Data: data}
+		return &acp.RPCError{Code: -32700, Message: "Parse error", Data: castparams.DataValue(detail, value)}
 	}
 	return nil
 }

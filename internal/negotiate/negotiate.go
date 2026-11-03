@@ -20,7 +20,7 @@ import (
 	"strconv"
 
 	"github.com/BrokkAi/acp-go"
-	"github.com/BrokkAi/acp-go/internal/jsonline"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 	"github.com/BrokkAi/acp-go/internal/serdejson"
 	schema1 "github.com/BrokkAi/acp-go/schema"
 	schema2 "github.com/BrokkAi/acp-go/schema/v2"
@@ -172,7 +172,7 @@ func OutgoingV2Params(params json.RawMessage) (json.RawMessage, error) {
 	}
 	value.Set("protocolVersion", &serdejson.Value{Kind: serdejson.Integer, Integer: "2"})
 	if detail := implementationError(value); detail != "" {
-		return nil, deserializationError(detail, value)
+		return nil, rpcparams.InvalidParamsValue(detail, value)
 	}
 	return serdejson.Encode(value), nil
 }
@@ -202,7 +202,7 @@ func V2Params(params json.RawMessage) (json.RawMessage, error) {
 	}
 	parsed, _ := serdejson.Parse(params)
 	if detail := implementationError(parsed); detail != "" {
-		return nil, deserializationError(detail, parsed)
+		return nil, rpcparams.InvalidParamsValue(detail, parsed)
 	}
 	return normalizeExactV2(object)
 }
@@ -221,19 +221,6 @@ func ValidateV2(params json.RawMessage) error {
 		return InvalidInitializeParams(detail)
 	}
 	return nil
-}
-
-// deserializationError is the reference SDK's -32602 for params that do not
-// deserialize as the typed request (json_cast_params): data carries the serde
-// reason, the params as the reference SDK holds them, and the phase.
-func deserializationError(detail string, params *serdejson.Value) *acp.RPCError {
-	var data bytes.Buffer
-	data.WriteString(`{"error":`)
-	data.Write(jsonline.Quote([]byte(detail)))
-	data.WriteString(`,"json":`)
-	data.Write(serdejson.Encode(params))
-	data.WriteString(`,"phase":"deserialization"}`)
-	return &acp.RPCError{Code: -32602, Message: "Invalid params", Data: data.Bytes()}
 }
 
 // normalizeExactV2 canonicalizes an exact v2 request whose info parses. The

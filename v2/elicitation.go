@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -42,7 +43,7 @@ func ElicitationComplete(handler func(schema.CompleteElicitationNotification) er
 			return nil
 		}
 		var notification schema.CompleteElicitationNotification
-		if err := json.Unmarshal(raw, &notification); err != nil {
+		if err := castparams.Unmarshal(raw, &notification); err != nil {
 			return err
 		}
 		if notification.ElicitationID == "" {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/mcpserver"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 	unstable "github.com/BrokkAi/acp-go/schema/v2/unstable"
 )
 
@@ -131,11 +132,31 @@ func (a *Attachment) AppendDeclarations(method string, params json.RawMessage) (
 	if !isSessionSetup(method) || a.isClosed() {
 		return params, nil
 	}
+	if err := validateSessionSetup(method, params); err != nil {
+		return nil, err
+	}
 	declarations, err := a.encodedDeclarations()
 	if err != nil {
 		return nil, err
 	}
 	return mcpserver.AppendDeclarations(params, declarations, true)
+}
+
+// validateSessionSetup decodes the params of a session setup request as the
+// reference SDK's validate_session_setup does before it declares a server:
+// params that do not decode as the method's request answer json_cast_params'
+// -32602 and are not forwarded.
+func validateSessionSetup(method string, params json.RawMessage) error {
+	var err error
+	switch method {
+	case unstable.SessionNewMethodName:
+		_, err = rpcparams.Decode[unstable.NewSessionRequest](params)
+	case unstable.SessionResumeMethodName:
+		_, err = rpcparams.Decode[unstable.ResumeSessionRequest](params)
+	case unstable.SessionForkMethodName:
+		_, err = rpcparams.Decode[unstable.ForkSessionRequest](params)
+	}
+	return err
 }
 
 func (a *Attachment) encodedDeclarations() ([]mcpserver.Declaration, error) {
@@ -163,7 +184,7 @@ func (a *Attachment) HandleSessionSetup(next acp.Handler) acp.Handler {
 			return nil, err
 		}
 		if next == nil {
-			return nil, &acp.RPCError{Code: -32601, Message: "unsupported method: " + method}
+			return nil, rpcparams.MethodNotFound(method)
 		}
 		return next(ctx, method, rewritten)
 	}

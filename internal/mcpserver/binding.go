@@ -11,6 +11,7 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/rpcctl"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 )
 
 // Envelope is a decoded agent-to-provider mcp/message request.
@@ -295,7 +296,8 @@ func (b *Binding) inputClosed() bool {
 func (b *Binding) Handle(ctx context.Context, raw json.RawMessage) (any, error) {
 	envelope, err := b.codec.Decode(raw)
 	if err != nil {
-		return nil, invalidEnvelope(err.Error())
+		// The reference SDK decodes the envelope with json_cast_params.
+		return nil, rpcparams.InvalidParams(err, raw)
 	}
 	if strings.TrimSpace(envelope.ServerID) == "" || strings.TrimSpace(envelope.RequestID) == "" || strings.TrimSpace(envelope.Method) == "" {
 		return nil, invalidEnvelope("mcp/message requires non-blank serverId, requestId, and method")

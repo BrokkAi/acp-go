@@ -470,6 +470,69 @@ series, minor releases may contain breaking API changes.
 - **Breaking:** `unstable.Projection.Notifications` returns an error for a
   subagent association the projection's `SubagentTree` refuses, instead of
   ignoring subagent and session-message updates.
+- **Breaking:** every stable dispatch layer answers params that do not
+  decode with the reference SDK's `json_cast_params` `-32602` (#94): code
+  `-32602`, message `Invalid params`, and data
+  `{"error": <serde error>, "json": <params>, "phase": "deserialization"}`.
+  This covers `agent.Runtime`, the draft-v2 `agent.Runtime`,
+  `agent.HandleClientHost` and its `HandleFilesystem`, `HandleTerminal`,
+  `HandlePermissions`, and `HandleElicitation` parts, the v2
+  `HandleClientHost`, `HandlePermissions`, and `HandleElicitation`,
+  `acp.HandleElicitation`, `clienthost.Host`, and the `initialize` of
+  `acptest.AgentHandler`, which now decodes the typed v1 or v2 request.
+  They previously answered `-32602` with the Go decode error as the message
+  and no data. The unstable `Handle` routes and the draft-v2 `initialize`
+  already used this shape and now share one constructor with the rest; the
+  echoed `json` now holds the params as `serde_json::Value` does (compact, a
+  repeated key at its first position with its last value, numbers as
+  serde_json writes them) instead of the received bytes.
+- **Breaking:** the unstable `mcp` and `v2/mcp` routers answer an
+  `mcp/message` envelope that does not decode with the same
+  `json_cast_params` `-32602` instead of the decode error as string data, and
+  `Attachment.AppendDeclarations` and `HandleSessionSetup` decode session
+  setup params as the method's request before declaring a server, as the
+  reference SDK's `validate_session_setup` does (#94): params that do not
+  decode, absent and `null` included, answer that `-32602` and are not
+  forwarded.
+- **Breaking:** the stable dispatch layers answer a request no handler serves
+  with the reference SDK's `-32601`:
+  `{"code":-32601,"message":"Method not found","data":"<method>"}`, as Rust
+  answers for both roles and protocol versions, extension methods included
+  (#94). This covers `agent.Runtime` and the draft-v2 `agent.Runtime`
+  (unknown methods, and optional methods the agent does not implement or
+  advertise), `agent.HandleClientHost` and its parts, the v2
+  `HandleClientHost`, `HandlePermissions`, and `HandleElicitation`,
+  `acp.HandleElicitation` (also without a configured handler),
+  `clienthost.Host`, `acptest.AgentHandler`, and the unstable `mcp` and
+  `v2/mcp` `MessageRouter.Handle` and `Attachment.HandleSessionSetup` without
+  `next` (Rust's MCP-over-ACP handlers decline every other method, which
+  then gets the same answer). They previously answered
+  `agent does not implement method: X`, `unsupported method: X`,
+  `elicitation support is not configured`, or a bare `-32601`. The unstable
+  dispatch shares the same constructor. Unknown notifications are still
+  ignored, as in Rust.
+- **Breaking:** the stable runtimes, client hosts, and notification adapters
+  (`SessionUpdates`, `ElicitationComplete`, the session projections and
+  trackers, and the runtimes' `session/cancel`) read absent params as `null`,
+  as the reference SDK's JSON-RPC layer does for every message (#94). A
+  message without params decodes, and fails, exactly like one with
+  `"params": null`: `session/list`, `logout`, and v2 `auth/logout` decode
+  either as their default request, and any other request fails with
+  ``invalid type: null, expected struct X``. Absent params previously failed
+  with Go's `unexpected end of JSON input`.
+- **Breaking:** the generated decoders in all four schema packages fail with
+  serde's exact error text, which reaches peers in those `-32602` answers
+  (#94). `TestDeserializeHints` now requires it for every rejected case. An
+  error no longer carries a field path or Go type name (such as
+  `NewSessionRequest.cwd: invalid type: number, expected a string`); a struct
+  reports the first value that does not decode in wire order before the
+  first missing required field in Rust declaration order; values are quoted
+  as serde quotes them (``invalid type: integer `5`, expected a string``,
+  ``invalid value: integer `-1`, expected u32``, ``missing field `cwd` ``,
+  ``unknown variant `x`, expected `a` or `b` ``); integers name their Rust
+  width (`u16`, `u32`, `u64`, `i64`), v1 `PathBuf` and v2 `AbsolutePath`
+  fields expect a `path string`, structs `struct X`, and a union Rust reads as
+  untagged fails with `data did not match any variant of untagged enum X`.
 - Every method the unstable `Handle` and `Install` routes serve (v1 and
   draft v2) decodes absent params as `null`, as the reference SDK's JSON-RPC
   layer does for every message: `providers/list`, `auth/status`, and the

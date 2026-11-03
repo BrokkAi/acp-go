@@ -25,6 +25,7 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/agent"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 	schema1 "github.com/BrokkAi/acp-go/schema"
 	schema2 "github.com/BrokkAi/acp-go/schema/v2"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
@@ -163,23 +164,33 @@ func AgentHandler(protocol uint16) acp.Handler {
 	return func(_ context.Context, method string, raw json.RawMessage) (any, error) {
 		switch method {
 		case schema1.InitializeMethodName:
-			var params struct {
-				ProtocolVersion uint16 `json:"protocolVersion"`
-			}
-			if err := json.Unmarshal(raw, &params); err != nil {
-				return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
+			// The params decode as the reference SDK decodes them, and fail
+			// with its json_cast_params -32602.
+			var requested schema1.ProtocolVersion
+			if protocol == 1 {
+				request, err := rpcparams.Decode[schema1.InitializeRequest](raw)
+				if err != nil {
+					return nil, err
+				}
+				requested = request.ProtocolVersion
+			} else {
+				request, err := rpcparams.Decode[schema2.InitializeRequest](raw)
+				if err != nil {
+					return nil, err
+				}
+				requested = schema1.ProtocolVersion(request.ProtocolVersion)
 			}
 			if protocol == 1 {
-				if params.ProtocolVersion < 1 {
-					return nil, &acp.RPCError{Code: -32600, Message: fmt.Sprintf("unexpected protocol %d", params.ProtocolVersion)}
+				if requested < 1 {
+					return nil, &acp.RPCError{Code: -32600, Message: fmt.Sprintf("unexpected protocol %d", requested)}
 				}
 				return schema1.InitializeResponse{
 					ProtocolVersion: acp.Version,
 					AgentInfo:       &schema1.Implementation{Name: "fixture-agent", Version: "1"},
 				}, nil
 			}
-			if params.ProtocolVersion != protocol {
-				return nil, &acp.RPCError{Code: -32600, Message: fmt.Sprintf("unexpected protocol %d", params.ProtocolVersion)}
+			if uint16(requested) != protocol {
+				return nil, &acp.RPCError{Code: -32600, Message: fmt.Sprintf("unexpected protocol %d", requested)}
 			}
 			return schema2.InitializeResponse{
 				ProtocolVersion: acpv2.Version,
@@ -192,7 +203,7 @@ func AgentHandler(protocol uint16) acp.Handler {
 			}
 			return schema2.NewSessionResponse{SessionID: "v2-session"}, nil
 		default:
-			return nil, &acp.RPCError{Code: -32601}
+			return nil, rpcparams.MethodNotFound(method)
 		}
 	}
 }

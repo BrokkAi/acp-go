@@ -457,7 +457,7 @@ func TestRuntimeGatesOptionalMethodsOnAgentCapabilities(t *testing.T) {
 		SessionID: "old", Cwd: hostRoot + "/tmp",
 	}, nil)
 	var rpcErr *acp.RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32601 || rpcErr.Message != "agent does not implement method: session/resume" {
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32601 || rpcErr.Message != "Method not found" || string(rpcErr.Data) != `"session/resume"` {
 		t.Fatalf("capability gate error = %v", err)
 	}
 }

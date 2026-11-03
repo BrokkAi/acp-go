@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -15,7 +16,7 @@ func SessionUpdates(handle func(Update) error) acp.Notifications {
 			return nil
 		}
 		var update Update
-		if err := json.Unmarshal(raw, &update); err != nil {
+		if err := castparams.Unmarshal(raw, &update); err != nil {
 			return err
 		}
 		return handle(update)

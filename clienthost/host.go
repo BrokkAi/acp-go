@@ -16,7 +16,9 @@ import (
 	"syscall"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/castparams"
 	"github.com/BrokkAi/acp-go/internal/osrun"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -168,7 +170,7 @@ func (h *Host) Notification(method string, raw json.RawMessage) error {
 		return nil
 	}
 	var update acp.Update
-	if err := json.Unmarshal(raw, &update); err != nil {
+	if err := castparams.Unmarshal(raw, &update); err != nil {
 		return err
 	}
 	h.mu.Lock()
@@ -195,18 +197,18 @@ func (h *Host) validSession(session schema.SessionId) bool {
 func (h *Host) Request(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 	switch method {
 	case schema.SessionRequestPermissionMethodName:
-		var request schema.RequestPermissionRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
+		request, err := rpcparams.Decode[schema.RequestPermissionRequest](raw)
+		if err != nil {
+			return nil, err
 		}
 		if !h.validSession(request.SessionID) {
 			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
 		}
 		return h.permission(ctx, raw, request)
 	case schema.FsReadTextFileMethodName:
-		var request schema.ReadTextFileRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
+		request, err := rpcparams.Decode[schema.ReadTextFileRequest](raw)
+		if err != nil {
+			return nil, err
 		}
 		if !h.validSession(request.SessionID) {
 			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
@@ -219,9 +221,9 @@ func (h *Host) Request(ctx context.Context, method string, raw json.RawMessage) 
 		}
 		return h.readFile(request)
 	case schema.FsWriteTextFileMethodName:
-		var request schema.WriteTextFileRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
-			return nil, &acp.RPCError{Code: -32602, Message: err.Error()}
+		request, err := rpcparams.Decode[schema.WriteTextFileRequest](raw)
+		if err != nil {
+			return nil, err
 		}
 		if !h.validSession(request.SessionID) {
 			return nil, &acp.RPCError{Code: -32602, Message: "unknown sessionId"}
@@ -240,7 +242,7 @@ func (h *Host) Request(ctx context.Context, method string, raw json.RawMessage) 
 		schema.TerminalReleaseMethodName:
 		return h.terminal(ctx, method, raw)
 	default:
-		return nil, &acp.RPCError{Code: -32601, Message: "unsupported method: " + method}
+		return nil, rpcparams.MethodNotFound(method)
 	}
 }
 

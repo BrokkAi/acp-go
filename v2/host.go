@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -35,7 +36,7 @@ func HandlePermissions(next acp.Handler, host Permissions) acp.Handler {
 		if host == nil || method != schema.SessionRequestPermissionMethodName {
 			return passToNext(ctx, next, method, raw)
 		}
-		request, err := decodeHostRequest[schema.RequestPermissionRequest](raw)
+		request, err := rpcparams.Decode[schema.RequestPermissionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -49,7 +50,7 @@ func HandleElicitation(next acp.Handler, host Elicitation) acp.Handler {
 		if host == nil || method != schema.ElicitationCreateMethodName {
 			return passToNext(ctx, next, method, raw)
 		}
-		request, err := decodeHostRequest[schema.CreateElicitationRequest](raw)
+		request, err := rpcparams.Decode[schema.CreateElicitationRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -65,15 +66,7 @@ func HandleClientHost(permissions Permissions, elicitation Elicitation) acp.Hand
 
 func passToNext(ctx context.Context, next acp.Handler, method string, raw json.RawMessage) (any, error) {
 	if next == nil {
-		return nil, &acp.RPCError{Code: -32601, Message: "unsupported method: " + method}
+		return nil, rpcparams.MethodNotFound(method)
 	}
 	return next(ctx, method, raw)
-}
-
-func decodeHostRequest[T any](raw json.RawMessage) (T, error) {
-	var request T
-	if err := json.Unmarshal(raw, &request); err != nil {
-		return request, &acp.RPCError{Code: -32602, Message: err.Error()}
-	}
-	return request, nil
 }

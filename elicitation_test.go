@@ -129,7 +129,7 @@ func TestHandleElicitationWithoutConfiguredHandler(t *testing.T) {
 		t.Fatalf("value = %v, err = %v", value, err)
 	}
 	var rpcErr *RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32601 || rpcErr.Message != "elicitation support is not configured" {
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32601 || rpcErr.Message != "Method not found" || string(rpcErr.Data) != `"elicitation/create"` {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

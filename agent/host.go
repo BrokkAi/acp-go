@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/BrokkAi/acp-go"
+	"github.com/BrokkAi/acp-go/internal/rpcparams"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -37,13 +38,13 @@ func HandleFilesystem(next acp.Handler, host Filesystem) acp.Handler {
 		}
 		switch method {
 		case schema.FsReadTextFileMethodName:
-			request, err := decodeRequest[schema.ReadTextFileRequest](raw)
+			request, err := rpcparams.Decode[schema.ReadTextFileRequest](raw)
 			if err != nil {
 				return nil, err
 			}
 			return host.ReadTextFile(ctx, request)
 		case schema.FsWriteTextFileMethodName:
-			request, err := decodeRequest[schema.WriteTextFileRequest](raw)
+			request, err := rpcparams.Decode[schema.WriteTextFileRequest](raw)
 			if err != nil {
 				return nil, err
 			}
@@ -62,31 +63,31 @@ func HandleTerminal(next acp.Handler, host Terminal) acp.Handler {
 		}
 		switch method {
 		case schema.TerminalCreateMethodName:
-			request, err := decodeRequest[schema.CreateTerminalRequest](raw)
+			request, err := rpcparams.Decode[schema.CreateTerminalRequest](raw)
 			if err != nil {
 				return nil, err
 			}
 			return host.CreateTerminal(ctx, request)
 		case schema.TerminalOutputMethodName:
-			request, err := decodeRequest[schema.TerminalOutputRequest](raw)
+			request, err := rpcparams.Decode[schema.TerminalOutputRequest](raw)
 			if err != nil {
 				return nil, err
 			}
 			return host.TerminalOutput(ctx, request)
 		case schema.TerminalWaitForExitMethodName:
-			request, err := decodeRequest[schema.WaitForTerminalExitRequest](raw)
+			request, err := rpcparams.Decode[schema.WaitForTerminalExitRequest](raw)
 			if err != nil {
 				return nil, err
 			}
 			return host.WaitForTerminalExit(ctx, request)
 		case schema.TerminalKillMethodName:
-			request, err := decodeRequest[schema.KillTerminalRequest](raw)
+			request, err := rpcparams.Decode[schema.KillTerminalRequest](raw)
 			if err != nil {
 				return nil, err
 			}
 			return host.KillTerminal(ctx, request)
 		case schema.TerminalReleaseMethodName:
-			request, err := decodeRequest[schema.ReleaseTerminalRequest](raw)
+			request, err := rpcparams.Decode[schema.ReleaseTerminalRequest](raw)
 			if err != nil {
 				return nil, err
 			}
@@ -103,7 +104,7 @@ func HandlePermissions(next acp.Handler, host Permissions) acp.Handler {
 		if host == nil || method != schema.SessionRequestPermissionMethodName {
 			return passToNext(ctx, next, method, raw)
 		}
-		request, err := decodeRequest[schema.RequestPermissionRequest](raw)
+		request, err := rpcparams.Decode[schema.RequestPermissionRequest](raw)
 		if err != nil {
 			return nil, err
 		}
@@ -117,7 +118,7 @@ func HandleElicitation(next acp.Handler, host Elicitation) acp.Handler {
 		if host == nil || method != schema.ElicitationCreateMethodName {
 			return passToNext(ctx, next, method, raw)
 		}
-		request, err := decodeRequest[schema.CreateElicitationRequest](raw)
+		request, err := rpcparams.Decode[schema.CreateElicitationRequest](raw)
 		if err != nil {
 			return nil, err
 		}

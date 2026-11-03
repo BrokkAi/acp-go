@@ -97,13 +97,16 @@ request, including one of these methods the handler does not implement, goes
 to `next`, and with no `next` answers `-32601` (`Method not found`, with the
 method name as data). Params that do not decode answer `-32602`
 (`Invalid params`, with data `{"error", "json", "phase": "deserialization"}`
-echoing the received params, or `null` when absent) without reaching the
-handler. The params decode as the reference SDK's schema crate decodes them,
-array params and malformed members included, and absent params decode as
-`null` for every routed method, as the reference SDK's JSON-RPC layer hands
-them over: `providers/list`, `auth/status`, and the archive-aware
-`session/list` read them as the default request, and a method with required
-fields answers them as it answers `null`. A fork response with a blank session ID answers `-32603`
+echoing the received params as `serde_json::Value` holds them, or `null`
+when absent) without reaching the handler, the same error the stable
+runtimes send (see [Params decoding in the dispatch
+layers](schema-pin-workflow.md#params-decoding-in-the-dispatch-layers)). The
+params decode as the reference SDK's schema crate decodes them, array params
+and malformed members included, and absent params decode as `null` for
+every routed method, as the reference SDK's JSON-RPC layer hands them over:
+`providers/list`, `auth/status`, and the archive-aware `session/list` read
+them as the default request, and a method with required fields answers them
+as it answers `null`. A fork response with a blank session ID answers `-32603`
 (`Internal error`, with the detail as string data) instead of reaching the
 wire. Status and title responses are sent as the handler returns them, as the
 reference SDK sends them.

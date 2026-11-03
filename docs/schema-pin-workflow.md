@@ -183,8 +183,14 @@ checked at generation:
 - `mapOnlyStructs`: plain structs with a `#[serde(flatten)]` field in Rust,
   per protocol version; an entry that is not a plain struct fails generation.
 - `stringTagUnions`: unions whose hand-written Rust `Deserialize` requires a
-  string tag (v2 `SetSessionConfigOptionRequest`).
+  string tag (v2 `SetSessionConfigOptionRequest`), with the errors it words
+  itself.
 - `defaultOnNullPayloads`: the `default_on_null!` inventory.
+- `pathFields`: v1 string fields Rust decodes as a `PathBuf`, whose errors
+  expect a "path string". v2 names the type `AbsolutePath`, so it needs no
+  table.
+- `flattenedEnums`: the Rust name of the enum each union with shared fields
+  and untagged variants flattens, which its errors name.
 
 Each package's generated `hints_gen_test.go` derives decode cases from the
 schema: valid, missing, `null`, and malformed values for every hinted field;
@@ -206,6 +212,55 @@ schema's, or one Rust omits when encoding, `rustOmittedDefaults`), an empty
 list equals an absent one, and a `Nullable` null equals omission except on
 patch fields, at any depth. A stale or missing fixture fails the test.
 
-The generated cases find no remaining accept/reject or value differences.
-Decode errors use serde's wording ("invalid type: sequence, expected a
-map") and never name Go types, but their text is not compared with Rust's.
+`TestDeserializeHints` also requires each rejected input to fail with
+serde's exact error text, which the agent runtimes and client hosts send to
+peers in `-32602` answers (see below). The decoders word errors as serde's
+derives do: one error, without a field path, for the first value that does
+not decode in wire order (each key at its first position, with its last
+value, as in `serde_json::Value`), then ``missing field `x` `` for the first
+required field absent in Rust declaration order. A value of the wrong type
+is ``invalid type: integer `5`, expected a string`` (or `u16`, `path
+string`, `struct EnvVariable`, `a sequence`, and so on), an integer out of
+range ``invalid value: integer `-1`, expected u32``, an unknown enum value
+or tag ``unknown variant `x`, expected one of ...``, and a union Rust reads
+as untagged `data did not match any variant of untagged enum X`. Errors
+never name Go types.
+
+The generated cases find no remaining accept/reject, value, or error text
+differences.
+
+## Params decoding in the dispatch layers
+
+Every acp-go layer that dispatches a request to a typed handler (the v1 and
+draft-v2 agent runtimes, `agent.HandleClientHost` and its parts, the v2
+`HandleClientHost`, `acp.HandleElicitation`, `clienthost.Host`, the
+unstable `Handle` routes, and the `mcp` and `v2/mcp` routers for
+`mcp/message` envelopes and session setup params) decodes params as the
+reference SDK 5.0.0 does:
+
+- Absent params read as `null` for every message, as Rust's
+  `params_from_transport` hands them over, so a message without params
+  decodes, and fails, exactly like one with `"params": null`. A
+  `default_on_null!` payload such as `session/list` decodes from either as
+  its default; any other request fails with
+  ``invalid type: null, expected struct X``.
+- Params that do not decode answer `json_cast_params`' `-32602`:
+  `{"code":-32602,"message":"Invalid params","data":{"error":<serde error>,"json":<params>,"phase":"deserialization"}}`,
+  where `json` holds the params as `serde_json::Value` does (compact, a
+  repeated key at its first position with its last value, numbers as
+  serde_json writes them, `null` when absent).
+
+A request no handler serves, including an extension method and an optional
+method the agent does not implement or advertise, answers
+`{"code":-32601,"message":"Method not found","data":"<method>"}`, the
+reference SDK's `reject_unhandled` answer for both roles and protocol
+versions; an unknown notification is ignored.
+
+Decoding stays linear in the size of the params: the decoders merge repeated
+keys of an object in one pass, as does the echo of the params.
+
+`internal/castparams` builds that data and `internal/rpcparams` the errors;
+each dispatch layer uses them rather than its own. The notification adapters
+(`SessionUpdates`, `ElicitationComplete`, the session projections and
+trackers, and the runtimes' `session/cancel`) read absent params as `null`
+too.
