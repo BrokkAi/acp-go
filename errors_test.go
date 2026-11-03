@@ -164,10 +164,12 @@ func TestRPCErrorDecodingReplacesAndRejectsMalformedObjects(t *testing.T) {
 	}
 }
 
-func TestRPCErrorRoundTripSortsExtensionMembers(t *testing.T) {
-	// Re-encoding is semantically unchanged, but members after code, message,
-	// and data come back in sorted key order and whitespace is dropped.
-	wire := `{"zeta":1, "message":"peer","alpha":{"b":2},"data":null,"code":-32000,"_meta":{}}`
+func TestRPCErrorRoundTripKeepsExtensionMemberOrder(t *testing.T) {
+	// As the reference SDK's relays write a received error object, members
+	// after code, message, and data keep the order they arrived in, a
+	// repeated one at its first position with its last value, and
+	// whitespace is dropped. Members added afterwards follow in sorted order.
+	wire := `{"zeta":1, "message":"peer","alpha":{"b":2},"data":null,"code":-32000,"_meta":{},"zeta":3}`
 	var decoded RPCError
 	if err := json.Unmarshal([]byte(wire), &decoded); err != nil {
 		t.Fatal(err)
@@ -176,8 +178,23 @@ func TestRPCErrorRoundTripSortsExtensionMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `{"code":-32000,"message":"peer","data":null,"_meta":{},"alpha":{"b":2},"zeta":1}`; string(encoded) != want {
+	if want := `{"code":-32000,"message":"peer","data":null,"zeta":3,"alpha":{"b":2},"_meta":{}}`; string(encoded) != want {
 		t.Fatalf("got  %s\nwant %s", encoded, want)
+	}
+	decoded.Extra["mid"] = json.RawMessage(`true`)
+	decoded.Extra["aaa"] = json.RawMessage(`0`)
+	delete(decoded.Extra, "alpha")
+	encoded, err = json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"code":-32000,"message":"peer","data":null,"zeta":3,"_meta":{},"aaa":0,"mid":true}`; string(encoded) != want {
+		t.Fatalf("got  %s\nwant %s", encoded, want)
+	}
+	// An Extra map built in Go is written in sorted order.
+	built, err := json.Marshal(RPCError{Code: 1, Message: "m", Extra: map[string]json.RawMessage{"b": json.RawMessage(`1`), "a": json.RawMessage(`2`)}})
+	if err != nil || string(built) != `{"code":1,"message":"m","a":2,"b":1}` {
+		t.Fatalf("built = %s, %v", built, err)
 	}
 }
 
@@ -310,7 +327,8 @@ func TestHandlerErrorsEncodeExtensions(t *testing.T) {
 		{
 			name: "forwarded peer error",
 			err:  forwardedPeerError(t, `{"zeta":"z","code":-32000,"message":"login","_meta":{"trace":1}}`),
-			want: `{"code":-32000,"message":"login","_meta":{"trace":1},"zeta":"z"}`,
+			// The peer's member order is kept, as the reference SDK relays it.
+			want: `{"code":-32000,"message":"login","zeta":"z","_meta":{"trace":1}}`,
 		},
 		{
 			name:     "invalid extension JSON",

@@ -50,7 +50,11 @@ const (
 // names belong to the typed fields: decoding never puts them in Extra, and
 // encoding ignores them in Extra, so an error object never carries a member
 // twice. An Extra entry with an empty value is omitted. Extra members are
-// encoded after the typed fields in sorted key order.
+// encoded after the typed fields: an error object decoded with UnmarshalJSON
+// keeps the order its members arrived in, as the reference SDK's relays do,
+// so a relayed error is written as it was received; members added to Extra
+// afterwards, and every member of an Extra map built in Go, follow in sorted
+// key order.
 //
 // Data and Extra values must be valid JSON and Code must fit int32; otherwise
 // encoding fails, and a Handler error that cannot be encoded is answered with
@@ -61,12 +65,38 @@ type RPCError struct {
 	Message string
 	Data    json.RawMessage
 	Extra   map[string]json.RawMessage
+
+	// extraOrder is the order UnmarshalJSON read the Extra members in.
+	extraOrder []string
+}
+
+// extraKeys lists the Extra members to encode: those UnmarshalJSON read, in
+// the order it read them, then any others in sorted order. Reserved names
+// and empty values are skipped.
+func (e RPCError) extraKeys() []string {
+	keys := make([]string, 0, len(e.Extra))
+	listed := make(map[string]bool, len(e.extraOrder))
+	for _, key := range e.extraOrder {
+		if value, ok := e.Extra[key]; ok && !listed[key] && !reservedErrorMember(key) && len(value) > 0 {
+			keys = append(keys, key)
+			listed[key] = true
+		}
+	}
+	var rest []string
+	for key, value := range e.Extra {
+		if !listed[key] && !reservedErrorMember(key) && len(value) > 0 {
+			rest = append(rest, key)
+		}
+	}
+	slices.Sort(rest)
+	return append(keys, rest...)
 }
 
 func (e *RPCError) Error() string { return fmt.Sprintf("ACP error %d: %s", e.Code, e.Message) }
 
 // MarshalJSON encodes the error object with its typed fields first, then the
-// Extra members in sorted key order.
+// Extra members: those UnmarshalJSON read in the order it read them, then
+// the rest in sorted key order.
 func (e RPCError) MarshalJSON() ([]byte, error) {
 	if !validErrorCode(e.Code) {
 		return nil, fmt.Errorf("acp: JSON-RPC error code %d does not fit int32", e.Code)
@@ -87,13 +117,7 @@ func (e RPCError) MarshalJSON() ([]byte, error) {
 		b.WriteString(`,"data":`)
 		b.Write(e.Data)
 	}
-	keys := make([]string, 0, len(e.Extra))
-	for key, value := range e.Extra {
-		if !reservedErrorMember(key) && len(value) > 0 {
-			keys = append(keys, key)
-		}
-	}
-	slices.Sort(keys)
+	keys := e.extraKeys()
 	for _, key := range keys {
 		value := e.Extra[key]
 		if !json.Valid(value) {
@@ -173,6 +197,11 @@ func (e *RPCError) UnmarshalJSON(data []byte) error {
 		default:
 			if decoded.Extra == nil {
 				decoded.Extra = make(map[string]json.RawMessage)
+			}
+			// A repeated member keeps the position of its first occurrence
+			// and the value of its last, as serde_json's map does.
+			if _, seen := decoded.Extra[key]; !seen {
+				decoded.extraOrder = append(decoded.extraOrder, key)
 			}
 			decoded.Extra[key] = value
 		}

@@ -91,13 +91,27 @@ transport failure closes the connection. This root
 transport is
 also used by the draft-v2 package, while its typed v1 facade remains v1-only.
 
+Every frame the connection writes is serialized as the reference SDK's
+`serde_json` writes it, the same encoding the HTTP transport uses: `<`, `>`,
+and `&` are not escaped, U+2028 and U+2029 are written raw, other escapes in
+forwarded JSON (such as `\u0061` or `\/`) are decoded, numbers are formatted
+as `serde_json` formats them, and a repeated object member keeps its first
+position with its last value. This covers params, results, error data, and
+forwarded `json.RawMessage` values alike. Object members keep the order
+`encoding/json` gives them. JSON the reference SDK cannot hold, such as
+invalid UTF-8 or a lone surrogate escape in a `json.RawMessage`, is never
+written: `Call` fails, `Notify` drops and reports it, and a handler result
+is answered with `-32603`.
+
 `*acp.RPCError` is the JSON-RPC error object as it appears on the wire, kept
 losslessly like Rust's raw JSON-RPC error. `Call` returns it for an error
 response, and a handler returns one (directly or wrapped) to choose its error
 response. `Data` keeps an omitted `data` (nil), `"data": null`, and a value
 apart, and `Extra` keeps every other member, such as extension fields, so a
-relay can re-emit the object semantically unchanged; members after `code`,
-`message`, and `data` are re-emitted in sorted key order. A handler that
+relay can re-emit the object unchanged; members after `code`, `message`, and
+`data` are re-emitted in the order they arrived in, as Rust's relays write
+them, and members of an `Extra` map built in Go are written in sorted key
+order. A handler that
 returns a `*RPCError` obtained from `Call` therefore forwards the peer's
 `Extra` members too. `code`, `message`, and `data` always come from the typed
 fields, never from `Extra`, so no member is ever encoded twice. As in Rust,

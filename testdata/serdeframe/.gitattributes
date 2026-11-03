@@ -1,0 +1,2 @@
+# Byte-exact wire fixtures: never convert line endings.
+* -text

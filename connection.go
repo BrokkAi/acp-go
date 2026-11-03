@@ -19,9 +19,14 @@ import (
 	"github.com/BrokkAi/acp-go/internal/jsonline"
 	"github.com/BrokkAi/acp-go/internal/lines"
 	"github.com/BrokkAi/acp-go/internal/rpcctl"
+	"github.com/BrokkAi/acp-go/internal/serdejson"
+	"github.com/BrokkAi/acp-go/internal/serdewire"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
+// packet is one JSON-RPC message. Its ID, Params, and Result, when set,
+// hold compact JSON (as encoding/json writes it, or compacted with
+// compactJSON), which the frame writer requires.
 type packet struct {
 	Version string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -405,9 +410,27 @@ func (c *Connection) queue(ctx context.Context, build func() (any, error)) (w ou
 	if err != nil {
 		return outgoing{}, false, err
 	}
-	b, err := json.Marshal(value)
+	b, err := encodeFrame(value)
 	if err != nil {
-		return outgoing{}, true, err
+		p, isPacket := value.(packet)
+		switch {
+		case !isPacket:
+			return outgoing{}, true, err
+		case p.Result != nil || p.Error != nil:
+			// A response that cannot be written is answered with -32603, so
+			// the request is still answered.
+			b, err = encodeFrame(packet{Version: "2.0", ID: p.ID, Error: &RPCError{Code: -32603, Message: "encode response: " + err.Error()}})
+			if err != nil {
+				return outgoing{}, true, err
+			}
+		case len(p.ID) == 0 && errors.Is(err, serdewire.ErrUnrepresentable):
+			// A notification the reference SDK could not have sent is
+			// dropped and reported, like one whose params are not an
+			// object or array.
+			return outgoing{}, true, errDroppedNotification{err}
+		default:
+			return outgoing{}, true, err
+		}
 	}
 	w = outgoing{data: append(b, '\n'), sent: make(chan error, 1)}
 	select {
@@ -474,7 +497,13 @@ func (c *Connection) guardOutgoing(method string, params json.RawMessage, notifi
 			return nil, false, err
 		}
 		if rewritten != nil {
-			params = rewritten
+			// A guard's rewrite need not be compact; the frame writer
+			// requires compact JSON.
+			compact, err := compactJSON(rewritten)
+			if err != nil {
+				return nil, true, err
+			}
+			params = compact
 		}
 	}
 	if err := checkWireParams(params); err != nil {
@@ -949,14 +978,14 @@ func decodeMessage(line []byte) (packet, messageKind) {
 		}
 		// The reference SDK reads the whole message as a serde_json value
 		// first, so a repeated member of the error object keeps its last
-		// value there instead of being rejected as RPCError rejects it.
-		var errorMembers map[string]json.RawMessage
-		if json.Unmarshal(rawError, &errorMembers) != nil || errorMembers == nil {
+		// value, at the position of its first, instead of being rejected as
+		// RPCError rejects it, and the members keep their order.
+		members, err := serdejson.ParseAnyDepth(rawError)
+		if err != nil || members.Kind != serdejson.Object {
 			return packet{}, malformedResponse
 		}
-		canonical, err := json.Marshal(errorMembers)
 		p.Error = new(RPCError)
-		if err != nil || p.Error.UnmarshalJSON(canonical) != nil {
+		if p.Error.UnmarshalJSON(serdejson.Encode(members)) != nil {
 			return packet{}, malformedResponse
 		}
 		return p, responseMessage
@@ -1052,6 +1081,11 @@ func (c *Connection) startRequest(p packet) {
 		w, _, err := c.queue(c.ctx, func() (any, error) {
 			if c.outResponse != nil {
 				result, err := c.outResponse(p.ID, p.Method, response.Result, rpcErrorOrNil(response.Error))
+				if err == nil && result != nil {
+					// A guard's rewrite need not be compact; the frame
+					// writer requires compact JSON.
+					result, err = compactJSON(result)
+				}
 				response.Result, response.Error = result, nil
 				if err != nil {
 					response.Result, response.Error = nil, errorObject(err)
@@ -1182,9 +1216,9 @@ func (c *Connection) admit(p packet) (admitted bool) {
 	if refusal == nil {
 		return true
 	}
-	frame, err := json.Marshal(packet{Version: "2.0", ID: p.ID, Error: refusal})
+	frame, err := encodeFrame(packet{Version: "2.0", ID: p.ID, Error: refusal})
 	if err != nil {
-		frame, _ = json.Marshal(packet{Version: "2.0", ID: p.ID, Error: &RPCError{Code: -32603, Message: "encode error response: " + err.Error()}})
+		frame, _ = encodeFrame(packet{Version: "2.0", ID: p.ID, Error: &RPCError{Code: -32603, Message: "encode error response: " + err.Error()}})
 	}
 	c.answerFrame(frame)
 	return false

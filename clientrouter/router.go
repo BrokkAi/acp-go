@@ -15,6 +15,8 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/negotiate"
+	"github.com/BrokkAi/acp-go/internal/serdejson"
+	"github.com/BrokkAi/acp-go/internal/serdewire"
 	schema1 "github.com/BrokkAi/acp-go/schema"
 	schema2 "github.com/BrokkAi/acp-go/schema/v2"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
@@ -353,7 +355,9 @@ func validateV2Initialize(frame wireFrame) error {
 }
 
 func exchangeInitialize(reader *bufio.Reader, agent io.Writer, request wireFrame) ([]byte, error) {
-	encoded, err := json.Marshal(request)
+	// The frame is written as the reference SDK writes one, like every frame
+	// acp.Connection writes.
+	encoded, err := serdewire.Marshal(request)
 	if err != nil {
 		return nil, err
 	}
@@ -382,13 +386,19 @@ func initializeResponseVersion(response []byte) (uint16, uint16, error) {
 	return envelope.Result.ProtocolVersion, envelope.Result.ProtocolVersion, nil
 }
 
+// responseWithID rewrites the id of a response frame, keeping its members
+// where they are, and writes it as the reference SDK writes a frame.
 func responseWithID(response []byte, id json.RawMessage) ([]byte, error) {
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(response, &envelope); err != nil {
-		return nil, err
+	envelope, err := serdejson.ParseAnyDepth(response)
+	if err != nil || envelope.Kind != serdejson.Object {
+		return nil, errors.New("initialize response is not a JSON object")
 	}
-	envelope["id"] = id
-	return json.Marshal(envelope)
+	replacement, err := serdejson.ParseAnyDepth(id)
+	if err != nil {
+		return nil, errors.New("initialize request id is not JSON")
+	}
+	envelope.Set("id", replacement)
+	return serdejson.Encode(envelope), nil
 }
 
 func normalizeV2InitializeForV1(params []byte) ([]byte, bool, error) {

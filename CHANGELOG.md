@@ -525,6 +525,51 @@ series, minor releases may contain breaking API changes.
 
 ### Changed
 
+- **Breaking (wire):** `acp.Connection`, the client router, and the agent and
+  proxy routers' answers write every frame exactly as the reference SDK
+  writes it with `serde_json` (built with `preserve_order`), the encoding
+  `transport/http` already uses. The bytes `encoding/json`
+  produces, including nested `MarshalJSON` output (generated schema unions,
+  `RPCError` and its data, the negotiated initialize params) and forwarded
+  `json.RawMessage` values, are written as `serde_json` writes the same value:
+  - `<`, `>`, and `&` are written raw instead of as `\u003c`, `\u003e`, and
+    `\u0026`, and U+2028 and U+2029 raw instead of as `\u2028` and `\u2029`;
+  - any other escape `serde_json` does not write, such as `\u0061`, `\/`,
+    upper-case hex, a surrogate pair, or `\u000a`, is decoded and written in
+    `serde_json`'s form (`a`, `/`, the character, `\n`);
+  - a number that is not an integer fitting `i64` or `u64` is written as
+    `serde_json` writes the `f64` it parses to, so `1.0` stays `1.0`, `1e21`
+    becomes `1e+21`, `1E-7` becomes `1e-7`, `-0` becomes `-0.0`, and a larger
+    integer becomes a float such as `1.8446744073709552e+19`;
+  - a repeated object member, which only raw JSON can carry, keeps the
+    position of its first occurrence with the value of its last.
+
+  Object members keep the order `encoding/json` gives them. A request or
+  notification with an empty method is written with `"method":""`, as the
+  reference SDK writes it, instead of without the member. The client
+  router's reused initialize response keeps its members in place instead of
+  sorting them.
+
+  JSON the reference SDK cannot hold, such as invalid UTF-8 or a lone
+  surrogate escape in a `json.RawMessage`, or a number that overflows `f64`,
+  is never written (a Rust peer would answer it with `-32700` or fail the
+  transport): `Call` fails with the encoding error before writing, `Notify`
+  drops the notification and reports the error to the `WithErrorHandler`
+  hook, and a handler result is answered with `-32603`. Params and results a
+  protocol guard rewrites are compacted before they are written.
+
+  Frames already in `serde_json`'s form are found in one scan and written as
+  they are, and request, notification, result, and error frames are no
+  longer re-marshaled around their params, result, or error. Encoding is
+  faster than before for typical frames; a frame `serde_json` rewrites
+  costs about as much as before, and one dense with numbers that need
+  re-formatting costs more.
+- `RPCError` keeps the order a received error object's extension members
+  arrived in, as the reference SDK's relays do, so a relayed error is
+  written as it was received (a repeated member at its first position with
+  its last value); members of an `Extra` map built in Go, and members added
+  to a decoded one, are written after them in sorted key order, as before.
+
 - Frames have no size limit, as in Rust `agent-client-protocol` 5.0.0, whose
   line readers have none (#90). `acp.Connection` (and so `v2.Connection` and
   the agent runtimes), `agentrouter`, `clientrouter`, `proxyrouter`, the HTTP
