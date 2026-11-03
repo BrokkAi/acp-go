@@ -250,7 +250,7 @@ func TestClosedEnumsRejectUnknownValues(t *testing.T) {
 	}
 }
 
-func TestPrimitiveUnionsGetAValidator(t *testing.T) {
+func TestPrimitiveUnionsGetATypedCodec(t *testing.T) {
 	root := &rootSchema{Defs: map[string]*rawSchema{
 		"Option": {Type: json.RawMessage(`"object"`), Required: []string{"value"}, Properties: map[string]*rawSchema{"value": str()}},
 	}}
@@ -267,11 +267,13 @@ func TestPrimitiveUnionsGetAValidator(t *testing.T) {
 	r := &ir{ByName: map[string]*typeDef{"Value": td, "Option": opt}, Defs: []*typeDef{td, opt}}
 	src := string(emitTypes(r, "test", "testpkg"))
 	for _, want := range []string{
-		"func validValue(raw json.RawMessage) error {",
+		"func decodeValueUnion(raw json.RawMessage) (Value, error) {",
 		"if jsonKind(raw) == '\"' {",
-		"!isNull(raw) && json.Unmarshal(raw, new(int64)) == nil",
-		"decodeList(raw, new([]Option), false, false,",
-		"return errors.New(\"data did not match any variant of untagged enum Value\")",
+		"if value := new(int64); !isNull(raw) && !isNegativeZero(raw) && json.Unmarshal(raw, value) == nil {",
+		"if value := []Option(nil); decodeList(raw, &value, false, false,",
+		"return nil, errors.New(\"data did not match any variant of untagged enum Value\")",
+		"func appendValueUnion(b []byte, v Value) ([]byte, error) {",
+		"case []Option:",
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("generated source missing %q:\n%s", want, src)

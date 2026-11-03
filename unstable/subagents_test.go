@@ -561,7 +561,7 @@ func TestInitializeAdvertisesSubagents(t *testing.T) {
 		result <- err
 	}()
 	request := agentSide.next(t)
-	if got := string(request["params"]); !strings.Contains(got, `"clientCapabilities":{"subagents":{}}`) || !strings.Contains(got, `"protocolVersion":1`) {
+	if got := string(request["params"]); !strings.Contains(got, `"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"subagents":{},"auth":{"terminal":false}}`) || !strings.Contains(got, `"protocolVersion":1`) {
 		t.Fatalf("initialize params = %s", got)
 	}
 	agentSide.send(t, `{"jsonrpc":"2.0","id":`+string(request["id"])+`,"result":{"protocolVersion":1,"agentCapabilities":{"providers":{}}}}`)

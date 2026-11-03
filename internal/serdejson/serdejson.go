@@ -71,7 +71,7 @@ func Parse(data []byte) (*Value, error) {
 	if !jsonline.Valid(data) {
 		return nil, ErrInvalid
 	}
-	return parse(data)
+	return parse(data, false)
 }
 
 // ParseAnyDepth is Parse without serde_json's recursion limit, for a value
@@ -81,20 +81,33 @@ func ParseAnyDepth(data []byte) (*Value, error) {
 	if !jsonline.ValidAnyDepth(data) {
 		return nil, ErrInvalid
 	}
-	return parse(data)
+	return parse(data, false)
 }
 
-func parse(data []byte) (*Value, error) {
+// ParseTyped is ParseAnyDepth for JSON a Go value encodes to, such as
+// json.Marshal output, rather than wire text: a number with a fraction or an
+// exponent reads as the float64 nearest to it, which for encoding/json's and
+// FormatFloat's shortest round-trip digits is exactly the float64 they
+// encoded, where serde_json's own parsing need not round to it. It reads
+// what serde_json::to_value would hold for the Go value.
+func ParseTyped(data []byte) (*Value, error) {
+	if !jsonline.ValidAnyDepth(data) {
+		return nil, ErrInvalid
+	}
+	return parse(data, true)
+}
+
+func parse(data []byte, exact bool) (*Value, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	value, err := decode(decoder)
+	value, err := decode(decoder, exact)
 	if err != nil {
 		return nil, ErrInvalid
 	}
 	return value, nil
 }
 
-func decode(decoder *json.Decoder) (*Value, error) {
+func decode(decoder *json.Decoder, exact bool) (*Value, error) {
 	token, err := decoder.Token()
 	if err != nil {
 		return nil, err
@@ -107,13 +120,13 @@ func decode(decoder *json.Decoder) (*Value, error) {
 	case string:
 		return &Value{Kind: String, String: token}, nil
 	case json.Number:
-		return number(string(token))
+		return number(string(token), exact)
 	case json.Delim:
 		switch token {
 		case '[':
 			result := &Value{Kind: Array}
 			for decoder.More() {
-				item, err := decode(decoder)
+				item, err := decode(decoder, exact)
 				if err != nil {
 					return nil, err
 				}
@@ -131,7 +144,7 @@ func decode(decoder *json.Decoder) (*Value, error) {
 				if err != nil {
 					return nil, err
 				}
-				item, err := decode(decoder)
+				item, err := decode(decoder, exact)
 				if err != nil {
 					return nil, err
 				}
@@ -170,8 +183,9 @@ func decode(decoder *json.Decoder) (*Value, error) {
 // keys rather than scanning them.
 const indexedObject = 16
 
-// number reads a JSON number token as serde_json does.
-func number(text string) (*Value, error) {
+// number reads a JSON number token as serde_json does, or, when exact is
+// set, with a fraction or exponent as the nearest float64.
+func number(text string, exact bool) (*Value, error) {
 	if !strings.ContainsAny(text, ".eE") && text != "-0" {
 		if _, err := strconv.ParseUint(text, 10, 64); err == nil {
 			return &Value{Kind: Integer, Integer: text}, nil
@@ -179,6 +193,13 @@ func number(text string) (*Value, error) {
 		if _, err := strconv.ParseInt(text, 10, 64); err == nil {
 			return &Value{Kind: Integer, Integer: text}, nil
 		}
+	}
+	if exact {
+		f, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			return nil, ErrInvalid
+		}
+		return &Value{Kind: Float, Float: f}, nil
 	}
 	f, ok := jsonline.ParseFloat([]byte(text))
 	if !ok {

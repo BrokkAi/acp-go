@@ -569,7 +569,78 @@ series, minor releases may contain breaking API changes.
   written as it was received (a repeated member at its first position with
   its last value); members of an `Extra` map built in Go, and members added
   to a decoded one, are written after them in sorted key order, as before.
+- **Breaking (wire):** the generated types in `schema`, `schema/unstable`,
+  `schema/v2`, and `schema/v2/unstable` encode exactly as the pinned Rust
+  schema crate (`agent-client-protocol-schema` 1.15.1) serializes them with
+  `serde_json`. Every struct and union has a generated `MarshalJSON`, checked
+  byte for byte against `serde_json::to_string` of the Rust value for every
+  def by `TestDeserializeHints`. The differences from before:
+  - Members are written in Rust declaration order instead of sorted (v2
+    `InitializeResponse` is `protocolVersion`, `info`, `capabilities`, ...;
+    `_meta` comes last), and the Go struct fields are declared in that order
+    too, so an unkeyed struct literal no longer compiles the same way. A
+    tagged union writes its tag first, and a union a struct flattens
+    (`CreateElicitationRequest.mode`, `SessionConfigOption`'s `type`, v2
+    `IdleStateUpdate.stopReason`, ...) is written where Rust declares it.
+  - An `f64` (`Annotations.priority`, `Cost.amount`, the
+    `NumberPropertySchema` bounds) is written as serde_json writes it:
+    `1.0`, `-0.0`, `1e+20`, `1e-7`, not `1`, `-0`, `100000000000000000000`,
+    `1e-07`. It also decodes as serde_json reads it, which does not always
+    round to the nearest `float64`.
+  - Defaults Rust always writes are filled in for an unset field: the v1
+    capability flags (`"loadSession":false`, `"terminal":false`,
+    `"fs":{"readTextFile":false,"writeTextFile":false}`,
+    `"auth":{"terminal":false}`, ...), v1 `InitializeResponse.authMethods`,
+    v2 `InitializeRequest`/`InitializeResponse` `capabilities`, and
+    `ElicitationSchema`'s `type` and `properties`. A required list or map
+    writes `[]` or `{}` when nil instead of `null` (for example an HTTP MCP
+    server's `headers`).
+  - A `null` in a v2 `Nullable` field that is not a patch is left out, as
+    Rust reads it as `None`; patch fields still write it. v1
+    `ToolCall.kind` `other` and `status` `pending` are left out, as Rust
+    leaves out its defaults; read a missing status as `pending`. A non-`Option`
+    list or map without a default is left out when empty; an `Option` one is
+    written when set, empty included.
+  - Raw JSON that Rust holds as a `serde_json::Value` (optional raw fields
+    such as `rawInput`, open variants, a decoded v2 `ErrorData`, the unstable
+    `ProxySuccessorResponse`) is re-encoded as serde_json re-encodes a
+    `Value` (compact, a repeated key once, numbers and escapes in serde_json's
+    form) instead of verbatim, and an open tagged-union variant writes its tag,
+    its declared fields, and then its other members sorted by key, as Rust's
+    `Other` types do, an elicitation mode's without the other scope's keys.
+    `ProxySuccessorResponse` is a defined `json.RawMessage` type instead of an
+    alias.
+  - `McpError` keeps the other members Rust flattens into a map, in wire
+    order, in a new `Extra` field, and writes them after `code`, `message`,
+    and `data`; before, decoding dropped them.
+  - An integer, or an integer arm of a union of primitives, rejects `-0`, which
+    serde_json reads as the f64 `-0.0`.
+  - **Breaking (API):** an optional raw JSON field that Rust holds as an
+    `Option<Value>` (such as v1 `rawInput` or `Error.data`) decodes `null` as
+    `nil` (None) instead of `json.RawMessage("null")`, so a
+    `json.RawMessage("null")` set in Go is written as `null`, as Rust writes
+    `Some(Value::Null)`. Patch fields keep the decoded `null`.
+  - **Breaking (API):** a union of primitives (`RequestId`,
+    `ElicitationContentValue`, `SessionConfigSelectOptions`) decodes to the
+    Go value of the Rust arm it matches, which it then encodes as that arm:
+    an `int64` for an integer instead of a `float64` (so a large request id
+    keeps its value), a `float64` only for a number arm, `[]string` or
+    `[]SessionConfigSelectOption`/`[]SessionConfigSelectGroup` instead of
+    `[]any`, so select options are written in Rust's member order.
+  - Encoding a session update is about 7x faster with 6x fewer allocations,
+    since unions no longer re-encode their payloads through a map.
 
+  `acp.Connection` writes params and results it encodes from a Go value
+  without re-reading their floats as serde_json reads wire text, as the
+  reference SDK writes a Rust value; before, about a third of typed f64
+  values (such as `0.9405161066866751`) and raw `serde_json::Value` fields
+  such as `rawInput` were written with different digits. Params forwarded as
+  a `json.RawMessage` are still read as wire text.
+
+  `Meta` and other untyped (`any`) values still lose map key order and the
+  integers above 2^53, as `encoding/json` decodes them; an ordered `Meta`
+  type is left to a follow-up. See
+  [docs/schema-pin-workflow.md](docs/schema-pin-workflow.md#encode-rules).
 - Frames have no size limit, as in Rust `agent-client-protocol` 5.0.0, whose
   line readers have none (#90). `acp.Connection` (and so `v2.Connection` and
   the agent runtimes), `agentrouter`, `clientrouter`, `proxyrouter`, the HTTP

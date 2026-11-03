@@ -228,7 +228,7 @@ func TestSessionClientCapabilitiesAdvertiseNoticesAndCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"session":{"_meta":{"a":1,"b":2},"compaction":{},"configOptions":{"boolean":{}},"notices":{}}}`
+	want := `{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"compaction":{},"configOptions":{"boolean":{}},"notices":{},"_meta":{"a":1,"b":2}},"auth":{"terminal":false}}`
 	if string(encoded) != want {
 		t.Fatalf("capabilities = %s, want %s", encoded, want)
 	}
@@ -332,7 +332,7 @@ func TestSessionClientCapabilitiesCopiesEveryField(t *testing.T) {
 	for i := range typ.NumField() {
 		got = append(got, typ.Field(i).Name)
 	}
-	want := []string{"Meta", "Compaction", "ConfigOptions", "Notices"}
+	want := []string{"Compaction", "ConfigOptions", "Notices", "Meta"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("schema.ClientSessionCapabilities fields = %v, SessionClientCapabilities copies %v", got, want)
 	}

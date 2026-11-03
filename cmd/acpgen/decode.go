@@ -98,10 +98,20 @@ func seqCapable(name string) bool {
 }
 
 // isAnyType reports whether the Go type is a union of primitives, which
-// decodes through its generated validator.
+// decodes through its generated decoder.
 func isAnyType(name string) bool {
 	td := resolve(name)
 	return td != nil && td.Kind == kindAny && len(td.AnyArms) > 0
+}
+
+// isFloatType reports whether the Go type is an f64, which decodes as
+// serde_json reads one.
+func isFloatType(name string) bool {
+	if name == "float64" {
+		return true
+	}
+	td := resolve(name)
+	return td != nil && (td.Kind == kindNewtype || td.Kind == kindEnum) && td.Base == "float64"
 }
 
 // declType renders the Go type a field is declared with.
@@ -147,9 +157,13 @@ func valueCall(typ, dst string, nullOK, itemNullOK, skip bool, cb, itemCB string
 		case declOf(elem) != declNone:
 			return fmt.Sprintf("decodePtr(raw, %s, %t, %s)", dst, nullOK, cb)
 		case isAnyType(elem):
-			return fmt.Sprintf("decodeChecked(raw, %s, %t, valid%s)", dst, nullOK, elem)
+			return fmt.Sprintf("decodeCheckedPtr(raw, %s, %t, decode%sUnion)", dst, nullOK, elem)
+		case isFloatType(elem):
+			return fmt.Sprintf("decodeFloatPtr(raw, %s, %t)", dst, nullOK)
 		}
 		return fmt.Sprintf("decodeValue(raw, %s, %t, %s)", dst, nullOK, cb)
+	case isFloatType(typ):
+		return fmt.Sprintf("decodeFloat(raw, %s, %t)", dst, nullOK)
 	case strings.HasPrefix(typ, "[]"):
 		elem := typ[2:]
 		return fmt.Sprintf("decodeList(raw, %s, %t, %t, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", dst, nullOK, skip, elem, valueCall(elem, "dst", itemNullOK, false, false, itemCB, itemCB, path))
@@ -157,7 +171,7 @@ func valueCall(typ, dst string, nullOK, itemNullOK, skip bool, cb, itemCB string
 		elem := typ[strings.Index(typ, "]")+1:]
 		return fmt.Sprintf("decodeMap(raw, %s, %t, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t})", dst, nullOK, elem, valueCall(elem, "dst", itemNullOK, false, false, itemCB, itemCB, false))
 	case isAnyType(typ):
-		return fmt.Sprintf("decodeChecked(raw, %s, %t, valid%s)", dst, nullOK, typ)
+		return fmt.Sprintf("decodeChecked(raw, %s, %t, decode%sUnion)", dst, nullOK, typ)
 	}
 	return fmt.Sprintf("decodeValue(raw, %s, %t, %s)", dst, nullOK, cb)
 }
@@ -190,9 +204,12 @@ func fieldCall(f field, buffered string) string {
 // failure returns the value's own error, as serde reports it, without the
 // field's path.
 func emitFieldValue(b *strings.Builder, f field, buffered string) {
-	if f.DefaultOnNull && !f.Nullable {
+	switch {
+	case f.DefaultOnNull && !f.Nullable:
 		fmt.Fprintf(b, "\t\tif isNull(raw) {\n\t\t\tv.%s = %s\n\t\t} else if err := %s; err != nil {\n", f.GoName, f.defaultExpr(), fieldCall(f, buffered))
-	} else {
+	case f.RawNone:
+		fmt.Fprintf(b, "\t\tif isNull(raw) {\n\t\t\tv.%s = nil\n\t\t} else if err := %s; err != nil {\n", f.GoName, fieldCall(f, buffered))
+	default:
 		fmt.Fprintf(b, "\t\tif err := %s; err != nil {\n", fieldCall(f, buffered))
 	}
 	if f.DefaultOnError {
@@ -262,7 +279,7 @@ func emitStructDecode(b *strings.Builder, td *typeDef, typeName string, fields [
 		}
 		emitFlattenedDecode(b, td)
 	} else {
-		emitMapVisit(b, fields, seqOrder)
+		emitMapVisit(b, fields, seqOrder, td != nil && td.Extras)
 	}
 	b.WriteString("\treturn nil\n}\n\n")
 	if seqOrder != nil {
@@ -291,7 +308,10 @@ func requiresFields(fields []field) bool {
 // the first that fails ending the decode; then the first required field
 // absent, in Rust declaration order, fails as missing. Unknown members are
 // ignored.
-func emitMapVisit(b *strings.Builder, fields []field, order []string) {
+func emitMapVisit(b *strings.Builder, fields []field, order []string, extras bool) {
+	if extras {
+		b.WriteString("\tvar extras rawObject\n")
+	}
 	b.WriteString("\tfor _, m := range raws {\n\t\traw := m.raw\n\t\tswitch string(m.key) {\n")
 	for _, f := range fields {
 		fmt.Fprintf(b, "\t\tcase %q:\n", f.JSONName)
@@ -303,7 +323,13 @@ func emitMapVisit(b *strings.Builder, fields []field, order []string) {
 			}
 		}
 	}
+	if extras {
+		b.WriteString("\t\tdefault:\n\t\t\textras = append(extras, m)\n")
+	}
 	b.WriteString("\t\t}\n\t}\n")
+	if extras {
+		b.WriteString("\tif len(extras) > 0 {\n\t\tv.Extra = rawObjectJSON(extras)\n\t}\n")
+	}
 	byName := map[string]field{}
 	for _, f := range fields {
 		byName[f.JSONName] = f
@@ -498,7 +524,7 @@ func emitTaggedUnionDecode(b *strings.Builder, r *ir, td *typeDef) {
 		}
 		if form == "fields" {
 			if len(td.Fields) > 0 {
-				emitMapVisit(b, td.Fields, td.FieldOrder)
+				emitMapVisit(b, td.Fields, td.FieldOrder, false)
 			}
 			if len(td.Fields) > 0 {
 				// Rust flattens the enum beside the shared fields, so it
@@ -745,47 +771,35 @@ func emitEnumDecode(b *strings.Builder, td *typeDef) {
 	fmt.Fprintf(b, "func (v *%s) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }\n\n", td.Name)
 }
 
-// emitAnyValidator writes the validator of a union of primitives: a value
+// emitAnyDecoder writes the decoder of a union of primitives: a value
 // must match one of its arms, as Rust's untagged enum requires.
-func emitAnyValidator(b *strings.Builder, td *typeDef) {
+func emitAnyDecoder(b *strings.Builder, td *typeDef) {
 	if len(td.AnyArms) == 0 {
 		return
 	}
-	fmt.Fprintf(b, "// valid%s reports whether raw matches an arm of %s.\nfunc valid%s(raw json.RawMessage) error {\n", td.Name, td.Name, td.Name)
+	fmt.Fprintf(b, "// decode%sUnion decodes raw as the first arm of %s it matches, as serde\n// decodes an untagged enum: a string, an integer of the arm's type, a float64,\n// a bool, nil for null, a list of the arm's item type, or the raw JSON of an\n// unconstrained arm.\nfunc decode%sUnion(raw json.RawMessage) (%s, error) {\n", td.Name, td.Name, td.Name, td.Name)
 	for _, arm := range td.AnyArms {
-		var cond string
 		switch arm.Kind {
 		case "any":
-			cond = "true"
+			b.WriteString("\treturn append(json.RawMessage(nil), raw...), nil\n}\n\n")
+			return
 		case "null":
-			cond = "isNull(raw)"
+			b.WriteString("\tif isNull(raw) {\n\t\treturn nil, nil\n\t}\n")
 		case "string":
-			cond = `jsonKind(raw) == '"'`
+			b.WriteString("\tif jsonKind(raw) == '\"' {\n\t\tvar value string\n\t\tif err := json.Unmarshal(raw, &value); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t\treturn value, nil\n\t}\n")
 		case "boolean":
-			cond = `string(raw) == "true" || string(raw) == "false"`
+			b.WriteString("\tif string(raw) == \"true\" || string(raw) == \"false\" {\n\t\treturn string(raw) == \"true\", nil\n\t}\n")
 		case "number":
-			cond = `jsonKind(raw) == '-' || (jsonKind(raw) >= '0' && jsonKind(raw) <= '9')`
+			b.WriteString("\tif kind := jsonKind(raw); kind == '-' || (kind >= '0' && kind <= '9') {\n\t\tvar value float64\n\t\tif err := decodeFloat(raw, &value, false); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t\treturn value, nil\n\t}\n")
 		case "integer":
-			cond = fmt.Sprintf("!isNull(raw) && json.Unmarshal(raw, new(%s)) == nil", arm.GoType)
+			// serde_json reads -0 as the f64 -0.0, which the integer arm
+			// rejects.
+			fmt.Fprintf(b, "\tif value := new(%s); !isNull(raw) && !isNegativeZero(raw) && json.Unmarshal(raw, value) == nil {\n\t\treturn *value, nil\n\t}\n", arm.GoType)
 		case "array":
-			cond = fmt.Sprintf("decodeList(raw, new([]%s), false, false, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t}) == nil", arm.GoType, arm.GoType, valueCall(arm.GoType, "dst", arm.ItemNullOK, false, false, "true", "true", false))
+			fmt.Fprintf(b, "\tif value := []%s(nil); decodeList(raw, &value, false, false, func(raw json.RawMessage, dst *%s) error {\n\t\treturn %s\n\t}) == nil {\n\t\treturn value, nil\n\t}\n", arm.GoType, arm.GoType, valueCall(arm.GoType, "dst", arm.ItemNullOK, false, false, "true", "true", false))
 		}
-		fmt.Fprintf(b, "\tif %s {\n\t\treturn nil\n\t}\n", cond)
 	}
-	fmt.Fprintf(b, "\treturn %s\n}\n\n", untaggedError(td.Name))
-}
-
-// emitFlattenedCodec writes the encoder of a struct carrying a flattened
-// tagged union: a lifted variant payload field is encoded only alongside its
-// own tag value, and a custom or future tag re-encodes the other fields it
-// arrived with.
-func emitFlattenedCodec(b *strings.Builder, td *typeDef) {
-	if td.Flatten == nil {
-		return
-	}
-	shadow := unexport(td.Name) + "Shadow"
-	fmt.Fprintf(b, "// %s mirrors %s without its codec methods.\ntype %s %s\n\n", shadow, td.Name, shadow, td.Name)
-	emitFlattenedMarshal(b, td, shadow)
+	fmt.Fprintf(b, "\treturn nil, %s\n}\n\n", untaggedError(td.Name))
 }
 
 // sharedKeys lists the wire keys a flattened struct owns regardless of its
@@ -818,26 +832,6 @@ func (r *ir) hasNonZero() bool {
 		}
 	}
 	return false
-}
-
-func emitFlattenedMarshal(b *strings.Builder, td *typeDef, shadow string) {
-	fl := td.Flatten
-	fmt.Fprintf(b, "func (v %s) MarshalJSON() ([]byte, error) {\n", td.Name)
-	fmt.Fprintf(b, "\tencoded, err := json.Marshal(%s(v))\n\tif err != nil {\n\t\treturn nil, err\n\t}\n", shadow)
-	fmt.Fprintf(b, "\tvar obj map[string]json.RawMessage\n\tif err := json.Unmarshal(encoded, &obj); err != nil {\n\t\treturn nil, err\n\t}\n")
-	fmt.Fprintf(b, "\tvar tag %s\n\tif v.%s != nil {\n\t\ttag = *v.%s\n\t}\n", fl.Enum, fl.TagGo, fl.TagGo)
-	for _, f := range td.Fields {
-		if f.Variant != "" {
-			fmt.Fprintf(b, "\tif tag != %q {\n\t\tdelete(obj, %q)\n\t}\n", f.Variant, f.JSONName)
-		}
-	}
-	cases := make([]string, 0, len(fl.Known)+1)
-	cases = append(cases, `""`)
-	for _, known := range fl.Known {
-		cases = append(cases, fmt.Sprintf("%q", known))
-	}
-	fmt.Fprintf(b, "\tswitch tag {\n\tcase %s:\n\tdefault:\n\t\tfor key, raw := range v.%s {\n\t\t\tif _, owned := obj[key]; !owned {\n\t\t\t\tobj[key] = raw\n\t\t\t}\n\t\t}\n\t}\n", strings.Join(cases, ", "), fl.ExtrasGo)
-	b.WriteString("\treturn json.Marshal(obj)\n}\n\n")
 }
 
 // emitDecodeHelpers writes the helpers the generated decoders share.
@@ -997,6 +991,20 @@ func objectData(data []byte, raws rawObject) json.RawMessage {
 	}
 	out, _ := json.Marshal(obj)
 	return out
+}
+
+// rawObjectJSON writes members as a JSON object, in order.
+func rawObjectJSON(members rawObject) json.RawMessage {
+	out := json.RawMessage{'{'}
+	for i, m := range members {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = appendString(out, string(m.key))
+		out = append(out, ':')
+		out = append(out, m.raw...)
+	}
+	return append(out, '}')
 }
 
 // splitObject splits a JSON object into its members without copying them.
@@ -1313,10 +1321,34 @@ func decodeValue[T any](raw json.RawMessage, dst *T, nullOK, buffered bool) erro
 	if !nullOK && isNull(raw) {
 		return nullError[T]()
 	}
+	if isNegativeZero(raw) {
+		// serde_json reads -0 as the f64 -0.0, which an integer rejects.
+		if t := reflect.TypeFor[T](); isInteger(t) {
+			return invalidType(raw, expecting(t))
+		}
+	}
 	if d, ok := any(dst).(decoder); ok {
 		return d.decodeJSON(raw, buffered)
 	}
 	return typeError(json.Unmarshal(raw, dst), raw)
+}
+
+// isNegativeZero reports whether raw is the number -0.
+func isNegativeZero(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "-0"
+}
+
+// isInteger reports whether t, or what it points to, is an integer.
+func isInteger(t reflect.Type) bool {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return true
+	}
+	return false
 }
 
 // typeError rewrites encoding/json's type errors the way serde words them,
@@ -1375,20 +1407,67 @@ func decodePtr[T any, P interface {
 	return nil
 }
 
-// decodeChecked decodes a union of primitives after check accepts it.
-func decodeChecked[T any](raw json.RawMessage, dst *T, nullOK bool, check func(json.RawMessage) error) error {
+// decodeChecked decodes a union of primitives with its generated decoder,
+// which yields the Go value of the first arm the value matches.
+func decodeChecked[T any](raw json.RawMessage, dst *T, nullOK bool, decode func(json.RawMessage) (T, error)) error {
 	if isNull(raw) && !nullOK {
-		if err := check(raw); err != nil {
+		if _, err := decode(raw); err != nil {
 			return err
 		}
 		return nullError[T]()
 	}
-	if !isNull(raw) {
-		if err := check(raw); err != nil {
-			return err
+	if isNull(raw) {
+		var zero T
+		*dst = zero
+		return nil
+	}
+	value, err := decode(raw)
+	if err != nil {
+		return err
+	}
+	*dst = value
+	return nil
+}
+
+// decodeCheckedPtr decodes an optional union of primitives.
+func decodeCheckedPtr[T any](raw json.RawMessage, dst **T, nullOK bool, decode func(json.RawMessage) (T, error)) error {
+	var value T
+	if err := decodeChecked(raw, &value, nullOK, decode); err != nil {
+		return err
+	}
+	if isNull(raw) {
+		*dst = nil
+	} else {
+		*dst = &value
+	}
+	return nil
+}
+
+// decodeFloat decodes an f64 as serde_json reads one: built without its
+// float_roundtrip feature, as the reference SDK is, it does not always round
+// to the nearest float64.
+func decodeFloat[T ~float64](raw json.RawMessage, dst *T, nullOK bool) error {
+	token := bytes.TrimSpace(raw)
+	if c := jsonKind(token); c == '-' || (c >= '0' && c <= '9') {
+		if f, ok := jsonline.ParseFloat(token); ok {
+			*dst = T(f)
+			return nil
 		}
 	}
-	return typeError(json.Unmarshal(raw, dst), raw)
+	return decodeValue(raw, dst, nullOK, false)
+}
+
+// decodeFloatPtr decodes an optional f64.
+func decodeFloatPtr[T ~float64](raw json.RawMessage, dst **T, nullOK bool) error {
+	if isNull(raw) {
+		return decodeValue(raw, dst, nullOK, false)
+	}
+	value := new(T)
+	if err := decodeFloat(raw, value, false); err != nil {
+		return err
+	}
+	*dst = value
+	return nil
 }
 
 // decodeList decodes a list item by item. With skip set

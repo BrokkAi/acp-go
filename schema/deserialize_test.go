@@ -86,8 +86,9 @@ func TestDeserializeHintExamples(t *testing.T) {
 		},
 		{
 			name: "an unknown tool kind in the map form reads as other", value: new(ToolCall),
+			// Rust leaves out the default kind when encoding.
 			input: `{"toolCallId":"t","title":"x","kind":{"bogus":null}}`,
-			want:  `{"toolCallId":"t","title":"x","kind":"other"}`,
+			want:  `{"toolCallId":"t","title":"x"}`,
 		},
 		{
 			name: "a map-form role is kept in a list", value: new(Annotations),

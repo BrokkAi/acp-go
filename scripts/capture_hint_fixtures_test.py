@@ -12,25 +12,31 @@ class CaptureHintFixturesTests(unittest.TestCase):
         self.assertLess(source.index("acp::v1::A"), source.index("acp::v1::B"))
         self.assertIn('#[cfg(feature = "unstable_protocol_v2")]\npub fn v2(', source)
 
+    def test_dispatch_uses_the_rust_path_of_types_outside_the_module(self):
+        source = capture.dispatch_source({"v1": {"ProtocolVersion"}, "v2": {"ErrorData"}})
+        self.assertIn('"ProtocolVersion" => Some(run::<acp::ProtocolVersion>(input)),', source)
+        self.assertIn('"ErrorData" => Some(run::<serde_json::Value>(input)),', source)
+        self.assertNotIn("acp::v1::ProtocolVersion", source)
+
     def test_dispatch_without_types_still_compiles_both_tables(self):
         source = capture.dispatch_source({})
         self.assertIn("pub fn v1(", source)
         self.assertIn("pub fn v2(", source)
 
-    def test_fixtures_record_value_or_error(self):
+    def test_fixtures_record_value_encoding_or_error(self):
         header = {"pin": "schema-v1.0.0", "pkg": "v1"}
         requests = [
             {"id": "A.x/valid", "pkg": "v1", "type": "A", "input": '{"x": 1}'},
             {"id": "A.x/null", "pkg": "v1", "type": "A", "input": '{"x": null}'},
         ]
         responses = {
-            "A.x/valid": {"id": "A.x/valid", "ok": {"x": 1}},
+            "A.x/valid": {"id": "A.x/valid", "ok": {"x": 1}, "encoded": '{"x":1}'},
             "A.x/null": {"id": "A.x/null", "error": "invalid type: null"},
         }
         doc = capture.fixtures(header, requests, responses)
         self.assertEqual(doc["pin"], "schema-v1.0.0")
         self.assertEqual(doc["protocol"], "v1")
-        self.assertEqual(doc["cases"]["A.x/valid"], {"input": '{"x": 1}', "ok": {"x": 1}})
+        self.assertEqual(doc["cases"]["A.x/valid"], {"input": '{"x": 1}', "ok": {"x": 1}, "encoded": '{"x":1}'})
         self.assertEqual(doc["cases"]["A.x/null"], {"input": '{"x": null}', "error": "invalid type: null"})
 
     def test_fixtures_reject_types_the_probe_lacks(self):

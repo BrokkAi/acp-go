@@ -213,7 +213,7 @@ func TestSessionFacadesEncodeArchiveFilterAndTitle(t *testing.T) {
 		}
 		want := `{"cwd":"/repo"}`
 		if value != nil {
-			want = `{"archived":"` + string(*value) + `","cwd":"/repo"}`
+			want = `{"cwd":"/repo","archived":"` + string(*value) + `"}`
 		}
 		if request := <-requests; request.method != schema.SessionListMethodName || string(request.params) != want {
 			t.Fatalf("session/list frame = %s %s, want %s", request.method, request.params, want)

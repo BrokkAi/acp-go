@@ -242,19 +242,19 @@ func TestProxyRouterNegotiatesLikeAgentRouter(t *testing.T) {
 			name: "newer version selects v2", v1: true, v2: true,
 			params:    `{"protocolVersion":3,"info":{"name":"conductor","version":"3"},"_future":true}`,
 			selected:  2,
-			wantFrame: `{"id":1,"jsonrpc":"2.0","method":"proxy/initialize","params":{"info":{"name":"conductor","version":"3"},"protocolVersion":2}}`,
+			wantFrame: `{"id":1,"jsonrpc":"2.0","method":"proxy/initialize","params":{"protocolVersion":2,"info":{"name":"conductor","version":"3"},"capabilities":{}}}`,
 		},
 		{
 			name: "newer version without info selects v2", v2: true,
 			params:    `{"protocolVersion":3}`,
 			selected:  2,
-			wantFrame: `{"id":1,"jsonrpc":"2.0","method":"proxy/initialize","params":{"info":{"name":"unknown","version":"unknown"},"protocolVersion":2}}`,
+			wantFrame: `{"id":1,"jsonrpc":"2.0","method":"proxy/initialize","params":{"protocolVersion":2,"info":{"name":"unknown","version":"unknown"},"capabilities":{}}}`,
 		},
 		{
 			name: "v2 request selects configured v1", v1: true,
 			params:    `{"protocolVersion":2,"info":{"name":"conductor","version":"2"}}`,
 			selected:  1,
-			wantFrame: `{"id":1,"jsonrpc":"2.0","method":"proxy/initialize","params":{"clientCapabilities":{"session":{"configOptions":{"boolean":{}}}},"clientInfo":{"name":"conductor","version":"2"},"protocolVersion":1}}`,
+			wantFrame: `{"id":1,"jsonrpc":"2.0","method":"proxy/initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"configOptions":{"boolean":{}}},"auth":{"terminal":false}},"clientInfo":{"name":"conductor","version":"2"}}}`,
 		},
 		{
 			name: "exact version is handed over unchanged", v1: true, v2: true,

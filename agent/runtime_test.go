@@ -372,7 +372,11 @@ func TestRuntimeNegotiatesV1ForEveryValidVersion(t *testing.T) {
 				}
 				// Unknown newer fields never enable v1 file-system or
 				// terminal-execution capabilities.
-				if capabilities.Fs != nil || capabilities.Terminal != nil {
+				// The v1 request carries them as false, the defaults Rust
+				// always writes.
+				fs := capabilities.Fs
+				if fs != nil && ((fs.ReadTextFile != nil && *fs.ReadTextFile) || (fs.WriteTextFile != nil && *fs.WriteTextFile)) ||
+					capabilities.Terminal != nil && *capabilities.Terminal {
 					t.Fatalf("v1-only capabilities enabled: %+v", capabilities)
 				}
 				if request.Meta["trace"] != "x" {

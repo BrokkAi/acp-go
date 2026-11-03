@@ -23,12 +23,19 @@
 // its Error field, encoded only with StopReasonError. The state updates read
 // a malformed stopReason, error, background, or _meta as not reported, as
 // Rust does; elsewhere decoding is still strict (#82). Untyped "any other
-// value" arms, such as ErrorData's Other, keep the raw JSON verbatim, and a
-// decoded ErrorData variant re-encodes its original bytes until changed.
+// value" arms, such as ErrorData's Other, keep the raw JSON, and a decoded
+// ErrorData variant re-encodes its wire value, as serde_json re-encodes a
+// Value, until changed.
+//
+// Encoding writes what the Rust schema crate writes with serde_json: fields
+// in Rust declaration order, None left out, and f64 values with a decimal
+// point or exponent. See docs/schema-pin-workflow.md, Encode rules.
 //
 // ACP v2 patch fields distinguish an omitted property from JSON null. Those
 // fields use Nullable[T], whose Set, Null, and Value members preserve all
-// three wire states: omitted, explicit null, and a concrete value.
+// three wire states: omitted, explicit null, and a concrete value. Other
+// optional fields are Nullable too, but there Rust reads null as None, so a
+// null is encoded as an omitted field.
 //
 // The upsert updates (ToolCallUpdate, TerminalUpdate, UserMessage,
 // AgentMessage, AgentThought, SessionInfoUpdate, and CompactionUpdate) have

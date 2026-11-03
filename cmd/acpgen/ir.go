@@ -20,7 +20,7 @@ const (
 	kindUntaggedUnion
 	kindAny
 	kindAlias
-	kindRaw // arbitrary JSON preserved verbatim (json.RawMessage alias)
+	kindRaw // arbitrary JSON preserved verbatim (a json.RawMessage type re-encoded as a serde_json::Value)
 )
 
 type field struct {
@@ -57,6 +57,9 @@ type field struct {
 	// Path marks a string field Rust decodes as a path (see pathFields),
 	// which serde's errors name "path string".
 	Path bool
+	// RawNone marks an optional raw JSON field whose null reads as nil
+	// (see markRawOptions).
+	RawNone bool
 }
 
 // flattenInfo describes a tagged union flattened into its parent struct.
@@ -132,6 +135,10 @@ type typeDef struct {
 	// ObjectOnly is set on a struct Rust reads only from an object (a
 	// flattened field; see mapOnlyStructs).
 	ObjectOnly bool
+	// Extras is set on a struct whose schema admits additional properties,
+	// which Rust keeps in a flattened serde_json::Map: the other members are
+	// kept, in order, in its Extra field and written after the fields.
+	Extras bool
 }
 
 // anyArm is one arm of a union of primitives.
@@ -541,6 +548,12 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 		for _, f := range td.Fields {
 			r.HasNullable = r.HasNullable || f.Nullable
 		}
+		if (td.Kind == kindTaggedUnion || td.Kind == kindUntaggedUnion) && len(td.Fields) > 0 {
+			// Encoding writes the union where the Rust struct declares it.
+			if _, err := flattenIndex(name, td.Fields); err != nil {
+				return nil, err
+			}
+		}
 		td.Side, td.Method = def.Side, def.Method
 		if preserveNull && td.Kind == kindStruct && patchDefs[name].upsert {
 			if err := checkUpsert(td); err != nil {
@@ -562,6 +575,7 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 	if err := r.resolveRefs(); err != nil {
 		return nil, err
 	}
+	r.markRawOptions()
 	if err := r.checkCollisions(); err != nil {
 		return nil, err
 	}
@@ -569,6 +583,32 @@ func buildIR(root *rootSchema, meta *metaFile, pin string) (*ir, error) {
 		return nil, err
 	}
 	return r, nil
+}
+
+// markRawOptions marks the optional raw JSON fields Rust holds as an
+// Option<Value> (or Option<Box<RawValue>>), whose null reads as None: they
+// decode null as nil, so that a json.RawMessage("null") a caller sets is
+// Some(Value::Null), which Rust writes. A patch field (Rust MaybeUndefined)
+// keeps the null.
+func (r *ir) markRawOptions() {
+	curIR = r
+	for _, td := range r.Defs {
+		for i := range td.Fields {
+			f := &td.Fields[i]
+			if !f.Required && !f.Nullable && isRawType(f.GoType) &&
+				!patchField(r, td.Name, f.JSONName) && !rawPatchFields[td.Name+"."+f.JSONName] {
+				f.RawNone = true
+			}
+		}
+		for j := range td.Variants {
+			for i := range td.Variants[j].Inline {
+				f := &td.Variants[j].Inline[i]
+				if !f.Required && !f.Nullable && isRawType(f.GoType) {
+					f.RawNone = true
+				}
+			}
+		}
+	}
 }
 
 // applyV1PatchFields makes the named optional fields of a v1 struct def
@@ -660,11 +700,12 @@ func classify(name string, def *rawSchema, root *rootSchema, preserveNull bool) 
 		}
 		td.Kind = kindStruct
 		td.SeqOrder = def.propOrder()
+		td.Extras = isTrue(def.Additional)
 		required := map[string]bool{}
 		for _, k := range def.Required {
 			required[k] = true
 		}
-		for _, p := range sortedProps(def.Properties) {
+		for _, p := range orderedProps(def) {
 			f, err := fieldFrom(p.key, p.value, root, preserveNull)
 			if err != nil {
 				return nil, fmt.Errorf("%s.%s: %w", name, p.key, err)
@@ -773,7 +814,7 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 			if payload == nil || payload.Properties == nil || len(payload.AnyOf) > 0 || len(payload.OneOf) > 0 {
 				return nil, true, fmt.Errorf("%s: flattened %q variant %q payload must be one object def", name, tag, cv)
 			}
-			for _, p := range sortedProps(payload.Properties) {
+			for _, p := range orderedProps(payload) {
 				f, err := fieldFrom(p.key, p.value, root, preserveNull)
 				if err != nil {
 					return nil, true, fmt.Errorf("%s.%s: %w", target, p.key, err)
@@ -805,18 +846,19 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 	for _, k := range def.Required {
 		required[k] = true
 	}
-	for _, p := range sortedProps(def.Properties) {
+	if required[tag] {
+		return nil, true, fmt.Errorf("%s: a required flattened %q is not supported", name, tag)
+	}
+	// Null selects the "not reported" variant, which omission also selects,
+	// so the tag is a plain optional field even where null is otherwise
+	// preserved.
+	members := append([]field{{
+		JSONName: tag, GoName: goNameOf(tag), GoType: enumName,
+		Doc: tagDoc, NullOK: true,
+	}}, lifted...)
+	var own []field
+	for _, p := range orderedProps(def) {
 		if p.key == tag {
-			// Null selects the "not reported" variant, which omission also
-			// selects, so the tag is a plain optional field even where null
-			// is otherwise preserved.
-			if required[tag] {
-				return nil, true, fmt.Errorf("%s: a required flattened %q is not supported", name, tag)
-			}
-			td.Fields = append(td.Fields, field{
-				JSONName: tag, GoName: goNameOf(tag), GoType: enumName,
-				Doc: tagDoc, NullOK: true,
-			})
 			continue
 		}
 		f, err := fieldFrom(p.key, p.value, root, preserveNull)
@@ -824,18 +866,57 @@ func classifyFlattenedUnion(name string, def *rawSchema, variants []*rawSchema, 
 			return nil, true, fmt.Errorf("%s.%s: %w", name, p.key, err)
 		}
 		f.Required = required[p.key]
-		td.Fields = append(td.Fields, f)
+		own = append(own, f)
 	}
 	for _, f := range lifted {
-		for _, existing := range td.Fields {
+		for _, existing := range own {
 			if existing.JSONName == f.JSONName || existing.GoName == f.GoName || f.GoName == td.Flatten.ExtrasGo {
 				return nil, true, fmt.Errorf("%s: flattened variant field %q collides with a struct field", name, f.JSONName)
 			}
 		}
-		td.Fields = append(td.Fields, f)
 	}
-	sort.SliceStable(td.Fields, func(i, j int) bool { return td.Fields[i].JSONName < td.Fields[j].JSONName })
+	// The fields are declared in wire order: the struct's own fields, with
+	// the tag and its payload fields where Rust flattens the union.
+	at, err := flattenIndex(name, own)
+	if err != nil {
+		return nil, true, err
+	}
+	td.Fields = append(append(append([]field(nil), own[:at]...), members...), own[at:]...)
 	return td, true, nil
+}
+
+// flattenAfter places the union a Rust struct flattens (#[serde(flatten)])
+// among the struct's own fields, which the schema lists beside the union
+// without saying where it sits. serde writes the union's members, the tag
+// first for an internally tagged one, in place of the flattened field: after
+// the named field, or before every field for "".
+var flattenAfter = map[string]string{
+	"CreateElicitationRequest":      "",
+	"CreateElicitationResponse":     "",
+	"ElicitationFormMode":           "",
+	"ElicitationUrlMode":            "",
+	"IdleStateUpdate":               "",
+	"SessionConfigOption":           "category",
+	"SetSessionConfigOptionRequest": "configId",
+	"DiffChange":                    "mimeType",
+}
+
+// flattenIndex returns the position among fields, the struct's own fields,
+// of the union the def flattens (see flattenAfter).
+func flattenIndex(name string, fields []field) (int, error) {
+	after, ok := flattenAfter[name]
+	if !ok {
+		return 0, fmt.Errorf("%s: flattens a union beside its own fields; add where Rust declares it to flattenAfter", name)
+	}
+	if after == "" {
+		return 0, nil
+	}
+	for i, f := range fields {
+		if f.JSONName == after {
+			return i + 1, nil
+		}
+	}
+	return 0, fmt.Errorf("%s: flattenAfter names %q, which is not one of its fields", name, after)
 }
 
 // carries reports whether the generated type encodes the given wire key as a
@@ -861,7 +942,7 @@ func sharedFields(name string, def *rawSchema, skip string, root *rootSchema, pr
 		required[k] = true
 	}
 	var fields []field
-	for _, p := range sortedProps(def.Properties) {
+	for _, p := range orderedProps(def) {
 		if p.key == skip {
 			continue
 		}
@@ -1006,7 +1087,7 @@ func classifyUnionShape(name string, def *rawSchema, variants []*rawSchema, root
 			for _, k := range v.Required {
 				required[k] = true
 			}
-			for _, p := range sortedProps(v.Properties) {
+			for _, p := range orderedProps(v) {
 				f, err := fieldFrom(p.key, p.value, root, preserveNull)
 				if err != nil {
 					return nil, fmt.Errorf("%s %s variant: %w", name, nv.GoName, err)
@@ -1124,7 +1205,7 @@ func taggedVariants(name string, variants []*rawSchema, root *rootSchema, preser
 			for _, k := range v.Required {
 				required[k] = true
 			}
-			for _, p := range sortedProps(props) {
+			for _, p := range orderedProps(v) {
 				f, err := fieldFrom(p.key, p.value, root, preserveNull)
 				if err != nil {
 					return nil, fmt.Errorf("%s default variant: %w", name, err)
@@ -1160,7 +1241,7 @@ func taggedVariants(name string, variants []*rawSchema, root *rootSchema, preser
 			for _, k := range v.Required {
 				required[k] = true
 			}
-			for _, p := range sortedProps(props) {
+			for _, p := range orderedProps(v) {
 				if p.key == tag {
 					continue
 				}
@@ -1209,7 +1290,7 @@ func taggedVariants(name string, variants []*rawSchema, root *rootSchema, preser
 			for _, k := range v.Required {
 				required[k] = true
 			}
-			for _, p := range sortedProps(props) {
+			for _, p := range orderedProps(v) {
 				if p.key == tag {
 					continue
 				}
@@ -1489,6 +1570,17 @@ func sortedProps(m map[string]*rawSchema) []propEntry {
 	out := make([]propEntry, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, propEntry{key: k, value: m[k]})
+	}
+	return out
+}
+
+// orderedProps returns the properties of s in schema order, which is the
+// Rust declaration order serde writes the fields in.
+func orderedProps(s *rawSchema) []propEntry {
+	keys := s.propOrder()
+	out := make([]propEntry, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, propEntry{key: k, value: s.Properties[k]})
 	}
 	return out
 }

@@ -244,7 +244,7 @@ func TestRPCErrorSchemaErrorDropsExtensions(t *testing.T) {
 		}
 		want := `{"code":-32000,"message":"peer"}`
 		if data != "" {
-			want = `{"code":-32000,"data":` + data + `,"message":"peer"}`
+			want = `{"code":-32000,"message":"peer","data":` + data + `}`
 		}
 		if string(encoded) != want {
 			t.Fatalf("got %s, want %s", encoded, want)

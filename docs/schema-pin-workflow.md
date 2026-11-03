@@ -45,7 +45,7 @@ schema crate or when the Rust SDK moves its exact pin.
      -out schema/v2/unstable -package unstable
    go run ./cmd/acpgen -schema schema/v2/unstable/schema.json \
      -meta schema/v2/unstable/meta.json -out schema/v2/unstable -package unstable
-   python3 scripts/capture_hint_fixtures.py   # recapture the Rust decode outcomes
+   python3 scripts/capture_hint_fixtures.py   # recapture the Rust decode and encode outcomes
    ```
 
 2. **Review the generated API diff.** This is the gate, not a formality. Read
@@ -85,8 +85,10 @@ schema crate or when the Rust SDK moves its exact pin.
      `cmd/acpgen` models, so teach it the group and its side constant;
    - `parity_gen_test.go` and `golden_test.go` updates, and any new goldens;
    - `hints_gen_test.go` and `testdata/hints_rust.json`: recapture the Rust
-     outcomes (see [Decode rules](#decode-rules)) and review the fixture diff
-     next to the generated code.
+     outcomes (see [Decode rules](#decode-rules) and
+     [Encode rules](#encode-rules)) and review the fixture diff next to the
+     generated code. A new union a Rust struct flattens beside its own fields
+     fails generation until `flattenAfter` says where Rust declares it.
 
    Preserve the guardrails: open-world enums and unknown tags must keep
    decoding, raw `_meta` payloads must round-trip, and nothing may convert v1
@@ -142,8 +144,18 @@ Everything else decodes as serde does:
   as `other` (`#[serde(other)]`). An open enum keeps any string, and the map
   form only for a variant it names. `null` is never an enum value.
 - A union of primitives (an untagged Rust enum such as
-  `SessionConfigSelectOptions` or `ElicitationContentValue`) accepts only a
-  value one of its arms decodes; the Go value stays `any`.
+  `SessionConfigSelectOptions`, `ElicitationContentValue`, or `RequestId`)
+  accepts only a value one of its arms decodes, and holds the Go value of the
+  first such arm: a `string`, an integer of the arm's width (`int64`), a
+  `float64`, a `bool`, `nil` for `null`, a typed slice (such as
+  `[]SessionConfigSelectOption`), or the `json.RawMessage` of an
+  unconstrained arm.
+- An `f64` reads as serde_json reads it. Built without its `float_roundtrip`
+  feature, as the reference SDK is, serde_json does not always round to the
+  nearest `float64` (`7.2e-300` reads as `7.199999999999999e-300`), and
+  neither do the decoders.
+- An optional raw JSON field that Rust holds as an `Option<Value>` reads
+  `null` as `nil` (None); a patch field keeps it as `json.RawMessage("null")`.
 - A tagged union routes on its tag; whatever its tagged variants do not decode
   (a missing, invalid, or unknown tag, or a payload that does not decode) goes
   to its untagged variants in schema order. The open variant takes a string
@@ -191,6 +203,11 @@ checked at generation:
   table.
 - `flattenedEnums`: the Rust name of the enum each union with shared fields
   and untagged variants flattens, which its errors name.
+- `flattenAfter`: where each Rust struct declares the union it flattens
+  beside its own fields, which sets where encoding writes the union's
+  members.
+- `rawPatchFields` (`cmd/acpgen/encode.go`): raw JSON fields outside the
+  patch tables that Rust holds as `MaybeUndefined<Value>` (`McpError.data`).
 
 Each package's generated `hints_gen_test.go` derives decode cases from the
 schema: valid, missing, `null`, and malformed values for every hinted field;
@@ -227,6 +244,82 @@ as untagged `data did not match any variant of untagged enum X`. Errors
 never name Go types.
 
 The generated cases find no remaining accept/reject, value, or error text
+differences.
+
+## Encode rules
+
+The generated types encode exactly as the pinned Rust schema crate serializes
+the same value with `serde_json::to_string` (built with `preserve_order`, as
+the reference SDK is). Every struct and union has a generated `MarshalJSON`;
+the struct tags no longer drive encoding.
+
+- Fields are written in Rust declaration order, the schema's property order,
+  which is also the order the Go fields are declared in. A union a Rust
+  struct flattens is written where the struct declares it (`flattenAfter`):
+  an internally tagged union writes its tag first, then its payload's fields.
+- An `Option` that is `None` is left out (`skip_serializing_none`), and so is
+  a `null` in a `Nullable` field that is not a patch, since Rust reads it as
+  `None`. A patch field (Rust `MaybeUndefined`) writes its explicit `null`.
+- A field that is not an `Option` but has a default (`#[serde(default)]`) is
+  always written: the v1 capability flags (`"loadSession":false`,
+  `"fs":{"readTextFile":false,"writeTextFile":false}`, ...), v1
+  `InitializeResponse.authMethods`, v2 `InitializeRequest.capabilities` and
+  `InitializeResponse.capabilities`, and `ElicitationSchema.type` and
+  `properties`. An unset Go field writes the
+  schema's default. A required list or map writes `[]` or `{}` when nil.
+- A list or map that is not an `Option` and has no default is left out when
+  empty (`skip_serializing_if = "Vec::is_empty"`); an `Option` list or map
+  is written when non-nil, empty included.
+- A field Rust leaves out when it holds its default (`rustOmittedDefaults`:
+  v1 `ToolCall.kind` `other` and `status` `pending`) is left out then.
+- An `f64` is written as serde_json formats it, always with a decimal point
+  or an exponent: `1.0`, `-0.0`, `0.1`, `1e+20`, `1e-7`, `5e-324`.
+- A raw JSON value Rust holds as a `serde_json::Value` (an optional raw
+  field, an open variant's preserved payload, a decoded `ErrorData`, a
+  successor response) is re-encoded as serde_json re-encodes a `Value`:
+  compact, members in order, a repeated key once at its first position with
+  its last value, numbers and escapes in serde_json's form. An open variant of
+  a tagged union is written as Rust's `Other` type writes it: the tag, the
+  fields the type declares, then its other members sorted by key (a flattened
+  `BTreeMap`), without the keys of the enclosing struct, and for an
+  elicitation mode the keys of the scope that matched, without those of the
+  other scope.
+- The other members of a struct whose schema admits additional properties
+  (`McpError`, whose Rust type flattens a `serde_json::Map`) are kept, in
+  wire order, in its `Extra` field and written after its fields.
+- A union of primitives writes each Go value as the Rust arm holding it.
+- Strings are escaped as serde_json escapes them. `json.Marshal` further
+  escapes `<`, `>`, `&`, U+2028, and U+2029 in any `MarshalJSON` output, as
+  it does for every type.
+
+`Meta` and the other untyped values (`any`) are decoded and written by
+`encoding/json`, which sorts map keys and holds every number as a `float64`,
+losing the integers above 2^53; Rust keeps the member order and the integer
+and float forms of a `serde_json::Value`. Their strings and numbers are
+written in serde_json's form.
+
+`acp.Connection` writes params and results it encodes from a Go value with
+`serdewire.EncodeTyped`, which only undoes `json.Marshal`'s escapes and
+writes each float64 as serde_json writes it, without re-reading its digits
+as serde_json reads wire text: the reference SDK writes a Rust value with
+`serde_json::to_value` and `to_string`, which never parse a number it holds.
+Params forwarded as a `json.RawMessage` are wire text and are read as
+serde_json reads them (`serdewire.Encode`).
+
+The encode cases in `hints_gen_test.go` decode, for every def, its minimal
+and full documents, the full document of every union variant, every `f64`
+field set to integral, negative-zero, large, small, subnormal, and inexact
+values, every integer field set to `-0` (which serde_json reads as the f64
+`-0.0` and an integer rejects), every optional list and map set empty, every
+raw JSON field set to a value with a repeated key, floats, and escapes, every
+arm of every union-of-primitives field, a custom elicitation mode carrying
+both scopes, the other members of `McpError`, and a string with every escape
+class, and capture
+`serde_json::to_string` of the Rust value alongside the decode outcome.
+`TestDeserializeHints` requires the frame writer's encoding
+(`serdewire.MarshalTyped`) and the generated `MarshalJSON` of the decoded Go
+value to be byte for byte that string, and `json.Marshal` too wherever it
+holds none of the characters `json.Marshal` escapes. They find no remaining
 differences.
 
 ## Params decoding in the dispatch layers

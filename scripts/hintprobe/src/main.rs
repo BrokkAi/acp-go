@@ -2,7 +2,8 @@
 //! outcome, so the Go decoders can be compared with it.
 //!
 //! Reads one request per line, `{"id", "pkg", "type", "input"}`, and writes
-//! one response per line: `{"id", "ok": <re-encoded value>}`,
+//! one response per line: `{"id", "ok": <re-encoded value>, "encoded":
+//! <the exact serde_json::to_string output>}`,
 //! `{"id", "error": <message>}`, or `{"id", "missing": true}` for a type the
 //! dispatch table does not know.
 
@@ -41,12 +42,15 @@ fn main() {
             _ => None,
         };
         let resp = match result {
-            None => serde_json::json!({"id": id, "missing": true}),
-            Some(Ok(value)) => {
-                let value: serde_json::Value = serde_json::from_str(&value).expect("re-encoded JSON");
-                serde_json::json!({"id": id, "ok": value})
+            None => serde_json::json!({"id": id, "missing": true}).to_string(),
+            // The re-encoding is written as is, not parsed into a Value
+            // again: serde_json's float parsing is not exact, so a second
+            // parse could change a number.
+            Some(Ok(encoded)) => {
+                let quoted = serde_json::to_string(&encoded).expect("encode string");
+                format!("{{\"id\":{id},\"ok\":{encoded},\"encoded\":{quoted}}}")
             }
-            Some(Err(error)) => serde_json::json!({"id": id, "error": error}),
+            Some(Err(error)) => serde_json::json!({"id": id, "error": error}).to_string(),
         };
         writeln!(out, "{resp}").expect("write response");
     }

@@ -29,6 +29,23 @@ func BenchmarkDecodeSessionNotification(b *testing.B) {
 	}
 }
 
+func BenchmarkEncodeSessionNotification(b *testing.B) {
+	notifications := make([]SessionNotification, len(benchUpdates))
+	for i, u := range benchUpdates {
+		if err := json.Unmarshal([]byte(u), &notifications[i]); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		for i := range notifications {
+			if _, err := json.Marshal(&notifications[i]); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
 // manyMembers returns a PromptRequest object with n junk members between a
 // sessionId and its repeat.
 func manyMembers(n int) []byte {

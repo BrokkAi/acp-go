@@ -20,6 +20,12 @@
 //     ProtocolVersion is uint16 and ErrorCode is int32).
 //   - Union variants with unrecognized tags decode into the Other variant,
 //     preserving the raw payload for proxying.
+//   - Encoding writes what the Rust schema crate writes with serde_json:
+//     fields in Rust declaration order, None left out, defaults Rust always
+//     writes filled in, and f64 values with a decimal point or exponent
+//     (1.0, 1e+20). A union of primitives holds the Go value of the arm it
+//     decodes as (string, int64, float64, bool, nil, or a typed slice). See
+//     docs/schema-pin-workflow.md, Encode rules.
 //   - The JSON-RPC routing envelopes (AgentRequest, AgentNotification, and
 //     friends) are not emitted; dispatch by method string and decode params
 //     with the type named by the Methods registry.

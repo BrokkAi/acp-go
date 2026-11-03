@@ -45,7 +45,7 @@ func (c *Connection) queueNotification(ctx context.Context, method string, param
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	w, _, err := c.queue(ctx, c.buildNotification(method, encoded))
+	w, _, err := c.queue(ctx, c.buildNotification(method, encoded, typedJSON(params)))
 	if c.droppedNotification(method, err) {
 		return func(context.Context) error { return nil }, nil
 	}

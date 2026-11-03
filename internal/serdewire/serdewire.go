@@ -50,16 +50,45 @@ func Marshal(v any) ([]byte, error) {
 //
 // b must be compact (as json.Marshal and json.Compact write it) and valid
 // JSON apart from what ErrUnrepresentable reports.
-func Encode(b []byte) ([]byte, error) {
+func Encode(b []byte) ([]byte, error) { return encode(b, false) }
+
+// MarshalTyped encodes v with encoding/json and writes the result as
+// EncodeTyped does.
+func MarshalTyped(v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return EncodeTyped(b)
+}
+
+// EncodeTyped is Encode for the encoding of a Go value, such as json.Marshal
+// output, as opposed to JSON text read from a peer. The reference SDK writes
+// a Rust value with serde_json::to_value and to_string, which never parse an
+// f64 it holds, so a number with a fraction or an exponent is read here as
+// the float64 nearest to it: for the shortest round-trip digits encoding/json
+// and the generated encoders write, that is exactly the float64 they
+// encoded, and a number already in serde_json's form is written as it is.
+// Encode instead reads every such number as serde_json reads wire text,
+// which does not always round to the nearest float64. Raw JSON inside the
+// value is read the same way; the generated encoders have already
+// re-encoded the raw JSON the Rust types hold as serde_json reads it.
+func EncodeTyped(b []byte) ([]byte, error) { return encode(b, true) }
+
+func encode(b []byte, typed bool) ([]byte, error) {
 	switch classify(b) {
 	case serdeExact:
 		return b, nil
 	case serdeTokens:
-		if out, ok := rewriteTokens(b); ok {
+		if out, ok := rewriteTokens(b, typed); ok {
 			return out, nil
 		}
 	}
-	value, err := serdejson.ParseAnyDepth(b)
+	parse := serdejson.ParseAnyDepth
+	if typed {
+		parse = serdejson.ParseTyped
+	}
+	value, err := parse(b)
 	if err != nil {
 		return nil, ErrUnrepresentable
 	}
@@ -384,9 +413,10 @@ func serdeUnicodeEscape(hex []byte) bool {
 }
 
 // rewriteTokens writes b, classified serdeTokens, with each string and
-// number as serde_json writes it. It reports false for what only the general
-// path decides, such as a lone surrogate escape or a number that overflows.
-func rewriteTokens(b []byte) ([]byte, bool) {
+// number as serde_json writes it, a number read as EncodeTyped reads one when
+// typed is set. It reports false for what only the general path decides,
+// such as a lone surrogate escape or a number that overflows.
+func rewriteTokens(b []byte, typed bool) ([]byte, bool) {
 	out := make([]byte, 0, len(b)+len(b)/8)
 	for i := 0; i < len(b); i++ {
 		switch c := b[i]; c {
@@ -407,7 +437,7 @@ func rewriteTokens(b []byte) ([]byte, bool) {
 				out = append(out, b[i:end]...)
 			} else {
 				var ok bool
-				if out, ok = appendSerdeNumber(out, b[i:end]); !ok {
+				if out, ok = appendSerdeNumber(out, b[i:end], typed); !ok {
 					return nil, false
 				}
 			}
@@ -512,9 +542,10 @@ func hex4(s []byte) (rune, bool) {
 
 // appendSerdeNumber appends the JSON number token as serde_json writes the
 // number it parses: an integer that fits u64 or i64 as written, anything
-// else as the f64 serde_json evaluates it to. It reports false for a number
-// that overflows f64, which serde_json rejects.
-func appendSerdeNumber(out, token []byte) ([]byte, bool) {
+// else as the f64 serde_json evaluates it to, or with typed set as the
+// nearest f64. It reports false for a number that overflows f64, which
+// serde_json rejects.
+func appendSerdeNumber(out, token []byte, typed bool) ([]byte, bool) {
 	if !hasFraction(token) && string(token) != "-0" {
 		if _, err := strconv.ParseUint(string(token), 10, 64); err == nil {
 			return append(out, token...), true
@@ -522,6 +553,13 @@ func appendSerdeNumber(out, token []byte) ([]byte, bool) {
 		if _, err := strconv.ParseInt(string(token), 10, 64); err == nil {
 			return append(out, token...), true
 		}
+	}
+	if typed {
+		f, err := strconv.ParseFloat(string(token), 64)
+		if err != nil {
+			return nil, false
+		}
+		return serdejson.AppendFloat(out, f), true
 	}
 	f, ok := jsonline.ParseFloat(token)
 	if !ok {

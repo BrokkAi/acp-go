@@ -417,24 +417,24 @@ func TestAttachedRequestsValidateModernMetadata(t *testing.T) {
 		want         string
 	}{
 		{"no metadata", "tools/list", map[string]any{},
-			`{"code":-32602,"data":"inner params._meta must be an object","message":"Invalid params"}`},
+			`{"code":-32602,"message":"Invalid params","data":"inner params._meta must be an object"}`},
 		{"old version", "tools/list", map[string]any{"_meta": map[string]any{
 			"io.modelcontextprotocol/protocolVersion":    "2025-11-25",
 			"io.modelcontextprotocol/clientCapabilities": map[string]any{},
-		}}, `{"code":-32022,"data":{"requested":"2025-11-25","supported":["2026-07-28"]},"message":"Unsupported protocol version"}`},
+		}}, `{"code":-32022,"message":"Unsupported protocol version","data":{"requested":"2025-11-25","supported":["2026-07-28"]}}`},
 		{"null version", "tools/list", map[string]any{"_meta": map[string]any{
 			"io.modelcontextprotocol/protocolVersion":    nil,
 			"io.modelcontextprotocol/clientCapabilities": map[string]any{},
-		}}, `{"code":-32602,"data":"inner params._meta requires io.modelcontextprotocol/protocolVersion","message":"Invalid params"}`},
+		}}, `{"code":-32602,"message":"Invalid params","data":"inner params._meta requires io.modelcontextprotocol/protocolVersion"}`},
 		{"capabilities not an object", "tools/list", map[string]any{"_meta": map[string]any{
 			"io.modelcontextprotocol/protocolVersion": "2026-07-28",
-		}}, `{"code":-32602,"data":"inner params._meta requires io.modelcontextprotocol/clientCapabilities object","message":"Invalid params"}`},
+		}}, `{"code":-32602,"message":"Invalid params","data":"inner params._meta requires io.modelcontextprotocol/clientCapabilities object"}`},
 		{"initialize", "initialize", modernParams(nil),
-			`{"code":-32601,"data":"native MCP requests do not use initialize","message":"Method not found"}`},
+			`{"code":-32601,"message":"Method not found","data":"native MCP requests do not use initialize"}`},
 		{"unknown tool", "tools/call", modernParams(map[string]any{"name": "missing"}),
 			"{\"code\":-32602,\"message\":\"tool `missing` not found\"}"},
 		{"unparsable call", "tools/call", modernParams(nil),
-			"{\"code\":-32602,\"data\":\"missing field `name`\",\"message\":\"Invalid MCP request\"}"},
+			"{\"code\":-32602,\"message\":\"Invalid MCP request\",\"data\":\"missing field `name`\"}"},
 	}
 	for i, tc := range cases {
 		outcome, err := h.caller.Call(ctx, serverID, string(rune('a'+i)), tc.method, tc.params, nil)
