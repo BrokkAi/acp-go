@@ -398,6 +398,45 @@ series, minor releases may contain breaking API changes.
 - The HTTP client opens a session's event stream before it sends the first
   message naming the session and when a `session/new` or `session/fork`
   result names a new one, and `Close` sends `DELETE`, as the Rust client does.
+- Unstable subagent sessions on v1 and draft v2 (#60), following the
+  subagents RFD and the reference SDK's `unstable_subagents` feature:
+  - `unstable.SubagentsClientCapabilities` returns the v1
+    `clientCapabilities.subagents` (`{}`), and `unstable.Initialize`
+    negotiates v1 exactly as `acp.Connection.InitializeWithInfo` does with the
+    unstable client capabilities, which the stable `acp.Capabilities` cannot
+    carry, decoding the response as the unstable schema. Draft v2 needs no
+    capability.
+  - `SubagentTree` (v1 and draft v2) folds `subagent_update`,
+    `session_message`, and `session_message_chunk`, and in v2 the child's own
+    `state_update`, into a parent/child tree: `Subagent`, `IsSubagent`,
+    `Children`, `Descendants`, per-child association patches (omitted
+    unchanged, `null` clears, values replace; v2 `_meta` patches by key),
+    effective `Capabilities` and confirmed `State` kept apart from the
+    reported `Association`, inherited `Directories`, per-session `Messages`
+    and `Message` (upserts replace content, `null` and `[]` clear it, chunks
+    append, participants come only from upserts), `LinkedMessage`, and v2
+    `BackgroundSubagents`. It refuses an association that reparents a child,
+    names its own parent, or creates a cycle, and reports a relative
+    directory with an error while applying the rest of the update.
+  - Restricted children: `CheckClientMethod` permits only `session/cancel`
+    (while the child advertises `capabilities.cancel`) and the read-only
+    `session/status` on a child; `Cancel` sends `session/cancel` for one
+    child and fails before writing otherwise.
+  - Invalidation: `Restore` runs a parent `session/load` or
+    `session/resume` (v2: `session/resume`, with replay for
+    `replayFrom: start`) with child controls disabled until it succeeds, keeps
+    snapshots replayed before the response as history only, and marks the
+    response boundary in wire order; `Closed` invalidates a closed parent's
+    descendants and returns them for request cleanup; `Disconnected` drops
+    every live state and control.
+  - `unstable.Projection.Subagents` returns the tree the projection feeds.
+  - Agent side: `NotifySubagentUpdate`, `NotifySubagentState` (v2 sends the
+    child's `state_update` and mirrors it on the association),
+    `NotifySessionMessage`, `NotifySessionMessageChunk`, the
+    `*Notification` constructors, the `RunningState`, `RequiresActionState`,
+    `UnknownState`, `IdleState`, and `ErrorState` snapshots, and the `Value`
+    and `Null` patch-field helpers. They fail before writing for blank IDs
+    and relative directories.
 
 - `acp.Connection.Shutdown(ctx)`, the reference SDK's orderly close of a
   connection whose `connect_with` foreground returned `Ok` (#80). It stops
@@ -413,6 +452,24 @@ series, minor releases may contain breaking API changes.
 
 ### Changed
 
+- **Breaking:** the v1 agent runtime's `Client.Notify` gates
+  `session/update` params of every type, not only `acp.Update`: a typed
+  `schema/unstable.SessionNotification`, raw JSON, or any value that encodes
+  as a session update. Before writing, with `-32601`, it refuses `notice`
+  without `session.notices`, `compaction_update` and
+  `compaction_summary_chunk` without `session.compaction`, a
+  `config_option_update` carrying a boolean option without
+  `session.configOptions.boolean`, `plan_update` and `plan_removed` without
+  the unstable `clientCapabilities.plan` (never gated before, even typed),
+  and `subagent_update`, `session_message`, and `session_message_chunk`
+  without the unstable `clientCapabilities.subagents`. Params that do not
+  decode, including the positional form, are refused by their
+  `sessionUpdate` tag for every kind the tag alone decides. The v1 runtime
+  now reads the initialize request's client capabilities with the unstable
+  schema for these checks.
+- **Breaking:** `unstable.Projection.Notifications` returns an error for a
+  subagent association the projection's `SubagentTree` refuses, instead of
+  ignoring subagent and session-message updates.
 - Every method the unstable `Handle` and `Install` routes serve (v1 and
   draft v2) decodes absent params as `null`, as the reference SDK's JSON-RPC
   layer does for every message: `providers/list`, `auth/status`, and the

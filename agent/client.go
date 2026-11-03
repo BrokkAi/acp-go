@@ -7,6 +7,7 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/schema"
+	unstableschema "github.com/BrokkAi/acp-go/schema/unstable"
 )
 
 type clientConnection struct {
@@ -15,6 +16,9 @@ type clientConnection struct {
 
 	mu           sync.RWMutex
 	capabilities *schema.ClientCapabilities
+	// unstable holds the client capabilities read with the unstable schema,
+	// for session updates sent as unstable params.
+	unstable unstableschema.ClientCapabilities
 }
 
 var _ Client = (*clientConnection)(nil)
@@ -29,7 +33,7 @@ func (c *clientConnection) connection() *acp.Connection {
 	return c.connectionValue
 }
 
-func (c *clientConnection) initialize(capabilities *schema.ClientCapabilities) {
+func (c *clientConnection) initialize(capabilities *schema.ClientCapabilities, unstable unstableschema.ClientCapabilities) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if capabilities != nil {
@@ -37,6 +41,13 @@ func (c *clientConnection) initialize(capabilities *schema.ClientCapabilities) {
 		capabilities = &copied
 	}
 	c.capabilities = capabilities
+	c.unstable = unstable
+}
+
+func (c *clientConnection) unstableCapabilities() unstableschema.ClientCapabilities {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.unstable
 }
 
 func (c *clientConnection) clientCapabilities() schema.ClientCapabilities {
@@ -57,6 +68,15 @@ func (c *clientConnection) Call(ctx context.Context, method string, params, resu
 // acp.RequireSessionUpdateCapability). The check covers params of type
 // acp.Update (schema.SessionNotification) or a pointer to one, so it applies
 // to session/load history replay as well as live updates.
+//
+// Any other params that encode as a session/update, such as a
+// schema/unstable.SessionNotification or hand-built JSON, are checked against
+// the client capabilities read with the unstable schema: the same notice,
+// compaction, and boolean config option gates, plus plan_update and
+// plan_removed, which need the unstable clientCapabilities.plan, and
+// subagent_update, session_message, and session_message_chunk, which need
+// the unstable clientCapabilities.subagents. Params that do not decode are
+// refused by their sessionUpdate tag where the tag alone decides.
 func (c *clientConnection) Notify(ctx context.Context, method string, params any) error {
 	if method == schema.SessionUpdateMethodName {
 		var update *schema.SessionUpdate
@@ -66,6 +86,10 @@ func (c *clientConnection) Notify(ctx context.Context, method string, params any
 		case *schema.SessionNotification:
 			if notification != nil {
 				update = &notification.Update
+			}
+		default:
+			if err := requireUnstableSessionUpdate(c.unstableCapabilities(), params); err != nil {
+				return err
 			}
 		}
 		if update != nil {

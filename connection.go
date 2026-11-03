@@ -557,7 +557,9 @@ func encodeRequestID(requestID any) (json.RawMessage, error) {
 type pendingCall struct {
 	method       string
 	acceptsLower bool
-	reply        chan reply
+	// settled is the rpcctl.WithSettled hook of the call's context.
+	settled func(method string, err error)
+	reply   chan reply
 }
 
 type reply struct {
@@ -571,6 +573,9 @@ type reply struct {
 func (c *Connection) settle(call pendingCall, result json.RawMessage, err error) {
 	if c.inResponse != nil {
 		result, err = c.inResponse(call.method, call.acceptsLower, result, err)
+	}
+	if call.settled != nil {
+		call.settled(call.method, err)
 	}
 	call.reply <- reply{result: result, err: err}
 }
@@ -593,7 +598,7 @@ func (c *Connection) Call(ctx context.Context, method string, params, result any
 	c.mu.Lock()
 	c.sequence++
 	id := strconv.FormatUint(c.sequence, 10)
-	call := pendingCall{method: method, acceptsLower: rpcctl.AcceptsLowerVersion(ctx), reply: make(chan reply, 1)}
+	call := pendingCall{method: method, acceptsLower: rpcctl.AcceptsLowerVersion(ctx), settled: rpcctl.Settled(ctx), reply: make(chan reply, 1)}
 	c.pending[id] = call
 	c.mu.Unlock()
 	forget := func() { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }

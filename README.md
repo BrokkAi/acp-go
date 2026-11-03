@@ -132,8 +132,11 @@ Before writing an update, the runtime refuses a `notice` unless the client
 advertised `session.notices`, compaction updates unless it advertised
 `session.compaction`, and a `config_option_update` with a boolean option
 unless it advertised `session.configOptions.boolean`. `Client.Notify` applies
-the same check to `session/update` params of type `acp.Update`, so history
-replay during `session/load` is gated too. A refusal is an `*acp.RPCError`
+the same check to `session/update` params of every type, so history replay
+during `session/load` is gated too; for unstable or hand-built params it also
+refuses `plan_update` and `plan_removed` without the unstable `plan`
+capability and the subagent updates without the unstable `subagents`
+capability. A refusal is an `*acp.RPCError`
 with code `-32601`, like an unadvertised host method;
 `acp.RequireSessionUpdateCapability` exposes the check. The
 runtime enforces protocol initialization, dispatches generated request/response
@@ -201,8 +204,11 @@ system prompts, subagents, proxy chains, and end-turn token usage. The
 `unstable` (v1) and `v2/unstable` (draft v2) packages add typed facades on
 top: capability-gated provider configuration, session fork, session
 archive/unarchive, status, title, archived-filter listing, auth status (with
-`auth/status_update` notifications), and the session lifecycle requests that
-carry a client-provided system prompt for clients, and
+`auth/status_update` notifications), the session lifecycle requests that
+carry a client-provided system prompt, and a subagent tree (`SubagentTree`)
+that tracks child sessions, their messages and work state, and permits only
+the child mutations an association advertises, for clients; subagent update
+senders and
 `Install` for agents, which sets `Handle` dispatch, the `Advertise`
 initialize hook, and the runtime `Overrides` (such as `session/list` with the
 archive filter, and `session/new`, `session/load`, and `session/resume` with
