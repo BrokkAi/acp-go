@@ -62,12 +62,15 @@ naming the value, so tests can assert the message.
 
 ## Behavior guarantees kept
 
-- Raw `_meta` payloads round-trip unchanged: `schema.TestMetaPayloadsRoundTrip`,
-  and the draft-v2 `Nullable[Meta]` case in `tracecontext`. Decoding and
-  re-encoding a `_meta` writes what the Rust schema crate writes, member order
-  and integers included: the `Meta` and `encode-meta` cases of each package's
+- Raw `_meta` payloads keep their content: every member, in wire order, with
+  exact integers, survives a decode and re-encode
+  (`schema.TestMetaPayloadsRoundTrip`, and the draft-v2 `Nullable[Meta]` case
+  in `tracecontext`). The bytes are normalized exactly as the Rust schema
+  crate writes them, not kept verbatim: compact, a repeated key once at its
+  first position with its last value, floats and escapes in serde_json's form
+  (the `Meta` and `encode-meta` cases of each package's
   `TestDeserializeHints`, and `TestTypedFramesMatchTheRustEncoding` for
-  `acp.Connection` frames.
+  `acp.Connection` frames).
 - Unknown values of open enums decode and re-encode, and closed v1 enums
   decode as Rust's do: `schema.TestOpenWorldEnumsDecodeUnknownValues`.
 - Unknown union tags are rejected: `schema/golden_test.go`.

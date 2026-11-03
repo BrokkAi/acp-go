@@ -49,6 +49,13 @@ import (
 // members mean on the wire: the key at its first position with its last
 // value, as Get reads it and encoding writes it. Decoding never repeats a
 // key.
+//
+// An Object is a slice, so copies share their members: Set, Delete, and
+// SwapDelete may write into the backing array another copy still uses, and
+// two copies that append may overwrite each other's new members. Clone an
+// Object before changing one that is shared, such as one decoded into a
+// message other code still reads. An Object is not safe for concurrent
+// mutation, and not for mutation while another goroutine reads it.
 type Object []Member
 
 // Member is one member of an Object.
@@ -146,14 +153,40 @@ func (o Object) Keys() []string {
 	return keys
 }
 
-// Clone returns a copy of o's members; the values are shared. nil returns
-// nil.
+// Clone returns a deep copy of o, as Rust's Map::clone is: nested Objects and
+// []any arrays are copied too, and other values (strings, numbers, and Go
+// values set in code) are shared. nil returns nil.
 func (o Object) Clone() Object {
 	if o == nil {
 		return nil
 	}
-	return append(Object{}, o...)
+	out := make(Object, len(o))
+	for i, member := range o {
+		out[i] = Member{Key: member.Key, Value: cloneValue(member.Value)}
+	}
+	return out
 }
+
+func cloneValue(v any) any {
+	switch x := v.(type) {
+	case Object:
+		return x.Clone()
+	case []any:
+		if x == nil {
+			return x
+		}
+		out := make([]any, len(x))
+		for i, item := range x {
+			out[i] = cloneValue(item)
+		}
+		return out
+	}
+	return v
+}
+
+// scannedMembers is how many members hasRepeats compares by key hash
+// without allocating; a larger object's keys go in a map.
+const scannedMembers = 256
 
 // hasRepeats reports whether a key occurs more than once.
 func (o Object) hasRepeats() bool {
@@ -167,6 +200,20 @@ func (o Object) hasRepeats() bool {
 		}
 		return false
 	}
+	if len(o) <= scannedMembers {
+		// Keys with equal hashes are compared; the hashes live on the stack.
+		var hashes [scannedMembers]uint64
+		for i, member := range o {
+			h := keyHash(member.Key)
+			for j := 0; j < i; j++ {
+				if hashes[j] == h && o[j].Key == member.Key {
+					return true
+				}
+			}
+			hashes[i] = h
+		}
+		return false
+	}
 	seen := make(map[string]struct{}, len(o))
 	for _, member := range o {
 		if _, ok := seen[member.Key]; ok {
@@ -175,6 +222,16 @@ func (o Object) hasRepeats() bool {
 		seen[member.Key] = struct{}{}
 	}
 	return false
+}
+
+// keyHash is FNV-1a of key.
+func keyHash(key string) uint64 {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= 1099511628211
+	}
+	return h
 }
 
 // merged returns the members as the wire reads them: each key once, at its
@@ -192,6 +249,142 @@ func (o Object) merged() Object {
 	}
 	return out
 }
+
+// Equal reports whether o and other hold the same members in the same order,
+// each key at its first position with its last value, and with Equal values.
+// A nil Object, which encodes as null, equals only another nil one. Unlike
+// Rust's Map equality, which ignores order, the order matters here, as it
+// does on the wire.
+func (o Object) Equal(other Object) bool {
+	if (o == nil) != (other == nil) {
+		return false
+	}
+	if o.hasRepeats() {
+		o = o.merged()
+	}
+	if other.hasRepeats() {
+		other = other.merged()
+	}
+	if len(o) != len(other) {
+		return false
+	}
+	for i := range o {
+		if o[i].Key != other[i].Key || !Equal(o[i].Value, other[i].Value) {
+			return false
+		}
+	}
+	return true
+}
+
+// Equal reports whether a and b are the same JSON value, as serde_json
+// compares Values except that object members compare in order (see
+// Object.Equal). Numbers compare by their class, as serde_json's Number
+// does: an integer equals an integer of the same value whatever its Go type
+// (int, int64, uint64, ...), a float (float32 or float64) equals a float of
+// the same value (so -0.0 equals 0.0, and NaN nothing), and an integer never
+// equals a float: 1 is not 1.0. A json.RawMessage or json.Number compares as
+// the value serde_json reads from it, a map[string]any as its keys sorted,
+// and any other Go value as the value its encoding holds.
+func Equal(a, b any) bool {
+	a, b = normalize(a), normalize(b)
+	switch x := a.(type) {
+	case nil:
+		return b == nil
+	case bool:
+		y, ok := b.(bool)
+		return ok && x == y
+	case string:
+		y, ok := b.(string)
+		return ok && x == y
+	case int64:
+		y, ok := b.(int64)
+		return ok && x == y
+	case uint64:
+		y, ok := b.(uint64)
+		return ok && x == y
+	case float64:
+		y, ok := b.(float64)
+		return ok && x == y
+	case []any:
+		y, ok := b.([]any)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for i := range x {
+			if !Equal(x[i], y[i]) {
+				return false
+			}
+		}
+		return true
+	case Object:
+		y, ok := b.(Object)
+		return ok && x != nil && y != nil && x.Equal(y)
+	}
+	return false
+}
+
+// normalize returns v as one of the classes Equal compares: nil, bool,
+// string, int64 for a negative integer, uint64 for a non-negative one,
+// float64, []any, or a non-nil Object.
+func normalize(v any) any {
+	switch x := v.(type) {
+	case nil, bool, string, float64:
+		return v
+	case int64:
+		if x >= 0 {
+			return uint64(x)
+		}
+		return x
+	case int:
+		return normalize(int64(x))
+	case int8:
+		return normalize(int64(x))
+	case int16:
+		return normalize(int64(x))
+	case int32:
+		return normalize(int64(x))
+	case uint64:
+		return x
+	case uint:
+		return uint64(x)
+	case uint8:
+		return uint64(x)
+	case uint16:
+		return uint64(x)
+	case uint32:
+		return uint64(x)
+	case float32:
+		return float64(x)
+	case Object:
+		if x == nil {
+			return nil
+		}
+		return x
+	case []any:
+		if x == nil {
+			return nil
+		}
+		return x
+	case map[string]any:
+		if x == nil {
+			return nil
+		}
+		return ObjectOf(x)
+	}
+	encoded, err := Marshal(v)
+	if err != nil {
+		return encodingFailed{}
+	}
+	parsed, err := Parse(encoded)
+	if err != nil {
+		return encodingFailed{}
+	}
+	return normalize(parsed)
+}
+
+// encodingFailed stands for a value that does not encode, which equals
+// nothing.
+type encodingFailed struct{}
 
 // MarshalJSON writes o as serde_json writes the Map. nil writes null.
 func (o Object) MarshalJSON() ([]byte, error) {
@@ -382,13 +575,25 @@ func appendText(b, text []byte) ([]byte, error) {
 // f64.
 var ErrInvalid = errors.New("jsonvalue: not a JSON value serde_json accepts")
 
+// ErrTooDeep reports input nested deeper than MaxDepth.
+var ErrTooDeep = errors.New("jsonvalue: JSON nested too deeply")
+
+// MaxDepth is how deeply Parse nests arrays and objects, as encoding/json
+// limits it, so a hostile input cannot exhaust the stack. serde_json's own
+// limit is 128; acp-go applies it where it reads a frame, so a received
+// message never reaches Parse nested deeper than that.
+const MaxDepth = 10000
+
 // Parse reads data, one JSON value with optional surrounding whitespace, as
-// serde_json reads a Value, without its recursion limit. See the package
+// serde_json reads a Value, nested at most MaxDepth deep. See the package
 // documentation for the Go values it returns.
 func Parse(data []byte) (any, error) {
 	p := parser{data: data}
 	p.space()
 	value, ok := p.value()
+	if p.tooDeep {
+		return nil, ErrTooDeep
+	}
 	if !ok {
 		return nil, ErrInvalid
 	}
@@ -402,8 +607,10 @@ func Parse(data []byte) (any, error) {
 // parser reads one JSON value in a single pass, checking it as serde_json
 // does.
 type parser struct {
-	data []byte
-	i    int
+	data    []byte
+	i       int
+	depth   int
+	tooDeep bool
 }
 
 func (p *parser) space() {
@@ -430,9 +637,15 @@ func (p *parser) value() (any, bool) {
 		return nil, false
 	}
 	switch c := p.data[p.i]; {
-	case c == '{':
-		return p.object()
-	case c == '[':
+	case c == '{' || c == '[':
+		if p.depth++; p.depth > MaxDepth {
+			p.tooDeep = true
+			return nil, false
+		}
+		defer func() { p.depth-- }()
+		if c == '{' {
+			return p.object()
+		}
 		return p.array()
 	case c == '"':
 		s, ok := p.string()

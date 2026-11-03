@@ -243,7 +243,9 @@ const metaDecl = `// Meta is the reserved _meta channel for extension data, a JS
 // value re-encoded exactly as serde_json writes it. It is a jsonvalue.Object,
 // the same type in every schema package; see jsonvalue for the Go values a
 // decoded Meta holds. The other JSON objects Rust holds as a serde_json::Map
-// are a Meta too. nil is no metadata, and Meta{} an empty object.
+// are a Meta too. nil is no metadata, and Meta{} an empty object. A Meta is
+// a slice, so copies share members: Clone a decoded Meta before changing it
+// where other code still reads it.
 //
 // Build one with NewMeta from a map, whose keys it sorts, or as a literal to
 // choose the order:

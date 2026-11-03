@@ -47,10 +47,14 @@ func FromMeta(meta jsonvalue.Object) (Context, bool) {
 }
 
 // IntoMeta writes the non-empty fields of tc to the reserved keys of meta and
-// returns the result, so a generated Meta keeps its other keys. A key meta
-// already holds keeps its position; new keys are appended in the order
-// traceparent, tracestate, baggage. A nil meta starts a new object. Fields
-// left empty in tc do not change meta, and an empty tc returns meta
+// returns the result, which keeps meta's other keys. Use the returned value:
+// a key meta already holds is replaced in place, in the backing array meta
+// shares with the caller, but a new key is appended, which only the returned
+// Object is sure to hold (append may reallocate), so assign it back, as in
+// notification.Meta = tracecontext.IntoMeta(notification.Meta, tc). Clone
+// meta first if other code still reads it. New keys are appended in the
+// order traceparent, tracestate, baggage. A nil meta starts a new object.
+// Fields left empty in tc do not change meta, and an empty tc returns meta
 // unchanged.
 func IntoMeta(meta jsonvalue.Object, tc Context) jsonvalue.Object {
 	if tc.Empty() {

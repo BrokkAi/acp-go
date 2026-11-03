@@ -674,7 +674,17 @@ series, minor releases may contain breaking API changes.
   `Notify` params, and the params of `MessageClient.Call`.
   `tracecontext.FromMeta` and `IntoMeta` take and return a `jsonvalue.Object`;
   `IntoMeta` appends new keys in the order `traceparent`, `tracestate`,
-  `baggage`.
+  `baggage`. Use the value `IntoMeta` returns: before, it updated a non-nil
+  map in place, but a key it adds now reaches only the returned `Object`, so
+  code that ignored the result loses the new keys.
+  An `Object` is a slice: copies share members, so `Clone` one before
+  changing it where other code still reads it (`Clone` is deep, as Rust's
+  `Map::clone` is), and do not mutate one concurrently. `Object.Equal` and
+  `jsonvalue.Equal` compare values as serde_json does (an integer never
+  equals a float, `-0.0` equals `0.0`), with object members in order.
+  `jsonvalue.Parse` nests at most `MaxDepth` (10000, as `encoding/json`)
+  deep and fails with `ErrTooDeep` beyond it; received frames are still
+  held to serde_json's limit of 128 where they are read.
 - **Breaking (wire):** a `_meta`, and every other `Meta`, is written as
   `serde_json::to_string` writes the `serde_json::Map` Rust decodes from the
   same input (#107), checked byte for byte against the pinned crate by
