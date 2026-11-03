@@ -8,7 +8,8 @@ import (
 
 // goldens are hand-written wire documents for representative flows. Unlike
 // the synthesized parity cases, they carry realistic field values and pin the
-// exact shapes an implementer sends and receives.
+// exact shapes an implementer sends and receives, including the defaults Rust
+// always writes (the capability flags).
 var goldens = []struct {
 	name string
 	typ  any
@@ -22,6 +23,7 @@ var goldens = []struct {
 			"clientCapabilities": {
 				"fs": {"readTextFile": true, "writeTextFile": true},
 				"terminal": true,
+				"auth": {"terminal": false},
 				"elicitation": {"form": {}}
 			},
 			"clientInfo": {"name": "acp-go", "version": "0.1.0"}
@@ -34,7 +36,9 @@ var goldens = []struct {
 			"protocolVersion": 1,
 			"agentCapabilities": {
 				"loadSession": true,
-				"promptCapabilities": {"image": true},
+				"promptCapabilities": {"image": true, "audio": false, "embeddedContext": false},
+				"mcpCapabilities": {"http": false, "sse": false},
+				"sessionCapabilities": {},
 				"auth": {"logout": {}}
 			},
 			"agentInfo": {"name": "example-agent", "version": "1.2.3"},

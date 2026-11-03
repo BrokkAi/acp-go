@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Capture the Rust schema crate's decode outcomes for the generated hint cases.
+"""Capture the Rust schema crate's decode and encode outcomes for the generated hint cases.
 
 cmd/acpgen generates decode cases for every schema package
 (hints_gen_test.go). This script dumps them with
 `go test -run TestDeserializeHints -args -hints.dump=...`, decodes each one with
 a probe built on the pinned Rust schema crate (scripts/hintprobe), and writes
 the outcomes to the package's testdata/hints_rust.json, which the generated
-test compares the Go decoders with.
+test compares the Go decoders and encoders with: the decode error, or the
+re-encoded value and the exact serde_json::to_string output.
 
 Run it from any directory after regenerating the schema packages. It needs
 cargo; the probe pins the crate versions the reference Rust SDK resolves.
@@ -33,6 +34,14 @@ PACKAGES = {
     "schema/v2/unstable": "unstable",
 }
 FEATURES = {"stable": "unstable_protocol_v2", "unstable": "unstable,unstable_protocol_v2"}
+# Rust paths of the defs that are not public types of the protocol module:
+# ProtocolVersion lives at the crate root, and the v2 ErrorData only
+# describes Error::data in the schema, a serde_json::Value in the Rust type.
+RUST_PATHS = {
+    ("v1", "ProtocolVersion"): "acp::ProtocolVersion",
+    ("v2", "ProtocolVersion"): "acp::ProtocolVersion",
+    ("v2", "ErrorData"): "serde_json::Value",
+}
 
 
 def dump_cases(package):
@@ -44,7 +53,7 @@ def dump_cases(package):
              "-args", "-hints.dump=" + str(path)],
             cwd=ROOT, check=True, stdout=subprocess.DEVNULL,
         )
-        lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        lines = [json.loads(line) for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
     return lines[0], lines[1:]
 
 
@@ -63,7 +72,8 @@ def dispatch_source(types):
         lines.append(f"pub fn {protocol}(name: &str, input: &str) -> Option<Result<String, String>> {{")
         lines.append("    match name {")
         for name in sorted(types.get(protocol, ())):
-            lines.append(f'        "{name}" => Some(run::<acp::{protocol}::{name}>(input)),')
+            path = RUST_PATHS.get((protocol, name), f"acp::{protocol}::{name}")
+            lines.append(f'        "{name}" => Some(run::<{path}>(input)),')
         lines.append("        _ => {")
         lines.append("            let _ = input;")
         lines.append("            None")
@@ -88,10 +98,14 @@ def run_probe(build, requests):
     binary = target / "debug" / ("acp-hintprobe" + (".exe" if os.name == "nt" else ""))
     out = subprocess.run(
         [str(binary)], input="".join(json.dumps(r) + "\n" for r in requests),
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, encoding="utf-8", check=True,
     ).stdout
     responses = {}
-    for line in out.splitlines():
+    # Split on newlines only: serde_json writes U+2028 and U+2029 unescaped,
+    # and str.splitlines would split on them.
+    for line in out.split("\n"):
+        if not line.strip():
+            continue
         resp = json.loads(line)
         responses[resp["id"]] = resp
     return responses
@@ -107,6 +121,7 @@ def fixtures(header, requests, responses):
         outcome = {"input": req["input"]}
         if "ok" in resp:
             outcome["ok"] = resp["ok"]
+            outcome["encoded"] = resp["encoded"]
         else:
             outcome["error"] = resp["error"]
         cases[req["id"]] = outcome
@@ -122,7 +137,7 @@ def main():
         doc = fixtures(header, requests, run_probe(PACKAGES[package], requests))
         path = ROOT / package / "testdata" / "hints_rust.json"
         path.parent.mkdir(exist_ok=True)
-        path.write_text(json.dumps(doc, indent=1, sort_keys=True, ensure_ascii=False) + "\n")
+        path.write_text(json.dumps(doc, indent=1, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"wrote {path.relative_to(ROOT)} ({len(requests)} cases)")
 
 

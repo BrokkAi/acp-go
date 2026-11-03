@@ -73,8 +73,8 @@ func TestSessionHelpersCombineMCPServersWithASystemPrompt(t *testing.T) {
 	}
 	for range 3 {
 		params := string(<-requests)
-		if !strings.Contains(params, `"mcpServers":[{"name":"docs","serverId":"docs-1","type":"acp"}]`) ||
-			!strings.Contains(params, `"systemPrompt":{"content":[{"text":"Use the docs server.","type":"text"}],"mode":"append"}`) {
+		if !strings.Contains(params, `"mcpServers":[{"type":"acp","name":"docs","serverId":"docs-1"}]`) ||
+			!strings.Contains(params, `"systemPrompt":{"mode":"append","content":[{"type":"text","text":"Use the docs server."}]}`) {
 			t.Fatalf("params = %s", params)
 		}
 	}

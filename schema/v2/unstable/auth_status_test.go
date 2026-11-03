@@ -22,9 +22,9 @@ var authStatusDecodeCases = []struct{ wire, want string }{
 	{`{"state":"unknown","accounts":[null,{"label":"a"}]}`, `{"state":"unknown","accounts":[{"label":"a"}]}`},
 	{`{"state":"unknown","_meta":5}`, `{"state":"unknown"}`},
 	{`{"state":"unknown","accounts":[{"label":"a","extra":1}]}`, `{"state":"unknown","accounts":[{"label":"a"}]}`},
-	// Rust re-encodes {"label":"a"}; the draft-v2 Nullable fields keep an
-	// explicit null, which means the same as omission here.
-	{`{"state":"unknown","accounts":[{"label":"a","active":null,"name":null}]}`, `{"state":"unknown","accounts":[{"label":"a","active":null,"name":null}]}`},
+	// A null in a field that is not a patch reads as None, which Rust leaves
+	// out.
+	{`{"state":"unknown","accounts":[{"label":"a","active":null,"name":null}]}`, `{"state":"unknown","accounts":[{"label":"a"}]}`},
 	{`{"state":"authenticated","accounts":[{"label":"Key","active":true,"name":"octocat","email":"user@example.com","organization":"Example","_meta":{"k":"v"}},{"label":"Vertex AI"}]}`, `{"state":"authenticated","accounts":[{"label":"Key","active":true,"name":"octocat","email":"user@example.com","organization":"Example","_meta":{"k":"v"}},{"label":"Vertex AI"}]}`},
 }
 
@@ -45,7 +45,7 @@ func TestAuthStatusDecodesAsRust(t *testing.T) {
 				return
 			}
 			encoded, _ := json.Marshal(value)
-			if canonical(t, string(encoded)) != canonical(t, c.want) {
+			if string(encoded) != c.want {
 				t.Errorf("%s %s re-encoded as %s, want %s", name, c.wire, encoded, c.want)
 			}
 		}

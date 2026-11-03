@@ -148,7 +148,7 @@ func (v Nullable[T]) IsZero() bool { return !v.Set }
 func emitTypes(r *ir, pin, packageName string) []byte {
 	var b strings.Builder
 	b.WriteString(header(pin, "wire types"))
-	b.WriteString("package " + packageName + "\n\nimport (\n\t\"encoding/json\"\n\t\"errors\"\n\t\"fmt\"\n\t\"reflect\"\n\t\"strings\"\n\n\t\"github.com/BrokkAi/acp-go/internal/serdejson\"\n)\n\n")
+	b.WriteString("package " + packageName + "\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"errors\"\n\t\"fmt\"\n\t\"reflect\"\n\t\"slices\"\n\t\"sort\"\n\t\"strconv\"\n\t\"strings\"\n\t\"unicode/utf8\"\n\n\t\"github.com/BrokkAi/acp-go/internal/jsonline\"\n\t\"github.com/BrokkAi/acp-go/internal/serdejson\"\n\t\"github.com/BrokkAi/acp-go/internal/serdewire\"\n)\n\n")
 	b.WriteString("// Meta is the reserved _meta channel for extension data.\ntype Meta map[string]any\n\n")
 	// Shared helpers are written once per generated file.
 	unchangedEmitted = false
@@ -160,6 +160,7 @@ func emitTypes(r *ir, pin, packageName string) []byte {
 		emitMetaPatch(&b)
 	}
 	emitDecodeHelpers(&b, r.PreserveNull || r.HasNullable, r.hasNonZero())
+	emitEncodeHelpers(&b)
 
 	for _, td := range r.Defs {
 		writeDoc(&b, "", td.Doc)
@@ -191,10 +192,15 @@ func emitTypes(r *ir, pin, packageName string) []byte {
 
 		case kindAny:
 			fmt.Fprintf(&b, "type %s any\n\n", td.Name)
-			emitAnyValidator(&b, td)
+			emitAnyDecoder(&b, td)
+			emitAnyEncoder(&b, td)
 
 		case kindRaw:
-			fmt.Fprintf(&b, "type %s = json.RawMessage\n\n", td.Name)
+			// Rust holds the value as a serde_json::Value, so it is
+			// re-encoded as one.
+			fmt.Fprintf(&b, "type %s json.RawMessage\n\n", td.Name)
+			fmt.Fprintf(&b, "func (v %s) MarshalJSON() ([]byte, error) { return appendRaw(nil, json.RawMessage(v)) }\n\n", td.Name)
+			fmt.Fprintf(&b, "func (v *%s) UnmarshalJSON(data []byte) error {\n\t*v = append((*v)[:0], data...)\n\treturn nil\n}\n\n", td.Name)
 
 		case kindTaggedUnion:
 			emitTaggedUnion(&b, r, td)
@@ -212,12 +218,16 @@ func emitStruct(b *strings.Builder, td *typeDef) {
 		writeDoc(b, "\t", f.Doc)
 		fmt.Fprintf(b, "\t%s\n", f.goDecl())
 	}
+	if td.Extras {
+		b.WriteString("\t// Extra holds the other members, as a JSON object in wire order, which\n\t// Rust keeps in a flattened map. They are written after the fields.\n")
+		b.WriteString("\tExtra json.RawMessage `json:\"-\"`\n")
+	}
 	if fl := td.Flatten; fl != nil {
 		fmt.Fprintf(b, "\t// %s keeps the other fields of a custom or future %s, which are\n\t// re-encoded with it. It is ignored for the known values.\n", fl.ExtrasGo, fl.TagJSON)
 		fmt.Fprintf(b, "\t%s map[string]json.RawMessage `json:\"-\"`\n", fl.ExtrasGo)
 	}
 	b.WriteString("}\n\n")
-	emitFlattenedCodec(b, td)
+	emitStructEncode(b, curIR, td, td.Name, td.Name, td.Fields)
 	var seq []string
 	if !td.ObjectOnly {
 		seq = td.SeqOrder
@@ -340,7 +350,6 @@ func payloadType(r *ir, td *typeDef, v variant) string {
 
 func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 	kindType := td.Name + "Kind"
-	shadow := unexport(td.Name) + "Shadow"
 
 	fmt.Fprintf(b, "type %s string\n\n", kindType)
 	b.WriteString("const (\n")
@@ -378,38 +387,11 @@ func emitTaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 			fmt.Fprintf(b, "\t%s\n", f.goDecl())
 		}
 		b.WriteString("}\n\n")
+		emitStructEncode(b, r, nil, td.Name, td.Name+v.GoName, v.Inline)
 		emitStructDecode(b, nil, td.Name+v.GoName, v.Inline, v.SeqOrder)
 	}
 
-	if len(td.Fields) > 0 {
-		fmt.Fprintf(b, "// %s mirrors %s without its union methods, for encoding common fields.\ntype %s %s\n\n", shadow, td.Name, shadow, td.Name)
-	}
-
-	// Marshal: derive the tag from the set payload, merge common fields.
-	fmt.Fprintf(b, "func (v %s) MarshalJSON() ([]byte, error) {\n", td.Name)
-	fmt.Fprintf(b, "\tobj := map[string]json.RawMessage{}\n")
-	if len(td.Fields) > 0 {
-		fmt.Fprintf(b, "\tif common, err := json.Marshal(%s(v)); err != nil {\n\t\treturn nil, err\n\t} else if len(common) > 2 {\n\t\tif err := json.Unmarshal(common, &obj); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t}\n", shadow)
-	}
-	fmt.Fprintf(b, "\tset := 0\n")
-	for _, v := range td.Variants {
-		fmt.Fprintf(b, "\tif v.%s != nil {\n\t\tset++\n\t}\n", v.GoName)
-	}
-	fmt.Fprintf(b, "\tif set != 1 {\n\t\treturn nil, fmt.Errorf(\"%%s: exactly one variant must be set, have %%d\", \"%s\", set)\n\t}\n", td.Name)
-	for _, v := range td.Variants {
-		switch {
-		case v.Open:
-			fmt.Fprintf(b, "\tif v.Other != nil {\n\t\treturn v.Other.Raw, nil\n\t}\n")
-		default:
-			fmt.Fprintf(b, "\tif v.%s != nil {\n", v.GoName)
-			if v.Const != "" {
-				fmt.Fprintf(b, "\t\tif tag, err := json.Marshal(%q); err != nil {\n\t\t\treturn nil, err\n\t\t} else {\n\t\t\tobj[%q] = tag\n\t\t}\n", v.Const, td.TagJSON)
-			}
-			fmt.Fprintf(b, "\t\tpayload, err := json.Marshal(v.%s)\n\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t\tvar fields map[string]json.RawMessage\n\t\tif err := json.Unmarshal(payload, &fields); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"%s payload: %%w\", err)\n\t\t}\n\t\tfor k, raw := range fields {\n\t\t\tobj[k] = raw\n\t\t}\n\t}\n", v.GoName, td.Name)
-		}
-	}
-	fmt.Fprintf(b, "\treturn json.Marshal(obj)\n}\n\n")
-
+	emitUnionEncode(b, r, td)
 	emitTaggedUnionDecode(b, r, td)
 }
 
@@ -434,8 +416,6 @@ func hasOpenVariant(td *typeDef) bool {
 }
 
 func emitUntaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
-	shadow := unexport(td.Name) + "Shadow"
-
 	fmt.Fprintf(b, "// %s is a shape-disambiguated union. Exactly one variant pointer must be\n// set; decoding probes each variant's required wire keys in order.\n", td.Name)
 	fmt.Fprintf(b, "type %s struct {\n", td.Name)
 	for _, f := range td.Fields {
@@ -467,46 +447,11 @@ func emitUntaggedUnion(b *strings.Builder, r *ir, td *typeDef) {
 			fmt.Fprintf(b, "\t%s\n", f.goDecl())
 		}
 		b.WriteString("}\n\n")
+		emitStructEncode(b, r, nil, td.Name, td.Name+v.GoName, v.Inline)
 		emitStructDecode(b, nil, td.Name+v.GoName, v.Inline, v.SeqOrder)
 	}
 
-	if len(td.Fields) > 0 {
-		fmt.Fprintf(b, "// %s mirrors %s without its union methods, for encoding common fields.\ntype %s %s\n\n", shadow, td.Name, shadow, td.Name)
-	}
-
-	fmt.Fprintf(b, "func (v %s) MarshalJSON() ([]byte, error) {\n", td.Name)
-	fmt.Fprintf(b, "\tobj := map[string]json.RawMessage{}\n")
-	if len(td.Fields) > 0 {
-		fmt.Fprintf(b, "\tif common, err := json.Marshal(%s(v)); err != nil {\n\t\treturn nil, err\n\t} else if len(common) > 2 {\n\t\tif err := json.Unmarshal(common, &obj); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t}\n", shadow)
-	}
-	fmt.Fprintf(b, "\tset := 0\n")
-	for _, v := range td.Variants {
-		fmt.Fprintf(b, "\tif v.%s != nil {\n\t\tset++\n\t}\n", v.GoName)
-	}
-	fmt.Fprintf(b, "\tif set != 1 {\n\t\treturn nil, fmt.Errorf(\"%%s: exactly one variant must be set, have %%d\", \"%s\", set)\n\t}\n", td.Name)
-	if hasOpenVariant(td) {
-		b.WriteString("\tswitch v.rawVariant {\n")
-		for _, v := range td.Variants {
-			if !v.Open {
-				fmt.Fprintf(b, "\tcase %q:\n\t\tif v.%s != nil && unchangedSince(v.raw, v.%s) {\n\t\t\treturn v.raw, nil\n\t\t}\n", v.GoName, v.GoName, v.GoName)
-			}
-		}
-		b.WriteString("\t}\n")
-	}
-	for _, v := range td.Variants {
-		if v.Open {
-			fmt.Fprintf(b, "\tif v.%s != nil {\n\t\treturn v.%s.Raw, nil\n\t}\n", v.GoName, v.GoName)
-			continue
-		}
-		fmt.Fprintf(b, "\tif v.%s != nil {\n\t\tpayload, err := json.Marshal(v.%s)\n\t\tif err != nil {\n\t\treturn nil, err\n\t\t}\n", v.GoName, v.GoName)
-		if strings.HasPrefix(v.Payload, "[]") {
-			fmt.Fprintf(b, "\t\treturn payload, nil\n\t}\n")
-		} else {
-			fmt.Fprintf(b, "\t\tvar fields map[string]json.RawMessage\n\t\tif err := json.Unmarshal(payload, &fields); err != nil {\n\t\t\treturn nil, fmt.Errorf(\"%s payload: %%w\", err)\n\t\t}\n\t\tfor k, raw := range fields {\n\t\t\tobj[k] = raw\n\t\t}\n\t}\n", td.Name)
-		}
-	}
-	fmt.Fprintf(b, "\treturn json.Marshal(obj)\n}\n\n")
-
+	emitUnionEncode(b, r, td)
 	emitUntaggedUnionDecode(b, r, td)
 }
 

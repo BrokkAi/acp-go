@@ -126,6 +126,11 @@ func hintCases(r *ir) ([]hintCase, error) {
 			out = append(out, cases...)
 		}
 	}
+	encode, err := encodeCases(r)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, encode...)
 	seen := map[string]bool{}
 	for _, c := range out {
 		if strings.Contains(c.input, "`") {
@@ -617,3 +622,238 @@ func emitHints(r *ir, pin, packageName string) []byte {
 
 // modulePath is the import path of the module the generated packages live in.
 const modulePath = "github.com/BrokkAi/acp-go"
+
+// floatSamples are the number values the encode cases put in every f64
+// field: serde_json writes an f64 with a decimal point or an exponent, by
+// rules of its own, where encoding/json writes an integral float64 as an
+// integer.
+var floatSamples = []struct{ name, value string }{
+	{"integral", "1"},
+	{"negative-zero", "-0.0"},
+	{"fraction", "0.1"},
+	{"large", "1e20"},
+	{"huge", "1e300"},
+	{"small", "1e-7"},
+	{"tiny", "5e-324"},
+	{"digits", "123456789.123456789"},
+	// serde_json, built without float_roundtrip, reads these as a float64
+	// next to the nearest one.
+	{"inexact", "7.2e-300"},
+	{"rounded", "9007199254740993.0"},
+	// Shortest digits serde_json's parsing would not read back as the same
+	// float64, so a writer must not re-parse a typed value.
+	{"shortest", "0.9405161066866751"},
+}
+
+// anySamples are the values the encode cases decode as each arm of a union
+// of primitives, by arm kind.
+var anySamples = map[string][]string{
+	"string":  {`"s"`},
+	"integer": {"-5", "0", "-0", "9223372036854775807", "18446744073709551615"},
+	"number":  {"1", "1.0", "-0.0", "1e20", "0.1", "7.2e-300", "18446744073709551616"},
+	"boolean": {"true", "false"},
+	"null":    {"null"},
+	"any":     {rawSample},
+}
+
+// escapeSample is a string serde_json writes with only its own escapes: the
+// control characters, the quote, and the backslash. The rest is written as
+// is, a solidus and an escaped surrogate pair included.
+const escapeSample = `"<a href=\"x\">&amp;</a> \u2028\u2029 \u0001\u001f\b\f\t\n\r\\ \u00e9 \ud83d\ude00 \/"`
+
+// integerType reports whether a Go field type is an integer, or a newtype or
+// enum of one.
+func integerType(typ string) bool {
+	if strings.HasPrefix(typ, "int") || strings.HasPrefix(typ, "uint") {
+		return true
+	}
+	td := resolve(typ)
+	return td != nil && (td.Kind == kindNewtype || td.Kind == kindEnum) &&
+		(strings.HasPrefix(td.Base, "int") || strings.HasPrefix(td.Base, "uint"))
+}
+
+// rawSample is the value the encode cases put in every raw JSON field.
+const rawSample = `{"z": 1.0, "a": [1e2, -0, 0.10, 12345678901234567890, 123456789.123456789, 0.9405161066866751], "z": {"y": null, "x": "\u0041\/"}}`
+
+// encodeCases derives the cases that check encoding: every def's minimal and
+// full documents, every union variant's full document, and each f64 field
+// set to the floatSamples. The generated test requires json.Marshal of the
+// decoded value to be byte for byte what the Rust schema crate writes for
+// the same input.
+func encodeCases(r *ir) ([]hintCase, error) {
+	var out []hintCase
+	fieldCases := func(name, def, doc string, fields []field) error {
+		if !strings.HasPrefix(doc, "{") {
+			return nil
+		}
+		for _, f := range fields {
+			// An empty list or map: Rust writes it for an Option, and
+			// leaves it out where it skips empty values.
+			if !f.Required && f.Variant == "" {
+				empty := ""
+				switch {
+				case strings.HasPrefix(f.GoType, "[]"):
+					empty = "[]"
+				case strings.HasPrefix(f.GoType, "map[") || f.GoType == "Meta":
+					empty = "{}"
+				}
+				if empty != "" {
+					input, err := withMember(doc, f.JSONName, empty)
+					if err != nil {
+						return err
+					}
+					out = append(out, hintCase{name: name + "." + f.JSONName + "/encode-empty", def: def, input: input})
+				}
+			}
+			// Each arm of a union of primitives, which decodes as its own
+			// Go value and must encode as Rust's arm does. A union of
+			// primitives is a Go interface type, so it is exercised as a
+			// field, where the generated codec handles it.
+			elem, list := strings.CutPrefix(f.GoType, "[]")
+			mapped := false
+			if strings.HasPrefix(elem, "map[string]") {
+				elem, mapped = strings.TrimPrefix(elem, "map[string]"), true
+			}
+			if td := resolve(elem); td != nil && td.Kind == kindAny && f.Variant == "" {
+				for i, arm := range td.AnyArms {
+					samples := anySamples[arm.Kind]
+					if arm.Kind == "array" {
+						item, err := synthElem(r, arm.GoType, map[string]int{def: 1})
+						if err != nil {
+							return err
+						}
+						samples = []string{"[]", "[" + item + "]"}
+					}
+					for j, sample := range samples {
+						value := sample
+						switch {
+						case list:
+							value = "[" + sample + "]"
+						case mapped:
+							value = `{"k": ` + sample + `}`
+						}
+						input, err := withMember(doc, f.JSONName, value)
+						if err != nil {
+							return err
+						}
+						out = append(out, hintCase{name: fmt.Sprintf("%s.%s/encode-arm-%d-%s-%d", name, f.JSONName, i, arm.Kind, j), def: def, input: input})
+					}
+				}
+			}
+			// Raw JSON, which Rust holds as a serde_json::Value: member
+			// order kept, a repeated key once with its last value, and
+			// numbers and escapes re-encoded.
+			if f.GoType == "json.RawMessage" || (r.ByName[f.GoType] != nil && r.ByName[f.GoType].Kind == kindRaw) {
+				input, err := withMember(doc, f.JSONName, rawSample)
+				if err != nil {
+					return err
+				}
+				out = append(out, hintCase{name: name + "." + f.JSONName + "/encode-raw", def: def, input: input})
+			}
+			// -0, which serde_json reads as the f64 -0.0 that an integer
+			// rejects.
+			if integerType(f.GoType) && f.Variant == "" {
+				input, err := withMember(doc, f.JSONName, "-0")
+				if err != nil {
+					return err
+				}
+				out = append(out, hintCase{name: name + "." + f.JSONName + "/negative-zero", def: def, input: input})
+			}
+			if f.GoType != "float64" {
+				continue
+			}
+			for _, s := range floatSamples {
+				input, err := withMember(doc, f.JSONName, s.value)
+				if err != nil {
+					return err
+				}
+				out = append(out, hintCase{name: name + "." + f.JSONName + "/float-" + s.name, def: def, input: input})
+			}
+		}
+		return nil
+	}
+	// The discriminator enum synthesized for a flattened union is no Rust
+	// type; a Rust type of the same name is the whole union.
+	synthesized := map[string]bool{}
+	for _, td := range r.Defs {
+		if td.Flatten != nil {
+			synthesized[td.Flatten.Enum] = true
+		}
+	}
+	for _, td := range r.Defs {
+		if envelopeDefs[td.Name] || synthesized[td.Name] {
+			continue
+		}
+		switch td.Kind {
+		case kindStruct, kindTaggedUnion, kindUntaggedUnion, kindNewtype, kindEnum, kindAny, kindRaw:
+		default:
+			continue
+		}
+		minimal, err := synthWire(r, td.Name, false, map[string]int{})
+		if err != nil {
+			return nil, err
+		}
+		full, err := synthWire(r, td.Name, true, map[string]int{})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out,
+			hintCase{name: td.Name + "/encode-minimal", def: td.Name, input: minimal},
+			hintCase{name: td.Name + "/encode-full", def: td.Name, input: full})
+		if td.Kind == kindRaw {
+			out = append(out, hintCase{name: td.Name + "/encode-raw", def: td.Name, input: rawSample})
+		}
+		// A custom elicitation mode carrying the keys of both scopes: Rust's
+		// Other type writes the scope that matched and drops the other's.
+		if td.Kind == kindTaggedUnion {
+			for _, v := range td.Variants {
+				if v.Open && len(v.OpenAnyOf) > 1 {
+					input := fmt.Sprintf(`{%q: "_custom", "message": "", "requestId": 1, "sessionId": "s", "toolCallId": null, "z": 1, "a": 2}`, td.TagJSON)
+					out = append(out, hintCase{name: td.Name + "[" + v.GoName + "]/encode-scopes", def: td.Name, input: input})
+				}
+			}
+		}
+		// Other members of a struct Rust flattens a map into.
+		if td.Extras && strings.HasPrefix(full, "{") && full != "{}" {
+			extras := `"z": 1, "a": {"y": 2, "x": 1}, "z": 1.0, "q": null`
+			out = append(out,
+				hintCase{name: td.Name + "/encode-extras-first", def: td.Name, input: "{" + extras + ", " + full[1:]},
+				hintCase{name: td.Name + "/encode-extras-last", def: td.Name, input: strings.TrimSuffix(full, "}") + ", " + extras + "}"})
+		}
+		// String escapes, in the text of a text content block.
+		if td.Name == "TextContent" {
+			input, err := withMember(full, "text", escapeSample)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, hintCase{name: td.Name + ".text/encode-escapes", def: td.Name, input: input})
+		}
+		if td.Kind == kindNewtype && td.Base == "float64" {
+			for _, s := range floatSamples {
+				out = append(out, hintCase{name: td.Name + "/float-" + s.name, def: td.Name, input: s.value})
+			}
+		}
+		if err := fieldCases(td.Name, td.Name, full, td.Fields); err != nil {
+			return nil, err
+		}
+		if td.Kind != kindTaggedUnion && td.Kind != kindUntaggedUnion {
+			continue
+		}
+		for i := range td.Variants {
+			v := &td.Variants[i]
+			if v.Open {
+				continue
+			}
+			doc, err := synthVariant(r, td, v, true, map[string]int{td.Name: 1})
+			if err != nil {
+				return nil, err
+			}
+			name := td.Name + "[" + v.GoName + "]"
+			out = append(out, hintCase{name: name + "/encode-full", def: td.Name, input: doc})
+			if err := fieldCases(name, td.Name, doc, v.Inline); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}

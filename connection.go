@@ -34,7 +34,25 @@ type packet struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *RPCError       `json:"error,omitempty"`
+	// paramsTyped and resultTyped mark params and a result json.Marshal
+	// encoded from a Go value, which the frame writer reads as the encoding
+	// of a value (serdewire.EncodeTyped) rather than as wire text.
+	paramsTyped bool
+	resultTyped bool
 }
+
+// typedJSON reports whether v is a Go value rather than JSON text held as a
+// json.RawMessage, such as params forwarded unchanged. The reference SDK
+// writes a Rust value with serde_json::to_value and to_string, which never
+// re-parse a number it holds, and re-parses forwarded raw JSON.
+func typedJSON(v any) bool {
+	switch v.(type) {
+	case json.RawMessage, *json.RawMessage:
+		return false
+	}
+	return true
+}
+
 type outgoing struct {
 	data []byte
 	sent chan error
@@ -521,7 +539,7 @@ type errDroppedNotification struct{ err error }
 func (e errDroppedNotification) Error() string { return e.err.Error() }
 
 // buildNotification is the frame builder of Notify and queueNotification.
-func (c *Connection) buildNotification(method string, params json.RawMessage) func() (any, error) {
+func (c *Connection) buildNotification(method string, params json.RawMessage, typed bool) func() (any, error) {
 	return func() (any, error) {
 		guarded, admitted, err := c.guardOutgoing(method, params, true)
 		if err != nil {
@@ -530,7 +548,7 @@ func (c *Connection) buildNotification(method string, params json.RawMessage) fu
 			}
 			return nil, err
 		}
-		return packet{Version: "2.0", Method: method, Params: guarded}, nil
+		return packet{Version: "2.0", Method: method, Params: guarded, paramsTyped: typed}, nil
 	}
 }
 
@@ -552,7 +570,7 @@ func (c *Connection) Notify(ctx context.Context, method string, params any) erro
 	if err != nil {
 		return err
 	}
-	w, _, err := c.queue(ctx, c.buildNotification(method, b))
+	w, _, err := c.queue(ctx, c.buildNotification(method, b, typedJSON(params)))
 	if c.droppedNotification(method, err) {
 		return nil
 	}
@@ -698,7 +716,7 @@ func (c *Connection) Call(ctx context.Context, method string, params, result any
 		if err != nil {
 			return nil, err
 		}
-		return packet{Version: "2.0", ID: json.RawMessage(id), Method: method, Params: guarded}, nil
+		return packet{Version: "2.0", ID: json.RawMessage(id), Method: method, Params: guarded, paramsTyped: typedJSON(params)}, nil
 	})
 	if err != nil {
 		if built || admitted {
@@ -1169,6 +1187,7 @@ func (c *Connection) executeRequest(ctx context.Context, p packet) (response pac
 		response.Error = errorObject(err)
 	} else {
 		response.Result, err = json.Marshal(value)
+		response.resultTyped = typedJSON(value)
 		if err != nil {
 			response.Error = &RPCError{Code: -32603, Message: err.Error()}
 			response.Result = nil

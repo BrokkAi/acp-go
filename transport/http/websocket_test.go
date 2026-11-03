@@ -152,10 +152,27 @@ func wsReadText(t *testing.T, conn net.Conn, reader *bufio.Reader) string {
 	if _, err := io.ReadFull(reader, head); err != nil {
 		t.Fatal(err)
 	}
-	if head[0] != 0x81 || head[1]&0x80 != 0 || head[1]&0x7f >= 126 {
+	if head[0] != 0x81 || head[1]&0x80 != 0 {
 		t.Fatalf("unexpected frame header % x", head)
 	}
-	payload := make([]byte, head[1])
+	// RFC 6455 section 5.2: 126 and 127 announce a 16-bit and a 64-bit
+	// extended payload length.
+	length := uint64(head[1] & 0x7f)
+	switch length {
+	case 126, 127:
+		extended := make([]byte, 2)
+		if length == 127 {
+			extended = make([]byte, 8)
+		}
+		if _, err := io.ReadFull(reader, extended); err != nil {
+			t.Fatal(err)
+		}
+		length = 0
+		for _, b := range extended {
+			length = length<<8 | uint64(b)
+		}
+	}
+	payload := make([]byte, length)
 	if _, err := io.ReadFull(reader, payload); err != nil {
 		t.Fatal(err)
 	}

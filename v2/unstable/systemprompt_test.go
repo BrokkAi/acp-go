@@ -139,7 +139,7 @@ func TestSystemPromptConstructors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded) != `{"content":[{"text":"Review only.","type":"text"}],"mode":"append"}` {
+	if string(encoded) != `{"mode":"append","content":[{"type":"text","text":"Review only."}]}` {
 		t.Fatalf("NewTextSystemPrompt = %s", encoded)
 	}
 	if prompt := acpunstable.NewSystemPrompt(); prompt.Mode != acpunstable.Append || prompt.Content != nil {
@@ -170,7 +170,7 @@ func TestLifecycleFacadesCarryAndApplyTheSystemPrompt(t *testing.T) {
 	// The wire form carries the mode explicitly.
 	for range 4 {
 		raw := <-implementation.requests
-		if !strings.Contains(string(raw), `"systemPrompt":{"content":[{"text":"Review only.","type":"text"}],"mode":"`) {
+		if !strings.Contains(string(raw), `"systemPrompt":{"mode":"`) || !strings.Contains(string(raw), `"content":[{"type":"text","text":"Review only."}]}`) {
 			t.Fatalf("lifecycle params = %s", raw)
 		}
 	}

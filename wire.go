@@ -33,12 +33,12 @@ func appendPacket(p packet) ([]byte, error) {
 	params, result := p.Params, p.Result
 	var err error
 	if len(params) > 0 {
-		if params, err = serdewire.Encode(params); err != nil {
+		if params, err = encodeMember(params, p.paramsTyped); err != nil {
 			return nil, err
 		}
 	}
 	if len(result) > 0 {
-		if result, err = serdewire.Encode(result); err != nil {
+		if result, err = encodeMember(result, p.resultTyped); err != nil {
 			return nil, err
 		}
 	}
@@ -84,6 +84,16 @@ func appendPacket(p packet) ([]byte, error) {
 		out = append(out, rpcError...)
 	}
 	return append(out, '}'), nil
+}
+
+// encodeMember writes a packet's params or result as serde_json writes it:
+// the encoding of a Go value as serdewire.EncodeTyped reads it, and JSON
+// text, such as forwarded params, as serdewire.Encode does.
+func encodeMember(b []byte, typed bool) ([]byte, error) {
+	if typed {
+		return serdewire.EncodeTyped(b)
+	}
+	return serdewire.Encode(b)
 }
 
 // compactJSON compacts JSON a guard or a MarshalJSON method produced, which

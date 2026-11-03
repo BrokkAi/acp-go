@@ -65,7 +65,7 @@ func TestSystemPromptConstructors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded) != `{"content":[{"text":"Review only.","type":"text"}],"mode":"append"}` {
+	if string(encoded) != `{"mode":"append","content":[{"type":"text","text":"Review only."}]}` {
 		t.Fatalf("NewTextSystemPrompt = %s", encoded)
 	}
 	override := acpunstable.NewSystemPrompt(prompt.Content...)
@@ -100,7 +100,7 @@ func TestLifecycleFacadesCarryTheSystemPrompt(t *testing.T) {
 			if err := json.Unmarshal(request.params, &params); err != nil {
 				t.Fatal(err)
 			}
-			want := `{"content":[{"text":"Review only.","type":"text"}],"mode":"` + string(mode) + `"}`
+			want := `{"mode":"` + string(mode) + `","content":[{"type":"text","text":"Review only."}]}`
 			if request.method != method || string(params.SystemPrompt) != want {
 				t.Fatalf("%s frame = %s %s", method, request.method, request.params)
 			}

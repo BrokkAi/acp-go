@@ -57,10 +57,11 @@ func TestFlattenedUnionBecomesStructAndOpenEnum(t *testing.T) {
 	for _, f := range td.Fields {
 		names = append(names, f.GoName+" "+f.GoType)
 	}
-	if got := strings.Join(names, ", "); got != "Meta Meta, Error Failure, StopReason StopReason" {
+	// Wire order: Rust flattens the union before the struct's own fields.
+	if got := strings.Join(names, ", "); got != "StopReason StopReason, Error Failure, Meta Meta" {
 		t.Fatalf("fields = %s", got)
 	}
-	for _, f := range td.Fields[1:] { // _meta keeps its v2 Nullable shape
+	for _, f := range td.Fields[:2] { // _meta keeps its v2 Nullable shape
 		if f.Required || f.Nullable {
 			t.Fatalf("field %s must be a plain optional field: %+v", f.GoName, f)
 		}
@@ -82,7 +83,8 @@ func TestFlattenedUnionBecomesStructAndOpenEnum(t *testing.T) {
 		Defs: []*typeDef{failure, td, enum}}, "test", "testpkg"))
 	for _, want := range []string{
 		"StopReasonFields map[string]json.RawMessage `json:\"-\"`",
-		"if tag != \"error\" {\n\t\tdelete(obj, \"error\")",
+		"\tcase \"error\":\n\t\t\tif v.Error != nil {",
+		"appendRawMembers(b, v.StopReasonFields, []string{\"_meta\", \"stopReason\", \"usage\"})",
 		"if tag, ok := decodeTag(raw, true, idleStateUpdateTags); ok {",
 		"if v.decodeStopReasonVariant(raws) != nil {",
 		"case \"_meta\", \"stopReason\", \"usage\":",
@@ -135,7 +137,7 @@ func TestUntaggedUnionOpenArmKeepsRawValue(t *testing.T) {
 	src := string(emitTypes(&ir{ByName: map[string]*typeDef{"Data": td, "NotFound": notFound}, Defs: []*typeDef{td, notFound}}, "test", "testpkg"))
 	for _, want := range []string{
 		"type DataOther struct{ Raw json.RawMessage }",
-		"return v.Other.Raw, nil",
+		"return appendRaw(b, v.Other.Raw)",
 		"v.Other = &DataOther{Raw: append(json.RawMessage(nil), data...)}",
 	} {
 		if !strings.Contains(src, want) {

@@ -3,13 +3,20 @@
 package unstable
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/BrokkAi/acp-go/internal/jsonline"
 	"github.com/BrokkAi/acp-go/internal/serdejson"
+	"github.com/BrokkAi/acp-go/internal/serdewire"
 )
 
 // Meta is the reserved _meta channel for extension data.
@@ -202,6 +209,20 @@ func objectData(data []byte, raws rawObject) json.RawMessage {
 	}
 	out, _ := json.Marshal(obj)
 	return out
+}
+
+// rawObjectJSON writes members as a JSON object, in order.
+func rawObjectJSON(members rawObject) json.RawMessage {
+	out := json.RawMessage{'{'}
+	for i, m := range members {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = appendString(out, string(m.key))
+		out = append(out, ':')
+		out = append(out, m.raw...)
+	}
+	return append(out, '}')
 }
 
 // splitObject splits a JSON object into its members without copying them.
@@ -518,10 +539,34 @@ func decodeValue[T any](raw json.RawMessage, dst *T, nullOK, buffered bool) erro
 	if !nullOK && isNull(raw) {
 		return nullError[T]()
 	}
+	if isNegativeZero(raw) {
+		// serde_json reads -0 as the f64 -0.0, which an integer rejects.
+		if t := reflect.TypeFor[T](); isInteger(t) {
+			return invalidType(raw, expecting(t))
+		}
+	}
 	if d, ok := any(dst).(decoder); ok {
 		return d.decodeJSON(raw, buffered)
 	}
 	return typeError(json.Unmarshal(raw, dst), raw)
+}
+
+// isNegativeZero reports whether raw is the number -0.
+func isNegativeZero(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "-0"
+}
+
+// isInteger reports whether t, or what it points to, is an integer.
+func isInteger(t reflect.Type) bool {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return true
+	}
+	return false
 }
 
 // typeError rewrites encoding/json's type errors the way serde words them,
@@ -580,20 +625,67 @@ func decodePtr[T any, P interface {
 	return nil
 }
 
-// decodeChecked decodes a union of primitives after check accepts it.
-func decodeChecked[T any](raw json.RawMessage, dst *T, nullOK bool, check func(json.RawMessage) error) error {
+// decodeChecked decodes a union of primitives with its generated decoder,
+// which yields the Go value of the first arm the value matches.
+func decodeChecked[T any](raw json.RawMessage, dst *T, nullOK bool, decode func(json.RawMessage) (T, error)) error {
 	if isNull(raw) && !nullOK {
-		if err := check(raw); err != nil {
+		if _, err := decode(raw); err != nil {
 			return err
 		}
 		return nullError[T]()
 	}
-	if !isNull(raw) {
-		if err := check(raw); err != nil {
-			return err
+	if isNull(raw) {
+		var zero T
+		*dst = zero
+		return nil
+	}
+	value, err := decode(raw)
+	if err != nil {
+		return err
+	}
+	*dst = value
+	return nil
+}
+
+// decodeCheckedPtr decodes an optional union of primitives.
+func decodeCheckedPtr[T any](raw json.RawMessage, dst **T, nullOK bool, decode func(json.RawMessage) (T, error)) error {
+	var value T
+	if err := decodeChecked(raw, &value, nullOK, decode); err != nil {
+		return err
+	}
+	if isNull(raw) {
+		*dst = nil
+	} else {
+		*dst = &value
+	}
+	return nil
+}
+
+// decodeFloat decodes an f64 as serde_json reads one: built without its
+// float_roundtrip feature, as the reference SDK is, it does not always round
+// to the nearest float64.
+func decodeFloat[T ~float64](raw json.RawMessage, dst *T, nullOK bool) error {
+	token := bytes.TrimSpace(raw)
+	if c := jsonKind(token); c == '-' || (c >= '0' && c <= '9') {
+		if f, ok := jsonline.ParseFloat(token); ok {
+			*dst = T(f)
+			return nil
 		}
 	}
-	return typeError(json.Unmarshal(raw, dst), raw)
+	return decodeValue(raw, dst, nullOK, false)
+}
+
+// decodeFloatPtr decodes an optional f64.
+func decodeFloatPtr[T ~float64](raw json.RawMessage, dst **T, nullOK bool) error {
+	if isNull(raw) {
+		return decodeValue(raw, dst, nullOK, false)
+	}
+	value := new(T)
+	if err := decodeFloat(raw, value, false); err != nil {
+		return err
+	}
+	*dst = value
+	return nil
 }
 
 // decodeList decodes a list item by item. With skip set
@@ -665,23 +757,279 @@ func decodeNullable[T any](raw json.RawMessage, dst *Nullable[T], decode func(js
 	return nil
 }
 
+// closeObject finishes an object whose members, each written with a leading
+// comma, start at start: the first comma becomes the opening brace.
+func closeObject(b []byte, start int) []byte {
+	if len(b) == start {
+		return append(b, '{', '}')
+	}
+	b[start] = '{'
+	return append(b, '}')
+}
+
+// appendString writes s as a JSON string with the escapes serde_json writes:
+// \", \\, \b, \f, \n, \r, \t, and \u00XX for the other control characters.
+// Invalid UTF-8 is written as U+FFFD, as encoding/json does.
+func appendString(b []byte, s string) []byte {
+	const hex = "0123456789abcdef"
+	b = append(b, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= 0x20 && c != '"' && c != '\\' && c < utf8.RuneSelf {
+			i++
+			continue
+		}
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == utf8.RuneError && size == 1 {
+				b = append(b, s[start:i]...)
+				b = append(b, "\ufffd"...)
+				i++
+				start = i
+				continue
+			}
+			i += size
+			continue
+		}
+		b = append(b, s[start:i]...)
+		switch c {
+		case '"':
+			b = append(b, '\\', '"')
+		case '\\':
+			b = append(b, '\\', '\\')
+		case '\b':
+			b = append(b, '\\', 'b')
+		case '\f':
+			b = append(b, '\\', 'f')
+		case '\n':
+			b = append(b, '\\', 'n')
+		case '\r':
+			b = append(b, '\\', 'r')
+		case '\t':
+			b = append(b, '\\', 't')
+		default:
+			b = append(b, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xF])
+		}
+		i++
+		start = i
+	}
+	b = append(b, s[start:]...)
+	return append(b, '"')
+}
+
+// appendFloat writes an f64 as serde_json does.
+func appendFloat(b []byte, f float64) []byte {
+	return append(b, serdejson.FormatFloat(f)...)
+}
+
+// appendAny writes an untyped value as serde_json writes the value
+// serde_json::to_value builds for it: encoding/json's encoding, with its
+// strings and numbers in serde_json's form (serdewire.EncodeTyped). Map keys
+// are in encoding/json's sorted order.
+func appendAny(b []byte, v any) ([]byte, error) {
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if encoded, err = serdewire.EncodeTyped(encoded); err != nil {
+		return nil, err
+	}
+	return append(b, encoded...), nil
+}
+
+// appendRaw writes raw JSON as serde_json re-encodes the serde_json::Value
+// it reads it as. Empty raw JSON is null.
+func appendRaw(b []byte, raw json.RawMessage) ([]byte, error) {
+	if len(raw) == 0 {
+		return append(b, "null"...), nil
+	}
+	var compact bytes.Buffer
+	compact.Grow(len(raw))
+	if err := json.Compact(&compact, raw); err != nil {
+		return nil, fmt.Errorf("invalid raw JSON %q: %w", raw, err)
+	}
+	encoded, err := serdewire.Encode(compact.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("invalid raw JSON %q: %w", raw, err)
+	}
+	return append(b, encoded...), nil
+}
+
+// sortedKeys returns the keys of m in order.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// appendRawMembers writes the members of m, the other fields of a custom
+// flattened value, sorted by key as Rust's BTreeMap holds them, leaving out
+// the keys in skip.
+func appendRawMembers(b []byte, m map[string]json.RawMessage, skip []string) ([]byte, error) {
+	var err error
+	for _, key := range sortedKeys(m) {
+		if slices.Contains(skip, key) {
+			continue
+		}
+		b = append(b, ',')
+		b = appendString(b, key)
+		b = append(b, ':')
+		if b, err = appendRaw(b, m[key]); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
+// appendObjectMembers writes the members of raw, a JSON object such as the
+// other members of a struct Rust flattens a serde_json::Map into, each with a
+// leading comma, as serde_json writes that map.
+func appendObjectMembers(b []byte, raw json.RawMessage) ([]byte, error) {
+	value, err := serdejson.ParseAnyDepth(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid raw JSON %q: %w", raw, err)
+	}
+	if value.Kind != serdejson.Object {
+		return nil, fmt.Errorf("other members are not an object: %s", raw)
+	}
+	for _, member := range value.Members {
+		b = append(b, ',')
+		b = appendString(b, member.Key)
+		b = append(b, ':')
+		b = append(b, serdejson.Encode(member.Value)...)
+	}
+	return b, nil
+}
+
+// appendOpenMembers writes the members of an open variant's wire object as
+// Rust's Other type does: the tag, then the fields it declares in order (one
+// marked optional with a trailing "?" is left out when null), then those of
+// the first scope arm whose required fields are present, then every other
+// member but the keys of any scope arm sorted by key, as its flattened
+// BTreeMap holds them. Values are
+// re-encoded as serde_json::Value. skip lists the keys the enclosing struct
+// owns.
+func appendOpenMembers(b []byte, raw json.RawMessage, tag string, declared []string, scopes [][]string, skip []string) ([]byte, error) {
+	value, err := serdejson.ParseAnyDepth(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid raw JSON %q: %w", raw, err)
+	}
+	if value.Kind != serdejson.Object {
+		return nil, fmt.Errorf("open variant is not an object: %s", raw)
+	}
+	written := map[string]bool{}
+	write := func(key string, optional bool) {
+		item, ok := value.Get(key)
+		written[key] = true
+		if !ok || (optional && item.Kind == serdejson.Null) {
+			return
+		}
+		b = append(b, ',')
+		b = appendString(b, key)
+		b = append(b, ':')
+		b = append(b, serdejson.Encode(item)...)
+	}
+	write(tag, false)
+	fields := func(keys []string) {
+		for _, key := range keys {
+			name, optional := strings.CutSuffix(key, "?")
+			write(name, optional)
+		}
+	}
+	fields(declared)
+	for _, arm := range scopes {
+		matched := true
+		for _, key := range arm {
+			if !strings.HasSuffix(key, "?") {
+				if _, ok := value.Get(key); !ok {
+					matched = false
+				}
+			}
+		}
+		if matched {
+			fields(arm)
+			break
+		}
+	}
+	// Rust's Other type takes every scope key out of its other fields,
+	// whichever arm matched.
+	for _, arm := range scopes {
+		for _, key := range arm {
+			written[strings.TrimSuffix(key, "?")] = true
+		}
+	}
+	rest := make([]serdejson.Member, 0, len(value.Members))
+	for _, member := range value.Members {
+		if !written[member.Key] && !slices.Contains(skip, member.Key) {
+			rest = append(rest, member)
+		}
+	}
+	sort.SliceStable(rest, func(i, j int) bool { return rest[i].Key < rest[j].Key })
+	for _, member := range rest {
+		b = append(b, ',')
+		b = appendString(b, member.Key)
+		b = append(b, ':')
+		b = append(b, serdejson.Encode(member.Value)...)
+	}
+	return b, nil
+}
+
 // Authentication-related capabilities supported by the agent.
 type AgentAuthCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
-	// Whether the agent supports the logout method.
-	// Optional. Omitted or null both mean the agent does not advertise support.
-	// Supplying {} means the agent supports the logout method.
-	Logout *LogoutCapabilities `json:"logout,omitempty"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
 	// Whether the agent supports the auth/status method.
 	// Optional. Omitted or null both mean the agent does not advertise support.
 	// Supplying {} means the agent supports the auth/status method.
 	Status *AuthStatusCapabilities `json:"status,omitempty"`
+	// Whether the agent supports the logout method.
+	// Optional. Omitted or null both mean the agent does not advertise support.
+	// Supplying {} means the agent supports the logout method.
+	Logout *LogoutCapabilities `json:"logout,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v AgentAuthCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AgentAuthCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AgentAuthCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Status != nil {
+		b = append(b, ",\"status\":"...)
+		if b, err = (*v.Status).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Logout != nil {
+		b = append(b, ",\"logout\":"...)
+		if b, err = (*v.Logout).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AgentAuthCapabilities) nullError() error {
@@ -710,17 +1058,17 @@ func (v *AgentAuthCapabilities) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "status":
+			if err := decodePtr(raw, &v.Status, true, true); err != nil {
+				v.Status = nil
 			}
 		case "logout":
 			if err := decodePtr(raw, &v.Logout, true, true); err != nil {
 				v.Logout = nil
 			}
-		case "status":
-			if err := decodePtr(raw, &v.Status, true, true); err != nil {
-				v.Status = nil
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -758,27 +1106,94 @@ func (v *AgentAuthCapabilities) decodeSeq(items []json.RawMessage, buffered bool
 // available features and content types.
 // See protocol docs: Agent Capabilities
 type AgentCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
-	// Authentication-related capabilities supported by the agent.
-	Auth *AgentAuthCapabilities `json:"auth,omitempty"`
 	// Whether the agent supports session/load.
 	LoadSession *bool `json:"loadSession,omitempty"`
-	// MCP capabilities supported by the agent.
-	MCPCapabilities *McpCapabilities `json:"mcpCapabilities,omitempty"`
 	// Prompt capabilities supported by the agent.
 	PromptCapabilities *PromptCapabilities `json:"promptCapabilities,omitempty"`
+	// MCP capabilities supported by the agent.
+	MCPCapabilities *McpCapabilities `json:"mcpCapabilities,omitempty"`
+	// Session lifecycle and prompt capabilities advertised by the agent.
+	SessionCapabilities *SessionCapabilities `json:"sessionCapabilities,omitempty"`
+	// Authentication-related capabilities supported by the agent.
+	Auth *AgentAuthCapabilities `json:"auth,omitempty"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
 	// Provider configuration capabilities supported by the agent.
 	// Optional. Omitted or null both mean the agent does not advertise support.
 	// Supplying {} means the agent supports provider configuration methods.
 	Providers *ProvidersCapabilities `json:"providers,omitempty"`
-	// Session lifecycle and prompt capabilities advertised by the agent.
-	SessionCapabilities *SessionCapabilities `json:"sessionCapabilities,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v AgentCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AgentCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AgentCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.LoadSession != nil {
+		b = append(b, ",\"loadSession\":"...)
+		b = strconv.AppendBool(b, (*v.LoadSession))
+	} else {
+		b = append(b, ",\"loadSession\":false"...)
+	}
+	if v.PromptCapabilities != nil {
+		b = append(b, ",\"promptCapabilities\":"...)
+		if b, err = (*v.PromptCapabilities).appendJSON(b); err != nil {
+			return nil, err
+		}
+	} else {
+		b = append(b, ",\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false}"...)
+	}
+	if v.MCPCapabilities != nil {
+		b = append(b, ",\"mcpCapabilities\":"...)
+		if b, err = (*v.MCPCapabilities).appendJSON(b); err != nil {
+			return nil, err
+		}
+	} else {
+		b = append(b, ",\"mcpCapabilities\":{\"http\":false,\"sse\":false,\"acp\":false}"...)
+	}
+	if v.SessionCapabilities != nil {
+		b = append(b, ",\"sessionCapabilities\":"...)
+		if b, err = (*v.SessionCapabilities).appendJSON(b); err != nil {
+			return nil, err
+		}
+	} else {
+		b = append(b, ",\"sessionCapabilities\":{}"...)
+	}
+	if v.Auth != nil {
+		b = append(b, ",\"auth\":"...)
+		if b, err = (*v.Auth).appendJSON(b); err != nil {
+			return nil, err
+		}
+	} else {
+		b = append(b, ",\"auth\":{}"...)
+	}
+	if v.Providers != nil {
+		b = append(b, ",\"providers\":"...)
+		if b, err = (*v.Providers).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AgentCapabilities) nullError() error {
@@ -807,33 +1222,33 @@ func (v *AgentCapabilities) decodeFields(data []byte, raws rawObject, buffered b
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "auth":
-			if err := decodePtr(raw, &v.Auth, false, true); err != nil {
-				v.Auth = nil
-			}
 		case "loadSession":
 			if err := decodeValue(raw, &v.LoadSession, false, true); err != nil {
 				v.LoadSession = nil
-			}
-		case "mcpCapabilities":
-			if err := decodePtr(raw, &v.MCPCapabilities, false, true); err != nil {
-				v.MCPCapabilities = nil
 			}
 		case "promptCapabilities":
 			if err := decodePtr(raw, &v.PromptCapabilities, false, true); err != nil {
 				v.PromptCapabilities = nil
 			}
-		case "providers":
-			if err := decodePtr(raw, &v.Providers, true, true); err != nil {
-				v.Providers = nil
+		case "mcpCapabilities":
+			if err := decodePtr(raw, &v.MCPCapabilities, false, true); err != nil {
+				v.MCPCapabilities = nil
 			}
 		case "sessionCapabilities":
 			if err := decodePtr(raw, &v.SessionCapabilities, false, true); err != nil {
 				v.SessionCapabilities = nil
+			}
+		case "auth":
+			if err := decodePtr(raw, &v.Auth, false, true); err != nil {
+				v.Auth = nil
+			}
+		case "providers":
+			if err := decodePtr(raw, &v.Providers, true, true); err != nil {
+				v.Providers = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -892,17 +1307,59 @@ func (v *AgentCapabilities) decodeSeq(items []json.RawMessage, buffered bool) er
 
 // Optional annotations for the client. The client can use annotations to inform how objects are used or displayed
 type Annotations struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Intended recipients for this content, such as the user or assistant.
 	Audience []Role `json:"audience,omitempty"`
 	// Timestamp indicating when the underlying resource was last modified.
 	LastModified *string `json:"lastModified,omitempty"`
 	// Relative importance of this content when clients choose what to surface.
 	Priority *float64 `json:"priority,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v Annotations) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *Annotations) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *Annotations) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Audience != nil {
+		b = append(b, ",\"audience\":"...)
+		b = append(b, '[')
+		for i0 := range v.Audience {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, string(v.Audience[i0]))
+		}
+		b = append(b, ']')
+	}
+	if v.LastModified != nil {
+		b = append(b, ",\"lastModified\":"...)
+		b = appendString(b, (*v.LastModified))
+	}
+	if v.Priority != nil {
+		b = append(b, ",\"priority\":"...)
+		b = appendFloat(b, float64((*v.Priority)))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*Annotations) nullError() error {
@@ -931,10 +1388,6 @@ func (v *Annotations) decodeFields(data []byte, raws rawObject, buffered bool) e
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "audience":
 			if err := decodeList(raw, &v.Audience, true, true, func(raw json.RawMessage, dst *Role) error {
 				return decodeValue(raw, dst, false, true)
@@ -946,8 +1399,12 @@ func (v *Annotations) decodeFields(data []byte, raws rawObject, buffered bool) e
 				v.LastModified = nil
 			}
 		case "priority":
-			if err := decodeValue(raw, &v.Priority, true, true); err != nil {
+			if err := decodeFloatPtr(raw, &v.Priority, true); err != nil {
 				v.Priority = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -972,7 +1429,7 @@ func (v *Annotations) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Priority, true, true); err != nil {
+		if err := decodeFloatPtr(raw, &v.Priority, true); err != nil {
 			v.Priority = nil
 		}
 	}
@@ -997,13 +1454,38 @@ func (v *Annotations) decodeSeq(items []json.RawMessage, buffered bool) error {
 // free the session's resources as if session/close had been called, then archive it.
 // Archiving an archived session succeeds. A session that does not exist gets -32002.
 type ArchiveSessionRequest struct {
+	// The ID of the session to archive.
+	SessionID SessionId `json:"sessionId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the session to archive.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v ArchiveSessionRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ArchiveSessionRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ArchiveSessionRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ArchiveSessionRequest) nullError() error {
@@ -1035,13 +1517,13 @@ func (v *ArchiveSessionRequest) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -1082,6 +1564,29 @@ type ArchiveSessionResponse struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ArchiveSessionResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ArchiveSessionResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ArchiveSessionResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ArchiveSessionResponse) nullError() error {
@@ -1135,17 +1640,50 @@ func (v *ArchiveSessionResponse) decodeSeq(items []json.RawMessage, buffered boo
 
 // Audio provided to or from an LLM.
 type AudioContent struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Optional annotations that help clients decide how to display or route this content.
 	Annotations *Annotations `json:"annotations,omitempty"`
 	// Base64-encoded media payload.
 	Data string `json:"data"`
 	// MIME type describing the encoded media payload.
 	MimeType string `json:"mimeType"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v AudioContent) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AudioContent) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AudioContent) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Annotations != nil {
+		b = append(b, ",\"annotations\":"...)
+		if b, err = (*v.Annotations).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ",\"data\":"...)
+	b = appendString(b, v.Data)
+	b = append(b, ",\"mimeType\":"...)
+	b = appendString(b, v.MimeType)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AudioContent) nullError() error {
@@ -1177,10 +1715,6 @@ func (v *AudioContent) decodeFields(data []byte, raws rawObject, buffered bool) 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "annotations":
 			if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
 				v.Annotations = nil
@@ -1192,6 +1726,10 @@ func (v *AudioContent) decodeFields(data []byte, raws rawObject, buffered bool) 
 		case "mimeType":
 			if err := decodeValue(raw, &v.MimeType, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -1248,27 +1786,68 @@ func (v *AudioContent) decodeSeq(items []json.RawMessage, buffered bool) error {
 // account identifiers, and SHOULD NOT log them or send them elsewhere, such as to
 // telemetry.
 type AuthAccount struct {
+	// Human-readable name for the account, suitable for display on its own,
+	// for example Claude Max, OpenAI API key, or Vertex AI.
+	Label string `json:"label"`
+	// Whether the agent currently uses this account by default.
+	// Several accounts MAY be active, for example one per provider.
+	// Optional. Omitted and null are equivalent and mean the agent does not indicate whether this account is in effect.
+	Active *bool `json:"active,omitempty"`
+	// Display name of the user, such as a username or full name.
+	// Optional. Omitted and null are equivalent and mean no name is reported.
+	Name *string `json:"name,omitempty"`
+	// Email address of the user.
+	// Optional. Omitted and null are equivalent and mean no email is reported.
+	Email *string `json:"email,omitempty"`
+	// Display name of the organization, team, or workspace the account is using.
+	// Optional. Omitted and null are equivalent and mean no organization is reported.
+	Organization *string `json:"organization,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Whether the agent currently uses this account by default.
-	// Several accounts MAY be active, for example one per provider.
-	// Optional. Omitted and null are equivalent and mean the agent does not indicate whether this account is in effect.
-	Active *bool `json:"active,omitempty"`
-	// Email address of the user.
-	// Optional. Omitted and null are equivalent and mean no email is reported.
-	Email *string `json:"email,omitempty"`
-	// Human-readable name for the account, suitable for display on its own,
-	// for example Claude Max, OpenAI API key, or Vertex AI.
-	Label string `json:"label"`
-	// Display name of the user, such as a username or full name.
-	// Optional. Omitted and null are equivalent and mean no name is reported.
-	Name *string `json:"name,omitempty"`
-	// Display name of the organization, team, or workspace the account is using.
-	// Optional. Omitted and null are equivalent and mean no organization is reported.
-	Organization *string `json:"organization,omitempty"`
+}
+
+func (v AuthAccount) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthAccount) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthAccount) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"label\":"...)
+	b = appendString(b, v.Label)
+	if v.Active != nil {
+		b = append(b, ",\"active\":"...)
+		b = strconv.AppendBool(b, (*v.Active))
+	}
+	if v.Name != nil {
+		b = append(b, ",\"name\":"...)
+		b = appendString(b, (*v.Name))
+	}
+	if v.Email != nil {
+		b = append(b, ",\"email\":"...)
+		b = appendString(b, (*v.Email))
+	}
+	if v.Organization != nil {
+		b = append(b, ",\"organization\":"...)
+		b = appendString(b, (*v.Organization))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AuthAccount) nullError() error {
@@ -1300,29 +1879,29 @@ func (v *AuthAccount) decodeFields(data []byte, raws rawObject, buffered bool) e
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "label":
+			if err := decodeValue(raw, &v.Label, false, buffered); err != nil {
+				return err
 			}
 		case "active":
 			if err := decodeValue(raw, &v.Active, true, true); err != nil {
 				v.Active = nil
 			}
-		case "email":
-			if err := decodeValue(raw, &v.Email, true, true); err != nil {
-				v.Email = nil
-			}
-		case "label":
-			if err := decodeValue(raw, &v.Label, false, buffered); err != nil {
-				return err
-			}
 		case "name":
 			if err := decodeValue(raw, &v.Name, true, true); err != nil {
 				v.Name = nil
 			}
+		case "email":
+			if err := decodeValue(raw, &v.Email, true, true); err != nil {
+				v.Email = nil
+			}
 		case "organization":
 			if err := decodeValue(raw, &v.Organization, true, true); err != nil {
 				v.Organization = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -1383,16 +1962,45 @@ func (v *AuthAccount) decodeSeq(items []json.RawMessage, buffered bool) error {
 // method types the client can handle. This governs opt-in types that require
 // additional client-side support.
 type AuthCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Whether the client supports terminal authentication methods.
 	// The client should set this to true only when it can reproduce the
 	// configured agent invocation in an interactive terminal. When true, the
 	// agent may include terminal entries in its authentication methods.
 	Terminal *bool `json:"terminal,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v AuthCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Terminal != nil {
+		b = append(b, ",\"terminal\":"...)
+		b = strconv.AppendBool(b, (*v.Terminal))
+	} else {
+		b = append(b, ",\"terminal\":false"...)
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AuthCapabilities) nullError() error {
@@ -1421,13 +2029,13 @@ func (v *AuthCapabilities) decodeFields(data []byte, raws rawObject, buffered bo
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "terminal":
 			if err := decodeValue(raw, &v.Terminal, false, true); err != nil {
 				v.Terminal = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -1472,8 +2080,18 @@ type AuthMethod struct {
 	Terminal *AuthMethodTerminal `json:"-"`
 }
 
-func (v AuthMethod) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v AuthMethod) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthMethod) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthMethod) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Agent != nil {
 		set++
@@ -1484,38 +2102,20 @@ func (v AuthMethod) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "AuthMethod", set)
 	}
-	if v.Agent != nil {
-		payload, err := json.Marshal(v.Agent)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Agent != nil:
+		if b, err = v.Agent.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("AuthMethod payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.Terminal != nil:
+		b = append(b, ",\"type\":\"terminal\""...)
+		if b, err = v.Terminal.appendMembers(b); err != nil {
+			return nil, err
 		}
 	}
-	if v.Terminal != nil {
-		if tag, err := json.Marshal("terminal"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Terminal)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("AuthMethod payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var authMethodTags = []string{"terminal"}
@@ -1608,17 +2208,48 @@ func (v *AuthMethod) decodeSeq(items []json.RawMessage, buffered bool) error {
 // Agent handles authentication itself through authenticate.
 // This is the default authentication method type.
 type AuthMethodAgent struct {
+	// Unique identifier for this authentication method.
+	ID AuthMethodId `json:"id"`
+	// Human-readable name of the authentication method.
+	Name string `json:"name"`
+	// Optional human-readable description of this authentication method.
+	Description *string `json:"description,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Optional human-readable description of this authentication method.
-	Description *string `json:"description,omitempty"`
-	// Unique identifier for this authentication method.
-	ID AuthMethodId `json:"id"`
-	// Human-readable name of the authentication method.
-	Name string `json:"name"`
+}
+
+func (v AuthMethodAgent) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthMethodAgent) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthMethodAgent) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"id\":"...)
+	b = appendString(b, string(v.ID))
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AuthMethodAgent) nullError() error {
@@ -1650,14 +2281,6 @@ func (v *AuthMethodAgent) decodeFields(data []byte, raws rawObject, buffered boo
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "description":
-			if err := decodeValue(raw, &v.Description, true, true); err != nil {
-				v.Description = nil
-			}
 		case "id":
 			if err := decodeValue(raw, &v.ID, false, buffered); err != nil {
 				return err
@@ -1665,6 +2288,14 @@ func (v *AuthMethodAgent) decodeFields(data []byte, raws rawObject, buffered boo
 		case "name":
 			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
 				return err
+			}
+		case "description":
+			if err := decodeValue(raw, &v.Description, true, true); err != nil {
+				v.Description = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -1723,22 +2354,78 @@ type AuthMethodId string
 // A zero exit status signals success. Any other termination signals failure.
 // The client MUST NOT pass this method to authenticate.
 type AuthMethodTerminal struct {
+	// Unique identifier for this authentication method.
+	ID AuthMethodId `json:"id"`
+	// Human-readable name of the authentication method.
+	Name string `json:"name"`
+	// Optional human-readable description of this authentication method.
+	Description *string `json:"description,omitempty"`
+	// Additional arguments to append to the configured agent invocation for terminal auth.
+	Args []string `json:"args,omitempty"`
+	// Additional environment variables to set on the configured agent invocation for terminal auth.
+	// These values override same-named variables in the base launch configuration.
+	Env map[string]string `json:"env,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Additional arguments to append to the configured agent invocation for terminal auth.
-	Args []string `json:"args,omitempty"`
-	// Optional human-readable description of this authentication method.
-	Description *string `json:"description,omitempty"`
-	// Additional environment variables to set on the configured agent invocation for terminal auth.
-	// These values override same-named variables in the base launch configuration.
-	Env map[string]string `json:"env,omitempty"`
-	// Unique identifier for this authentication method.
-	ID AuthMethodId `json:"id"`
-	// Human-readable name of the authentication method.
-	Name string `json:"name"`
+}
+
+func (v AuthMethodTerminal) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthMethodTerminal) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthMethodTerminal) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"id\":"...)
+	b = appendString(b, string(v.ID))
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if len(v.Args) > 0 {
+		b = append(b, ",\"args\":"...)
+		b = append(b, '[')
+		for i0 := range v.Args {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.Args[i0])
+		}
+		b = append(b, ']')
+	}
+	if len(v.Env) > 0 {
+		b = append(b, ",\"env\":"...)
+		b = append(b, '{')
+		for n, k0 := range sortedKeys(v.Env) {
+			if n > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, k0)
+			b = append(b, ':')
+			item0 := v.Env[k0]
+			b = appendString(b, item0)
+		}
+		b = append(b, '}')
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AuthMethodTerminal) nullError() error {
@@ -1770,9 +2457,17 @@ func (v *AuthMethodTerminal) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "id":
+			if err := decodeValue(raw, &v.ID, false, buffered); err != nil {
+				return err
+			}
+		case "name":
+			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+				return err
+			}
+		case "description":
+			if err := decodeValue(raw, &v.Description, true, true); err != nil {
+				v.Description = nil
 			}
 		case "args":
 			if isNull(raw) {
@@ -1782,10 +2477,6 @@ func (v *AuthMethodTerminal) decodeFields(data []byte, raws rawObject, buffered 
 			}); err != nil {
 				return err
 			}
-		case "description":
-			if err := decodeValue(raw, &v.Description, true, true); err != nil {
-				v.Description = nil
-			}
 		case "env":
 			if isNull(raw) {
 				v.Env = nil
@@ -1794,13 +2485,9 @@ func (v *AuthMethodTerminal) decodeFields(data []byte, raws rawObject, buffered 
 			}); err != nil {
 				return err
 			}
-		case "id":
-			if err := decodeValue(raw, &v.ID, false, buffered); err != nil {
-				return err
-			}
-		case "name":
-			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -1923,6 +2610,29 @@ type AuthStatusCapabilities struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v AuthStatusCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthStatusCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthStatusCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*AuthStatusCapabilities) nullError() error {
 	return errors.New("invalid type: null, expected struct AuthStatusCapabilities")
 }
@@ -1986,6 +2696,29 @@ type AuthStatusRequest struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v AuthStatusRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthStatusRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthStatusRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*AuthStatusRequest) nullError() error {
 	return errors.New("invalid type: null, expected struct Wire")
 }
@@ -2039,20 +2772,58 @@ func (v *AuthStatusRequest) decodeSeq(items []json.RawMessage, buffered bool) er
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Response to the auth/status method.
 type AuthStatusResponse struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// Whether the agent can start sessions without the user signing in first.
+	// This is the only field clients should act on. Clients MUST treat values they
+	// do not recognize as unknown.
+	State AuthState `json:"state"`
 	// The accounts the agent has configured, for display.
 	// Optional. Omitted and empty are equivalent and mean no accounts are reported.
 	// Agents that hold credentials for several providers or accounts SHOULD list each
 	// of them and mark the ones in effect with active.
 	Accounts []AuthAccount `json:"accounts,omitempty"`
-	// Whether the agent can start sessions without the user signing in first.
-	// This is the only field clients should act on. Clients MUST treat values they
-	// do not recognize as unknown.
-	State AuthState `json:"state"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v AuthStatusResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthStatusResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthStatusResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"state\":"...)
+	b = appendString(b, string(v.State))
+	if len(v.Accounts) > 0 {
+		b = append(b, ",\"accounts\":"...)
+		b = append(b, '[')
+		for i0 := range v.Accounts {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.Accounts[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AuthStatusResponse) nullError() error {
@@ -2084,9 +2855,9 @@ func (v *AuthStatusResponse) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "state":
+			if err := decodeValue(raw, &v.State, false, buffered); err != nil {
+				return err
 			}
 		case "accounts":
 			if err := decodeList(raw, &v.Accounts, false, true, func(raw json.RawMessage, dst *AuthAccount) error {
@@ -2094,9 +2865,9 @@ func (v *AuthStatusResponse) decodeFields(data []byte, raws rawObject, buffered 
 			}); err != nil {
 				v.Accounts = nil
 			}
-		case "state":
-			if err := decodeValue(raw, &v.State, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -2143,20 +2914,58 @@ func (v *AuthStatusResponse) decodeSeq(items []json.RawMessage, buffered bool) e
 // auth.status capability MAY send it at any time after initialize, and SHOULD only
 // send it when the reported status differs from the last one sent on the connection.
 type AuthStatusUpdateNotification struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// Whether the agent can start sessions without the user signing in first.
+	// This is the only field clients should act on. Clients MUST treat values they
+	// do not recognize as unknown.
+	State AuthState `json:"state"`
 	// The accounts the agent has configured, for display.
 	// Optional. Omitted and empty are equivalent and mean no accounts are reported.
 	// Agents that hold credentials for several providers or accounts SHOULD list each
 	// of them and mark the ones in effect with active.
 	Accounts []AuthAccount `json:"accounts,omitempty"`
-	// Whether the agent can start sessions without the user signing in first.
-	// This is the only field clients should act on. Clients MUST treat values they
-	// do not recognize as unknown.
-	State AuthState `json:"state"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v AuthStatusUpdateNotification) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthStatusUpdateNotification) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthStatusUpdateNotification) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"state\":"...)
+	b = appendString(b, string(v.State))
+	if len(v.Accounts) > 0 {
+		b = append(b, ",\"accounts\":"...)
+		b = append(b, '[')
+		for i0 := range v.Accounts {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.Accounts[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AuthStatusUpdateNotification) nullError() error {
@@ -2190,9 +2999,9 @@ func (v *AuthStatusUpdateNotification) decodeFields(data []byte, raws rawObject,
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "state":
+			if err := decodeValue(raw, &v.State, false, buffered); err != nil {
+				return err
 			}
 		case "accounts":
 			if err := decodeList(raw, &v.Accounts, false, true, func(raw json.RawMessage, dst *AuthAccount) error {
@@ -2200,9 +3009,9 @@ func (v *AuthStatusUpdateNotification) decodeFields(data []byte, raws rawObject,
 			}); err != nil {
 				v.Accounts = nil
 			}
-		case "state":
-			if err := decodeValue(raw, &v.State, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -2245,14 +3054,39 @@ func (v *AuthStatusUpdateNotification) decodeSeq(items []json.RawMessage, buffer
 // Request parameters for the authenticate method.
 // Specifies which authentication method to use.
 type AuthenticateRequest struct {
+	// The ID of the authentication method to use.
+	// Must be one of the methods advertised in the initialize response.
+	MethodID AuthMethodId `json:"methodId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the authentication method to use.
-	// Must be one of the methods advertised in the initialize response.
-	MethodID AuthMethodId `json:"methodId"`
+}
+
+func (v AuthenticateRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthenticateRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthenticateRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"methodId\":"...)
+	b = appendString(b, string(v.MethodID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AuthenticateRequest) nullError() error {
@@ -2284,13 +3118,13 @@ func (v *AuthenticateRequest) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "methodId":
 			if err := decodeValue(raw, &v.MethodID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -2329,6 +3163,29 @@ type AuthenticateResponse struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v AuthenticateResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AuthenticateResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AuthenticateResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AuthenticateResponse) nullError() error {
@@ -2382,17 +3239,50 @@ func (v *AuthenticateResponse) decodeSeq(items []json.RawMessage, buffered bool)
 
 // Information about a command.
 type AvailableCommand struct {
+	// Command name (e.g., create_plan, research_codebase).
+	Name string `json:"name"`
+	// Human-readable description of what the command does.
+	Description string `json:"description"`
+	// Input for the command if required
+	Input *AvailableCommandInput `json:"input,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Human-readable description of what the command does.
-	Description string `json:"description"`
-	// Input for the command if required
-	Input *AvailableCommandInput `json:"input,omitempty"`
-	// Command name (e.g., create_plan, research_codebase).
-	Name string `json:"name"`
+}
+
+func (v AvailableCommand) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AvailableCommand) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AvailableCommand) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	b = append(b, ",\"description\":"...)
+	b = appendString(b, v.Description)
+	if v.Input != nil {
+		b = append(b, ",\"input\":"...)
+		if b, err = (*v.Input).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AvailableCommand) nullError() error {
@@ -2424,9 +3314,9 @@ func (v *AvailableCommand) decodeFields(data []byte, raws rawObject, buffered bo
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "name":
+			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+				return err
 			}
 		case "description":
 			if err := decodeValue(raw, &v.Description, false, buffered); err != nil {
@@ -2436,9 +3326,9 @@ func (v *AvailableCommand) decodeFields(data []byte, raws rawObject, buffered bo
 			if err := decodePtr(raw, &v.Input, true, true); err != nil {
 				v.Input = nil
 			}
-		case "name":
-			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -2492,13 +3382,47 @@ type AvailableCommandInput = UnstructuredCommandInput
 
 // Available commands are ready or have changed
 type AvailableCommandsUpdate struct {
+	// Commands the agent can execute
+	AvailableCommands []AvailableCommand `json:"availableCommands"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Commands the agent can execute
-	AvailableCommands []AvailableCommand `json:"availableCommands"`
+}
+
+func (v AvailableCommandsUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *AvailableCommandsUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *AvailableCommandsUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"availableCommands\":"...)
+	b = append(b, '[')
+	for i0 := range v.AvailableCommands {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.AvailableCommands[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*AvailableCommandsUpdate) nullError() error {
@@ -2530,15 +3454,15 @@ func (v *AvailableCommandsUpdate) decodeFields(data []byte, raws rawObject, buff
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "availableCommands":
 			if err := decodeList(raw, &v.AvailableCommands, false, true, func(raw json.RawMessage, dst *AvailableCommand) error {
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
 				v.AvailableCommands = []AvailableCommand{}
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -2574,17 +3498,48 @@ func (v *AvailableCommandsUpdate) decodeSeq(items []json.RawMessage, buffered bo
 
 // Binary resource contents.
 type BlobResourceContents struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Base64-encoded bytes for a binary resource payload.
 	Blob string `json:"blob"`
 	// MIME type describing the encoded media payload.
 	MimeType *string `json:"mimeType,omitempty"`
 	// URI associated with this resource or media payload.
 	URI string `json:"uri"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v BlobResourceContents) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *BlobResourceContents) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *BlobResourceContents) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"blob\":"...)
+	b = appendString(b, v.Blob)
+	if v.MimeType != nil {
+		b = append(b, ",\"mimeType\":"...)
+		b = appendString(b, (*v.MimeType))
+	}
+	b = append(b, ",\"uri\":"...)
+	b = appendString(b, v.URI)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*BlobResourceContents) nullError() error {
@@ -2616,10 +3571,6 @@ func (v *BlobResourceContents) decodeFields(data []byte, raws rawObject, buffere
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "blob":
 			if err := decodeValue(raw, &v.Blob, false, buffered); err != nil {
 				return err
@@ -2631,6 +3582,10 @@ func (v *BlobResourceContents) decodeFields(data []byte, raws rawObject, buffere
 		case "uri":
 			if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -2689,6 +3644,29 @@ type BooleanConfigOptionCapabilities struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v BooleanConfigOptionCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *BooleanConfigOptionCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *BooleanConfigOptionCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*BooleanConfigOptionCapabilities) nullError() error {
 	return errors.New("invalid type: null, expected struct BooleanConfigOptionCapabilities")
 }
@@ -2742,21 +3720,56 @@ func (v *BooleanConfigOptionCapabilities) decodeSeq(items []json.RawMessage, buf
 
 // Schema for boolean properties in an elicitation form.
 type BooleanPropertySchema struct {
+	// Optional title for the property.
+	// Optional. Omitted and null are equivalent and mean no title is provided.
+	Title *string `json:"title,omitempty"`
+	// Human-readable description.
+	// Optional. Omitted and null are equivalent and mean no description is provided.
+	Description *string `json:"description,omitempty"`
+	// Default value.
+	// Optional. Omitted and null are equivalent and mean no default value is provided.
+	Default *bool `json:"default,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Default value.
-	// Optional. Omitted and null are equivalent and mean no default value is provided.
-	Default *bool `json:"default,omitempty"`
-	// Human-readable description.
-	// Optional. Omitted and null are equivalent and mean no description is provided.
-	Description *string `json:"description,omitempty"`
-	// Optional title for the property.
-	// Optional. Omitted and null are equivalent and mean no title is provided.
-	Title *string `json:"title,omitempty"`
+}
+
+func (v BooleanPropertySchema) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *BooleanPropertySchema) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *BooleanPropertySchema) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, (*v.Title))
+	}
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.Default != nil {
+		b = append(b, ",\"default\":"...)
+		b = strconv.AppendBool(b, (*v.Default))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*BooleanPropertySchema) nullError() error {
@@ -2785,21 +3798,21 @@ func (v *BooleanPropertySchema) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "default":
-			if err := decodeValue(raw, &v.Default, true, true); err != nil {
-				v.Default = nil
+		case "title":
+			if err := decodeValue(raw, &v.Title, true, true); err != nil {
+				v.Title = nil
 			}
 		case "description":
 			if err := decodeValue(raw, &v.Description, true, true); err != nil {
 				v.Description = nil
 			}
-		case "title":
-			if err := decodeValue(raw, &v.Title, true, true); err != nil {
-				v.Title = nil
+		case "default":
+			if err := decodeValue(raw, &v.Default, true, true); err != nil {
+				v.Default = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -2841,13 +3854,38 @@ func (v *BooleanPropertySchema) decodeSeq(items []json.RawMessage, buffered bool
 // Notification to cancel ongoing operations for a session.
 // See protocol docs: Cancellation
 type CancelNotification struct {
+	// The ID of the session to cancel operations for.
+	SessionID SessionId `json:"sessionId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the session to cancel operations for.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v CancelNotification) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CancelNotification) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CancelNotification) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*CancelNotification) nullError() error {
@@ -2879,13 +3917,13 @@ func (v *CancelNotification) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -2920,13 +3958,40 @@ func (v *CancelNotification) decodeSeq(items []json.RawMessage, buffered bool) e
 // Notification to cancel an ongoing request.
 // See protocol docs: Cancellation
 type CancelRequestNotification struct {
+	// The ID of the request to cancel.
+	RequestID RequestId `json:"requestId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the request to cancel.
-	RequestID RequestId `json:"requestId"`
+}
+
+func (v CancelRequestNotification) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CancelRequestNotification) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CancelRequestNotification) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"requestId\":"...)
+	if b, err = appendRequestIdUnion(b, v.RequestID); err != nil {
+		return nil, err
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*CancelRequestNotification) nullError() error {
@@ -2960,13 +4025,13 @@ func (v *CancelRequestNotification) decodeFields(data []byte, raws rawObject, bu
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
+		case "requestId":
+			if err := decodeChecked(raw, &v.RequestID, true, decodeRequestIdUnion); err != nil {
+				return err
+			}
 		case "_meta":
 			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
 				v.Meta = nil
-			}
-		case "requestId":
-			if err := decodeChecked(raw, &v.RequestID, true, validRequestId); err != nil {
-				return err
 			}
 		}
 	}
@@ -2980,7 +4045,7 @@ func (v *CancelRequestNotification) decodeSeq(items []json.RawMessage, buffered 
 	*v = CancelRequestNotification{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeChecked(raw, &v.RequestID, true, validRequestId); err != nil {
+		if err := decodeChecked(raw, &v.RequestID, true, decodeRequestIdUnion); err != nil {
 			return err
 		}
 	} else {
@@ -3003,29 +4068,11 @@ func (v *CancelRequestNotification) decodeSeq(items []json.RawMessage, buffered 
 // available features and methods.
 // See protocol docs: Client Capabilities
 type ClientCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
-	// Authentication capabilities supported by the client.
-	// Determines which authentication method types the agent may include
-	// in its InitializeResponse.
-	Auth *AuthCapabilities `json:"auth,omitempty"`
-	// Elicitation capabilities supported by the client.
-	// Determines which elicitation modes the agent may use.
-	// Optional. Omitted or null both mean the client does not advertise
-	// elicitation support.
-	Elicitation *ElicitationCapabilities `json:"elicitation,omitempty"`
 	// File system capabilities supported by the client.
 	// Determines which file operations the agent can request.
 	Fs *FileSystemCapabilities `json:"fs,omitempty"`
-	// UNSTABLE
-	// This capability is not part of the spec yet, and may be removed or changed at any point.
-	// Whether the client supports plan_update and plan_removed session updates.
-	// Optional. Omitted or null both mean the client does not advertise support.
-	// Supplying {} means the client can receive both update types.
-	Plan *PlanCapabilities `json:"plan,omitempty"`
+	// Whether the Client support all terminal/* methods.
+	Terminal *bool `json:"terminal,omitempty"`
 	// Session-related capabilities supported by the client.
 	// Optional. Omitted or null both mean the client does not advertise any
 	// session-related extensions.
@@ -3038,8 +4085,95 @@ type ClientCapabilities struct {
 	// Supplying {} means the client understands child associations, work-state
 	// snapshots, session-directed messages, and restricted-session semantics.
 	Subagents *SubagentCapabilities `json:"subagents,omitempty"`
-	// Whether the Client support all terminal/* methods.
-	Terminal *bool `json:"terminal,omitempty"`
+	// UNSTABLE
+	// This capability is not part of the spec yet, and may be removed or changed at any point.
+	// Whether the client supports plan_update and plan_removed session updates.
+	// Optional. Omitted or null both mean the client does not advertise support.
+	// Supplying {} means the client can receive both update types.
+	Plan *PlanCapabilities `json:"plan,omitempty"`
+	// Authentication capabilities supported by the client.
+	// Determines which authentication method types the agent may include
+	// in its InitializeResponse.
+	Auth *AuthCapabilities `json:"auth,omitempty"`
+	// Elicitation capabilities supported by the client.
+	// Determines which elicitation modes the agent may use.
+	// Optional. Omitted or null both mean the client does not advertise
+	// elicitation support.
+	Elicitation *ElicitationCapabilities `json:"elicitation,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ClientCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ClientCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ClientCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Fs != nil {
+		b = append(b, ",\"fs\":"...)
+		if b, err = (*v.Fs).appendJSON(b); err != nil {
+			return nil, err
+		}
+	} else {
+		b = append(b, ",\"fs\":{\"readTextFile\":false,\"writeTextFile\":false}"...)
+	}
+	if v.Terminal != nil {
+		b = append(b, ",\"terminal\":"...)
+		b = strconv.AppendBool(b, (*v.Terminal))
+	} else {
+		b = append(b, ",\"terminal\":false"...)
+	}
+	if v.Session != nil {
+		b = append(b, ",\"session\":"...)
+		if b, err = (*v.Session).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Subagents != nil {
+		b = append(b, ",\"subagents\":"...)
+		if b, err = (*v.Subagents).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Plan != nil {
+		b = append(b, ",\"plan\":"...)
+		if b, err = (*v.Plan).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Auth != nil {
+		b = append(b, ",\"auth\":"...)
+		if b, err = (*v.Auth).appendJSON(b); err != nil {
+			return nil, err
+		}
+	} else {
+		b = append(b, ",\"auth\":{\"terminal\":false}"...)
+	}
+	if v.Elicitation != nil {
+		b = append(b, ",\"elicitation\":"...)
+		if b, err = (*v.Elicitation).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ClientCapabilities) nullError() error {
@@ -3068,25 +4202,13 @@ func (v *ClientCapabilities) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "auth":
-			if err := decodePtr(raw, &v.Auth, false, true); err != nil {
-				v.Auth = nil
-			}
-		case "elicitation":
-			if err := decodePtr(raw, &v.Elicitation, true, true); err != nil {
-				v.Elicitation = nil
-			}
 		case "fs":
 			if err := decodePtr(raw, &v.Fs, false, true); err != nil {
 				v.Fs = nil
 			}
-		case "plan":
-			if err := decodePtr(raw, &v.Plan, true, true); err != nil {
-				v.Plan = nil
+		case "terminal":
+			if err := decodeValue(raw, &v.Terminal, false, true); err != nil {
+				v.Terminal = nil
 			}
 		case "session":
 			if err := decodePtr(raw, &v.Session, true, true); err != nil {
@@ -3096,9 +4218,21 @@ func (v *ClientCapabilities) decodeFields(data []byte, raws rawObject, buffered 
 			if err := decodePtr(raw, &v.Subagents, true, true); err != nil {
 				v.Subagents = nil
 			}
-		case "terminal":
-			if err := decodeValue(raw, &v.Terminal, false, true); err != nil {
-				v.Terminal = nil
+		case "plan":
+			if err := decodePtr(raw, &v.Plan, true, true); err != nil {
+				v.Plan = nil
+			}
+		case "auth":
+			if err := decodePtr(raw, &v.Auth, false, true); err != nil {
+				v.Auth = nil
+			}
+		case "elicitation":
+			if err := decodePtr(raw, &v.Elicitation, true, true); err != nil {
+				v.Elicitation = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -3169,6 +4303,31 @@ type ClientNotification struct {
 	Params json.RawMessage `json:"params,omitempty"`
 }
 
+func (v ClientNotification) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ClientNotification) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ClientNotification) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"method\":"...)
+	b = appendString(b, v.Method)
+	if v.Params != nil {
+		b = append(b, ",\"params\":"...)
+		if b, err = appendRaw(b, v.Params); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*ClientNotification) nullError() error {
 	return errors.New("invalid type: null, expected struct ClientNotification")
 }
@@ -3203,7 +4362,9 @@ func (v *ClientNotification) decodeFields(data []byte, raws rawObject, buffered 
 				return err
 			}
 		case "params":
-			if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			if isNull(raw) {
+				v.Params = nil
+			} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 				return err
 			}
 		}
@@ -3226,7 +4387,9 @@ func (v *ClientNotification) decodeSeq(items []json.RawMessage, buffered bool) e
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+		if isNull(raw) {
+			v.Params = nil
+		} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 			return err
 		}
 	}
@@ -3244,6 +4407,35 @@ type ClientRequest struct {
 	Method string `json:"method"`
 	// Method-specific request parameters.
 	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (v ClientRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ClientRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ClientRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"id\":"...)
+	if b, err = appendRequestIdUnion(b, v.ID); err != nil {
+		return nil, err
+	}
+	b = append(b, ",\"method\":"...)
+	b = appendString(b, v.Method)
+	if v.Params != nil {
+		b = append(b, ",\"params\":"...)
+		if b, err = appendRaw(b, v.Params); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ClientRequest) nullError() error {
@@ -3276,7 +4468,7 @@ func (v *ClientRequest) decodeFields(data []byte, raws rawObject, buffered bool)
 		raw := m.raw
 		switch string(m.key) {
 		case "id":
-			if err := decodeChecked(raw, &v.ID, true, validRequestId); err != nil {
+			if err := decodeChecked(raw, &v.ID, true, decodeRequestIdUnion); err != nil {
 				return err
 			}
 		case "method":
@@ -3284,7 +4476,9 @@ func (v *ClientRequest) decodeFields(data []byte, raws rawObject, buffered bool)
 				return err
 			}
 		case "params":
-			if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			if isNull(raw) {
+				v.Params = nil
+			} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 				return err
 			}
 		}
@@ -3302,7 +4496,7 @@ func (v *ClientRequest) decodeSeq(items []json.RawMessage, buffered bool) error 
 	*v = ClientRequest{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeChecked(raw, &v.ID, true, validRequestId); err != nil {
+		if err := decodeChecked(raw, &v.ID, true, decodeRequestIdUnion); err != nil {
 			return err
 		}
 	} else {
@@ -3318,7 +4512,9 @@ func (v *ClientRequest) decodeSeq(items []json.RawMessage, buffered bool) error 
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+		if isNull(raw) {
+			v.Params = nil
+		} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 			return err
 		}
 	}
@@ -3330,11 +4526,6 @@ func (v *ClientRequest) decodeSeq(items []json.RawMessage, buffered bool) error 
 
 // Session-related capabilities supported by the client.
 type ClientSessionCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Support for ID-addressed context compaction updates. Omitted or null
 	// means unsupported. {} advertises the complete compaction contract.
 	Compaction *CompactionCapabilities `json:"compaction,omitempty"`
@@ -3346,6 +4537,52 @@ type ClientSessionCapabilities struct {
 	// Optional. Omitted or null both mean the client does not advertise support.
 	// Supplying {} means the client can present notices to the user.
 	Notices *NoticeCapabilities `json:"notices,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ClientSessionCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ClientSessionCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ClientSessionCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Compaction != nil {
+		b = append(b, ",\"compaction\":"...)
+		if b, err = (*v.Compaction).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.ConfigOptions != nil {
+		b = append(b, ",\"configOptions\":"...)
+		if b, err = (*v.ConfigOptions).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Notices != nil {
+		b = append(b, ",\"notices\":"...)
+		if b, err = (*v.Notices).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ClientSessionCapabilities) nullError() error {
@@ -3376,10 +4613,6 @@ func (v *ClientSessionCapabilities) decodeFields(data []byte, raws rawObject, bu
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "compaction":
 			if err := decodeValue(raw, &v.Compaction, true, true); err != nil {
 				v.Compaction = nil
@@ -3391,6 +4624,10 @@ func (v *ClientSessionCapabilities) decodeFields(data []byte, raws rawObject, bu
 		case "notices":
 			if err := decodeValue(raw, &v.Notices, true, true); err != nil {
 				v.Notices = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -3435,13 +4672,38 @@ func (v *ClientSessionCapabilities) decodeSeq(items []json.RawMessage, buffered 
 // associated with the session.
 // Only available if the Agent supports the sessionCapabilities.close capability.
 type CloseSessionRequest struct {
+	// The ID of the session to close.
+	SessionID SessionId `json:"sessionId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the session to close.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v CloseSessionRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CloseSessionRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CloseSessionRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*CloseSessionRequest) nullError() error {
@@ -3473,13 +4735,13 @@ func (v *CloseSessionRequest) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -3518,6 +4780,29 @@ type CloseSessionResponse struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v CloseSessionResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CloseSessionResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CloseSessionResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*CloseSessionResponse) nullError() error {
@@ -3573,6 +4858,23 @@ func (v *CloseSessionResponse) decodeSeq(items []json.RawMessage, buffered bool)
 type CompactionCapabilities struct {
 }
 
+func (v CompactionCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CompactionCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CompactionCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	return b, nil
+}
+
 // Unique identifier for a context compaction within a session.
 type CompactionId string
 
@@ -3620,12 +4922,41 @@ func (v *CompactionStatus) decodeJSON(data []byte, _ bool) error { return v.Unma
 // Agents MUST only send this update when the Client advertised
 // the session.compaction Client capability.
 type CompactionSummaryChunk struct {
-	// Metadata scoped to this chunk. Omission and null both mean absent.
-	Meta Meta `json:"_meta,omitempty"`
 	// ID of the compaction whose summary receives this content.
 	CompactionID CompactionId `json:"compactionId"`
 	// One content block to append.
 	Content ContentBlock `json:"content"`
+	// Metadata scoped to this chunk. Omission and null both mean absent.
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v CompactionSummaryChunk) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CompactionSummaryChunk) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CompactionSummaryChunk) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"compactionId\":"...)
+	b = appendString(b, string(v.CompactionID))
+	b = append(b, ",\"content\":"...)
+	if b, err = v.Content.appendJSON(b); err != nil {
+		return nil, err
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*CompactionSummaryChunk) nullError() error {
@@ -3657,10 +4988,6 @@ func (v *CompactionSummaryChunk) decodeFields(data []byte, raws rawObject, buffe
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "compactionId":
 			if err := decodeValue(raw, &v.CompactionID, false, buffered); err != nil {
 				return err
@@ -3668,6 +4995,10 @@ func (v *CompactionSummaryChunk) decodeFields(data []byte, raws rawObject, buffe
 		case "content":
 			if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -3718,16 +5049,69 @@ func (v *CompactionSummaryChunk) decodeSeq(items []json.RawMessage, buffered boo
 // stored value unchanged, null clears it, and a concrete value replaces it.
 // summary: [] also clears the summary.
 type CompactionUpdate struct {
-	// Extensible metadata patch for this compaction.
-	Meta Nullable[Meta] `json:"_meta,omitzero"`
 	// The Agent-owned ID of this compaction, unique within the session.
 	CompactionID CompactionId `json:"compactionId"`
-	// Human-readable error details for the compaction.
-	Error Nullable[string] `json:"error,omitzero"`
 	// Current lifecycle status.
 	Status CompactionStatus `json:"status"`
 	// Complete replacement user-displayable summary content for the compaction.
 	Summary Nullable[[]ContentBlock] `json:"summary,omitzero"`
+	// Human-readable error details for the compaction.
+	Error Nullable[string] `json:"error,omitzero"`
+	// Extensible metadata patch for this compaction.
+	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v CompactionUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CompactionUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CompactionUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"compactionId\":"...)
+	b = appendString(b, string(v.CompactionID))
+	b = append(b, ",\"status\":"...)
+	b = appendString(b, string(v.Status))
+	switch {
+	case v.Summary.Set && !v.Summary.Null:
+		b = append(b, ",\"summary\":"...)
+		b = append(b, '[')
+		for i0 := range v.Summary.Value {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.Summary.Value[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	case v.Summary.Set && v.Summary.Null:
+		b = append(b, ",\"summary\":null"...)
+	}
+	switch {
+	case v.Error.Set && !v.Error.Null:
+		b = append(b, ",\"error\":"...)
+		b = appendString(b, v.Error.Value)
+	case v.Error.Set && v.Error.Null:
+		b = append(b, ",\"error\":null"...)
+	}
+	switch {
+	case v.Meta.Set && !v.Meta.Null:
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta.Value); err != nil {
+			return nil, err
+		}
+	case v.Meta.Set && v.Meta.Null:
+		b = append(b, ",\"_meta\":null"...)
+	}
+	return b, nil
 }
 
 func (*CompactionUpdate) nullError() error {
@@ -3759,21 +5143,9 @@ func (v *CompactionUpdate) decodeFields(data []byte, raws rawObject, buffered bo
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
-				return decodeValue(raw, dst, false, true)
-			}); err != nil {
-				v.Meta = Nullable[Meta]{}
-			}
 		case "compactionId":
 			if err := decodeValue(raw, &v.CompactionID, false, buffered); err != nil {
 				return err
-			}
-		case "error":
-			if err := decodeNullable(raw, &v.Error, func(raw json.RawMessage, dst *string) error {
-				return decodeValue(raw, dst, false, true)
-			}); err != nil {
-				v.Error = Nullable[string]{}
 			}
 		case "status":
 			if err := decodeValue(raw, &v.Status, false, buffered); err != nil {
@@ -3786,6 +5158,18 @@ func (v *CompactionUpdate) decodeFields(data []byte, raws rawObject, buffered bo
 				})
 			}); err != nil {
 				v.Summary = Nullable[[]ContentBlock]{}
+			}
+		case "error":
+			if err := decodeNullable(raw, &v.Error, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, true)
+			}); err != nil {
+				v.Error = Nullable[string]{}
+			}
+		case "_meta":
+			if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+				return decodeValue(raw, dst, false, true)
+			}); err != nil {
+				v.Meta = Nullable[Meta]{}
 			}
 		}
 	}
@@ -3850,14 +5234,39 @@ func (v *CompactionUpdate) decodeSeq(items []json.RawMessage, buffered bool) err
 
 // Notification sent by the agent when a URL-based elicitation is complete.
 type CompleteElicitationNotification struct {
+	// The ID of the elicitation that completed.
+	ElicitationID ElicitationId `json:"elicitationId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the elicitation that completed.
-	ElicitationID ElicitationId `json:"elicitationId"`
+}
+
+func (v CompleteElicitationNotification) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CompleteElicitationNotification) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CompleteElicitationNotification) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"elicitationId\":"...)
+	b = appendString(b, string(v.ElicitationID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*CompleteElicitationNotification) nullError() error {
@@ -3891,13 +5300,13 @@ func (v *CompleteElicitationNotification) decodeFields(data []byte, raws rawObje
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "elicitationId":
 			if err := decodeValue(raw, &v.ElicitationID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -3931,13 +5340,47 @@ func (v *CompleteElicitationNotification) decodeSeq(items []json.RawMessage, buf
 
 // Session configuration options have been updated.
 type ConfigOptionUpdate struct {
+	// The full set of configuration options and their current values.
+	ConfigOptions []SessionConfigOption `json:"configOptions"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The full set of configuration options and their current values.
-	ConfigOptions []SessionConfigOption `json:"configOptions"`
+}
+
+func (v ConfigOptionUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ConfigOptionUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ConfigOptionUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"configOptions\":"...)
+	b = append(b, '[')
+	for i0 := range v.ConfigOptions {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.ConfigOptions[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ConfigOptionUpdate) nullError() error {
@@ -3969,15 +5412,15 @@ func (v *ConfigOptionUpdate) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "configOptions":
 			if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
 				v.ConfigOptions = []SessionConfigOption{}
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -4013,13 +5456,40 @@ func (v *ConfigOptionUpdate) decodeSeq(items []json.RawMessage, buffered bool) e
 
 // Standard content block (text, images, resources).
 type Content struct {
+	// The actual content block.
+	Content ContentBlock `json:"content"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The actual content block.
-	Content ContentBlock `json:"content"`
+}
+
+func (v Content) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *Content) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *Content) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"content\":"...)
+	if b, err = v.Content.appendJSON(b); err != nil {
+		return nil, err
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*Content) nullError() error { return errors.New("invalid type: null, expected struct Content") }
@@ -4049,13 +5519,13 @@ func (v *Content) decodeFields(data []byte, raws rawObject, buffered bool) error
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "content":
 			if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -4117,8 +5587,18 @@ type ContentBlock struct {
 	Resource     *EmbeddedResource `json:"-"`
 }
 
-func (v ContentBlock) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v ContentBlock) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ContentBlock) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ContentBlock) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Text != nil {
 		set++
@@ -4138,97 +5618,36 @@ func (v ContentBlock) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "ContentBlock", set)
 	}
-	if v.Text != nil {
-		if tag, err := json.Marshal("text"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Text)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Text != nil:
+		b = append(b, ",\"type\":\"text\""...)
+		if b, err = v.Text.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ContentBlock payload: %w", err)
+	case v.Image != nil:
+		b = append(b, ",\"type\":\"image\""...)
+		if b, err = v.Image.appendMembers(b); err != nil {
+			return nil, err
 		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.Audio != nil:
+		b = append(b, ",\"type\":\"audio\""...)
+		if b, err = v.Audio.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.ResourceLink != nil:
+		b = append(b, ",\"type\":\"resource_link\""...)
+		if b, err = v.ResourceLink.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.Resource != nil:
+		b = append(b, ",\"type\":\"resource\""...)
+		if b, err = v.Resource.appendMembers(b); err != nil {
+			return nil, err
 		}
 	}
-	if v.Image != nil {
-		if tag, err := json.Marshal("image"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Image)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ContentBlock payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Audio != nil {
-		if tag, err := json.Marshal("audio"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Audio)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ContentBlock payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.ResourceLink != nil {
-		if tag, err := json.Marshal("resource_link"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.ResourceLink)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ContentBlock payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Resource != nil {
-		if tag, err := json.Marshal("resource"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Resource)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ContentBlock payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var contentBlockTags = []string{"text", "image", "audio", "resource_link", "resource"}
@@ -4366,17 +5785,48 @@ func (v *ContentBlock) decodeSeq(items []json.RawMessage, buffered bool) error {
 
 // A streamed item of content
 type ContentChunk struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// A single item of content
 	Content ContentBlock `json:"content"`
 	// A unique identifier for the message this chunk belongs to.
 	// All chunks belonging to the same message share the same messageId.
 	// A change in messageId indicates a new message has started.
 	MessageID *MessageId `json:"messageId,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ContentChunk) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ContentChunk) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ContentChunk) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"content\":"...)
+	if b, err = v.Content.appendJSON(b); err != nil {
+		return nil, err
+	}
+	if v.MessageID != nil {
+		b = append(b, ",\"messageId\":"...)
+		b = appendString(b, string((*v.MessageID)))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ContentChunk) nullError() error {
@@ -4408,10 +5858,6 @@ func (v *ContentChunk) decodeFields(data []byte, raws rawObject, buffered bool) 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "content":
 			if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
 				return err
@@ -4419,6 +5865,10 @@ func (v *ContentChunk) decodeFields(data []byte, raws rawObject, buffered bool) 
 		case "messageId":
 			if err := decodeValue(raw, &v.MessageID, true, true); err != nil {
 				v.MessageID = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -4458,16 +5908,43 @@ func (v *ContentChunk) decodeSeq(items []json.RawMessage, buffered bool) error {
 
 // Cost information for a session.
 type Cost struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Total cumulative cost for session.
 	Amount float64 `json:"amount"`
 	// Unit of amount: an ISO 4217 currency code (e.g., "USD", "EUR") for money, or another
 	// unit such as "credits".
 	Currency string `json:"currency"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v Cost) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *Cost) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *Cost) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"amount\":"...)
+	b = appendFloat(b, float64(v.Amount))
+	b = append(b, ",\"currency\":"...)
+	b = appendString(b, v.Currency)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*Cost) nullError() error { return errors.New("invalid type: null, expected struct Cost") }
@@ -4497,17 +5974,17 @@ func (v *Cost) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "amount":
-			if err := decodeValue(raw, &v.Amount, false, buffered); err != nil {
+			if err := decodeFloat(raw, &v.Amount, false); err != nil {
 				return err
 			}
 		case "currency":
 			if err := decodeValue(raw, &v.Currency, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -4524,7 +6001,7 @@ func (v *Cost) decodeSeq(items []json.RawMessage, buffered bool) error {
 	*v = Cost{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Amount, false, buffered); err != nil {
+		if err := decodeFloat(raw, &v.Amount, false); err != nil {
 			return err
 		}
 	} else {
@@ -4566,17 +6043,17 @@ const (
 // derived from the payload on encode; setting it by hand has no effect.
 type CreateElicitationRequest struct {
 	Kind CreateElicitationRequestKind `json:"-"`
+	// A human-readable message describing what input is needed.
+	Message string `json:"message"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
-	// A human-readable message describing what input is needed.
-	Message string                         `json:"message"`
-	Form    *ElicitationFormMode           `json:"-"`
-	URL     *ElicitationUrlMode            `json:"-"`
-	Other   *CreateElicitationRequestOther `json:"-"`
+	Meta  Meta                           `json:"_meta,omitempty"`
+	Form  *ElicitationFormMode           `json:"-"`
+	URL   *ElicitationUrlMode            `json:"-"`
+	Other *CreateElicitationRequestOther `json:"-"`
 }
 
 // CreateElicitationRequestOther preserves an unrecognized CreateElicitationRequest payload verbatim.
@@ -4584,18 +6061,18 @@ type CreateElicitationRequestOther struct{ Raw json.RawMessage }
 
 func (v CreateElicitationRequestOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }
 
-// createElicitationRequestShadow mirrors CreateElicitationRequest without its union methods, for encoding common fields.
-type createElicitationRequestShadow CreateElicitationRequest
+func (v CreateElicitationRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
 
-func (v CreateElicitationRequest) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
-	if common, err := json.Marshal(createElicitationRequestShadow(v)); err != nil {
+func (v *CreateElicitationRequest) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
 		return nil, err
-	} else if len(common) > 2 {
-		if err := json.Unmarshal(common, &obj); err != nil {
-			return nil, err
-		}
 	}
+	return closeObject(b, start), nil
+}
+
+func (v *CreateElicitationRequest) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Form != nil {
 		set++
@@ -4609,46 +6086,33 @@ func (v CreateElicitationRequest) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "CreateElicitationRequest", set)
 	}
-	if v.Form != nil {
-		if tag, err := json.Marshal("form"); err != nil {
-			return nil, err
-		} else {
-			obj["mode"] = tag
-		}
-		payload, err := json.Marshal(v.Form)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Form != nil:
+		b = append(b, ",\"mode\":\"form\""...)
+		if b, err = v.Form.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("CreateElicitationRequest payload: %w", err)
+	case v.URL != nil:
+		b = append(b, ",\"mode\":\"url\""...)
+		if b, err = v.URL.appendMembers(b); err != nil {
+			return nil, err
 		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.Other != nil:
+		if b, err = appendOpenMembers(b, v.Other.Raw, "mode", nil, [][]string{{"sessionId", "toolCallId?"}, {"requestId"}}, []string{"message", "_meta"}); err != nil {
+			return nil, err
 		}
 	}
-	if v.URL != nil {
-		if tag, err := json.Marshal("url"); err != nil {
-			return nil, err
-		} else {
-			obj["mode"] = tag
-		}
-		payload, err := json.Marshal(v.URL)
-		if err != nil {
+	b = append(b, ",\"message\":"...)
+	b = appendString(b, v.Message)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("CreateElicitationRequest payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
 	}
-	if v.Other != nil {
-		return v.Other.Raw, nil
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var createElicitationRequestTags = []string{"form", "url"}
@@ -4675,13 +6139,13 @@ func (v *CreateElicitationRequest) decodeFields(data []byte, raws rawObject, buf
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "message":
 			if err := decodeValue(raw, &v.Message, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -4764,21 +6228,55 @@ func (v CreateElicitationResponseOther) MarshalJSON() ([]byte, error) { return v
 type CreateElicitationResponseDecline struct {
 }
 
+func (v CreateElicitationResponseDecline) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CreateElicitationResponseDecline) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CreateElicitationResponseDecline) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	return b, nil
+}
+
 type CreateElicitationResponseCancel struct {
 }
 
-// createElicitationResponseShadow mirrors CreateElicitationResponse without its union methods, for encoding common fields.
-type createElicitationResponseShadow CreateElicitationResponse
+func (v CreateElicitationResponseCancel) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
 
-func (v CreateElicitationResponse) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
-	if common, err := json.Marshal(createElicitationResponseShadow(v)); err != nil {
+func (v *CreateElicitationResponseCancel) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
 		return nil, err
-	} else if len(common) > 2 {
-		if err := json.Unmarshal(common, &obj); err != nil {
-			return nil, err
-		}
 	}
+	return closeObject(b, start), nil
+}
+
+func (v *CreateElicitationResponseCancel) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	return b, nil
+}
+
+func (v CreateElicitationResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CreateElicitationResponse) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CreateElicitationResponse) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Accept != nil {
 		set++
@@ -4795,64 +6293,36 @@ func (v CreateElicitationResponse) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "CreateElicitationResponse", set)
 	}
-	if v.Accept != nil {
-		if tag, err := json.Marshal("accept"); err != nil {
-			return nil, err
-		} else {
-			obj["action"] = tag
-		}
-		payload, err := json.Marshal(v.Accept)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Accept != nil:
+		b = append(b, ",\"action\":\"accept\""...)
+		if b, err = v.Accept.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("CreateElicitationResponse payload: %w", err)
+	case v.Decline != nil:
+		b = append(b, ",\"action\":\"decline\""...)
+		if b, err = v.Decline.appendMembers(b); err != nil {
+			return nil, err
 		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.Cancel != nil:
+		b = append(b, ",\"action\":\"cancel\""...)
+		if b, err = v.Cancel.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.Other != nil:
+		if b, err = appendOpenMembers(b, v.Other.Raw, "action", nil, nil, []string{"_meta"}); err != nil {
+			return nil, err
 		}
 	}
-	if v.Decline != nil {
-		if tag, err := json.Marshal("decline"); err != nil {
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
 			return nil, err
-		} else {
-			obj["action"] = tag
-		}
-		payload, err := json.Marshal(v.Decline)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("CreateElicitationResponse payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
 		}
 	}
-	if v.Cancel != nil {
-		if tag, err := json.Marshal("cancel"); err != nil {
-			return nil, err
-		} else {
-			obj["action"] = tag
-		}
-		payload, err := json.Marshal(v.Cancel)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("CreateElicitationResponse payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Other != nil {
-		return v.Other.Raw, nil
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var createElicitationResponseTags = []string{"accept", "decline", "cancel"}
@@ -4924,19 +6394,16 @@ func (v *CreateElicitationResponse) decodeFields(data []byte, raws rawObject, bu
 
 // Request to create a new terminal and execute a command.
 type CreateTerminalRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
-	// Array of command arguments.
-	Args []string `json:"args,omitempty"`
+	// The session ID for this request.
+	SessionID SessionId `json:"sessionId"`
 	// The command to execute.
 	Command string `json:"command"`
-	// Working directory for the command. Must be an absolute path.
-	Cwd *string `json:"cwd,omitempty"`
+	// Array of command arguments.
+	Args []string `json:"args,omitempty"`
 	// Environment variables for the command.
 	Env []EnvVariable `json:"env,omitempty"`
+	// Working directory for the command. Must be an absolute path.
+	Cwd *string `json:"cwd,omitempty"`
 	// Maximum number of output bytes to retain.
 	// When the limit is exceeded, the Client truncates from the beginning of the output
 	// to stay within the limit.
@@ -4944,8 +6411,70 @@ type CreateTerminalRequest struct {
 	// string output, even if this means the retained output is slightly less than the
 	// specified limit.
 	OutputByteLimit *uint64 `json:"outputByteLimit,omitempty"`
-	// The session ID for this request.
-	SessionID SessionId `json:"sessionId"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v CreateTerminalRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CreateTerminalRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CreateTerminalRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"command\":"...)
+	b = appendString(b, v.Command)
+	if len(v.Args) > 0 {
+		b = append(b, ",\"args\":"...)
+		b = append(b, '[')
+		for i0 := range v.Args {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.Args[i0])
+		}
+		b = append(b, ']')
+	}
+	if len(v.Env) > 0 {
+		b = append(b, ",\"env\":"...)
+		b = append(b, '[')
+		for i0 := range v.Env {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.Env[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.Cwd != nil {
+		b = append(b, ",\"cwd\":"...)
+		b = appendString(b, (*v.Cwd))
+	}
+	if v.OutputByteLimit != nil {
+		b = append(b, ",\"outputByteLimit\":"...)
+		b = strconv.AppendUint(b, uint64((*v.OutputByteLimit)), 10)
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*CreateTerminalRequest) nullError() error {
@@ -4977,9 +6506,13 @@ func (v *CreateTerminalRequest) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+				return err
+			}
+		case "command":
+			if err := decodeValue(raw, &v.Command, false, buffered); err != nil {
+				return err
 			}
 		case "args":
 			if isNull(raw) {
@@ -4987,14 +6520,6 @@ func (v *CreateTerminalRequest) decodeFields(data []byte, raws rawObject, buffer
 			} else if err := decodeList(raw, &v.Args, false, false, func(raw json.RawMessage, dst *string) error {
 				return decodeValue(raw, dst, false, buffered)
 			}); err != nil {
-				return err
-			}
-		case "command":
-			if err := decodeValue(raw, &v.Command, false, buffered); err != nil {
-				return err
-			}
-		case "cwd":
-			if err := decodePath(raw, &v.Cwd, true); err != nil {
 				return err
 			}
 		case "env":
@@ -5005,13 +6530,17 @@ func (v *CreateTerminalRequest) decodeFields(data []byte, raws rawObject, buffer
 			}); err != nil {
 				return err
 			}
+		case "cwd":
+			if err := decodePath(raw, &v.Cwd, true); err != nil {
+				return err
+			}
 		case "outputByteLimit":
 			if err := decodeValue(raw, &v.OutputByteLimit, true, buffered); err != nil {
 				return err
 			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -5088,13 +6617,38 @@ func (v *CreateTerminalRequest) decodeSeq(items []json.RawMessage, buffered bool
 
 // Response containing the ID of the created terminal.
 type CreateTerminalResponse struct {
+	// The unique identifier for the created terminal.
+	TerminalID TerminalId `json:"terminalId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The unique identifier for the created terminal.
-	TerminalID TerminalId `json:"terminalId"`
+}
+
+func (v CreateTerminalResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CreateTerminalResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CreateTerminalResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"terminalId\":"...)
+	b = appendString(b, string(v.TerminalID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*CreateTerminalResponse) nullError() error {
@@ -5126,13 +6680,13 @@ func (v *CreateTerminalResponse) decodeFields(data []byte, raws rawObject, buffe
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "terminalId":
 			if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -5167,13 +6721,38 @@ func (v *CreateTerminalResponse) decodeSeq(items []json.RawMessage, buffered boo
 // The current mode of the session has changed
 // See protocol docs: Session Modes
 type CurrentModeUpdate struct {
+	// The ID of the current mode
+	CurrentModeID SessionModeId `json:"currentModeId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the current mode
-	CurrentModeID SessionModeId `json:"currentModeId"`
+}
+
+func (v CurrentModeUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *CurrentModeUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *CurrentModeUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"currentModeId\":"...)
+	b = appendString(b, string(v.CurrentModeID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*CurrentModeUpdate) nullError() error {
@@ -5205,13 +6784,13 @@ func (v *CurrentModeUpdate) decodeFields(data []byte, raws rawObject, buffered b
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "currentModeId":
 			if err := decodeValue(raw, &v.CurrentModeID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -5246,13 +6825,38 @@ func (v *CurrentModeUpdate) decodeSeq(items []json.RawMessage, buffered bool) er
 // Request parameters for deleting an existing session from session/list.
 // Only available if the Agent supports the sessionCapabilities.delete capability.
 type DeleteSessionRequest struct {
+	// The ID of the session to delete.
+	SessionID SessionId `json:"sessionId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the session to delete.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v DeleteSessionRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *DeleteSessionRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *DeleteSessionRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*DeleteSessionRequest) nullError() error {
@@ -5284,13 +6888,13 @@ func (v *DeleteSessionRequest) decodeFields(data []byte, raws rawObject, buffere
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -5329,6 +6933,29 @@ type DeleteSessionResponse struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v DeleteSessionResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *DeleteSessionResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *DeleteSessionResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*DeleteSessionResponse) nullError() error {
@@ -5384,17 +7011,48 @@ func (v *DeleteSessionResponse) decodeSeq(items []json.RawMessage, buffered bool
 // Shows changes to files in a format suitable for display in the client UI.
 // See protocol docs: Content
 type Diff struct {
+	// The absolute file path being modified.
+	Path string `json:"path"`
+	// The original content (omitted or null for new files).
+	OldText *string `json:"oldText,omitempty"`
+	// The new content after modification.
+	NewText string `json:"newText"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The new content after modification.
-	NewText string `json:"newText"`
-	// The original content (omitted or null for new files).
-	OldText *string `json:"oldText,omitempty"`
-	// The absolute file path being modified.
-	Path string `json:"path"`
+}
+
+func (v Diff) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *Diff) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *Diff) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"path\":"...)
+	b = appendString(b, v.Path)
+	if v.OldText != nil {
+		b = append(b, ",\"oldText\":"...)
+		b = appendString(b, (*v.OldText))
+	}
+	b = append(b, ",\"newText\":"...)
+	b = appendString(b, v.NewText)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*Diff) nullError() error { return errors.New("invalid type: null, expected struct Diff") }
@@ -5424,21 +7082,21 @@ func (v *Diff) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "newText":
-			if err := decodeValue(raw, &v.NewText, false, buffered); err != nil {
+		case "path":
+			if err := decodePath(raw, &v.Path, false); err != nil {
 				return err
 			}
 		case "oldText":
 			if err := decodeValue(raw, &v.OldText, true, true); err != nil {
 				v.OldText = nil
 			}
-		case "path":
-			if err := decodePath(raw, &v.Path, false); err != nil {
+		case "newText":
+			if err := decodeValue(raw, &v.NewText, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -5491,13 +7149,38 @@ func (v *Diff) decodeSeq(items []json.RawMessage, buffered bool) error {
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Request parameters for providers/disable.
 type DisableProviderRequest struct {
+	// Provider ID to disable.
+	ProviderID ProviderId `json:"providerId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Provider ID to disable.
-	ProviderID ProviderId `json:"providerId"`
+}
+
+func (v DisableProviderRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *DisableProviderRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *DisableProviderRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"providerId\":"...)
+	b = appendString(b, string(v.ProviderID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*DisableProviderRequest) nullError() error {
@@ -5529,13 +7212,13 @@ func (v *DisableProviderRequest) decodeFields(data []byte, raws rawObject, buffe
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "providerId":
 			if err := decodeValue(raw, &v.ProviderID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -5576,6 +7259,29 @@ type DisableProviderResponse struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v DisableProviderResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *DisableProviderResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *DisableProviderResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*DisableProviderResponse) nullError() error {
@@ -5633,6 +7339,39 @@ type ElicitationAcceptAction struct {
 	Content map[string]ElicitationContentValue `json:"content,omitempty"`
 }
 
+func (v ElicitationAcceptAction) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ElicitationAcceptAction) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ElicitationAcceptAction) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Content != nil {
+		b = append(b, ",\"content\":"...)
+		b = append(b, '{')
+		for n, k0 := range sortedKeys(v.Content) {
+			if n > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, k0)
+			b = append(b, ':')
+			item0 := v.Content[k0]
+			if b, err = appendElicitationContentValueUnion(b, item0); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, '}')
+	}
+	return b, nil
+}
+
 func (*ElicitationAcceptAction) nullError() error {
 	return errors.New("invalid type: null, expected struct ElicitationAcceptAction")
 }
@@ -5661,7 +7400,7 @@ func (v *ElicitationAcceptAction) decodeFields(data []byte, raws rawObject, buff
 		switch string(m.key) {
 		case "content":
 			if err := decodeMap(raw, &v.Content, true, func(raw json.RawMessage, dst *ElicitationContentValue) error {
-				return decodeChecked(raw, dst, false, validElicitationContentValue)
+				return decodeChecked(raw, dst, false, decodeElicitationContentValueUnion)
 			}); err != nil {
 				return err
 			}
@@ -5675,7 +7414,7 @@ func (v *ElicitationAcceptAction) decodeSeq(items []json.RawMessage, buffered bo
 	if len(items) > 0 {
 		raw := items[0]
 		if err := decodeMap(raw, &v.Content, true, func(raw json.RawMessage, dst *ElicitationContentValue) error {
-			return decodeChecked(raw, dst, false, validElicitationContentValue)
+			return decodeChecked(raw, dst, false, decodeElicitationContentValueUnion)
 		}); err != nil {
 			return err
 		}
@@ -5688,12 +7427,6 @@ func (v *ElicitationAcceptAction) decodeSeq(items []json.RawMessage, buffered bo
 
 // Elicitation capabilities supported by the client.
 type ElicitationCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// Optional. Omitted and null are equivalent and mean no metadata.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Whether the client supports form-based elicitation.
 	// Optional. Omitted and null are equivalent and mean form support is not advertised.
 	// Supplying {} explicitly advertises form support.
@@ -5702,6 +7435,47 @@ type ElicitationCapabilities struct {
 	// Optional. Omitted or null both mean the client does not advertise support.
 	// Supplying {} means the client supports URL-based elicitation.
 	URL *ElicitationUrlCapabilities `json:"url,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// Optional. Omitted and null are equivalent and mean no metadata.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ElicitationCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ElicitationCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ElicitationCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Form != nil {
+		b = append(b, ",\"form\":"...)
+		if b, err = (*v.Form).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.URL != nil {
+		b = append(b, ",\"url\":"...)
+		if b, err = (*v.URL).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ElicitationCapabilities) nullError() error {
@@ -5730,10 +7504,6 @@ func (v *ElicitationCapabilities) decodeFields(data []byte, raws rawObject, buff
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "form":
 			if err := decodePtr(raw, &v.Form, true, true); err != nil {
 				v.Form = nil
@@ -5741,6 +7511,10 @@ func (v *ElicitationCapabilities) decodeFields(data []byte, raws rawObject, buff
 		case "url":
 			if err := decodePtr(raw, &v.URL, true, true); err != nil {
 				v.URL = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -5776,26 +7550,72 @@ func (v *ElicitationCapabilities) decodeSeq(items []json.RawMessage, buffered bo
 // Allowed wire representations for ElicitationContentValue.
 type ElicitationContentValue any
 
-// validElicitationContentValue reports whether raw matches an arm of ElicitationContentValue.
-func validElicitationContentValue(raw json.RawMessage) error {
+// decodeElicitationContentValueUnion decodes raw as the first arm of ElicitationContentValue it matches, as serde
+// decodes an untagged enum: a string, an integer of the arm's type, a float64,
+// a bool, nil for null, a list of the arm's item type, or the raw JSON of an
+// unconstrained arm.
+func decodeElicitationContentValueUnion(raw json.RawMessage) (ElicitationContentValue, error) {
 	if jsonKind(raw) == '"' {
-		return nil
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, err
+		}
+		return value, nil
 	}
-	if !isNull(raw) && json.Unmarshal(raw, new(int64)) == nil {
-		return nil
+	if value := new(int64); !isNull(raw) && !isNegativeZero(raw) && json.Unmarshal(raw, value) == nil {
+		return *value, nil
 	}
-	if jsonKind(raw) == '-' || (jsonKind(raw) >= '0' && jsonKind(raw) <= '9') {
-		return nil
+	if kind := jsonKind(raw); kind == '-' || (kind >= '0' && kind <= '9') {
+		var value float64
+		if err := decodeFloat(raw, &value, false); err != nil {
+			return nil, err
+		}
+		return value, nil
 	}
 	if string(raw) == "true" || string(raw) == "false" {
-		return nil
+		return string(raw) == "true", nil
 	}
-	if decodeList(raw, new([]string), false, false, func(raw json.RawMessage, dst *string) error {
+	if value := []string(nil); decodeList(raw, &value, false, false, func(raw json.RawMessage, dst *string) error {
 		return decodeValue(raw, dst, false, true)
 	}) == nil {
-		return nil
+		return value, nil
 	}
-	return errors.New("data did not match any variant of untagged enum ElicitationContentValue")
+	return nil, errors.New("data did not match any variant of untagged enum ElicitationContentValue")
+}
+
+// appendElicitationContentValueUnion writes a ElicitationContentValue value as the Rust arm holding it.
+func appendElicitationContentValueUnion(b []byte, v ElicitationContentValue) ([]byte, error) {
+	var err error
+	_ = err
+	switch x := v.(type) {
+	case nil:
+		return append(b, "null"...), nil
+	case json.RawMessage:
+		return appendRaw(b, x)
+	case string:
+		b = appendString(b, x)
+		return b, nil
+	case int64:
+		b = strconv.AppendInt(b, int64(x), 10)
+		return b, nil
+	case float64:
+		b = appendFloat(b, float64(x))
+		return b, nil
+	case bool:
+		b = strconv.AppendBool(b, x)
+		return b, nil
+	case []string:
+		b = append(b, '[')
+		for i0 := range x {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, x[i0])
+		}
+		b = append(b, ']')
+		return b, nil
+	}
+	return appendAny(b, v)
 }
 
 // Form-based elicitation capabilities.
@@ -5807,6 +7627,29 @@ type ElicitationFormCapabilities struct {
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ElicitationFormCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ElicitationFormCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ElicitationFormCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ElicitationFormCapabilities) nullError() error {
@@ -5870,18 +7713,18 @@ type ElicitationFormMode struct {
 	Request         *ElicitationRequestScope `json:"-"`
 }
 
-// elicitationFormModeShadow mirrors ElicitationFormMode without its union methods, for encoding common fields.
-type elicitationFormModeShadow ElicitationFormMode
+func (v ElicitationFormMode) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
 
-func (v ElicitationFormMode) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
-	if common, err := json.Marshal(elicitationFormModeShadow(v)); err != nil {
+func (v *ElicitationFormMode) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
 		return nil, err
-	} else if len(common) > 2 {
-		if err := json.Unmarshal(common, &obj); err != nil {
-			return nil, err
-		}
 	}
+	return closeObject(b, start), nil
+}
+
+func (v *ElicitationFormMode) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Session != nil {
 		set++
@@ -5892,33 +7735,23 @@ func (v ElicitationFormMode) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "ElicitationFormMode", set)
 	}
-	if v.Session != nil {
-		payload, err := json.Marshal(v.Session)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Session != nil:
+		if b, err = v.Session.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ElicitationFormMode payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Request != nil {
-		payload, err := json.Marshal(v.Request)
-		if err != nil {
+	case v.Request != nil:
+		if b, err = v.Request.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ElicitationFormMode payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
 	}
-	return json.Marshal(obj)
+	b = append(b, ",\"requestedSchema\":"...)
+	if b, err = v.RequestedSchema.appendJSON(b); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func (*ElicitationFormMode) nullError() error {
@@ -6005,8 +7838,18 @@ type ElicitationPropertySchemaOther struct{ Raw json.RawMessage }
 
 func (v ElicitationPropertySchemaOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }
 
-func (v ElicitationPropertySchema) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v ElicitationPropertySchema) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ElicitationPropertySchema) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ElicitationPropertySchema) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.String != nil {
 		set++
@@ -6029,100 +7872,40 @@ func (v ElicitationPropertySchema) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "ElicitationPropertySchema", set)
 	}
-	if v.String != nil {
-		if tag, err := json.Marshal("string"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.String)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.String != nil:
+		b = append(b, ",\"type\":\"string\""...)
+		if b, err = v.String.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ElicitationPropertySchema payload: %w", err)
+	case v.Number != nil:
+		b = append(b, ",\"type\":\"number\""...)
+		if b, err = v.Number.appendMembers(b); err != nil {
+			return nil, err
 		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.Integer != nil:
+		b = append(b, ",\"type\":\"integer\""...)
+		if b, err = v.Integer.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.Boolean != nil:
+		b = append(b, ",\"type\":\"boolean\""...)
+		if b, err = v.Boolean.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.Array != nil:
+		b = append(b, ",\"type\":\"array\""...)
+		if b, err = v.Array.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.Other != nil:
+		if b, err = appendOpenMembers(b, v.Other.Raw, "type", nil, nil, nil); err != nil {
+			return nil, err
 		}
 	}
-	if v.Number != nil {
-		if tag, err := json.Marshal("number"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Number)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ElicitationPropertySchema payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Integer != nil {
-		if tag, err := json.Marshal("integer"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Integer)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ElicitationPropertySchema payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Boolean != nil {
-		if tag, err := json.Marshal("boolean"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Boolean)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ElicitationPropertySchema payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Array != nil {
-		if tag, err := json.Marshal("array"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Array)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ElicitationPropertySchema payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Other != nil {
-		return v.Other.Raw, nil
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var elicitationPropertySchemaTags = []string{"string", "number", "integer", "boolean", "array"}
@@ -6260,6 +8043,27 @@ type ElicitationRequestScope struct {
 	RequestID RequestId `json:"requestId"`
 }
 
+func (v ElicitationRequestScope) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ElicitationRequestScope) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ElicitationRequestScope) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"requestId\":"...)
+	if b, err = appendRequestIdUnion(b, v.RequestID); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
 func (*ElicitationRequestScope) nullError() error {
 	return errors.New("invalid type: null, expected struct ElicitationRequestScope")
 }
@@ -6290,7 +8094,7 @@ func (v *ElicitationRequestScope) decodeFields(data []byte, raws rawObject, buff
 		raw := m.raw
 		switch string(m.key) {
 		case "requestId":
-			if err := decodeChecked(raw, &v.RequestID, true, validRequestId); err != nil {
+			if err := decodeChecked(raw, &v.RequestID, true, decodeRequestIdUnion); err != nil {
 				return err
 			}
 		}
@@ -6305,7 +8109,7 @@ func (v *ElicitationRequestScope) decodeSeq(items []json.RawMessage, buffered bo
 	*v = ElicitationRequestScope{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeChecked(raw, &v.RequestID, true, validRequestId); err != nil {
+		if err := decodeChecked(raw, &v.RequestID, true, decodeRequestIdUnion); err != nil {
 			return err
 		}
 	} else {
@@ -6321,25 +8125,91 @@ func (v *ElicitationRequestScope) decodeSeq(items []json.RawMessage, buffered bo
 // This represents a JSON Schema object with primitive-typed properties,
 // as required by the elicitation specification.
 type ElicitationSchema struct {
+	// Type discriminator. Always "object".
+	Type *ElicitationSchemaType `json:"type,omitempty"`
+	// Optional title for the schema.
+	// Optional. Omitted and null are equivalent and mean no title is provided.
+	Title *string `json:"title,omitempty"`
+	// Property definitions (must be primitive types).
+	Properties map[string]ElicitationPropertySchema `json:"properties,omitempty"`
+	// List of required property names.
+	// Optional. Omitted and null are equivalent and mean no property names are required.
+	Required []string `json:"required,omitempty"`
+	// Optional description of what this schema represents.
+	// Optional. Omitted and null are equivalent and mean no schema description is provided.
+	Description *string `json:"description,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Optional description of what this schema represents.
-	// Optional. Omitted and null are equivalent and mean no schema description is provided.
-	Description *string `json:"description,omitempty"`
-	// Property definitions (must be primitive types).
-	Properties map[string]ElicitationPropertySchema `json:"properties,omitempty"`
-	// List of required property names.
-	// Optional. Omitted and null are equivalent and mean no property names are required.
-	Required []string `json:"required,omitempty"`
-	// Optional title for the schema.
-	// Optional. Omitted and null are equivalent and mean no title is provided.
-	Title *string `json:"title,omitempty"`
-	// Type discriminator. Always "object".
-	Type *ElicitationSchemaType `json:"type,omitempty"`
+}
+
+func (v ElicitationSchema) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ElicitationSchema) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ElicitationSchema) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Type != nil {
+		b = append(b, ",\"type\":"...)
+		b = appendString(b, string((*v.Type)))
+	} else {
+		b = append(b, ",\"type\":\"object\""...)
+	}
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, (*v.Title))
+	}
+	if v.Properties != nil {
+		b = append(b, ",\"properties\":"...)
+		b = append(b, '{')
+		for n, k0 := range sortedKeys(v.Properties) {
+			if n > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, k0)
+			b = append(b, ':')
+			item0 := v.Properties[k0]
+			if b, err = item0.appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, '}')
+	} else {
+		b = append(b, ",\"properties\":{}"...)
+	}
+	if v.Required != nil {
+		b = append(b, ",\"required\":"...)
+		b = append(b, '[')
+		for i0 := range v.Required {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.Required[i0])
+		}
+		b = append(b, ']')
+	}
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ElicitationSchema) nullError() error {
@@ -6368,13 +8238,13 @@ func (v *ElicitationSchema) decodeFields(data []byte, raws rawObject, buffered b
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "type":
+			if err := decodeValue(raw, &v.Type, false, true); err != nil {
+				v.Type = nil
 			}
-		case "description":
-			if err := decodeValue(raw, &v.Description, true, true); err != nil {
-				v.Description = nil
+		case "title":
+			if err := decodeValue(raw, &v.Title, true, true); err != nil {
+				v.Title = nil
 			}
 		case "properties":
 			if err := decodeMap(raw, &v.Properties, false, func(raw json.RawMessage, dst *ElicitationPropertySchema) error {
@@ -6388,13 +8258,13 @@ func (v *ElicitationSchema) decodeFields(data []byte, raws rawObject, buffered b
 			}); err != nil {
 				return err
 			}
-		case "title":
-			if err := decodeValue(raw, &v.Title, true, true); err != nil {
-				v.Title = nil
+		case "description":
+			if err := decodeValue(raw, &v.Description, true, true); err != nil {
+				v.Description = nil
 			}
-		case "type":
-			if err := decodeValue(raw, &v.Type, false, true); err != nil {
-				v.Type = nil
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -6495,6 +8365,29 @@ type ElicitationSessionScope struct {
 	ToolCallID *ToolCallId `json:"toolCallId,omitempty"`
 }
 
+func (v ElicitationSessionScope) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ElicitationSessionScope) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ElicitationSessionScope) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	if v.ToolCallID != nil {
+		b = append(b, ",\"toolCallId\":"...)
+		b = appendString(b, string((*v.ToolCallID)))
+	}
+	return b, nil
+}
+
 func (*ElicitationSessionScope) nullError() error {
 	return errors.New("invalid type: null, expected struct ElicitationSessionScope")
 }
@@ -6573,6 +8466,29 @@ type ElicitationUrlCapabilities struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v ElicitationUrlCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ElicitationUrlCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ElicitationUrlCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*ElicitationUrlCapabilities) nullError() error {
 	return errors.New("invalid type: null, expected struct ElicitationUrlCapabilities")
 }
@@ -6636,18 +8552,18 @@ type ElicitationUrlMode struct {
 	Request *ElicitationRequestScope `json:"-"`
 }
 
-// elicitationUrlModeShadow mirrors ElicitationUrlMode without its union methods, for encoding common fields.
-type elicitationUrlModeShadow ElicitationUrlMode
+func (v ElicitationUrlMode) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
 
-func (v ElicitationUrlMode) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
-	if common, err := json.Marshal(elicitationUrlModeShadow(v)); err != nil {
+func (v *ElicitationUrlMode) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
 		return nil, err
-	} else if len(common) > 2 {
-		if err := json.Unmarshal(common, &obj); err != nil {
-			return nil, err
-		}
 	}
+	return closeObject(b, start), nil
+}
+
+func (v *ElicitationUrlMode) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Session != nil {
 		set++
@@ -6658,33 +8574,23 @@ func (v ElicitationUrlMode) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "ElicitationUrlMode", set)
 	}
-	if v.Session != nil {
-		payload, err := json.Marshal(v.Session)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Session != nil:
+		if b, err = v.Session.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ElicitationUrlMode payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Request != nil {
-		payload, err := json.Marshal(v.Request)
-		if err != nil {
+	case v.Request != nil:
+		if b, err = v.Request.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ElicitationUrlMode payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
 	}
-	return json.Marshal(obj)
+	b = append(b, ",\"elicitationId\":"...)
+	b = appendString(b, string(v.ElicitationID))
+	b = append(b, ",\"url\":"...)
+	b = appendString(b, v.URL)
+	return b, nil
 }
 
 func (*ElicitationUrlMode) nullError() error {
@@ -6745,15 +8651,48 @@ func (v *ElicitationUrlMode) decodeJSON(data []byte, buffered bool) error {
 
 // The contents of a resource, embedded into a prompt or tool call result.
 type EmbeddedResource struct {
+	// Optional annotations that help clients decide how to display or route this content.
+	Annotations *Annotations `json:"annotations,omitempty"`
+	// Embedded resource payload, either text or binary data.
+	Resource EmbeddedResourceResource `json:"resource"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Optional annotations that help clients decide how to display or route this content.
-	Annotations *Annotations `json:"annotations,omitempty"`
-	// Embedded resource payload, either text or binary data.
-	Resource EmbeddedResourceResource `json:"resource"`
+}
+
+func (v EmbeddedResource) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *EmbeddedResource) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *EmbeddedResource) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Annotations != nil {
+		b = append(b, ",\"annotations\":"...)
+		if b, err = (*v.Annotations).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ",\"resource\":"...)
+	if b, err = v.Resource.appendJSON(b); err != nil {
+		return nil, err
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*EmbeddedResource) nullError() error {
@@ -6785,10 +8724,6 @@ func (v *EmbeddedResource) decodeFields(data []byte, raws rawObject, buffered bo
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "annotations":
 			if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
 				v.Annotations = nil
@@ -6796,6 +8731,10 @@ func (v *EmbeddedResource) decodeFields(data []byte, raws rawObject, buffered bo
 		case "resource":
 			if err := decodeValue(raw, &v.Resource, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -6841,8 +8780,18 @@ type EmbeddedResourceResource struct {
 	BlobResourceContents *BlobResourceContents `json:"-"`
 }
 
-func (v EmbeddedResourceResource) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v EmbeddedResourceResource) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *EmbeddedResourceResource) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *EmbeddedResourceResource) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.TextResourceContents != nil {
 		set++
@@ -6853,33 +8802,19 @@ func (v EmbeddedResourceResource) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "EmbeddedResourceResource", set)
 	}
-	if v.TextResourceContents != nil {
-		payload, err := json.Marshal(v.TextResourceContents)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.TextResourceContents != nil:
+		if b, err = v.TextResourceContents.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("EmbeddedResourceResource payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.BlobResourceContents != nil {
-		payload, err := json.Marshal(v.BlobResourceContents)
-		if err != nil {
+	case v.BlobResourceContents != nil:
+		if b, err = v.BlobResourceContents.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("EmbeddedResourceResource payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
 	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 func (*EmbeddedResourceResource) nullError() error {
@@ -6923,19 +8858,50 @@ func (v *EmbeddedResourceResource) decodeJSON(data []byte, buffered bool) error 
 
 // A titled enum option with a const value, human-readable title, and optional description.
 type EnumOption struct {
+	// The constant value for this option.
+	Const string `json:"const"`
+	// Human-readable title for this option.
+	Title string `json:"title"`
+	// Human-readable description.
+	// Optional. Omitted and null are equivalent and mean no description is provided.
+	Description *string `json:"description,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The constant value for this option.
-	Const string `json:"const"`
-	// Human-readable description.
-	// Optional. Omitted and null are equivalent and mean no description is provided.
-	Description *string `json:"description,omitempty"`
-	// Human-readable title for this option.
-	Title string `json:"title"`
+}
+
+func (v EnumOption) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *EnumOption) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *EnumOption) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"const\":"...)
+	b = appendString(b, v.Const)
+	b = append(b, ",\"title\":"...)
+	b = appendString(b, v.Title)
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*EnumOption) nullError() error {
@@ -6967,21 +8933,21 @@ func (v *EnumOption) decodeFields(data []byte, raws rawObject, buffered bool) er
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "const":
 			if err := decodeValue(raw, &v.Const, false, buffered); err != nil {
+				return err
+			}
+		case "title":
+			if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
 				return err
 			}
 		case "description":
 			if err := decodeValue(raw, &v.Description, true, true); err != nil {
 				v.Description = nil
 			}
-		case "title":
-			if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -7032,15 +8998,42 @@ func (v *EnumOption) decodeSeq(items []json.RawMessage, buffered bool) error {
 
 // An environment variable to set when launching an MCP server.
 type EnvVariable struct {
+	// The name of the environment variable.
+	Name string `json:"name"`
+	// The value to set for the environment variable.
+	Value string `json:"value"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The name of the environment variable.
-	Name string `json:"name"`
-	// The value to set for the environment variable.
-	Value string `json:"value"`
+}
+
+func (v EnvVariable) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *EnvVariable) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *EnvVariable) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	b = append(b, ",\"value\":"...)
+	b = appendString(b, v.Value)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*EnvVariable) nullError() error {
@@ -7072,10 +9065,6 @@ func (v *EnvVariable) decodeFields(data []byte, raws rawObject, buffered bool) e
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "name":
 			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
 				return err
@@ -7083,6 +9072,10 @@ func (v *EnvVariable) decodeFields(data []byte, raws rawObject, buffered bool) e
 		case "value":
 			if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -7133,12 +9126,39 @@ type Error struct {
 	// A number indicating the error type that occurred.
 	// This must be an integer as defined in the JSON-RPC specification.
 	Code ErrorCode `json:"code"`
-	// Optional primitive or structured value that contains additional information about the error.
-	// This may include debugging information or context-specific details.
-	Data json.RawMessage `json:"data,omitempty"`
 	// A string providing a short description of the error.
 	// The message should be limited to a concise single sentence.
 	Message string `json:"message"`
+	// Optional primitive or structured value that contains additional information about the error.
+	// This may include debugging information or context-specific details.
+	Data json.RawMessage `json:"data,omitempty"`
+}
+
+func (v Error) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *Error) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *Error) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"code\":"...)
+	b = strconv.AppendInt(b, int64(v.Code), 10)
+	b = append(b, ",\"message\":"...)
+	b = appendString(b, v.Message)
+	if v.Data != nil {
+		b = append(b, ",\"data\":"...)
+		if b, err = appendRaw(b, v.Data); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*Error) nullError() error { return errors.New("invalid type: null, expected struct Error") }
@@ -7172,13 +9192,15 @@ func (v *Error) decodeFields(data []byte, raws rawObject, buffered bool) error {
 			if err := decodeValue(raw, &v.Code, false, buffered); err != nil {
 				return err
 			}
-		case "data":
-			if err := decodeValue(raw, &v.Data, true, true); err != nil {
-				v.Data = nil
-			}
 		case "message":
 			if err := decodeValue(raw, &v.Message, false, buffered); err != nil {
 				return err
+			}
+		case "data":
+			if isNull(raw) {
+				v.Data = nil
+			} else if err := decodeValue(raw, &v.Data, true, true); err != nil {
+				v.Data = nil
 			}
 		}
 	}
@@ -7211,7 +9233,9 @@ func (v *Error) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Data, true, true); err != nil {
+		if isNull(raw) {
+			v.Data = nil
+		} else if err := decodeValue(raw, &v.Data, true, true); err != nil {
 			v.Data = nil
 		}
 	}
@@ -7256,6 +9280,29 @@ type ErrorStopReason struct {
 	// Optional. Omitted or null both mean the agent is not reporting failure details.
 	// Agents SHOULD include it.
 	Error *Error `json:"error,omitempty"`
+}
+
+func (v ErrorStopReason) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ErrorStopReason) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ErrorStopReason) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Error != nil {
+		b = append(b, ",\"error\":"...)
+		if b, err = (*v.Error).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ErrorStopReason) nullError() error {
@@ -7314,11 +9361,45 @@ func (v *ErrorStopReason) decodeSeq(items []json.RawMessage, buffered bool) erro
 type ExtNotification struct {
 }
 
+func (v ExtNotification) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ExtNotification) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ExtNotification) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	return b, nil
+}
+
 // Allows for sending an arbitrary request that is not part of the ACP spec.
 // Extension methods provide a way to add custom functionality while maintaining
 // protocol compatibility.
 // See protocol docs: Extensibility
 type ExtRequest struct {
+}
+
+func (v ExtRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ExtRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ExtRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	return b, nil
 }
 
 // Allows for sending an arbitrary response to an extension request that is not part of the ACP spec.
@@ -7328,18 +9409,70 @@ type ExtRequest struct {
 type ExtResponse struct {
 }
 
+func (v ExtResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ExtResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ExtResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	return b, nil
+}
+
 // File system capabilities that a client may support.
 // See protocol docs: FileSystem
 type FileSystemCapabilities struct {
+	// Whether the Client supports fs/read_text_file requests.
+	ReadTextFile *bool `json:"readTextFile,omitempty"`
+	// Whether the Client supports fs/write_text_file requests.
+	WriteTextFile *bool `json:"writeTextFile,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Whether the Client supports fs/read_text_file requests.
-	ReadTextFile *bool `json:"readTextFile,omitempty"`
-	// Whether the Client supports fs/write_text_file requests.
-	WriteTextFile *bool `json:"writeTextFile,omitempty"`
+}
+
+func (v FileSystemCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *FileSystemCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *FileSystemCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.ReadTextFile != nil {
+		b = append(b, ",\"readTextFile\":"...)
+		b = strconv.AppendBool(b, (*v.ReadTextFile))
+	} else {
+		b = append(b, ",\"readTextFile\":false"...)
+	}
+	if v.WriteTextFile != nil {
+		b = append(b, ",\"writeTextFile\":"...)
+		b = strconv.AppendBool(b, (*v.WriteTextFile))
+	} else {
+		b = append(b, ",\"writeTextFile\":false"...)
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*FileSystemCapabilities) nullError() error {
@@ -7368,10 +9501,6 @@ func (v *FileSystemCapabilities) decodeFields(data []byte, raws rawObject, buffe
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "readTextFile":
 			if err := decodeValue(raw, &v.ReadTextFile, false, true); err != nil {
 				v.ReadTextFile = nil
@@ -7379,6 +9508,10 @@ func (v *FileSystemCapabilities) decodeFields(data []byte, raws rawObject, buffe
 		case "writeTextFile":
 			if err := decodeValue(raw, &v.WriteTextFile, false, true); err != nil {
 				v.WriteTextFile = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -7418,22 +9551,17 @@ func (v *FileSystemCapabilities) decodeSeq(items []json.RawMessage, buffered boo
 // operations like generating summaries without affecting the original session's history.
 // Only available if the Agent supports the session.fork capability.
 type ForkSessionRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// The ID of the session to fork.
+	SessionID SessionId `json:"sessionId"`
+	// The working directory for this session. Must be an absolute path.
+	Cwd string `json:"cwd"`
 	// Additional workspace roots to activate for this session. Each path must be absolute.
 	// When omitted or empty, no additional roots are activated. When non-empty,
 	// this is the complete resulting additional-root list for the forked
 	// session.
 	AdditionalDirectories []string `json:"additionalDirectories,omitempty"`
-	// The working directory for this session. Must be an absolute path.
-	Cwd string `json:"cwd"`
 	// List of MCP servers to connect to for this session.
 	MCPServers []McpServer `json:"mcpServers,omitempty"`
-	// The ID of the session to fork.
-	SessionID SessionId `json:"sessionId"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
 	// System-level instructions for the forked session.
@@ -7443,6 +9571,68 @@ type ForkSessionRequest struct {
 	// sessionCapabilities.systemPrompt, and SHOULD send the same value they used
 	// for the source session.
 	SystemPrompt *SystemPrompt `json:"systemPrompt,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ForkSessionRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ForkSessionRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ForkSessionRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"cwd\":"...)
+	b = appendString(b, v.Cwd)
+	if len(v.AdditionalDirectories) > 0 {
+		b = append(b, ",\"additionalDirectories\":"...)
+		b = append(b, '[')
+		for i0 := range v.AdditionalDirectories {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.AdditionalDirectories[i0])
+		}
+		b = append(b, ']')
+	}
+	if len(v.MCPServers) > 0 {
+		b = append(b, ",\"mcpServers\":"...)
+		b = append(b, '[')
+		for i0 := range v.MCPServers {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.MCPServers[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.SystemPrompt != nil {
+		b = append(b, ",\"systemPrompt\":"...)
+		if b, err = (*v.SystemPrompt).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ForkSessionRequest) nullError() error {
@@ -7474,9 +9664,13 @@ func (v *ForkSessionRequest) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+				return err
+			}
+		case "cwd":
+			if err := decodePath(raw, &v.Cwd, false); err != nil {
+				return err
 			}
 		case "additionalDirectories":
 			if isNull(raw) {
@@ -7484,10 +9678,6 @@ func (v *ForkSessionRequest) decodeFields(data []byte, raws rawObject, buffered 
 			} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *string) error {
 				return decodePath(raw, dst, false)
 			}); err != nil {
-				return err
-			}
-		case "cwd":
-			if err := decodePath(raw, &v.Cwd, false); err != nil {
 				return err
 			}
 		case "mcpServers":
@@ -7498,13 +9688,13 @@ func (v *ForkSessionRequest) decodeFields(data []byte, raws rawObject, buffered 
 			}); err != nil {
 				return err
 			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
-				return err
-			}
 		case "systemPrompt":
 			if err := decodePtr(raw, &v.SystemPrompt, true, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -7577,18 +9767,62 @@ func (v *ForkSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) e
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Response from forking an existing session.
 type ForkSessionResponse struct {
+	// Unique identifier for the newly created forked session.
+	SessionID SessionId `json:"sessionId"`
+	// Initial mode state if supported by the Agent
+	// See protocol docs: Session Modes
+	Modes *SessionModeState `json:"modes,omitempty"`
+	// Initial session configuration options if supported by the Agent.
+	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Initial session configuration options if supported by the Agent.
-	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
-	// Initial mode state if supported by the Agent
-	// See protocol docs: Session Modes
-	Modes *SessionModeState `json:"modes,omitempty"`
-	// Unique identifier for the newly created forked session.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v ForkSessionResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ForkSessionResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ForkSessionResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	if v.Modes != nil {
+		b = append(b, ",\"modes\":"...)
+		if b, err = (*v.Modes).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.ConfigOptions != nil {
+		b = append(b, ",\"configOptions\":"...)
+		b = append(b, '[')
+		for i0 := range v.ConfigOptions {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.ConfigOptions[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ForkSessionResponse) nullError() error {
@@ -7620,9 +9854,13 @@ func (v *ForkSessionResponse) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+				return err
+			}
+		case "modes":
+			if err := decodePtr(raw, &v.Modes, true, true); err != nil {
+				v.Modes = nil
 			}
 		case "configOptions":
 			if err := decodeList(raw, &v.ConfigOptions, true, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
@@ -7630,13 +9868,9 @@ func (v *ForkSessionResponse) decodeFields(data []byte, raws rawObject, buffered
 			}); err != nil {
 				v.ConfigOptions = nil
 			}
-		case "modes":
-			if err := decodePtr(raw, &v.Modes, true, true); err != nil {
-				v.Modes = nil
-			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -7684,15 +9918,42 @@ func (v *ForkSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) 
 
 // An HTTP header to set when making requests to the MCP server.
 type HttpHeader struct {
+	// The name of the HTTP header.
+	Name string `json:"name"`
+	// The value to set for the HTTP header.
+	Value string `json:"value"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The name of the HTTP header.
-	Name string `json:"name"`
-	// The value to set for the HTTP header.
-	Value string `json:"value"`
+}
+
+func (v HttpHeader) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *HttpHeader) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *HttpHeader) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	b = append(b, ",\"value\":"...)
+	b = appendString(b, v.Value)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*HttpHeader) nullError() error {
@@ -7724,10 +9985,6 @@ func (v *HttpHeader) decodeFields(data []byte, raws rawObject, buffered bool) er
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "name":
 			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
 				return err
@@ -7735,6 +9992,10 @@ func (v *HttpHeader) decodeFields(data []byte, raws rawObject, buffered bool) er
 		case "value":
 			if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -7780,56 +10041,72 @@ func (v *HttpHeader) decodeSeq(items []json.RawMessage, buffered bool) error {
 // The child is ready to process another prompt.
 // An omitted, null, or malformed stopReason means not reported.
 type IdleStateUpdate struct {
-	// The _meta property is reserved by ACP for additional metadata.
-	// Implementations MUST NOT make assumptions about values at these keys.
-	// Optional. Omitted and null mean no metadata for this state snapshot.
-	Meta Meta `json:"_meta,omitempty"`
+	// Why foreground work stopped. The value selects one of this type's variants, which may add fields of their own.
+	// Optional. Omitted or null both mean the agent is not reporting a stop reason; a malformed value is treated the same way.
+	// See protocol docs: Current work state
+	StopReason *IdleStopReason `json:"stopReason,omitempty"`
 	// The failure, as a JSON-RPC error object.
 	// Optional. Omitted or null both mean the agent is not reporting failure details.
 	// Agents SHOULD include it.
 	// Sent only with stopReason "error"; encoding drops it otherwise.
 	Error *Error `json:"error,omitempty"`
-	// Why foreground work stopped. The value selects one of this type's variants, which may add fields of their own.
-	// Optional. Omitted or null both mean the agent is not reporting a stop reason; a malformed value is treated the same way.
-	// See protocol docs: Current work state
-	StopReason *IdleStopReason `json:"stopReason,omitempty"`
 	// UNSTABLE Token usage for completed foreground work.
 	// Optional. Omitted or null means not reported.
 	Usage *Usage `json:"usage,omitempty"`
+	// The _meta property is reserved by ACP for additional metadata.
+	// Implementations MUST NOT make assumptions about values at these keys.
+	// Optional. Omitted and null mean no metadata for this state snapshot.
+	Meta Meta `json:"_meta,omitempty"`
 	// StopReasonFields keeps the other fields of a custom or future stopReason, which are
 	// re-encoded with it. It is ignored for the known values.
 	StopReasonFields map[string]json.RawMessage `json:"-"`
 }
 
-// idleStateUpdateShadow mirrors IdleStateUpdate without its codec methods.
-type idleStateUpdateShadow IdleStateUpdate
+func (v IdleStateUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
 
-func (v IdleStateUpdate) MarshalJSON() ([]byte, error) {
-	encoded, err := json.Marshal(idleStateUpdateShadow(v))
+func (v *IdleStateUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
 	if err != nil {
 		return nil, err
 	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &obj); err != nil {
-		return nil, err
-	}
-	var tag IdleStopReason
+	return closeObject(b, start), nil
+}
+
+func (v *IdleStateUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
 	if v.StopReason != nil {
-		tag = *v.StopReason
-	}
-	if tag != "error" {
-		delete(obj, "error")
-	}
-	switch tag {
-	case "", "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled", "error":
-	default:
-		for key, raw := range v.StopReasonFields {
-			if _, owned := obj[key]; !owned {
-				obj[key] = raw
+		b = append(b, ",\"stopReason\":"...)
+		b = appendString(b, string(*v.StopReason))
+		switch *v.StopReason {
+		case "error":
+			if v.Error != nil {
+				b = append(b, ",\"error\":"...)
+				if b, err = (*v.Error).appendJSON(b); err != nil {
+					return nil, err
+				}
+			}
+		case "", "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled":
+		default:
+			if b, err = appendRawMembers(b, v.StopReasonFields, []string{"_meta", "stopReason", "usage"}); err != nil {
+				return nil, err
 			}
 		}
 	}
-	return json.Marshal(obj)
+	if v.Usage != nil {
+		b = append(b, ",\"usage\":"...)
+		if b, err = (*v.Usage).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*IdleStateUpdate) nullError() error {
@@ -7848,14 +10125,14 @@ func (v *IdleStateUpdate) decodeJSON(data []byte, buffered bool) error {
 
 func (v *IdleStateUpdate) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = IdleStateUpdate{}
-	if raw, ok := raws.get("_meta"); ok {
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-			v.Meta = nil
-		}
-	}
 	if raw, ok := raws.get("usage"); ok {
 		if err := decodePtr(raw, &v.Usage, true, true); err != nil {
 			v.Usage = nil
+		}
+	}
+	if raw, ok := raws.get("_meta"); ok {
+		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			v.Meta = nil
 		}
 	}
 	if raw, ok := raws.get("stopReason"); ok {
@@ -7953,11 +10230,6 @@ func (v *IdleStopReason) decodeJSON(data []byte, _ bool) error { return v.Unmars
 
 // An image provided to or from an LLM.
 type ImageContent struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Optional annotations that help clients decide how to display or route this content.
 	Annotations *Annotations `json:"annotations,omitempty"`
 	// Base64-encoded media payload.
@@ -7966,6 +10238,48 @@ type ImageContent struct {
 	MimeType string `json:"mimeType"`
 	// URI associated with this resource or media payload.
 	URI *string `json:"uri,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ImageContent) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ImageContent) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ImageContent) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Annotations != nil {
+		b = append(b, ",\"annotations\":"...)
+		if b, err = (*v.Annotations).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ",\"data\":"...)
+	b = appendString(b, v.Data)
+	b = append(b, ",\"mimeType\":"...)
+	b = appendString(b, v.MimeType)
+	if v.URI != nil {
+		b = append(b, ",\"uri\":"...)
+		b = appendString(b, (*v.URI))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ImageContent) nullError() error {
@@ -7997,10 +10311,6 @@ func (v *ImageContent) decodeFields(data []byte, raws rawObject, buffered bool) 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "annotations":
 			if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
 				v.Annotations = nil
@@ -8016,6 +10326,10 @@ func (v *ImageContent) decodeFields(data []byte, raws rawObject, buffered bool) 
 		case "uri":
 			if err := decodeValue(raw, &v.URI, true, true); err != nil {
 				v.URI = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -8074,11 +10388,6 @@ func (v *ImageContent) decodeSeq(items []json.RawMessage, buffered bool) error {
 // Describes the name and version of an ACP implementation, with an optional
 // title for UI representation.
 type Implementation struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Intended for programmatic or logical use, but can be used as a display
 	// name fallback if title isn't present.
 	Name string `json:"name"`
@@ -8089,6 +10398,42 @@ type Implementation struct {
 	// Version of the implementation. Can be displayed to the user or used
 	// for debugging or metrics purposes. (e.g. "1.0.0").
 	Version string `json:"version"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v Implementation) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *Implementation) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *Implementation) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, (*v.Title))
+	}
+	b = append(b, ",\"version\":"...)
+	b = appendString(b, v.Version)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*Implementation) nullError() error {
@@ -8120,10 +10465,6 @@ func (v *Implementation) decodeFields(data []byte, raws rawObject, buffered bool
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "name":
 			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
 				return err
@@ -8135,6 +10476,10 @@ func (v *Implementation) decodeFields(data []byte, raws rawObject, buffered bool
 		case "version":
 			if err := decodeValue(raw, &v.Version, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -8207,18 +10552,57 @@ type InitializeProxyResponse = InitializeResponse
 // Sent by the client to establish connection and negotiate capabilities.
 // See protocol docs: Initialization
 type InitializeRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// The latest protocol version supported by the client.
+	ProtocolVersion ProtocolVersion `json:"protocolVersion"`
 	// Capabilities supported by the client.
 	ClientCapabilities *ClientCapabilities `json:"clientCapabilities,omitempty"`
 	// Information about the Client name and version sent to the Agent.
 	// Note: in future versions of the protocol, this will be required.
 	ClientInfo *Implementation `json:"clientInfo,omitempty"`
-	// The latest protocol version supported by the client.
-	ProtocolVersion ProtocolVersion `json:"protocolVersion"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v InitializeRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *InitializeRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *InitializeRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"protocolVersion\":"...)
+	b = strconv.AppendUint(b, uint64(v.ProtocolVersion), 10)
+	if v.ClientCapabilities != nil {
+		b = append(b, ",\"clientCapabilities\":"...)
+		if b, err = (*v.ClientCapabilities).appendJSON(b); err != nil {
+			return nil, err
+		}
+	} else {
+		b = append(b, ",\"clientCapabilities\":{\"fs\":{\"readTextFile\":false,\"writeTextFile\":false},\"terminal\":false,\"auth\":{\"terminal\":false}}"...)
+	}
+	if v.ClientInfo != nil {
+		b = append(b, ",\"clientInfo\":"...)
+		if b, err = (*v.ClientInfo).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*InitializeRequest) nullError() error {
@@ -8250,9 +10634,9 @@ func (v *InitializeRequest) decodeFields(data []byte, raws rawObject, buffered b
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "protocolVersion":
+			if err := decodeValue(raw, &v.ProtocolVersion, false, buffered); err != nil {
+				return err
 			}
 		case "clientCapabilities":
 			if err := decodePtr(raw, &v.ClientCapabilities, false, true); err != nil {
@@ -8262,9 +10646,9 @@ func (v *InitializeRequest) decodeFields(data []byte, raws rawObject, buffered b
 			if err := decodePtr(raw, &v.ClientInfo, true, true); err != nil {
 				v.ClientInfo = nil
 			}
-		case "protocolVersion":
-			if err := decodeValue(raw, &v.ProtocolVersion, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -8312,22 +10696,76 @@ func (v *InitializeRequest) decodeSeq(items []json.RawMessage, buffered bool) er
 // Contains the negotiated protocol version and agent capabilities.
 // See protocol docs: Initialization
 type InitializeResponse struct {
+	// The protocol version the client specified if supported by the agent,
+	// or the latest protocol version supported by the agent.
+	// The client should disconnect, if it doesn't support this version.
+	ProtocolVersion ProtocolVersion `json:"protocolVersion"`
+	// Capabilities supported by the agent.
+	AgentCapabilities *AgentCapabilities `json:"agentCapabilities,omitempty"`
+	// Authentication methods supported by the agent.
+	AuthMethods []AuthMethod `json:"authMethods,omitempty"`
+	// Information about the Agent name and version sent to the Client.
+	// Note: in future versions of the protocol, this will be required.
+	AgentInfo *Implementation `json:"agentInfo,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Capabilities supported by the agent.
-	AgentCapabilities *AgentCapabilities `json:"agentCapabilities,omitempty"`
-	// Information about the Agent name and version sent to the Client.
-	// Note: in future versions of the protocol, this will be required.
-	AgentInfo *Implementation `json:"agentInfo,omitempty"`
-	// Authentication methods supported by the agent.
-	AuthMethods []AuthMethod `json:"authMethods,omitempty"`
-	// The protocol version the client specified if supported by the agent,
-	// or the latest protocol version supported by the agent.
-	// The client should disconnect, if it doesn't support this version.
-	ProtocolVersion ProtocolVersion `json:"protocolVersion"`
+}
+
+func (v InitializeResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *InitializeResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *InitializeResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"protocolVersion\":"...)
+	b = strconv.AppendUint(b, uint64(v.ProtocolVersion), 10)
+	if v.AgentCapabilities != nil {
+		b = append(b, ",\"agentCapabilities\":"...)
+		if b, err = (*v.AgentCapabilities).appendJSON(b); err != nil {
+			return nil, err
+		}
+	} else {
+		b = append(b, ",\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false,\"acp\":false},\"sessionCapabilities\":{},\"auth\":{}}"...)
+	}
+	if v.AuthMethods != nil {
+		b = append(b, ",\"authMethods\":"...)
+		b = append(b, '[')
+		for i0 := range v.AuthMethods {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.AuthMethods[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	} else {
+		b = append(b, ",\"authMethods\":[]"...)
+	}
+	if v.AgentInfo != nil {
+		b = append(b, ",\"agentInfo\":"...)
+		if b, err = (*v.AgentInfo).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*InitializeResponse) nullError() error {
@@ -8359,17 +10797,13 @@ func (v *InitializeResponse) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "protocolVersion":
+			if err := decodeValue(raw, &v.ProtocolVersion, false, buffered); err != nil {
+				return err
 			}
 		case "agentCapabilities":
 			if err := decodePtr(raw, &v.AgentCapabilities, false, true); err != nil {
 				v.AgentCapabilities = nil
-			}
-		case "agentInfo":
-			if err := decodePtr(raw, &v.AgentInfo, true, true); err != nil {
-				v.AgentInfo = nil
 			}
 		case "authMethods":
 			if err := decodeList(raw, &v.AuthMethods, false, true, func(raw json.RawMessage, dst *AuthMethod) error {
@@ -8377,9 +10811,13 @@ func (v *InitializeResponse) decodeFields(data []byte, raws rawObject, buffered 
 			}); err != nil {
 				v.AuthMethods = nil
 			}
-		case "protocolVersion":
-			if err := decodeValue(raw, &v.ProtocolVersion, false, buffered); err != nil {
-				return err
+		case "agentInfo":
+			if err := decodePtr(raw, &v.AgentInfo, true, true); err != nil {
+				v.AgentInfo = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -8433,27 +10871,70 @@ func (v *InitializeResponse) decodeSeq(items []json.RawMessage, buffered bool) e
 
 // Schema for integer properties in an elicitation form.
 type IntegerPropertySchema struct {
+	// Optional title for the property.
+	// Optional. Omitted and null are equivalent and mean no title is provided.
+	Title *string `json:"title,omitempty"`
+	// Human-readable description.
+	// Optional. Omitted and null are equivalent and mean no description is provided.
+	Description *string `json:"description,omitempty"`
+	// Minimum value (inclusive).
+	// Optional. Omitted and null are equivalent and mean there is no inclusive lower bound.
+	Minimum *int64 `json:"minimum,omitempty"`
+	// Maximum value (inclusive).
+	// Optional. Omitted and null are equivalent and mean there is no inclusive upper bound.
+	Maximum *int64 `json:"maximum,omitempty"`
+	// Default value.
+	// Optional. Omitted and null are equivalent and mean no default value is provided.
+	Default *int64 `json:"default,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Default value.
-	// Optional. Omitted and null are equivalent and mean no default value is provided.
-	Default *int64 `json:"default,omitempty"`
-	// Human-readable description.
-	// Optional. Omitted and null are equivalent and mean no description is provided.
-	Description *string `json:"description,omitempty"`
-	// Maximum value (inclusive).
-	// Optional. Omitted and null are equivalent and mean there is no inclusive upper bound.
-	Maximum *int64 `json:"maximum,omitempty"`
-	// Minimum value (inclusive).
-	// Optional. Omitted and null are equivalent and mean there is no inclusive lower bound.
-	Minimum *int64 `json:"minimum,omitempty"`
-	// Optional title for the property.
-	// Optional. Omitted and null are equivalent and mean no title is provided.
-	Title *string `json:"title,omitempty"`
+}
+
+func (v IntegerPropertySchema) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *IntegerPropertySchema) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *IntegerPropertySchema) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, (*v.Title))
+	}
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.Minimum != nil {
+		b = append(b, ",\"minimum\":"...)
+		b = strconv.AppendInt(b, int64((*v.Minimum)), 10)
+	}
+	if v.Maximum != nil {
+		b = append(b, ",\"maximum\":"...)
+		b = strconv.AppendInt(b, int64((*v.Maximum)), 10)
+	}
+	if v.Default != nil {
+		b = append(b, ",\"default\":"...)
+		b = strconv.AppendInt(b, int64((*v.Default)), 10)
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*IntegerPropertySchema) nullError() error {
@@ -8482,29 +10963,29 @@ func (v *IntegerPropertySchema) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "default":
-			if err := decodeValue(raw, &v.Default, true, true); err != nil {
-				v.Default = nil
+		case "title":
+			if err := decodeValue(raw, &v.Title, true, true); err != nil {
+				v.Title = nil
 			}
 		case "description":
 			if err := decodeValue(raw, &v.Description, true, true); err != nil {
 				v.Description = nil
 			}
-		case "maximum":
-			if err := decodeValue(raw, &v.Maximum, true, buffered); err != nil {
-				return err
-			}
 		case "minimum":
 			if err := decodeValue(raw, &v.Minimum, true, buffered); err != nil {
 				return err
 			}
-		case "title":
-			if err := decodeValue(raw, &v.Title, true, true); err != nil {
-				v.Title = nil
+		case "maximum":
+			if err := decodeValue(raw, &v.Maximum, true, buffered); err != nil {
+				return err
+			}
+		case "default":
+			if err := decodeValue(raw, &v.Default, true, true); err != nil {
+				v.Default = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -8557,15 +11038,42 @@ func (v *IntegerPropertySchema) decodeSeq(items []json.RawMessage, buffered bool
 
 // Request to kill a terminal without releasing it.
 type KillTerminalRequest struct {
+	// The session ID for this request.
+	SessionID SessionId `json:"sessionId"`
+	// The ID of the terminal to kill.
+	TerminalID TerminalId `json:"terminalId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The session ID for this request.
-	SessionID SessionId `json:"sessionId"`
-	// The ID of the terminal to kill.
-	TerminalID TerminalId `json:"terminalId"`
+}
+
+func (v KillTerminalRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *KillTerminalRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *KillTerminalRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"terminalId\":"...)
+	b = appendString(b, string(v.TerminalID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*KillTerminalRequest) nullError() error {
@@ -8597,10 +11105,6 @@ func (v *KillTerminalRequest) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
@@ -8608,6 +11112,10 @@ func (v *KillTerminalRequest) decodeFields(data []byte, raws rawObject, buffered
 		case "terminalId":
 			if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -8657,6 +11165,29 @@ type KillTerminalResponse struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v KillTerminalResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *KillTerminalResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *KillTerminalResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*KillTerminalResponse) nullError() error {
@@ -8719,6 +11250,29 @@ type ListProvidersRequest struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v ListProvidersRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ListProvidersRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ListProvidersRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*ListProvidersRequest) nullError() error {
 	return errors.New("invalid type: null, expected struct Wire")
 }
@@ -8772,13 +11326,47 @@ func (v *ListProvidersRequest) decodeSeq(items []json.RawMessage, buffered bool)
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Response to providers/list.
 type ListProvidersResponse struct {
+	// Configurable providers with current routing info suitable for UI display.
+	Providers []ProviderInfo `json:"providers"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Configurable providers with current routing info suitable for UI display.
-	Providers []ProviderInfo `json:"providers"`
+}
+
+func (v ListProvidersResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ListProvidersResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ListProvidersResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"providers\":"...)
+	b = append(b, '[')
+	for i0 := range v.Providers {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Providers[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ListProvidersResponse) nullError() error {
@@ -8810,15 +11398,15 @@ func (v *ListProvidersResponse) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "providers":
 			if err := decodeList(raw, &v.Providers, false, false, func(raw json.RawMessage, dst *ProviderInfo) error {
 				return decodeValue(raw, dst, false, buffered)
 			}); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -8855,11 +11443,10 @@ func (v *ListProvidersResponse) decodeSeq(items []json.RawMessage, buffered bool
 // Request parameters for listing existing sessions.
 // Only available if the Agent supports the sessionCapabilities.list capability.
 type ListSessionsRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// Filter sessions by working directory. Must be an absolute path.
+	Cwd *string `json:"cwd,omitempty"`
+	// Opaque cursor token from a previous response's nextCursor field for cursor-based pagination
+	Cursor *string `json:"cursor,omitempty"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
 	// Filter sessions by archive state.
@@ -8867,10 +11454,46 @@ type ListSessionsRequest struct {
 	// the Agent advertises the sessionCapabilities.archive capability. The filter combines with cwd and
 	// applies before pagination. Clients keep the same value when following nextCursor.
 	Archived *SessionArchiveFilter `json:"archived,omitempty"`
-	// Opaque cursor token from a previous response's nextCursor field for cursor-based pagination
-	Cursor *string `json:"cursor,omitempty"`
-	// Filter sessions by working directory. Must be an absolute path.
-	Cwd *string `json:"cwd,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ListSessionsRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ListSessionsRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ListSessionsRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Cwd != nil {
+		b = append(b, ",\"cwd\":"...)
+		b = appendString(b, (*v.Cwd))
+	}
+	if v.Cursor != nil {
+		b = append(b, ",\"cursor\":"...)
+		b = appendString(b, (*v.Cursor))
+	}
+	if v.Archived != nil {
+		b = append(b, ",\"archived\":"...)
+		b = appendString(b, string((*v.Archived)))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ListSessionsRequest) nullError() error {
@@ -8899,21 +11522,21 @@ func (v *ListSessionsRequest) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "archived":
-			if err := decodeValue(raw, &v.Archived, true, buffered); err != nil {
+		case "cwd":
+			if err := decodePath(raw, &v.Cwd, true); err != nil {
 				return err
 			}
 		case "cursor":
 			if err := decodeValue(raw, &v.Cursor, true, buffered); err != nil {
 				return err
 			}
-		case "cwd":
-			if err := decodePath(raw, &v.Cwd, true); err != nil {
+		case "archived":
+			if err := decodeValue(raw, &v.Archived, true, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -8954,16 +11577,54 @@ func (v *ListSessionsRequest) decodeSeq(items []json.RawMessage, buffered bool) 
 
 // Response from listing sessions.
 type ListSessionsResponse struct {
+	// Array of session information objects
+	Sessions []SessionInfo `json:"sessions"`
+	// Opaque cursor token. If present, pass this in the next request's cursor parameter
+	// to fetch the next page. If absent, there are no more results.
+	NextCursor *string `json:"nextCursor,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Opaque cursor token. If present, pass this in the next request's cursor parameter
-	// to fetch the next page. If absent, there are no more results.
-	NextCursor *string `json:"nextCursor,omitempty"`
-	// Array of session information objects
-	Sessions []SessionInfo `json:"sessions"`
+}
+
+func (v ListSessionsResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ListSessionsResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ListSessionsResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessions\":"...)
+	b = append(b, '[')
+	for i0 := range v.Sessions {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Sessions[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.NextCursor != nil {
+		b = append(b, ",\"nextCursor\":"...)
+		b = appendString(b, (*v.NextCursor))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ListSessionsResponse) nullError() error {
@@ -8995,19 +11656,19 @@ func (v *ListSessionsResponse) decodeFields(data []byte, raws rawObject, buffere
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "nextCursor":
-			if err := decodeValue(raw, &v.NextCursor, true, true); err != nil {
-				v.NextCursor = nil
-			}
 		case "sessions":
 			if err := decodeList(raw, &v.Sessions, false, true, func(raw json.RawMessage, dst *SessionInfo) error {
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
 				v.Sessions = []SessionInfo{}
+			}
+		case "nextCursor":
+			if err := decodeValue(raw, &v.NextCursor, true, true); err != nil {
+				v.NextCursor = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -9097,21 +11758,16 @@ func (v *LlmProtocol) decodeJSON(data []byte, _ bool) error { return v.Unmarshal
 // Only available if the Agent supports the loadSession capability.
 // See protocol docs: Loading Sessions
 type LoadSessionRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// List of MCP servers to connect to for this session.
+	MCPServers []McpServer `json:"mcpServers"`
+	// The working directory for this session. Must be an absolute path.
+	Cwd string `json:"cwd"`
 	// Additional workspace roots to activate for this session. Each path must be absolute.
 	// When omitted or empty, no additional roots are activated. When non-empty,
 	// this is the complete resulting additional-root list for the loaded
 	// session. It may differ from any previously used or reported list as long as
 	// the request cwd matches the session's cwd.
 	AdditionalDirectories []string `json:"additionalDirectories,omitempty"`
-	// The working directory for this session. Must be an absolute path.
-	Cwd string `json:"cwd"`
-	// List of MCP servers to connect to for this session.
-	MCPServers []McpServer `json:"mcpServers"`
 	// The ID of the session to load.
 	SessionID SessionId `json:"sessionId"`
 	// UNSTABLE
@@ -9123,6 +11779,66 @@ type LoadSessionRequest struct {
 	// sessionCapabilities.systemPrompt, and SHOULD send the same value they used
 	// when the session was created.
 	SystemPrompt *SystemPrompt `json:"systemPrompt,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v LoadSessionRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *LoadSessionRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *LoadSessionRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"mcpServers\":"...)
+	b = append(b, '[')
+	for i0 := range v.MCPServers {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.MCPServers[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	b = append(b, ",\"cwd\":"...)
+	b = appendString(b, v.Cwd)
+	if len(v.AdditionalDirectories) > 0 {
+		b = append(b, ",\"additionalDirectories\":"...)
+		b = append(b, '[')
+		for i0 := range v.AdditionalDirectories {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.AdditionalDirectories[i0])
+		}
+		b = append(b, ']')
+	}
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	if v.SystemPrompt != nil {
+		b = append(b, ",\"systemPrompt\":"...)
+		if b, err = (*v.SystemPrompt).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*LoadSessionRequest) nullError() error {
@@ -9154,15 +11870,11 @@ func (v *LoadSessionRequest) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "additionalDirectories":
+		case "mcpServers":
 			if isNull(raw) {
-				v.AdditionalDirectories = nil
-			} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *string) error {
-				return decodePath(raw, dst, false)
+				v.MCPServers = []McpServer{}
+			} else if err := decodeList(raw, &v.MCPServers, false, false, func(raw json.RawMessage, dst *McpServer) error {
+				return decodeValue(raw, dst, false, buffered)
 			}); err != nil {
 				return err
 			}
@@ -9170,11 +11882,11 @@ func (v *LoadSessionRequest) decodeFields(data []byte, raws rawObject, buffered 
 			if err := decodePath(raw, &v.Cwd, false); err != nil {
 				return err
 			}
-		case "mcpServers":
+		case "additionalDirectories":
 			if isNull(raw) {
-				v.MCPServers = []McpServer{}
-			} else if err := decodeList(raw, &v.MCPServers, false, false, func(raw json.RawMessage, dst *McpServer) error {
-				return decodeValue(raw, dst, false, buffered)
+				v.AdditionalDirectories = nil
+			} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *string) error {
+				return decodePath(raw, dst, false)
 			}); err != nil {
 				return err
 			}
@@ -9185,6 +11897,10 @@ func (v *LoadSessionRequest) decodeFields(data []byte, raws rawObject, buffered 
 		case "systemPrompt":
 			if err := decodePtr(raw, &v.SystemPrompt, true, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -9260,16 +11976,58 @@ func (v *LoadSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) e
 
 // Response from loading an existing session.
 type LoadSessionResponse struct {
+	// Initial mode state if supported by the Agent
+	// See protocol docs: Session Modes
+	Modes *SessionModeState `json:"modes,omitempty"`
+	// Initial session configuration options if supported by the Agent.
+	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Initial session configuration options if supported by the Agent.
-	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
-	// Initial mode state if supported by the Agent
-	// See protocol docs: Session Modes
-	Modes *SessionModeState `json:"modes,omitempty"`
+}
+
+func (v LoadSessionResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *LoadSessionResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *LoadSessionResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Modes != nil {
+		b = append(b, ",\"modes\":"...)
+		if b, err = (*v.Modes).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.ConfigOptions != nil {
+		b = append(b, ",\"configOptions\":"...)
+		b = append(b, '[')
+		for i0 := range v.ConfigOptions {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.ConfigOptions[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*LoadSessionResponse) nullError() error {
@@ -9298,9 +12056,9 @@ func (v *LoadSessionResponse) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "modes":
+			if err := decodePtr(raw, &v.Modes, true, true); err != nil {
+				v.Modes = nil
 			}
 		case "configOptions":
 			if err := decodeList(raw, &v.ConfigOptions, true, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
@@ -9308,9 +12066,9 @@ func (v *LoadSessionResponse) decodeFields(data []byte, raws rawObject, buffered
 			}); err != nil {
 				v.ConfigOptions = nil
 			}
-		case "modes":
-			if err := decodePtr(raw, &v.Modes, true, true); err != nil {
-				v.Modes = nil
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -9353,6 +12111,29 @@ type LogoutCapabilities struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v LogoutCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *LogoutCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *LogoutCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*LogoutCapabilities) nullError() error {
@@ -9414,6 +12195,29 @@ type LogoutRequest struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v LogoutRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *LogoutRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *LogoutRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*LogoutRequest) nullError() error {
 	return errors.New("invalid type: null, expected struct Wire")
 }
@@ -9472,6 +12276,29 @@ type LogoutResponse struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v LogoutResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *LogoutResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *LogoutResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*LogoutResponse) nullError() error {
 	return errors.New("invalid type: null, expected struct Wire")
 }
@@ -9523,19 +12350,60 @@ func (v *LogoutResponse) decodeSeq(items []json.RawMessage, buffered bool) error
 
 // MCP capabilities supported by the agent
 type McpCapabilities struct {
+	// Agent supports http MCP servers.
+	HTTP *bool `json:"http,omitempty"`
+	// Agent supports sse MCP servers.
+	SSE *bool `json:"sse,omitempty"`
+	// UNSTABLE
+	// This capability is not part of the spec yet, and may be removed or changed at any point.
+	// Agent supports acp MCP servers.
+	ACP *bool `json:"acp,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// UNSTABLE
-	// This capability is not part of the spec yet, and may be removed or changed at any point.
-	// Agent supports acp MCP servers.
-	ACP *bool `json:"acp,omitempty"`
-	// Agent supports http MCP servers.
-	HTTP *bool `json:"http,omitempty"`
-	// Agent supports sse MCP servers.
-	SSE *bool `json:"sse,omitempty"`
+}
+
+func (v McpCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *McpCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *McpCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.HTTP != nil {
+		b = append(b, ",\"http\":"...)
+		b = strconv.AppendBool(b, (*v.HTTP))
+	} else {
+		b = append(b, ",\"http\":false"...)
+	}
+	if v.SSE != nil {
+		b = append(b, ",\"sse\":"...)
+		b = strconv.AppendBool(b, (*v.SSE))
+	} else {
+		b = append(b, ",\"sse\":false"...)
+	}
+	if v.ACP != nil {
+		b = append(b, ",\"acp\":"...)
+		b = strconv.AppendBool(b, (*v.ACP))
+	} else {
+		b = append(b, ",\"acp\":false"...)
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*McpCapabilities) nullError() error {
@@ -9564,14 +12432,6 @@ func (v *McpCapabilities) decodeFields(data []byte, raws rawObject, buffered boo
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "acp":
-			if err := decodeValue(raw, &v.ACP, false, true); err != nil {
-				v.ACP = nil
-			}
 		case "http":
 			if err := decodeValue(raw, &v.HTTP, false, true); err != nil {
 				v.HTTP = nil
@@ -9579,6 +12439,14 @@ func (v *McpCapabilities) decodeFields(data []byte, raws rawObject, buffered boo
 		case "sse":
 			if err := decodeValue(raw, &v.SSE, false, true); err != nil {
 				v.SSE = nil
+			}
+		case "acp":
+			if err := decodeValue(raw, &v.ACP, false, true); err != nil {
+				v.ACP = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -9624,10 +12492,45 @@ func (v *McpCapabilities) decodeSeq(items []json.RawMessage, buffered bool) erro
 type McpError struct {
 	// Inner MCP error code. Never an ACP error code.
 	Code int32 `json:"code"`
-	// Optional error data. Explicit null is retained.
-	Data json.RawMessage `json:"data,omitempty"`
 	// Inner MCP error message.
 	Message string `json:"message"`
+	// Optional error data. Explicit null is retained.
+	Data json.RawMessage `json:"data,omitempty"`
+	// Extra holds the other members, as a JSON object in wire order, which
+	// Rust keeps in a flattened map. They are written after the fields.
+	Extra json.RawMessage `json:"-"`
+}
+
+func (v McpError) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *McpError) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *McpError) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"code\":"...)
+	b = strconv.AppendInt(b, int64(v.Code), 10)
+	b = append(b, ",\"message\":"...)
+	b = appendString(b, v.Message)
+	if v.Data != nil {
+		b = append(b, ",\"data\":"...)
+		if b, err = appendRaw(b, v.Data); err != nil {
+			return nil, err
+		}
+	}
+	if len(v.Extra) > 0 {
+		if b, err = appendObjectMembers(b, v.Extra); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*McpError) nullError() error { return errors.New("invalid type: null, expected struct McpError") }
@@ -9647,6 +12550,7 @@ func (v *McpError) decodeJSON(data []byte, buffered bool) error {
 
 func (v *McpError) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	*v = McpError{}
+	var extras rawObject
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
@@ -9654,15 +12558,20 @@ func (v *McpError) decodeFields(data []byte, raws rawObject, buffered bool) erro
 			if err := decodeValue(raw, &v.Code, false, buffered); err != nil {
 				return err
 			}
-		case "data":
-			if err := decodeValue(raw, &v.Data, true, buffered); err != nil {
-				return err
-			}
 		case "message":
 			if err := decodeValue(raw, &v.Message, false, buffered); err != nil {
 				return err
 			}
+		case "data":
+			if err := decodeValue(raw, &v.Data, true, buffered); err != nil {
+				return err
+			}
+		default:
+			extras = append(extras, m)
 		}
+	}
+	if len(extras) > 0 {
+		v.Extra = rawObjectJSON(extras)
 	}
 	if _, ok := raws.get("code"); !ok {
 		return missingField("code")
@@ -9703,8 +12612,18 @@ type McpServer struct {
 	ACP   *McpServerAcp   `json:"-"`
 }
 
-func (v McpServer) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v McpServer) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *McpServer) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *McpServer) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Stdio != nil {
 		set++
@@ -9721,74 +12640,30 @@ func (v McpServer) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "McpServer", set)
 	}
-	if v.Stdio != nil {
-		payload, err := json.Marshal(v.Stdio)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Stdio != nil:
+		if b, err = v.Stdio.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("McpServer payload: %w", err)
+	case v.HTTP != nil:
+		b = append(b, ",\"type\":\"http\""...)
+		if b, err = v.HTTP.appendMembers(b); err != nil {
+			return nil, err
 		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.SSE != nil:
+		b = append(b, ",\"type\":\"sse\""...)
+		if b, err = v.SSE.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.ACP != nil:
+		b = append(b, ",\"type\":\"acp\""...)
+		if b, err = v.ACP.appendMembers(b); err != nil {
+			return nil, err
 		}
 	}
-	if v.HTTP != nil {
-		if tag, err := json.Marshal("http"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.HTTP)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("McpServer payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.SSE != nil {
-		if tag, err := json.Marshal("sse"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.SSE)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("McpServer payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.ACP != nil {
-		if tag, err := json.Marshal("acp"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.ACP)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("McpServer payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var mcpServerTags = []string{"http", "sse", "acp"}
@@ -9908,17 +12783,44 @@ func (v *McpServer) decodeSeq(items []json.RawMessage, buffered bool) error {
 // The MCP server is provided by an ACP component and communicates over the ACP channel
 // using mcp/message.
 type McpServerAcp struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Human-readable name identifying this MCP server.
 	Name string `json:"name"`
 	// Unique identifier for this MCP server, generated by the component providing it.
 	// Providers MUST NOT reuse an ID for multiple ACP-transport MCP servers that are visible
 	// on the same ACP connection.
 	ServerID McpServerAcpId `json:"serverId"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v McpServerAcp) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *McpServerAcp) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *McpServerAcp) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	b = append(b, ",\"serverId\":"...)
+	b = appendString(b, string(v.ServerID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*McpServerAcp) nullError() error {
@@ -9950,10 +12852,6 @@ func (v *McpServerAcp) decodeFields(data []byte, raws rawObject, buffered bool) 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "name":
 			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
 				return err
@@ -9961,6 +12859,10 @@ func (v *McpServerAcp) decodeFields(data []byte, raws rawObject, buffered bool) 
 		case "serverId":
 			if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -10012,17 +12914,55 @@ type McpServerAcpId string
 
 // HTTP transport configuration for MCP.
 type McpServerHttp struct {
+	// Human-readable name identifying this MCP server.
+	Name string `json:"name"`
+	// URL to the MCP server.
+	URL string `json:"url"`
+	// HTTP headers to set when making requests to the MCP server.
+	Headers []HttpHeader `json:"headers"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// HTTP headers to set when making requests to the MCP server.
-	Headers []HttpHeader `json:"headers"`
-	// Human-readable name identifying this MCP server.
-	Name string `json:"name"`
-	// URL to the MCP server.
-	URL string `json:"url"`
+}
+
+func (v McpServerHttp) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *McpServerHttp) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *McpServerHttp) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	b = append(b, ",\"url\":"...)
+	b = appendString(b, v.URL)
+	b = append(b, ",\"headers\":"...)
+	b = append(b, '[')
+	for i0 := range v.Headers {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Headers[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*McpServerHttp) nullError() error {
@@ -10054,9 +12994,13 @@ func (v *McpServerHttp) decodeFields(data []byte, raws rawObject, buffered bool)
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "name":
+			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+				return err
+			}
+		case "url":
+			if err := decodeValue(raw, &v.URL, false, buffered); err != nil {
+				return err
 			}
 		case "headers":
 			if isNull(raw) {
@@ -10066,13 +13010,9 @@ func (v *McpServerHttp) decodeFields(data []byte, raws rawObject, buffered bool)
 			}); err != nil {
 				return err
 			}
-		case "name":
-			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
-				return err
-			}
-		case "url":
-			if err := decodeValue(raw, &v.URL, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -10132,17 +13072,55 @@ func (v *McpServerHttp) decodeSeq(items []json.RawMessage, buffered bool) error 
 
 // SSE transport configuration for MCP.
 type McpServerSse struct {
+	// Human-readable name identifying this MCP server.
+	Name string `json:"name"`
+	// URL to the MCP server.
+	URL string `json:"url"`
+	// HTTP headers to set when making requests to the MCP server.
+	Headers []HttpHeader `json:"headers"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// HTTP headers to set when making requests to the MCP server.
-	Headers []HttpHeader `json:"headers"`
-	// Human-readable name identifying this MCP server.
-	Name string `json:"name"`
-	// URL to the MCP server.
-	URL string `json:"url"`
+}
+
+func (v McpServerSse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *McpServerSse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *McpServerSse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	b = append(b, ",\"url\":"...)
+	b = appendString(b, v.URL)
+	b = append(b, ",\"headers\":"...)
+	b = append(b, '[')
+	for i0 := range v.Headers {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Headers[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*McpServerSse) nullError() error {
@@ -10174,9 +13152,13 @@ func (v *McpServerSse) decodeFields(data []byte, raws rawObject, buffered bool) 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "name":
+			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+				return err
+			}
+		case "url":
+			if err := decodeValue(raw, &v.URL, false, buffered); err != nil {
+				return err
 			}
 		case "headers":
 			if isNull(raw) {
@@ -10186,13 +13168,9 @@ func (v *McpServerSse) decodeFields(data []byte, raws rawObject, buffered bool) 
 			}); err != nil {
 				return err
 			}
-		case "name":
-			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
-				return err
-			}
-		case "url":
-			if err := decodeValue(raw, &v.URL, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -10252,19 +13230,66 @@ func (v *McpServerSse) decodeSeq(items []json.RawMessage, buffered bool) error {
 
 // Stdio transport configuration for MCP.
 type McpServerStdio struct {
+	// Human-readable name identifying this MCP server.
+	Name string `json:"name"`
+	// Absolute path to the MCP server executable.
+	Command string `json:"command"`
+	// Command-line arguments to pass to the MCP server.
+	Args []string `json:"args"`
+	// Environment variables to set when launching the MCP server.
+	Env []EnvVariable `json:"env"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Command-line arguments to pass to the MCP server.
-	Args []string `json:"args"`
-	// Absolute path to the MCP server executable.
-	Command string `json:"command"`
-	// Environment variables to set when launching the MCP server.
-	Env []EnvVariable `json:"env"`
-	// Human-readable name identifying this MCP server.
-	Name string `json:"name"`
+}
+
+func (v McpServerStdio) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *McpServerStdio) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *McpServerStdio) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	b = append(b, ",\"command\":"...)
+	b = appendString(b, v.Command)
+	b = append(b, ",\"args\":"...)
+	b = append(b, '[')
+	for i0 := range v.Args {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		b = appendString(b, v.Args[i0])
+	}
+	b = append(b, ']')
+	b = append(b, ",\"env\":"...)
+	b = append(b, '[')
+	for i0 := range v.Env {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Env[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*McpServerStdio) nullError() error {
@@ -10296,9 +13321,13 @@ func (v *McpServerStdio) decodeFields(data []byte, raws rawObject, buffered bool
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "name":
+			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
+				return err
+			}
+		case "command":
+			if err := decodePath(raw, &v.Command, false); err != nil {
+				return err
 			}
 		case "args":
 			if isNull(raw) {
@@ -10306,10 +13335,6 @@ func (v *McpServerStdio) decodeFields(data []byte, raws rawObject, buffered bool
 			} else if err := decodeList(raw, &v.Args, false, false, func(raw json.RawMessage, dst *string) error {
 				return decodeValue(raw, dst, false, buffered)
 			}); err != nil {
-				return err
-			}
-		case "command":
-			if err := decodePath(raw, &v.Command, false); err != nil {
 				return err
 			}
 		case "env":
@@ -10320,9 +13345,9 @@ func (v *McpServerStdio) decodeFields(data []byte, raws rawObject, buffered bool
 			}); err != nil {
 				return err
 			}
-		case "name":
-			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -10404,20 +13429,55 @@ type MessageId string
 // Sent by the provider to the consumer for an active request (including
 // subscription acknowledgements and updates). The outer envelope has no id.
 type MessageMcpNotification struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// The declared ACP MCP server handling the associated request.
+	ServerID McpServerAcpId `json:"serverId"`
+	// The identifier of the active inner MCP request.
+	RequestID McpRequestId `json:"requestId"`
 	// The inner MCP method name.
 	Method string `json:"method"`
 	// Optional inner MCP params.
 	// If omitted or set to null, the inner MCP message has no params.
 	Params map[string]any `json:"params,omitempty"`
-	// The identifier of the active inner MCP request.
-	RequestID McpRequestId `json:"requestId"`
-	// The declared ACP MCP server handling the associated request.
-	ServerID McpServerAcpId `json:"serverId"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v MessageMcpNotification) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *MessageMcpNotification) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *MessageMcpNotification) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"serverId\":"...)
+	b = appendString(b, string(v.ServerID))
+	b = append(b, ",\"requestId\":"...)
+	b = appendString(b, string(v.RequestID))
+	b = append(b, ",\"method\":"...)
+	b = appendString(b, v.Method)
+	if v.Params != nil {
+		b = append(b, ",\"params\":"...)
+		if b, err = appendAny(b, v.Params); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*MessageMcpNotification) nullError() error {
@@ -10449,9 +13509,13 @@ func (v *MessageMcpNotification) decodeFields(data []byte, raws rawObject, buffe
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "serverId":
+			if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
+				return err
+			}
+		case "requestId":
+			if err := decodeValue(raw, &v.RequestID, false, buffered); err != nil {
+				return err
 			}
 		case "method":
 			if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
@@ -10461,13 +13525,9 @@ func (v *MessageMcpNotification) decodeFields(data []byte, raws rawObject, buffe
 			if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 				return err
 			}
-		case "requestId":
-			if err := decodeValue(raw, &v.RequestID, false, buffered); err != nil {
-				return err
-			}
-		case "serverId":
-			if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -10531,20 +13591,55 @@ func (v *MessageMcpNotification) decodeSeq(items []json.RawMessage, buffered boo
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Request parameters for mcp/message.
 type MessageMcpRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// The declared ACP MCP server receiving this request.
+	ServerID McpServerAcpId `json:"serverId"`
+	// The caller-generated identifier for the inner MCP request.
+	RequestID McpRequestId `json:"requestId"`
 	// The inner MCP method name.
 	Method string `json:"method"`
 	// Optional inner MCP params.
 	// If omitted or set to null, the inner MCP message has no params.
 	Params map[string]any `json:"params,omitempty"`
-	// The caller-generated identifier for the inner MCP request.
-	RequestID McpRequestId `json:"requestId"`
-	// The declared ACP MCP server receiving this request.
-	ServerID McpServerAcpId `json:"serverId"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v MessageMcpRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *MessageMcpRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *MessageMcpRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"serverId\":"...)
+	b = appendString(b, string(v.ServerID))
+	b = append(b, ",\"requestId\":"...)
+	b = appendString(b, string(v.RequestID))
+	b = append(b, ",\"method\":"...)
+	b = appendString(b, v.Method)
+	if v.Params != nil {
+		b = append(b, ",\"params\":"...)
+		if b, err = appendAny(b, v.Params); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*MessageMcpRequest) nullError() error {
@@ -10576,9 +13671,13 @@ func (v *MessageMcpRequest) decodeFields(data []byte, raws rawObject, buffered b
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "serverId":
+			if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
+				return err
+			}
+		case "requestId":
+			if err := decodeValue(raw, &v.RequestID, false, buffered); err != nil {
+				return err
 			}
 		case "method":
 			if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
@@ -10588,13 +13687,9 @@ func (v *MessageMcpRequest) decodeFields(data []byte, raws rawObject, buffered b
 			if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 				return err
 			}
-		case "requestId":
-			if err := decodeValue(raw, &v.RequestID, false, buffered); err != nil {
-				return err
-			}
-		case "serverId":
-			if err := decodeValue(raw, &v.ServerID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -10670,10 +13765,37 @@ type MessageMcpResponse struct {
 }
 
 type MessageMcpResponseResult struct {
-	// Optional ACP carrier metadata.
-	Meta Meta `json:"_meta,omitempty"`
 	// Required, even if JSON null.
 	Result json.RawMessage `json:"result"`
+	// Optional ACP carrier metadata.
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v MessageMcpResponseResult) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *MessageMcpResponseResult) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *MessageMcpResponseResult) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"result\":"...)
+	if b, err = appendRaw(b, v.Result); err != nil {
+		return nil, err
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*MessageMcpResponseResult) nullError() error {
@@ -10705,13 +13827,13 @@ func (v *MessageMcpResponseResult) decodeFields(data []byte, raws rawObject, buf
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "result":
 			if err := decodeValue(raw, &v.Result, true, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -10744,10 +13866,37 @@ func (v *MessageMcpResponseResult) decodeSeq(items []json.RawMessage, buffered b
 }
 
 type MessageMcpResponseError struct {
-	// Optional ACP carrier metadata.
-	Meta Meta `json:"_meta,omitempty"`
 	// Required, non-null MCP error object.
 	Error McpError `json:"error"`
+	// Optional ACP carrier metadata.
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v MessageMcpResponseError) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *MessageMcpResponseError) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *MessageMcpResponseError) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"error\":"...)
+	if b, err = v.Error.appendJSON(b); err != nil {
+		return nil, err
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*MessageMcpResponseError) nullError() error {
@@ -10779,13 +13928,13 @@ func (v *MessageMcpResponseError) decodeFields(data []byte, raws rawObject, buff
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "error":
 			if err := decodeValue(raw, &v.Error, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -10817,8 +13966,18 @@ func (v *MessageMcpResponseError) decodeSeq(items []json.RawMessage, buffered bo
 	return nil
 }
 
-func (v MessageMcpResponse) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v MessageMcpResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *MessageMcpResponse) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *MessageMcpResponse) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Result != nil {
 		set++
@@ -10829,33 +13988,19 @@ func (v MessageMcpResponse) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "MessageMcpResponse", set)
 	}
-	if v.Result != nil {
-		payload, err := json.Marshal(v.Result)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Result != nil:
+		if b, err = v.Result.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("MessageMcpResponse payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Error != nil {
-		payload, err := json.Marshal(v.Error)
-		if err != nil {
+	case v.Error != nil:
+		if b, err = v.Error.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("MessageMcpResponse payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
 	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 func (*MessageMcpResponse) nullError() error {
@@ -10909,8 +14054,18 @@ type MultiSelectItemsOther struct{ Raw json.RawMessage }
 
 func (v MultiSelectItemsOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }
 
-func (v MultiSelectItems) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v MultiSelectItems) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *MultiSelectItems) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *MultiSelectItems) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Titled != nil {
 		set++
@@ -10924,41 +14079,24 @@ func (v MultiSelectItems) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "MultiSelectItems", set)
 	}
-	if v.Titled != nil {
-		payload, err := json.Marshal(v.Titled)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Titled != nil:
+		if b, err = v.Titled.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("MultiSelectItems payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.String != nil {
-		if tag, err := json.Marshal("string"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.String)
-		if err != nil {
+	case v.String != nil:
+		b = append(b, ",\"type\":\"string\""...)
+		if b, err = v.String.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("MultiSelectItems payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.Other != nil:
+		if b, err = appendOpenMembers(b, v.Other.Raw, "type", nil, nil, nil); err != nil {
+			return nil, err
 		}
 	}
-	if v.Other != nil {
-		return v.Other.Raw, nil
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var multiSelectItemsTags = []string{"string"}
@@ -11055,29 +14193,83 @@ func (v *MultiSelectItems) decodeSeq(items []json.RawMessage, buffered bool) err
 
 // Schema for multi-select (array) properties in an elicitation form.
 type MultiSelectPropertySchema struct {
+	// Optional title for the property.
+	// Optional. Omitted and null are equivalent and mean no title is provided.
+	Title *string `json:"title,omitempty"`
+	// Human-readable description.
+	// Optional. Omitted and null are equivalent and mean no description is provided.
+	Description *string `json:"description,omitempty"`
+	// Minimum number of items to select.
+	// Optional. Omitted and null are equivalent and mean there is no minimum selection count.
+	MinItems *uint64 `json:"minItems,omitempty"`
+	// Maximum number of items to select.
+	// Optional. Omitted and null are equivalent and mean there is no maximum selection count.
+	MaxItems *uint64 `json:"maxItems,omitempty"`
+	// The items definition describing allowed values.
+	Items MultiSelectItems `json:"items"`
+	// Default selected values.
+	// Optional. Omitted and null are equivalent and mean no default selections are provided.
+	Default []string `json:"default,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Default selected values.
-	// Optional. Omitted and null are equivalent and mean no default selections are provided.
-	Default []string `json:"default,omitempty"`
-	// Human-readable description.
-	// Optional. Omitted and null are equivalent and mean no description is provided.
-	Description *string `json:"description,omitempty"`
-	// The items definition describing allowed values.
-	Items MultiSelectItems `json:"items"`
-	// Maximum number of items to select.
-	// Optional. Omitted and null are equivalent and mean there is no maximum selection count.
-	MaxItems *uint64 `json:"maxItems,omitempty"`
-	// Minimum number of items to select.
-	// Optional. Omitted and null are equivalent and mean there is no minimum selection count.
-	MinItems *uint64 `json:"minItems,omitempty"`
-	// Optional title for the property.
-	// Optional. Omitted and null are equivalent and mean no title is provided.
-	Title *string `json:"title,omitempty"`
+}
+
+func (v MultiSelectPropertySchema) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *MultiSelectPropertySchema) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *MultiSelectPropertySchema) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, (*v.Title))
+	}
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.MinItems != nil {
+		b = append(b, ",\"minItems\":"...)
+		b = strconv.AppendUint(b, uint64((*v.MinItems)), 10)
+	}
+	if v.MaxItems != nil {
+		b = append(b, ",\"maxItems\":"...)
+		b = strconv.AppendUint(b, uint64((*v.MaxItems)), 10)
+	}
+	b = append(b, ",\"items\":"...)
+	if b, err = v.Items.appendJSON(b); err != nil {
+		return nil, err
+	}
+	if v.Default != nil {
+		b = append(b, ",\"default\":"...)
+		b = append(b, '[')
+		for i0 := range v.Default {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.Default[i0])
+		}
+		b = append(b, ']')
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*MultiSelectPropertySchema) nullError() error {
@@ -11111,9 +14303,25 @@ func (v *MultiSelectPropertySchema) decodeFields(data []byte, raws rawObject, bu
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "title":
+			if err := decodeValue(raw, &v.Title, true, true); err != nil {
+				v.Title = nil
+			}
+		case "description":
+			if err := decodeValue(raw, &v.Description, true, true); err != nil {
+				v.Description = nil
+			}
+		case "minItems":
+			if err := decodeValue(raw, &v.MinItems, true, buffered); err != nil {
+				return err
+			}
+		case "maxItems":
+			if err := decodeValue(raw, &v.MaxItems, true, buffered); err != nil {
+				return err
+			}
+		case "items":
+			if err := decodeValue(raw, &v.Items, false, buffered); err != nil {
+				return err
 			}
 		case "default":
 			if err := decodeList(raw, &v.Default, true, true, func(raw json.RawMessage, dst *string) error {
@@ -11121,25 +14329,9 @@ func (v *MultiSelectPropertySchema) decodeFields(data []byte, raws rawObject, bu
 			}); err != nil {
 				v.Default = nil
 			}
-		case "description":
-			if err := decodeValue(raw, &v.Description, true, true); err != nil {
-				v.Description = nil
-			}
-		case "items":
-			if err := decodeValue(raw, &v.Items, false, buffered); err != nil {
-				return err
-			}
-		case "maxItems":
-			if err := decodeValue(raw, &v.MaxItems, true, buffered); err != nil {
-				return err
-			}
-		case "minItems":
-			if err := decodeValue(raw, &v.MinItems, true, buffered); err != nil {
-				return err
-			}
-		case "title":
-			if err := decodeValue(raw, &v.Title, true, true); err != nil {
-				v.Title = nil
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -11206,18 +14398,13 @@ func (v *MultiSelectPropertySchema) decodeSeq(items []json.RawMessage, buffered 
 // Request parameters for creating a new session.
 // See protocol docs: Creating a Session
 type NewSessionRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// The working directory for this session. Must be an absolute path.
+	Cwd string `json:"cwd"`
 	// Additional workspace roots for this session. Each path must be absolute.
 	// These expand the session's filesystem scope without changing cwd, which
 	// remains the base for relative paths. When omitted or empty, no
 	// additional roots are activated for the new session.
 	AdditionalDirectories []string `json:"additionalDirectories,omitempty"`
-	// The working directory for this session. Must be an absolute path.
-	Cwd string `json:"cwd"`
 	// List of MCP (Model Context Protocol) servers the agent should connect to.
 	MCPServers []McpServer `json:"mcpServers"`
 	// UNSTABLE
@@ -11227,6 +14414,64 @@ type NewSessionRequest struct {
 	// own default instructions. Clients MUST only send this when the Agent
 	// advertises sessionCapabilities.systemPrompt.
 	SystemPrompt *SystemPrompt `json:"systemPrompt,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v NewSessionRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *NewSessionRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *NewSessionRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"cwd\":"...)
+	b = appendString(b, v.Cwd)
+	if len(v.AdditionalDirectories) > 0 {
+		b = append(b, ",\"additionalDirectories\":"...)
+		b = append(b, '[')
+		for i0 := range v.AdditionalDirectories {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.AdditionalDirectories[i0])
+		}
+		b = append(b, ']')
+	}
+	b = append(b, ",\"mcpServers\":"...)
+	b = append(b, '[')
+	for i0 := range v.MCPServers {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.MCPServers[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.SystemPrompt != nil {
+		b = append(b, ",\"systemPrompt\":"...)
+		if b, err = (*v.SystemPrompt).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*NewSessionRequest) nullError() error {
@@ -11258,9 +14503,9 @@ func (v *NewSessionRequest) decodeFields(data []byte, raws rawObject, buffered b
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "cwd":
+			if err := decodePath(raw, &v.Cwd, false); err != nil {
+				return err
 			}
 		case "additionalDirectories":
 			if isNull(raw) {
@@ -11268,10 +14513,6 @@ func (v *NewSessionRequest) decodeFields(data []byte, raws rawObject, buffered b
 			} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *string) error {
 				return decodePath(raw, dst, false)
 			}); err != nil {
-				return err
-			}
-		case "cwd":
-			if err := decodePath(raw, &v.Cwd, false); err != nil {
 				return err
 			}
 		case "mcpServers":
@@ -11285,6 +14526,10 @@ func (v *NewSessionRequest) decodeFields(data []byte, raws rawObject, buffered b
 		case "systemPrompt":
 			if err := decodePtr(raw, &v.SystemPrompt, true, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -11350,19 +14595,63 @@ func (v *NewSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) er
 // Response from creating a new session.
 // See protocol docs: Creating a Session
 type NewSessionResponse struct {
+	// Unique identifier for the created session.
+	// Used in all subsequent requests for this conversation.
+	SessionID SessionId `json:"sessionId"`
+	// Initial mode state if supported by the Agent
+	// See protocol docs: Session Modes
+	Modes *SessionModeState `json:"modes,omitempty"`
+	// Initial session configuration options if supported by the Agent.
+	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Initial session configuration options if supported by the Agent.
-	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
-	// Initial mode state if supported by the Agent
-	// See protocol docs: Session Modes
-	Modes *SessionModeState `json:"modes,omitempty"`
-	// Unique identifier for the created session.
-	// Used in all subsequent requests for this conversation.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v NewSessionResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *NewSessionResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *NewSessionResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	if v.Modes != nil {
+		b = append(b, ",\"modes\":"...)
+		if b, err = (*v.Modes).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.ConfigOptions != nil {
+		b = append(b, ",\"configOptions\":"...)
+		b = append(b, '[')
+		for i0 := range v.ConfigOptions {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.ConfigOptions[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*NewSessionResponse) nullError() error {
@@ -11394,9 +14683,13 @@ func (v *NewSessionResponse) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+				return err
+			}
+		case "modes":
+			if err := decodePtr(raw, &v.Modes, true, true); err != nil {
+				v.Modes = nil
 			}
 		case "configOptions":
 			if err := decodeList(raw, &v.ConfigOptions, true, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
@@ -11404,13 +14697,9 @@ func (v *NewSessionResponse) decodeFields(data []byte, raws rawObject, buffered 
 			}); err != nil {
 				v.ConfigOptions = nil
 			}
-		case "modes":
-			if err := decodePtr(raw, &v.Modes, true, true); err != nil {
-				v.Modes = nil
-			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -11464,16 +14753,47 @@ func (v *NewSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) e
 // message when the information should still be surfaced to the user.
 // See RFD: Session Notices
 type Notice struct {
-	// Metadata scoped to this notice.
-	// Omitted and null are equivalent and mean no metadata was supplied.
-	Meta Meta `json:"_meta,omitempty"`
-	// Optional plain-text detail or guidance.
-	// Omitted and null are equivalent and mean no description was supplied.
-	Description *string `json:"description,omitempty"`
 	// Presentation severity hint.
 	Severity NoticeSeverity `json:"severity"`
 	// Required non-empty plain-text title that can stand alone.
 	Title string `json:"title"`
+	// Optional plain-text detail or guidance.
+	// Omitted and null are equivalent and mean no description was supplied.
+	Description *string `json:"description,omitempty"`
+	// Metadata scoped to this notice.
+	// Omitted and null are equivalent and mean no metadata was supplied.
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v Notice) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *Notice) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *Notice) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"severity\":"...)
+	b = appendString(b, string(v.Severity))
+	b = append(b, ",\"title\":"...)
+	b = appendString(b, v.Title)
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*Notice) nullError() error { return errors.New("invalid type: null, expected struct Notice") }
@@ -11503,14 +14823,6 @@ func (v *Notice) decodeFields(data []byte, raws rawObject, buffered bool) error 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "description":
-			if err := decodeValue(raw, &v.Description, true, true); err != nil {
-				v.Description = nil
-			}
 		case "severity":
 			if err := decodeValue(raw, &v.Severity, false, buffered); err != nil {
 				return err
@@ -11518,6 +14830,14 @@ func (v *Notice) decodeFields(data []byte, raws rawObject, buffered bool) error 
 		case "title":
 			if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
 				return err
+			}
+		case "description":
+			if err := decodeValue(raw, &v.Description, true, true); err != nil {
+				v.Description = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -11570,6 +14890,23 @@ func (v *Notice) decodeSeq(items []json.RawMessage, buffered bool) error {
 type NoticeCapabilities struct {
 }
 
+func (v NoticeCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *NoticeCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *NoticeCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	return b, nil
+}
+
 // Severity hint for a session notice.
 type NoticeSeverity string
 
@@ -11609,27 +14946,70 @@ func (v *NoticeSeverity) decodeJSON(data []byte, _ bool) error { return v.Unmars
 
 // Schema for number (floating-point) properties in an elicitation form.
 type NumberPropertySchema struct {
+	// Optional title for the property.
+	// Optional. Omitted and null are equivalent and mean no title is provided.
+	Title *string `json:"title,omitempty"`
+	// Human-readable description.
+	// Optional. Omitted and null are equivalent and mean no description is provided.
+	Description *string `json:"description,omitempty"`
+	// Minimum value (inclusive).
+	// Optional. Omitted and null are equivalent and mean there is no inclusive lower bound.
+	Minimum *float64 `json:"minimum,omitempty"`
+	// Maximum value (inclusive).
+	// Optional. Omitted and null are equivalent and mean there is no inclusive upper bound.
+	Maximum *float64 `json:"maximum,omitempty"`
+	// Default value.
+	// Optional. Omitted and null are equivalent and mean no default value is provided.
+	Default *float64 `json:"default,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Default value.
-	// Optional. Omitted and null are equivalent and mean no default value is provided.
-	Default *float64 `json:"default,omitempty"`
-	// Human-readable description.
-	// Optional. Omitted and null are equivalent and mean no description is provided.
-	Description *string `json:"description,omitempty"`
-	// Maximum value (inclusive).
-	// Optional. Omitted and null are equivalent and mean there is no inclusive upper bound.
-	Maximum *float64 `json:"maximum,omitempty"`
-	// Minimum value (inclusive).
-	// Optional. Omitted and null are equivalent and mean there is no inclusive lower bound.
-	Minimum *float64 `json:"minimum,omitempty"`
-	// Optional title for the property.
-	// Optional. Omitted and null are equivalent and mean no title is provided.
-	Title *string `json:"title,omitempty"`
+}
+
+func (v NumberPropertySchema) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *NumberPropertySchema) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *NumberPropertySchema) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, (*v.Title))
+	}
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.Minimum != nil {
+		b = append(b, ",\"minimum\":"...)
+		b = appendFloat(b, float64((*v.Minimum)))
+	}
+	if v.Maximum != nil {
+		b = append(b, ",\"maximum\":"...)
+		b = appendFloat(b, float64((*v.Maximum)))
+	}
+	if v.Default != nil {
+		b = append(b, ",\"default\":"...)
+		b = appendFloat(b, float64((*v.Default)))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*NumberPropertySchema) nullError() error {
@@ -11658,29 +15038,29 @@ func (v *NumberPropertySchema) decodeFields(data []byte, raws rawObject, buffere
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "default":
-			if err := decodeValue(raw, &v.Default, true, true); err != nil {
-				v.Default = nil
+		case "title":
+			if err := decodeValue(raw, &v.Title, true, true); err != nil {
+				v.Title = nil
 			}
 		case "description":
 			if err := decodeValue(raw, &v.Description, true, true); err != nil {
 				v.Description = nil
 			}
-		case "maximum":
-			if err := decodeValue(raw, &v.Maximum, true, buffered); err != nil {
-				return err
-			}
 		case "minimum":
-			if err := decodeValue(raw, &v.Minimum, true, buffered); err != nil {
+			if err := decodeFloatPtr(raw, &v.Minimum, true); err != nil {
 				return err
 			}
-		case "title":
-			if err := decodeValue(raw, &v.Title, true, true); err != nil {
-				v.Title = nil
+		case "maximum":
+			if err := decodeFloatPtr(raw, &v.Maximum, true); err != nil {
+				return err
+			}
+		case "default":
+			if err := decodeFloatPtr(raw, &v.Default, true); err != nil {
+				v.Default = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -11703,19 +15083,19 @@ func (v *NumberPropertySchema) decodeSeq(items []json.RawMessage, buffered bool)
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Minimum, true, buffered); err != nil {
+		if err := decodeFloatPtr(raw, &v.Minimum, true); err != nil {
 			return err
 		}
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Maximum, true, buffered); err != nil {
+		if err := decodeFloatPtr(raw, &v.Maximum, true); err != nil {
 			return err
 		}
 	}
 	if len(items) > 4 {
 		raw := items[4]
-		if err := decodeValue(raw, &v.Default, true, true); err != nil {
+		if err := decodeFloatPtr(raw, &v.Default, true); err != nil {
 			v.Default = nil
 		}
 	}
@@ -11733,17 +15113,46 @@ func (v *NumberPropertySchema) decodeSeq(items []json.RawMessage, buffered bool)
 
 // An option presented to the user when requesting permission.
 type PermissionOption struct {
+	// Unique identifier for this permission option.
+	OptionID PermissionOptionId `json:"optionId"`
+	// Human-readable label to display to the user.
+	Name string `json:"name"`
+	// Hint about the nature of this permission option.
+	Kind PermissionOptionKind `json:"kind"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Hint about the nature of this permission option.
-	Kind PermissionOptionKind `json:"kind"`
-	// Human-readable label to display to the user.
-	Name string `json:"name"`
-	// Unique identifier for this permission option.
-	OptionID PermissionOptionId `json:"optionId"`
+}
+
+func (v PermissionOption) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PermissionOption) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PermissionOption) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"optionId\":"...)
+	b = appendString(b, string(v.OptionID))
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	b = append(b, ",\"kind\":"...)
+	b = appendString(b, string(v.Kind))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PermissionOption) nullError() error {
@@ -11775,21 +15184,21 @@ func (v *PermissionOption) decodeFields(data []byte, raws rawObject, buffered bo
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "kind":
-			if err := decodeValue(raw, &v.Kind, false, buffered); err != nil {
+		case "optionId":
+			if err := decodeValue(raw, &v.OptionID, false, buffered); err != nil {
 				return err
 			}
 		case "name":
 			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
 				return err
 			}
-		case "optionId":
-			if err := decodeValue(raw, &v.OptionID, false, buffered); err != nil {
+		case "kind":
+			if err := decodeValue(raw, &v.Kind, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -11892,15 +15301,49 @@ func (v *PermissionOptionKind) decodeJSON(data []byte, _ bool) error { return v.
 // Plans can evolve during execution as the agent discovers new requirements or completes tasks.
 // See protocol docs: Agent Plan
 type Plan struct {
+	// The list of tasks to be accomplished.
+	// When updating a plan, the agent must send a complete list of all entries
+	// with their current status. The client replaces the entire plan with each update.
+	Entries []PlanEntry `json:"entries"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The list of tasks to be accomplished.
-	// When updating a plan, the agent must send a complete list of all entries
-	// with their current status. The client replaces the entire plan with each update.
-	Entries []PlanEntry `json:"entries"`
+}
+
+func (v Plan) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *Plan) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *Plan) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"entries\":"...)
+	b = append(b, '[')
+	for i0 := range v.Entries {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Entries[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*Plan) nullError() error { return errors.New("invalid type: null, expected struct Plan") }
@@ -11930,15 +15373,15 @@ func (v *Plan) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "entries":
 			if err := decodeList(raw, &v.Entries, false, true, func(raw json.RawMessage, dst *PlanEntry) error {
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
 				v.Entries = []PlanEntry{}
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -11981,6 +15424,29 @@ type PlanCapabilities struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v PlanCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PlanCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PlanCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PlanCapabilities) nullError() error {
@@ -12037,11 +15503,6 @@ func (v *PlanCapabilities) decodeSeq(items []json.RawMessage, buffered bool) err
 // as part of fulfilling the user's request.
 // See protocol docs: Plan Entries
 type PlanEntry struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Human-readable description of what this task aims to accomplish.
 	Content string `json:"content"`
 	// The relative importance of this task.
@@ -12049,6 +15510,40 @@ type PlanEntry struct {
 	Priority PlanEntryPriority `json:"priority"`
 	// Current execution status of this task.
 	Status PlanEntryStatus `json:"status"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v PlanEntry) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PlanEntry) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PlanEntry) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"content\":"...)
+	b = appendString(b, v.Content)
+	b = append(b, ",\"priority\":"...)
+	b = appendString(b, string(v.Priority))
+	b = append(b, ",\"status\":"...)
+	b = appendString(b, string(v.Status))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PlanEntry) nullError() error {
@@ -12080,10 +15575,6 @@ func (v *PlanEntry) decodeFields(data []byte, raws rawObject, buffered bool) err
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "content":
 			if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
 				return err
@@ -12095,6 +15586,10 @@ func (v *PlanEntry) decodeFields(data []byte, raws rawObject, buffered bool) err
 		case "status":
 			if err := decodeValue(raw, &v.Status, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -12231,15 +15726,42 @@ func (v *PlanEntryStatus) decodeJSON(data []byte, _ bool) error { return v.Unmar
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // A plan represented by a file URI.
 type PlanFile struct {
+	// The plan ID to update.
+	PlanID PlanId `json:"planId"`
+	// The URI of the file containing the plan.
+	URI string `json:"uri"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The plan ID to update.
-	PlanID PlanId `json:"planId"`
-	// The URI of the file containing the plan.
-	URI string `json:"uri"`
+}
+
+func (v PlanFile) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PlanFile) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PlanFile) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"planId\":"...)
+	b = appendString(b, string(v.PlanID))
+	b = append(b, ",\"uri\":"...)
+	b = appendString(b, v.URI)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PlanFile) nullError() error { return errors.New("invalid type: null, expected struct PlanFile") }
@@ -12269,10 +15791,6 @@ func (v *PlanFile) decodeFields(data []byte, raws rawObject, buffered bool) erro
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "planId":
 			if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
 				return err
@@ -12280,6 +15798,10 @@ func (v *PlanFile) decodeFields(data []byte, raws rawObject, buffered bool) erro
 		case "uri":
 			if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -12331,17 +15853,53 @@ type PlanId string
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // A plan represented as structured entries.
 type PlanItems struct {
+	// The plan ID to update.
+	PlanID PlanId `json:"planId"`
+	// The list of tasks to be accomplished.
+	// When updating an item-based plan, the agent must send a complete list of all entries
+	// with their current status. The client replaces that plan with each update.
+	Entries []PlanEntry `json:"entries"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The list of tasks to be accomplished.
-	// When updating an item-based plan, the agent must send a complete list of all entries
-	// with their current status. The client replaces that plan with each update.
-	Entries []PlanEntry `json:"entries"`
-	// The plan ID to update.
-	PlanID PlanId `json:"planId"`
+}
+
+func (v PlanItems) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PlanItems) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PlanItems) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"planId\":"...)
+	b = appendString(b, string(v.PlanID))
+	b = append(b, ",\"entries\":"...)
+	b = append(b, '[')
+	for i0 := range v.Entries {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Entries[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PlanItems) nullError() error {
@@ -12373,9 +15931,9 @@ func (v *PlanItems) decodeFields(data []byte, raws rawObject, buffered bool) err
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "planId":
+			if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+				return err
 			}
 		case "entries":
 			if err := decodeList(raw, &v.Entries, false, true, func(raw json.RawMessage, dst *PlanEntry) error {
@@ -12383,9 +15941,9 @@ func (v *PlanItems) decodeFields(data []byte, raws rawObject, buffered bool) err
 			}); err != nil {
 				v.Entries = []PlanEntry{}
 			}
-		case "planId":
-			if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -12434,15 +15992,42 @@ func (v *PlanItems) decodeSeq(items []json.RawMessage, buffered bool) error {
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // A plan represented as raw markdown content.
 type PlanMarkdown struct {
+	// The plan ID to update.
+	PlanID PlanId `json:"planId"`
+	// Markdown content for the plan.
+	Content string `json:"content"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Markdown content for the plan.
-	Content string `json:"content"`
-	// The plan ID to update.
-	PlanID PlanId `json:"planId"`
+}
+
+func (v PlanMarkdown) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PlanMarkdown) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PlanMarkdown) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"planId\":"...)
+	b = appendString(b, string(v.PlanID))
+	b = append(b, ",\"content\":"...)
+	b = appendString(b, v.Content)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PlanMarkdown) nullError() error {
@@ -12474,17 +16059,17 @@ func (v *PlanMarkdown) decodeFields(data []byte, raws rawObject, buffered bool) 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "planId":
+			if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
+				return err
 			}
 		case "content":
 			if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
 				return err
 			}
-		case "planId":
-			if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -12531,13 +16116,38 @@ func (v *PlanMarkdown) decodeSeq(items []json.RawMessage, buffered bool) error {
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Removal notice for a plan identified by ID.
 type PlanRemoved struct {
+	// The plan ID to remove.
+	PlanID PlanId `json:"planId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The plan ID to remove.
-	PlanID PlanId `json:"planId"`
+}
+
+func (v PlanRemoved) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PlanRemoved) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PlanRemoved) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"planId\":"...)
+	b = appendString(b, string(v.PlanID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PlanRemoved) nullError() error {
@@ -12569,13 +16179,13 @@ func (v *PlanRemoved) decodeFields(data []byte, raws rawObject, buffered bool) e
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "planId":
 			if err := decodeValue(raw, &v.PlanID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -12611,13 +16221,40 @@ func (v *PlanRemoved) decodeSeq(items []json.RawMessage, buffered bool) error {
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // A content update for a plan identified by ID.
 type PlanUpdate struct {
+	// The updated plan content.
+	Plan PlanUpdateContent `json:"plan"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The updated plan content.
-	Plan PlanUpdateContent `json:"plan"`
+}
+
+func (v PlanUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PlanUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PlanUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"plan\":"...)
+	if b, err = v.Plan.appendJSON(b); err != nil {
+		return nil, err
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PlanUpdate) nullError() error {
@@ -12649,13 +16286,13 @@ func (v *PlanUpdate) decodeFields(data []byte, raws rawObject, buffered bool) er
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "plan":
 			if err := decodeValue(raw, &v.Plan, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -12708,8 +16345,18 @@ type PlanUpdateContent struct {
 	Markdown *PlanMarkdown         `json:"-"`
 }
 
-func (v PlanUpdateContent) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v PlanUpdateContent) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PlanUpdateContent) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PlanUpdateContent) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Items != nil {
 		set++
@@ -12723,61 +16370,26 @@ func (v PlanUpdateContent) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "PlanUpdateContent", set)
 	}
-	if v.Items != nil {
-		if tag, err := json.Marshal("items"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Items)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Items != nil:
+		b = append(b, ",\"type\":\"items\""...)
+		if b, err = v.Items.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("PlanUpdateContent payload: %w", err)
+	case v.File != nil:
+		b = append(b, ",\"type\":\"file\""...)
+		if b, err = v.File.appendMembers(b); err != nil {
+			return nil, err
 		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.Markdown != nil:
+		b = append(b, ",\"type\":\"markdown\""...)
+		if b, err = v.Markdown.appendMembers(b); err != nil {
+			return nil, err
 		}
 	}
-	if v.File != nil {
-		if tag, err := json.Marshal("file"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.File)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("PlanUpdateContent payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Markdown != nil {
-		if tag, err := json.Marshal("markdown"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Markdown)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("PlanUpdateContent payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var planUpdateContentTags = []string{"items", "file", "markdown"}
@@ -12898,19 +16510,60 @@ func (v *PlanUpdateContent) decodeSeq(items []json.RawMessage, buffered bool) er
 // the agent can process.
 // See protocol docs: Prompt Capabilities
 type PromptCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// Agent supports image content blocks.
+	Image *bool `json:"image,omitempty"`
 	// Agent supports audio content blocks.
 	Audio *bool `json:"audio,omitempty"`
 	// Agent supports embedded context in session/prompt requests.
 	// When enabled, the Client is allowed to include resource content blocks
 	// in prompt requests for pieces of context that are referenced in the message.
 	EmbeddedContext *bool `json:"embeddedContext,omitempty"`
-	// Agent supports image content blocks.
-	Image *bool `json:"image,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v PromptCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PromptCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PromptCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Image != nil {
+		b = append(b, ",\"image\":"...)
+		b = strconv.AppendBool(b, (*v.Image))
+	} else {
+		b = append(b, ",\"image\":false"...)
+	}
+	if v.Audio != nil {
+		b = append(b, ",\"audio\":"...)
+		b = strconv.AppendBool(b, (*v.Audio))
+	} else {
+		b = append(b, ",\"audio\":false"...)
+	}
+	if v.EmbeddedContext != nil {
+		b = append(b, ",\"embeddedContext\":"...)
+		b = strconv.AppendBool(b, (*v.EmbeddedContext))
+	} else {
+		b = append(b, ",\"embeddedContext\":false"...)
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PromptCapabilities) nullError() error {
@@ -12939,9 +16592,9 @@ func (v *PromptCapabilities) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "image":
+			if err := decodeValue(raw, &v.Image, false, true); err != nil {
+				v.Image = nil
 			}
 		case "audio":
 			if err := decodeValue(raw, &v.Audio, false, true); err != nil {
@@ -12951,9 +16604,9 @@ func (v *PromptCapabilities) decodeFields(data []byte, raws rawObject, buffered 
 			if err := decodeValue(raw, &v.EmbeddedContext, false, true); err != nil {
 				v.EmbeddedContext = nil
 			}
-		case "image":
-			if err := decodeValue(raw, &v.Image, false, true); err != nil {
-				v.Image = nil
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -12996,11 +16649,8 @@ func (v *PromptCapabilities) decodeSeq(items []json.RawMessage, buffered bool) e
 // Contains the user's message and any additional context.
 // See protocol docs: User Message
 type PromptRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// The ID of the session to send this user message to
+	SessionID SessionId `json:"sessionId"`
 	// The blocks of content that compose the user's message.
 	// As a baseline, the Agent MUST support text and resource_link content blocks,
 	// while other variants are optionally enabled via PromptCapabilities.
@@ -13011,8 +16661,47 @@ type PromptRequest struct {
 	// as it avoids extra round-trips and allows the message to include
 	// pieces of context from sources the agent may not have access to.
 	Prompt []ContentBlock `json:"prompt"`
-	// The ID of the session to send this user message to
-	SessionID SessionId `json:"sessionId"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v PromptRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PromptRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PromptRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"prompt\":"...)
+	b = append(b, '[')
+	for i0 := range v.Prompt {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Prompt[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PromptRequest) nullError() error {
@@ -13044,9 +16733,9 @@ func (v *PromptRequest) decodeFields(data []byte, raws rawObject, buffered bool)
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+				return err
 			}
 		case "prompt":
 			if err := decodeList(raw, &v.Prompt, false, false, func(raw json.RawMessage, dst *ContentBlock) error {
@@ -13054,9 +16743,9 @@ func (v *PromptRequest) decodeFields(data []byte, raws rawObject, buffered bool)
 			}); err != nil {
 				return err
 			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -13104,17 +16793,48 @@ func (v *PromptRequest) decodeSeq(items []json.RawMessage, buffered bool) error 
 // Response from processing a user prompt.
 // See protocol docs: Check for Completion
 type PromptResponse struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Indicates why the agent stopped processing the turn.
 	StopReason StopReason `json:"stopReason"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
 	// Token usage for this turn (optional).
 	Usage *Usage `json:"usage,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v PromptResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *PromptResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *PromptResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"stopReason\":"...)
+	b = appendString(b, string(v.StopReason))
+	if v.Usage != nil {
+		b = append(b, ",\"usage\":"...)
+		if b, err = (*v.Usage).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*PromptResponse) nullError() error {
@@ -13146,10 +16866,6 @@ func (v *PromptResponse) decodeFields(data []byte, raws rawObject, buffered bool
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "stopReason":
 			if err := decodeValue(raw, &v.StopReason, false, buffered); err != nil {
 				return err
@@ -13157,6 +16873,10 @@ func (v *PromptResponse) decodeFields(data []byte, raws rawObject, buffered bool
 		case "usage":
 			if err := decodePtr(raw, &v.Usage, true, true); err != nil {
 				v.Usage = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -13203,15 +16923,42 @@ type ProtocolVersion uint16
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Current effective non-secret routing configuration for a provider.
 type ProviderCurrentConfig struct {
+	// Protocol currently used by this provider.
+	APIType LlmProtocol `json:"apiType"`
+	// Base URL currently used by this provider.
+	BaseURL string `json:"baseUrl"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Protocol currently used by this provider.
-	APIType LlmProtocol `json:"apiType"`
-	// Base URL currently used by this provider.
-	BaseURL string `json:"baseUrl"`
+}
+
+func (v ProviderCurrentConfig) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ProviderCurrentConfig) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ProviderCurrentConfig) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"apiType\":"...)
+	b = appendString(b, string(v.APIType))
+	b = append(b, ",\"baseUrl\":"...)
+	b = appendString(b, v.BaseURL)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ProviderCurrentConfig) nullError() error {
@@ -13243,10 +16990,6 @@ func (v *ProviderCurrentConfig) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "apiType":
 			if err := decodeValue(raw, &v.APIType, false, buffered); err != nil {
 				return err
@@ -13254,6 +16997,10 @@ func (v *ProviderCurrentConfig) decodeFields(data []byte, raws rawObject, buffer
 		case "baseUrl":
 			if err := decodeValue(raw, &v.BaseURL, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -13305,21 +17052,63 @@ type ProviderId string
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Information about a configurable LLM provider.
 type ProviderInfo struct {
+	// Provider identifier, for example "main" or "openai".
+	ProviderID ProviderId `json:"providerId"`
+	// Supported protocol types for this provider.
+	Supported []LlmProtocol `json:"supported"`
+	// Whether this provider is mandatory and cannot be disabled via providers/disable.
+	// If true, clients must not call providers/disable for this provider ID.
+	Required bool `json:"required"`
+	// Current effective non-secret routing config.
+	// Null or omitted means provider is disabled.
+	Current *ProviderCurrentConfig `json:"current,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Current effective non-secret routing config.
-	// Null or omitted means provider is disabled.
-	Current *ProviderCurrentConfig `json:"current,omitempty"`
-	// Provider identifier, for example "main" or "openai".
-	ProviderID ProviderId `json:"providerId"`
-	// Whether this provider is mandatory and cannot be disabled via providers/disable.
-	// If true, clients must not call providers/disable for this provider ID.
-	Required bool `json:"required"`
-	// Supported protocol types for this provider.
-	Supported []LlmProtocol `json:"supported"`
+}
+
+func (v ProviderInfo) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ProviderInfo) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ProviderInfo) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"providerId\":"...)
+	b = appendString(b, string(v.ProviderID))
+	b = append(b, ",\"supported\":"...)
+	b = append(b, '[')
+	for i0 := range v.Supported {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		b = appendString(b, string(v.Supported[i0]))
+	}
+	b = append(b, ']')
+	b = append(b, ",\"required\":"...)
+	b = strconv.AppendBool(b, v.Required)
+	if v.Current != nil {
+		b = append(b, ",\"current\":"...)
+		if b, err = (*v.Current).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ProviderInfo) nullError() error {
@@ -13351,20 +17140,8 @@ func (v *ProviderInfo) decodeFields(data []byte, raws rawObject, buffered bool) 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "current":
-			if err := decodePtr(raw, &v.Current, true, buffered); err != nil {
-				return err
-			}
 		case "providerId":
 			if err := decodeValue(raw, &v.ProviderID, false, buffered); err != nil {
-				return err
-			}
-		case "required":
-			if err := decodeValue(raw, &v.Required, false, buffered); err != nil {
 				return err
 			}
 		case "supported":
@@ -13372,6 +17149,18 @@ func (v *ProviderInfo) decodeFields(data []byte, raws rawObject, buffered bool) 
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
 				v.Supported = []LlmProtocol{}
+			}
+		case "required":
+			if err := decodeValue(raw, &v.Required, false, buffered); err != nil {
+				return err
+			}
+		case "current":
+			if err := decodePtr(raw, &v.Current, true, buffered); err != nil {
+				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -13445,6 +17234,29 @@ type ProvidersCapabilities struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v ProvidersCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ProvidersCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ProvidersCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*ProvidersCapabilities) nullError() error {
 	return errors.New("invalid type: null, expected struct ProvidersCapabilities")
 }
@@ -13502,6 +17314,31 @@ type ProxyNotification struct {
 	Params json.RawMessage `json:"params,omitempty"`
 }
 
+func (v ProxyNotification) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ProxyNotification) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ProxyNotification) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"method\":"...)
+	b = appendString(b, v.Method)
+	if v.Params != nil {
+		b = append(b, ",\"params\":"...)
+		if b, err = appendRaw(b, v.Params); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*ProxyNotification) nullError() error {
 	return errors.New("invalid type: null, expected struct ProxyNotification")
 }
@@ -13536,7 +17373,9 @@ func (v *ProxyNotification) decodeFields(data []byte, raws rawObject, buffered b
 				return err
 			}
 		case "params":
-			if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			if isNull(raw) {
+				v.Params = nil
+			} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 				return err
 			}
 		}
@@ -13559,7 +17398,9 @@ func (v *ProxyNotification) decodeSeq(items []json.RawMessage, buffered bool) er
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+		if isNull(raw) {
+			v.Params = nil
+		} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 			return err
 		}
 	}
@@ -13577,6 +17418,35 @@ type ProxyRequest struct {
 	Method string `json:"method"`
 	// Method-specific request parameters.
 	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (v ProxyRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ProxyRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ProxyRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"id\":"...)
+	if b, err = appendRequestIdUnion(b, v.ID); err != nil {
+		return nil, err
+	}
+	b = append(b, ",\"method\":"...)
+	b = appendString(b, v.Method)
+	if v.Params != nil {
+		b = append(b, ",\"params\":"...)
+		if b, err = appendRaw(b, v.Params); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ProxyRequest) nullError() error {
@@ -13609,7 +17479,7 @@ func (v *ProxyRequest) decodeFields(data []byte, raws rawObject, buffered bool) 
 		raw := m.raw
 		switch string(m.key) {
 		case "id":
-			if err := decodeChecked(raw, &v.ID, true, validRequestId); err != nil {
+			if err := decodeChecked(raw, &v.ID, true, decodeRequestIdUnion); err != nil {
 				return err
 			}
 		case "method":
@@ -13617,7 +17487,9 @@ func (v *ProxyRequest) decodeFields(data []byte, raws rawObject, buffered bool) 
 				return err
 			}
 		case "params":
-			if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			if isNull(raw) {
+				v.Params = nil
+			} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 				return err
 			}
 		}
@@ -13635,7 +17507,7 @@ func (v *ProxyRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
 	*v = ProxyRequest{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeChecked(raw, &v.ID, true, validRequestId); err != nil {
+		if err := decodeChecked(raw, &v.ID, true, decodeRequestIdUnion); err != nil {
 			return err
 		}
 	} else {
@@ -13651,7 +17523,9 @@ func (v *ProxyRequest) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+		if isNull(raw) {
+			v.Params = nil
+		} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 			return err
 		}
 	}
@@ -13674,6 +17548,31 @@ type ProxyResponseResult struct {
 	ID RequestId `json:"id"`
 	// Method-specific response data.
 	Result json.RawMessage `json:"result"`
+}
+
+func (v ProxyResponseResult) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ProxyResponseResult) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ProxyResponseResult) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"id\":"...)
+	if b, err = appendRequestIdUnion(b, v.ID); err != nil {
+		return nil, err
+	}
+	b = append(b, ",\"result\":"...)
+	if b, err = appendRaw(b, v.Result); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func (*ProxyResponseResult) nullError() error {
@@ -13706,7 +17605,7 @@ func (v *ProxyResponseResult) decodeFields(data []byte, raws rawObject, buffered
 		raw := m.raw
 		switch string(m.key) {
 		case "id":
-			if err := decodeChecked(raw, &v.ID, true, validRequestId); err != nil {
+			if err := decodeChecked(raw, &v.ID, true, decodeRequestIdUnion); err != nil {
 				return err
 			}
 		case "result":
@@ -13728,7 +17627,7 @@ func (v *ProxyResponseResult) decodeSeq(items []json.RawMessage, buffered bool) 
 	*v = ProxyResponseResult{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeChecked(raw, &v.ID, true, validRequestId); err != nil {
+		if err := decodeChecked(raw, &v.ID, true, decodeRequestIdUnion); err != nil {
 			return err
 		}
 	} else {
@@ -13749,10 +17648,35 @@ func (v *ProxyResponseResult) decodeSeq(items []json.RawMessage, buffered bool) 
 }
 
 type ProxyResponseError struct {
-	// Method-specific error data.
-	Error Error `json:"error"`
 	// The id of the request this response answers.
 	ID RequestId `json:"id"`
+	// Method-specific error data.
+	Error Error `json:"error"`
+}
+
+func (v ProxyResponseError) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ProxyResponseError) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ProxyResponseError) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"id\":"...)
+	if b, err = appendRequestIdUnion(b, v.ID); err != nil {
+		return nil, err
+	}
+	b = append(b, ",\"error\":"...)
+	if b, err = v.Error.appendJSON(b); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func (*ProxyResponseError) nullError() error {
@@ -13784,12 +17708,12 @@ func (v *ProxyResponseError) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "error":
-			if err := decodeValue(raw, &v.Error, false, buffered); err != nil {
+		case "id":
+			if err := decodeChecked(raw, &v.ID, true, decodeRequestIdUnion); err != nil {
 				return err
 			}
-		case "id":
-			if err := decodeChecked(raw, &v.ID, true, validRequestId); err != nil {
+		case "error":
+			if err := decodeValue(raw, &v.Error, false, buffered); err != nil {
 				return err
 			}
 		}
@@ -13807,7 +17731,7 @@ func (v *ProxyResponseError) decodeSeq(items []json.RawMessage, buffered bool) e
 	*v = ProxyResponseError{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeChecked(raw, &v.ID, true, validRequestId); err != nil {
+		if err := decodeChecked(raw, &v.ID, true, decodeRequestIdUnion); err != nil {
 			return err
 		}
 	} else {
@@ -13827,8 +17751,18 @@ func (v *ProxyResponseError) decodeSeq(items []json.RawMessage, buffered bool) e
 	return nil
 }
 
-func (v ProxyResponse) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v ProxyResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ProxyResponse) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ProxyResponse) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Result != nil {
 		set++
@@ -13839,33 +17773,19 @@ func (v ProxyResponse) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "ProxyResponse", set)
 	}
-	if v.Result != nil {
-		payload, err := json.Marshal(v.Result)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Result != nil:
+		if b, err = v.Result.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ProxyResponse payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Error != nil {
-		payload, err := json.Marshal(v.Error)
-		if err != nil {
+	case v.Error != nil:
+		if b, err = v.Error.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ProxyResponse payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
 	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 func (*ProxyResponse) nullError() error {
@@ -13886,7 +17806,7 @@ func (v *ProxyResponse) decodeJSON(data []byte, buffered bool) error {
 			return nil
 		}
 	}
-	if !object || hasKeys(raws, "error", "id") {
+	if !object || hasKeys(raws, "id", "error") {
 		payload := new(ProxyResponseError)
 		if err = json.Unmarshal(data, payload); err == nil {
 			v.Error = payload
@@ -13905,6 +17825,13 @@ func (v *ProxyResponse) decodeJSON(data []byte, buffered bool) error {
 // and params are the wrapped notification's method and params.
 // See the Proxy Chains RFD.
 type ProxySuccessorNotification struct {
+	// Method name of the wrapped notification.
+	Method string `json:"method"`
+	// Params of the wrapped notification, forwarded unchanged.
+	// Optional. Omitted and null are equivalent and mean the wrapped notification has no params.
+	// When present, it MUST be a JSON object or array, as JSON-RPC requires.
+	// The wrapped notification's own _meta stays inside these params.
+	Params json.RawMessage `json:"params,omitempty"`
 	// Metadata for the proxy/successor envelope itself, separate from the wrapped
 	// message's _meta. It is hop-local: the conductor does not copy it into the message
 	// it unwraps.
@@ -13913,13 +17840,37 @@ type ProxySuccessorNotification struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Method name of the wrapped notification.
-	Method string `json:"method"`
-	// Params of the wrapped notification, forwarded unchanged.
-	// Optional. Omitted and null are equivalent and mean the wrapped notification has no params.
-	// When present, it MUST be a JSON object or array, as JSON-RPC requires.
-	// The wrapped notification's own _meta stays inside these params.
-	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (v ProxySuccessorNotification) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ProxySuccessorNotification) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ProxySuccessorNotification) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"method\":"...)
+	b = appendString(b, v.Method)
+	if v.Params != nil {
+		b = append(b, ",\"params\":"...)
+		if b, err = appendRaw(b, v.Params); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ProxySuccessorNotification) nullError() error {
@@ -13953,17 +17904,19 @@ func (v *ProxySuccessorNotification) decodeFields(data []byte, raws rawObject, b
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "method":
 			if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
 				return err
 			}
 		case "params":
-			if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			if isNull(raw) {
+				v.Params = nil
+			} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -13985,7 +17938,9 @@ func (v *ProxySuccessorNotification) decodeSeq(items []json.RawMessage, buffered
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+		if isNull(raw) {
+			v.Params = nil
+		} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 			return err
 		}
 	}
@@ -14014,6 +17969,13 @@ func (v *ProxySuccessorNotification) decodeSeq(items []json.RawMessage, buffered
 // request on the same connection. Cancellation is never forwarded to another hop.
 // See the Proxy Chains RFD.
 type ProxySuccessorRequest struct {
+	// Method name of the wrapped request.
+	Method string `json:"method"`
+	// Params of the wrapped request, forwarded unchanged.
+	// Optional. Omitted and null are equivalent and mean the wrapped request has no params.
+	// When present, it MUST be a JSON object or array, as JSON-RPC requires.
+	// The wrapped request's own _meta stays inside these params.
+	Params json.RawMessage `json:"params,omitempty"`
 	// Metadata for the proxy/successor envelope itself, separate from the wrapped
 	// message's _meta. It is hop-local: the conductor does not copy it into the message
 	// it unwraps.
@@ -14022,13 +17984,37 @@ type ProxySuccessorRequest struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Method name of the wrapped request.
-	Method string `json:"method"`
-	// Params of the wrapped request, forwarded unchanged.
-	// Optional. Omitted and null are equivalent and mean the wrapped request has no params.
-	// When present, it MUST be a JSON object or array, as JSON-RPC requires.
-	// The wrapped request's own _meta stays inside these params.
-	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (v ProxySuccessorRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ProxySuccessorRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ProxySuccessorRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"method\":"...)
+	b = appendString(b, v.Method)
+	if v.Params != nil {
+		b = append(b, ",\"params\":"...)
+		if b, err = appendRaw(b, v.Params); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ProxySuccessorRequest) nullError() error {
@@ -14060,17 +18046,19 @@ func (v *ProxySuccessorRequest) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "method":
 			if err := decodeValue(raw, &v.Method, false, buffered); err != nil {
 				return err
 			}
 		case "params":
-			if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+			if isNull(raw) {
+				v.Params = nil
+			} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -14092,7 +18080,9 @@ func (v *ProxySuccessorRequest) decodeSeq(items []json.RawMessage, buffered bool
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
+		if isNull(raw) {
+			v.Params = nil
+		} else if err := decodeValue(raw, &v.Params, true, buffered); err != nil {
 			return err
 		}
 	}
@@ -14111,24 +18101,68 @@ func (v *ProxySuccessorRequest) decodeSeq(items []json.RawMessage, buffered bool
 // UNSTABLE
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Result of a proxy/successor request: the wrapped request's result, forwarded unchanged.
-type ProxySuccessorResponse = json.RawMessage
+type ProxySuccessorResponse json.RawMessage
+
+func (v ProxySuccessorResponse) MarshalJSON() ([]byte, error) {
+	return appendRaw(nil, json.RawMessage(v))
+}
+
+func (v *ProxySuccessorResponse) UnmarshalJSON(data []byte) error {
+	*v = append((*v)[:0], data...)
+	return nil
+}
 
 // Request to read content from a text file.
 // Only available if the client supports the fs.readTextFile capability.
 type ReadTextFileRequest struct {
+	// The session ID for this request.
+	SessionID SessionId `json:"sessionId"`
+	// Absolute path to the file to read.
+	Path string `json:"path"`
+	// Line number to start reading from (1-based).
+	Line *uint32 `json:"line,omitempty"`
+	// Maximum number of lines to read.
+	Limit *uint32 `json:"limit,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Maximum number of lines to read.
-	Limit *uint32 `json:"limit,omitempty"`
-	// Line number to start reading from (1-based).
-	Line *uint32 `json:"line,omitempty"`
-	// Absolute path to the file to read.
-	Path string `json:"path"`
-	// The session ID for this request.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v ReadTextFileRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ReadTextFileRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ReadTextFileRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"path\":"...)
+	b = appendString(b, v.Path)
+	if v.Line != nil {
+		b = append(b, ",\"line\":"...)
+		b = strconv.AppendUint(b, uint64((*v.Line)), 10)
+	}
+	if v.Limit != nil {
+		b = append(b, ",\"limit\":"...)
+		b = strconv.AppendUint(b, uint64((*v.Limit)), 10)
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ReadTextFileRequest) nullError() error {
@@ -14160,25 +18194,25 @@ func (v *ReadTextFileRequest) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "limit":
-			if err := decodeValue(raw, &v.Limit, true, buffered); err != nil {
-				return err
-			}
-		case "line":
-			if err := decodeValue(raw, &v.Line, true, buffered); err != nil {
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
 			}
 		case "path":
 			if err := decodePath(raw, &v.Path, false); err != nil {
 				return err
 			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+		case "line":
+			if err := decodeValue(raw, &v.Line, true, buffered); err != nil {
 				return err
+			}
+		case "limit":
+			if err := decodeValue(raw, &v.Limit, true, buffered); err != nil {
+				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -14235,13 +18269,38 @@ func (v *ReadTextFileRequest) decodeSeq(items []json.RawMessage, buffered bool) 
 
 // Response containing the contents of a text file.
 type ReadTextFileResponse struct {
+	// Content payload returned by this response.
+	Content string `json:"content"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Content payload returned by this response.
-	Content string `json:"content"`
+}
+
+func (v ReadTextFileResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ReadTextFileResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ReadTextFileResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"content\":"...)
+	b = appendString(b, v.Content)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ReadTextFileResponse) nullError() error {
@@ -14273,13 +18332,13 @@ func (v *ReadTextFileResponse) decodeFields(data []byte, raws rawObject, buffere
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "content":
 			if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -14313,15 +18372,42 @@ func (v *ReadTextFileResponse) decodeSeq(items []json.RawMessage, buffered bool)
 
 // Request to release a terminal and free its resources.
 type ReleaseTerminalRequest struct {
+	// The session ID for this request.
+	SessionID SessionId `json:"sessionId"`
+	// The ID of the terminal to release.
+	TerminalID TerminalId `json:"terminalId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The session ID for this request.
-	SessionID SessionId `json:"sessionId"`
-	// The ID of the terminal to release.
-	TerminalID TerminalId `json:"terminalId"`
+}
+
+func (v ReleaseTerminalRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ReleaseTerminalRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ReleaseTerminalRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"terminalId\":"...)
+	b = appendString(b, string(v.TerminalID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ReleaseTerminalRequest) nullError() error {
@@ -14353,10 +18439,6 @@ func (v *ReleaseTerminalRequest) decodeFields(data []byte, raws rawObject, buffe
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
@@ -14364,6 +18446,10 @@ func (v *ReleaseTerminalRequest) decodeFields(data []byte, raws rawObject, buffe
 		case "terminalId":
 			if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -14413,6 +18499,29 @@ type ReleaseTerminalResponse struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ReleaseTerminalResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ReleaseTerminalResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ReleaseTerminalResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ReleaseTerminalResponse) nullError() error {
@@ -14471,18 +18580,44 @@ func (v *ReleaseTerminalResponse) decodeSeq(items []json.RawMessage, buffered bo
 // \[2\] Fractional parts may be problematic, since many decimal fractions cannot be represented exactly as binary fractions.
 type RequestId any
 
-// validRequestId reports whether raw matches an arm of RequestId.
-func validRequestId(raw json.RawMessage) error {
+// decodeRequestIdUnion decodes raw as the first arm of RequestId it matches, as serde
+// decodes an untagged enum: a string, an integer of the arm's type, a float64,
+// a bool, nil for null, a list of the arm's item type, or the raw JSON of an
+// unconstrained arm.
+func decodeRequestIdUnion(raw json.RawMessage) (RequestId, error) {
 	if isNull(raw) {
-		return nil
+		return nil, nil
 	}
-	if !isNull(raw) && json.Unmarshal(raw, new(int64)) == nil {
-		return nil
+	if value := new(int64); !isNull(raw) && !isNegativeZero(raw) && json.Unmarshal(raw, value) == nil {
+		return *value, nil
 	}
 	if jsonKind(raw) == '"' {
-		return nil
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, err
+		}
+		return value, nil
 	}
-	return errors.New("data did not match any variant of untagged enum RequestId")
+	return nil, errors.New("data did not match any variant of untagged enum RequestId")
+}
+
+// appendRequestIdUnion writes a RequestId value as the Rust arm holding it.
+func appendRequestIdUnion(b []byte, v RequestId) ([]byte, error) {
+	var err error
+	_ = err
+	switch x := v.(type) {
+	case nil:
+		return append(b, "null"...), nil
+	case json.RawMessage:
+		return appendRaw(b, x)
+	case int64:
+		b = strconv.AppendInt(b, int64(x), 10)
+		return b, nil
+	case string:
+		b = appendString(b, x)
+		return b, nil
+	}
+	return appendAny(b, v)
 }
 
 // The outcome of a permission request.
@@ -14505,8 +18640,35 @@ type RequestPermissionOutcome struct {
 type RequestPermissionOutcomeCancelled struct {
 }
 
-func (v RequestPermissionOutcome) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v RequestPermissionOutcomeCancelled) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *RequestPermissionOutcomeCancelled) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *RequestPermissionOutcomeCancelled) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	return b, nil
+}
+
+func (v RequestPermissionOutcome) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *RequestPermissionOutcome) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *RequestPermissionOutcome) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Cancelled != nil {
 		set++
@@ -14517,43 +18679,21 @@ func (v RequestPermissionOutcome) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "RequestPermissionOutcome", set)
 	}
-	if v.Cancelled != nil {
-		if tag, err := json.Marshal("cancelled"); err != nil {
-			return nil, err
-		} else {
-			obj["outcome"] = tag
-		}
-		payload, err := json.Marshal(v.Cancelled)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Cancelled != nil:
+		b = append(b, ",\"outcome\":\"cancelled\""...)
+		if b, err = v.Cancelled.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("RequestPermissionOutcome payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.Selected != nil:
+		b = append(b, ",\"outcome\":\"selected\""...)
+		if b, err = v.Selected.appendMembers(b); err != nil {
+			return nil, err
 		}
 	}
-	if v.Selected != nil {
-		if tag, err := json.Marshal("selected"); err != nil {
-			return nil, err
-		} else {
-			obj["outcome"] = tag
-		}
-		payload, err := json.Marshal(v.Selected)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("RequestPermissionOutcome payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var requestPermissionOutcomeTags = []string{"cancelled", "selected"}
@@ -14657,17 +18797,57 @@ func (v *RequestPermissionOutcome) decodeSeq(items []json.RawMessage, buffered b
 // Sent when the agent needs authorization before performing a sensitive operation.
 // See protocol docs: Requesting Permission
 type RequestPermissionRequest struct {
+	// The session ID for this request.
+	SessionID SessionId `json:"sessionId"`
+	// Details about the tool call requiring permission.
+	ToolCall ToolCallUpdate `json:"toolCall"`
+	// Available permission options for the user to choose from.
+	Options []PermissionOption `json:"options"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Available permission options for the user to choose from.
-	Options []PermissionOption `json:"options"`
-	// The session ID for this request.
-	SessionID SessionId `json:"sessionId"`
-	// Details about the tool call requiring permission.
-	ToolCall ToolCallUpdate `json:"toolCall"`
+}
+
+func (v RequestPermissionRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *RequestPermissionRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *RequestPermissionRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"toolCall\":"...)
+	if b, err = v.ToolCall.appendJSON(b); err != nil {
+		return nil, err
+	}
+	b = append(b, ",\"options\":"...)
+	b = append(b, '[')
+	for i0 := range v.Options {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Options[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*RequestPermissionRequest) nullError() error {
@@ -14699,16 +18879,6 @@ func (v *RequestPermissionRequest) decodeFields(data []byte, raws rawObject, buf
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "options":
-			if err := decodeList(raw, &v.Options, false, false, func(raw json.RawMessage, dst *PermissionOption) error {
-				return decodeValue(raw, dst, false, buffered)
-			}); err != nil {
-				return err
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
@@ -14716,6 +18886,16 @@ func (v *RequestPermissionRequest) decodeFields(data []byte, raws rawObject, buf
 		case "toolCall":
 			if err := decodeValue(raw, &v.ToolCall, false, buffered); err != nil {
 				return err
+			}
+		case "options":
+			if err := decodeList(raw, &v.Options, false, false, func(raw json.RawMessage, dst *PermissionOption) error {
+				return decodeValue(raw, dst, false, buffered)
+			}); err != nil {
+				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -14773,13 +18953,40 @@ func (v *RequestPermissionRequest) decodeSeq(items []json.RawMessage, buffered b
 
 // Response to a permission request.
 type RequestPermissionResponse struct {
+	// The user's decision on the permission request.
+	Outcome RequestPermissionOutcome `json:"outcome"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The user's decision on the permission request.
-	Outcome RequestPermissionOutcome `json:"outcome"`
+}
+
+func (v RequestPermissionResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *RequestPermissionResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *RequestPermissionResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"outcome\":"...)
+	if b, err = v.Outcome.appendJSON(b); err != nil {
+		return nil, err
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*RequestPermissionResponse) nullError() error {
@@ -14813,13 +19020,13 @@ func (v *RequestPermissionResponse) decodeFields(data []byte, raws rawObject, bu
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "outcome":
 			if err := decodeValue(raw, &v.Outcome, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -14857,6 +19064,29 @@ type RequiresActionStateUpdate struct {
 	// Implementations MUST NOT make assumptions about values at these keys.
 	// Optional. Omitted and null mean no metadata for this state snapshot.
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v RequiresActionStateUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *RequiresActionStateUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *RequiresActionStateUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*RequiresActionStateUpdate) nullError() error {
@@ -14912,11 +19142,6 @@ func (v *RequiresActionStateUpdate) decodeSeq(items []json.RawMessage, buffered 
 
 // A resource that the server is capable of reading, included in a prompt or tool call result.
 type ResourceLink struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Optional annotations that help clients decide how to display or route this content.
 	Annotations *Annotations `json:"annotations,omitempty"`
 	// Optional human-readable details shown with this protocol object.
@@ -14931,6 +19156,60 @@ type ResourceLink struct {
 	Title *string `json:"title,omitempty"`
 	// URI associated with this resource or media payload.
 	URI string `json:"uri"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ResourceLink) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ResourceLink) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ResourceLink) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Annotations != nil {
+		b = append(b, ",\"annotations\":"...)
+		if b, err = (*v.Annotations).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.MimeType != nil {
+		b = append(b, ",\"mimeType\":"...)
+		b = appendString(b, (*v.MimeType))
+	}
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	if v.Size != nil {
+		b = append(b, ",\"size\":"...)
+		b = strconv.AppendInt(b, int64((*v.Size)), 10)
+	}
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, (*v.Title))
+	}
+	b = append(b, ",\"uri\":"...)
+	b = appendString(b, v.URI)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ResourceLink) nullError() error {
@@ -14962,10 +19241,6 @@ func (v *ResourceLink) decodeFields(data []byte, raws rawObject, buffered bool) 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "annotations":
 			if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
 				v.Annotations = nil
@@ -14993,6 +19268,10 @@ func (v *ResourceLink) decodeFields(data []byte, raws rawObject, buffered bool) 
 		case "uri":
 			if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -15070,23 +19349,18 @@ func (v *ResourceLink) decodeSeq(items []json.RawMessage, buffered bool) error {
 // This is useful for agents that can resume sessions but don't implement full session loading.
 // Only available if the Agent supports the sessionCapabilities.resume capability.
 type ResumeSessionRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// The ID of the session to resume.
+	SessionID SessionId `json:"sessionId"`
+	// The working directory for this session. Must be an absolute path.
+	Cwd string `json:"cwd"`
 	// Additional workspace roots to activate for this session. Each path must be absolute.
 	// When omitted or empty, no additional roots are activated. When non-empty,
 	// this is the complete resulting additional-root list for the resumed
 	// session. It may differ from any previously used or reported list as long as
 	// the request cwd matches the session's cwd.
 	AdditionalDirectories []string `json:"additionalDirectories,omitempty"`
-	// The working directory for this session. Must be an absolute path.
-	Cwd string `json:"cwd"`
 	// List of MCP servers to connect to for this session.
 	MCPServers []McpServer `json:"mcpServers,omitempty"`
-	// The ID of the session to resume.
-	SessionID SessionId `json:"sessionId"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
 	// System-level instructions for the resumed session.
@@ -15096,6 +19370,68 @@ type ResumeSessionRequest struct {
 	// sessionCapabilities.systemPrompt, and SHOULD send the same value they used
 	// when the session was created.
 	SystemPrompt *SystemPrompt `json:"systemPrompt,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v ResumeSessionRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ResumeSessionRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ResumeSessionRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"cwd\":"...)
+	b = appendString(b, v.Cwd)
+	if len(v.AdditionalDirectories) > 0 {
+		b = append(b, ",\"additionalDirectories\":"...)
+		b = append(b, '[')
+		for i0 := range v.AdditionalDirectories {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.AdditionalDirectories[i0])
+		}
+		b = append(b, ']')
+	}
+	if len(v.MCPServers) > 0 {
+		b = append(b, ",\"mcpServers\":"...)
+		b = append(b, '[')
+		for i0 := range v.MCPServers {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.MCPServers[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.SystemPrompt != nil {
+		b = append(b, ",\"systemPrompt\":"...)
+		if b, err = (*v.SystemPrompt).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ResumeSessionRequest) nullError() error {
@@ -15127,9 +19463,13 @@ func (v *ResumeSessionRequest) decodeFields(data []byte, raws rawObject, buffere
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+				return err
+			}
+		case "cwd":
+			if err := decodePath(raw, &v.Cwd, false); err != nil {
+				return err
 			}
 		case "additionalDirectories":
 			if isNull(raw) {
@@ -15137,10 +19477,6 @@ func (v *ResumeSessionRequest) decodeFields(data []byte, raws rawObject, buffere
 			} else if err := decodeList(raw, &v.AdditionalDirectories, false, false, func(raw json.RawMessage, dst *string) error {
 				return decodePath(raw, dst, false)
 			}); err != nil {
-				return err
-			}
-		case "cwd":
-			if err := decodePath(raw, &v.Cwd, false); err != nil {
 				return err
 			}
 		case "mcpServers":
@@ -15151,13 +19487,13 @@ func (v *ResumeSessionRequest) decodeFields(data []byte, raws rawObject, buffere
 			}); err != nil {
 				return err
 			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
-				return err
-			}
 		case "systemPrompt":
 			if err := decodePtr(raw, &v.SystemPrompt, true, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -15228,16 +19564,58 @@ func (v *ResumeSessionRequest) decodeSeq(items []json.RawMessage, buffered bool)
 
 // Response from resuming an existing session.
 type ResumeSessionResponse struct {
+	// Initial mode state if supported by the Agent
+	// See protocol docs: Session Modes
+	Modes *SessionModeState `json:"modes,omitempty"`
+	// Initial session configuration options if supported by the Agent.
+	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Initial session configuration options if supported by the Agent.
-	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
-	// Initial mode state if supported by the Agent
-	// See protocol docs: Session Modes
-	Modes *SessionModeState `json:"modes,omitempty"`
+}
+
+func (v ResumeSessionResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ResumeSessionResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ResumeSessionResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Modes != nil {
+		b = append(b, ",\"modes\":"...)
+		if b, err = (*v.Modes).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.ConfigOptions != nil {
+		b = append(b, ",\"configOptions\":"...)
+		b = append(b, '[')
+		for i0 := range v.ConfigOptions {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.ConfigOptions[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ResumeSessionResponse) nullError() error {
@@ -15266,9 +19644,9 @@ func (v *ResumeSessionResponse) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "modes":
+			if err := decodePtr(raw, &v.Modes, true, true); err != nil {
+				v.Modes = nil
 			}
 		case "configOptions":
 			if err := decodeList(raw, &v.ConfigOptions, true, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
@@ -15276,9 +19654,9 @@ func (v *ResumeSessionResponse) decodeFields(data []byte, raws rawObject, buffer
 			}); err != nil {
 				v.ConfigOptions = nil
 			}
-		case "modes":
-			if err := decodePtr(raw, &v.Modes, true, true); err != nil {
-				v.Modes = nil
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -15356,6 +19734,29 @@ type RunningStateUpdate struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v RunningStateUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *RunningStateUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *RunningStateUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*RunningStateUpdate) nullError() error {
 	return errors.New("invalid type: null, expected struct RunningStateUpdate")
 }
@@ -15407,13 +19808,38 @@ func (v *RunningStateUpdate) decodeSeq(items []json.RawMessage, buffered bool) e
 
 // The user selected one of the provided options.
 type SelectedPermissionOutcome struct {
+	// The ID of the option the user selected.
+	OptionID PermissionOptionId `json:"optionId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the option the user selected.
-	OptionID PermissionOptionId `json:"optionId"`
+}
+
+func (v SelectedPermissionOutcome) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SelectedPermissionOutcome) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SelectedPermissionOutcome) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"optionId\":"...)
+	b = appendString(b, string(v.OptionID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SelectedPermissionOutcome) nullError() error {
@@ -15447,13 +19873,13 @@ func (v *SelectedPermissionOutcome) decodeFields(data []byte, raws rawObject, bu
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "optionId":
 			if err := decodeValue(raw, &v.OptionID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -15496,6 +19922,31 @@ type SessionAdditionalDirectoriesCapabilities struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionAdditionalDirectoriesCapabilities) MarshalJSON() ([]byte, error) {
+	return v.appendJSON(nil)
+}
+
+func (v *SessionAdditionalDirectoriesCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionAdditionalDirectoriesCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionAdditionalDirectoriesCapabilities) nullError() error {
@@ -15560,6 +20011,29 @@ type SessionArchiveCapabilities struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionArchiveCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionArchiveCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionArchiveCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionArchiveCapabilities) nullError() error {
@@ -15666,6 +20140,29 @@ type SessionCancelCapabilities struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v SessionCancelCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionCancelCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionCancelCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*SessionCancelCapabilities) nullError() error {
 	return errors.New("invalid type: null, expected struct SessionCancelCapabilities")
 }
@@ -15723,11 +20220,14 @@ func (v *SessionCancelCapabilities) decodeSeq(items []json.RawMessage, buffered 
 // Note: session/load is still handled by the top-level loadSession capability. This will be unified in future versions of the protocol.
 // See protocol docs: Session Capabilities
 type SessionCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// Whether the agent supports session/list.
+	// Optional. Omitted or null both mean the agent does not advertise support.
+	// Supplying {} means the agent supports listing sessions.
+	List *SessionListCapabilities `json:"list,omitempty"`
+	// Whether the agent supports session/delete.
+	// Optional. Omitted or null both mean the agent does not advertise support.
+	// Supplying {} means the agent supports deleting sessions from session/list.
+	Delete *SessionDeleteCapabilities `json:"delete,omitempty"`
 	// Whether the agent supports additionalDirectories on supported session lifecycle requests.
 	// Optional. Omitted or null both mean the agent does not advertise support.
 	// Supplying {} means the agent supports additionalDirectories on
@@ -15738,33 +20238,23 @@ type SessionCapabilities struct {
 	AdditionalDirectories *SessionAdditionalDirectoriesCapabilities `json:"additionalDirectories,omitempty"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
-	// Whether the agent supports session/archive and session/unarchive.
+	// Whether the agent supports systemPrompt on session lifecycle requests.
 	// Optional. Omitted or null both mean the agent does not advertise support.
-	// Supplying {} means the agent supports both methods, the archived filter on
-	// session/list, and SessionInfo.archived. Agents that advertise it MUST also advertise sessionCapabilities.list.
-	Archive *SessionArchiveCapabilities `json:"archive,omitempty"`
-	// Whether the agent supports session/close.
-	// Optional. Omitted or null both mean the agent does not advertise support.
-	// Supplying {} means the agent supports closing sessions.
-	Close *SessionCloseCapabilities `json:"close,omitempty"`
-	// Whether the agent supports session/delete.
-	// Optional. Omitted or null both mean the agent does not advertise support.
-	// Supplying {} means the agent supports deleting sessions from session/list.
-	Delete *SessionDeleteCapabilities `json:"delete,omitempty"`
+	// Supplying {} means the agent supports systemPrompt in append mode.
+	SystemPrompt *SessionSystemPromptCapabilities `json:"systemPrompt,omitempty"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
 	// Whether the agent supports session/fork.
 	// Optional. Omitted or null both mean the agent does not advertise support.
 	// Supplying {} means the agent supports forking sessions.
 	Fork *SessionForkCapabilities `json:"fork,omitempty"`
-	// Whether the agent supports session/list.
+	// UNSTABLE
+	// This capability is not part of the spec yet, and may be removed or changed at any point.
+	// Whether the agent supports session/archive and session/unarchive.
 	// Optional. Omitted or null both mean the agent does not advertise support.
-	// Supplying {} means the agent supports listing sessions.
-	List *SessionListCapabilities `json:"list,omitempty"`
-	// Whether the agent supports session/resume.
-	// Optional. Omitted or null both mean the agent does not advertise support.
-	// Supplying {} means the agent supports resuming sessions.
-	Resume *SessionResumeCapabilities `json:"resume,omitempty"`
+	// Supplying {} means the agent supports both methods, the archived filter on
+	// session/list, and SessionInfo.archived. Agents that advertise it MUST also advertise sessionCapabilities.list.
+	Archive *SessionArchiveCapabilities `json:"archive,omitempty"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
 	// Whether the agent supports session/status.
@@ -15773,18 +20263,108 @@ type SessionCapabilities struct {
 	Status *SessionStatusCapabilities `json:"status,omitempty"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
-	// Whether the agent supports systemPrompt on session lifecycle requests.
-	// Optional. Omitted or null both mean the agent does not advertise support.
-	// Supplying {} means the agent supports systemPrompt in append mode.
-	SystemPrompt *SessionSystemPromptCapabilities `json:"systemPrompt,omitempty"`
-	// UNSTABLE
-	// This capability is not part of the spec yet, and may be removed or changed at any point.
 	// Whether the agent supports session/set_title.
 	// Agents report titles through session/list and session_info_update without this
 	// capability. It only advertises that Clients can set titles.
 	// Optional. Omitted or null both mean the agent does not advertise support.
 	// Supplying {} means the agent supports setting session titles.
 	Title *SessionTitleCapabilities `json:"title,omitempty"`
+	// Whether the agent supports session/resume.
+	// Optional. Omitted or null both mean the agent does not advertise support.
+	// Supplying {} means the agent supports resuming sessions.
+	Resume *SessionResumeCapabilities `json:"resume,omitempty"`
+	// Whether the agent supports session/close.
+	// Optional. Omitted or null both mean the agent does not advertise support.
+	// Supplying {} means the agent supports closing sessions.
+	Close *SessionCloseCapabilities `json:"close,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.List != nil {
+		b = append(b, ",\"list\":"...)
+		if b, err = (*v.List).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Delete != nil {
+		b = append(b, ",\"delete\":"...)
+		if b, err = (*v.Delete).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.AdditionalDirectories != nil {
+		b = append(b, ",\"additionalDirectories\":"...)
+		if b, err = (*v.AdditionalDirectories).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.SystemPrompt != nil {
+		b = append(b, ",\"systemPrompt\":"...)
+		if b, err = (*v.SystemPrompt).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Fork != nil {
+		b = append(b, ",\"fork\":"...)
+		if b, err = (*v.Fork).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Archive != nil {
+		b = append(b, ",\"archive\":"...)
+		if b, err = (*v.Archive).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Status != nil {
+		b = append(b, ",\"status\":"...)
+		if b, err = (*v.Status).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		if b, err = (*v.Title).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Resume != nil {
+		b = append(b, ",\"resume\":"...)
+		if b, err = (*v.Resume).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Close != nil {
+		b = append(b, ",\"close\":"...)
+		if b, err = (*v.Close).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionCapabilities) nullError() error {
@@ -15813,49 +20393,49 @@ func (v *SessionCapabilities) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "additionalDirectories":
-			if err := decodePtr(raw, &v.AdditionalDirectories, true, true); err != nil {
-				v.AdditionalDirectories = nil
-			}
-		case "archive":
-			if err := decodePtr(raw, &v.Archive, true, true); err != nil {
-				v.Archive = nil
-			}
-		case "close":
-			if err := decodePtr(raw, &v.Close, true, true); err != nil {
-				v.Close = nil
+		case "list":
+			if err := decodePtr(raw, &v.List, true, true); err != nil {
+				v.List = nil
 			}
 		case "delete":
 			if err := decodePtr(raw, &v.Delete, true, true); err != nil {
 				v.Delete = nil
 			}
-		case "fork":
-			if err := decodePtr(raw, &v.Fork, true, true); err != nil {
-				v.Fork = nil
-			}
-		case "list":
-			if err := decodePtr(raw, &v.List, true, true); err != nil {
-				v.List = nil
-			}
-		case "resume":
-			if err := decodePtr(raw, &v.Resume, true, true); err != nil {
-				v.Resume = nil
-			}
-		case "status":
-			if err := decodePtr(raw, &v.Status, true, true); err != nil {
-				v.Status = nil
+		case "additionalDirectories":
+			if err := decodePtr(raw, &v.AdditionalDirectories, true, true); err != nil {
+				v.AdditionalDirectories = nil
 			}
 		case "systemPrompt":
 			if err := decodePtr(raw, &v.SystemPrompt, true, true); err != nil {
 				v.SystemPrompt = nil
 			}
+		case "fork":
+			if err := decodePtr(raw, &v.Fork, true, true); err != nil {
+				v.Fork = nil
+			}
+		case "archive":
+			if err := decodePtr(raw, &v.Archive, true, true); err != nil {
+				v.Archive = nil
+			}
+		case "status":
+			if err := decodePtr(raw, &v.Status, true, true); err != nil {
+				v.Status = nil
+			}
 		case "title":
 			if err := decodePtr(raw, &v.Title, true, true); err != nil {
 				v.Title = nil
+			}
+		case "resume":
+			if err := decodePtr(raw, &v.Resume, true, true); err != nil {
+				v.Resume = nil
+			}
+		case "close":
+			if err := decodePtr(raw, &v.Close, true, true); err != nil {
+				v.Close = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -15946,6 +20526,29 @@ type SessionCloseCapabilities struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v SessionCloseCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionCloseCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionCloseCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*SessionCloseCapabilities) nullError() error {
 	return errors.New("invalid type: null, expected struct SessionCloseCapabilities")
 }
@@ -15999,6 +20602,25 @@ func (v *SessionCloseCapabilities) decodeSeq(items []json.RawMessage, buffered b
 type SessionConfigBoolean struct {
 	// The current value of the boolean option.
 	CurrentValue bool `json:"currentValue"`
+}
+
+func (v SessionConfigBoolean) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionConfigBoolean) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionConfigBoolean) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"currentValue\":"...)
+	b = strconv.AppendBool(b, v.CurrentValue)
+	return b, nil
 }
 
 func (*SessionConfigBoolean) nullError() error {
@@ -16077,35 +20699,35 @@ const (
 // derived from the payload on encode; setting it by hand has no effect.
 type SessionConfigOption struct {
 	Kind SessionConfigOptionKind `json:"-"`
+	// Unique identifier for the configuration option.
+	ID SessionConfigId `json:"id"`
+	// Human-readable label for the option.
+	Name string `json:"name"`
+	// Optional description for the Client to display to the user.
+	Description *string `json:"description,omitempty"`
+	// Optional semantic category for this option (UX only).
+	Category *SessionConfigOptionCategory `json:"category,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
-	// Optional semantic category for this option (UX only).
-	Category *SessionConfigOptionCategory `json:"category,omitempty"`
-	// Optional description for the Client to display to the user.
-	Description *string `json:"description,omitempty"`
-	// Unique identifier for the configuration option.
-	ID SessionConfigId `json:"id"`
-	// Human-readable label for the option.
-	Name    string                `json:"name"`
+	Meta    Meta                  `json:"_meta,omitempty"`
 	Select  *SessionConfigSelect  `json:"-"`
 	Boolean *SessionConfigBoolean `json:"-"`
 }
 
-// sessionConfigOptionShadow mirrors SessionConfigOption without its union methods, for encoding common fields.
-type sessionConfigOptionShadow SessionConfigOption
+func (v SessionConfigOption) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
 
-func (v SessionConfigOption) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
-	if common, err := json.Marshal(sessionConfigOptionShadow(v)); err != nil {
+func (v *SessionConfigOption) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
 		return nil, err
-	} else if len(common) > 2 {
-		if err := json.Unmarshal(common, &obj); err != nil {
-			return nil, err
-		}
 	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionConfigOption) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Select != nil {
 		set++
@@ -16116,43 +20738,39 @@ func (v SessionConfigOption) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "SessionConfigOption", set)
 	}
-	if v.Select != nil {
-		if tag, err := json.Marshal("select"); err != nil {
+	var err error
+	_ = err
+	b = append(b, ",\"id\":"...)
+	b = appendString(b, string(v.ID))
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.Category != nil {
+		b = append(b, ",\"category\":"...)
+		b = appendString(b, string((*v.Category)))
+	}
+	switch {
+	case v.Select != nil:
+		b = append(b, ",\"type\":\"select\""...)
+		if b, err = v.Select.appendMembers(b); err != nil {
 			return nil, err
-		} else {
-			obj["type"] = tag
 		}
-		payload, err := json.Marshal(v.Select)
-		if err != nil {
+	case v.Boolean != nil:
+		b = append(b, ",\"type\":\"boolean\""...)
+		if b, err = v.Boolean.appendMembers(b); err != nil {
 			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionConfigOption payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
 		}
 	}
-	if v.Boolean != nil {
-		if tag, err := json.Marshal("boolean"); err != nil {
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
 			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Boolean)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionConfigOption payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
 		}
 	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var sessionConfigOptionTags = []string{"select", "boolean"}
@@ -16179,18 +20797,6 @@ func (v *SessionConfigOption) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "category":
-			if err := decodeValue(raw, &v.Category, true, true); err != nil {
-				v.Category = nil
-			}
-		case "description":
-			if err := decodeValue(raw, &v.Description, true, true); err != nil {
-				v.Description = nil
-			}
 		case "id":
 			if err := decodeValue(raw, &v.ID, false, buffered); err != nil {
 				return err
@@ -16198,6 +20804,18 @@ func (v *SessionConfigOption) decodeFields(data []byte, raws rawObject, buffered
 		case "name":
 			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
 				return err
+			}
+		case "description":
+			if err := decodeValue(raw, &v.Description, true, true); err != nil {
+				v.Description = nil
+			}
+		case "category":
+			if err := decodeValue(raw, &v.Category, true, true); err != nil {
+				v.Category = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -16290,17 +20908,46 @@ func (v *SessionConfigOptionCategory) decodeJSON(data []byte, _ bool) error {
 
 // Session configuration option capabilities supported by the client.
 type SessionConfigOptionsCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Whether the client supports boolean session configuration options.
 	// Optional. Omitted or null both mean the client does not advertise support.
 	// Supplying {} means agents may include type: "boolean" entries in
 	// configOptions, and the client may send session/set_config_option
 	// requests with type: "boolean" and a boolean value.
 	Boolean *BooleanConfigOptionCapabilities `json:"boolean,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionConfigOptionsCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionConfigOptionsCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionConfigOptionsCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Boolean != nil {
+		b = append(b, ",\"boolean\":"...)
+		if b, err = (*v.Boolean).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionConfigOptionsCapabilities) nullError() error {
@@ -16331,13 +20978,13 @@ func (v *SessionConfigOptionsCapabilities) decodeFields(data []byte, raws rawObj
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "boolean":
 			if err := decodePtr(raw, &v.Boolean, true, true); err != nil {
 				v.Boolean = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -16370,6 +21017,29 @@ type SessionConfigSelect struct {
 	CurrentValue SessionConfigValueId `json:"currentValue"`
 	// The set of selectable options.
 	Options SessionConfigSelectOptions `json:"options"`
+}
+
+func (v SessionConfigSelect) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionConfigSelect) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionConfigSelect) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"currentValue\":"...)
+	b = appendString(b, string(v.CurrentValue))
+	b = append(b, ",\"options\":"...)
+	if b, err = appendSessionConfigSelectOptionsUnion(b, v.Options); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func (*SessionConfigSelect) nullError() error {
@@ -16406,7 +21076,7 @@ func (v *SessionConfigSelect) decodeFields(data []byte, raws rawObject, buffered
 				return err
 			}
 		case "options":
-			if err := decodeChecked(raw, &v.Options, false, validSessionConfigSelectOptions); err != nil {
+			if err := decodeChecked(raw, &v.Options, false, decodeSessionConfigSelectOptionsUnion); err != nil {
 				return err
 			}
 		}
@@ -16432,7 +21102,7 @@ func (v *SessionConfigSelect) decodeSeq(items []json.RawMessage, buffered bool) 
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeChecked(raw, &v.Options, false, validSessionConfigSelectOptions); err != nil {
+		if err := decodeChecked(raw, &v.Options, false, decodeSessionConfigSelectOptionsUnion); err != nil {
 			return err
 		}
 	} else {
@@ -16446,17 +21116,55 @@ func (v *SessionConfigSelect) decodeSeq(items []json.RawMessage, buffered bool) 
 
 // A group of possible values for a session configuration option.
 type SessionConfigSelectGroup struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Unique identifier for this group.
 	Group SessionConfigGroupId `json:"group"`
 	// Human-readable label for this group.
 	Name string `json:"name"`
 	// The set of option values in this group.
 	Options []SessionConfigSelectOption `json:"options"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionConfigSelectGroup) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionConfigSelectGroup) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionConfigSelectGroup) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"group\":"...)
+	b = appendString(b, string(v.Group))
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	b = append(b, ",\"options\":"...)
+	b = append(b, '[')
+	for i0 := range v.Options {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Options[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionConfigSelectGroup) nullError() error {
@@ -16488,10 +21196,6 @@ func (v *SessionConfigSelectGroup) decodeFields(data []byte, raws rawObject, buf
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "group":
 			if err := decodeValue(raw, &v.Group, false, buffered); err != nil {
 				return err
@@ -16505,6 +21209,10 @@ func (v *SessionConfigSelectGroup) decodeFields(data []byte, raws rawObject, buf
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
 				v.Options = []SessionConfigSelectOption{}
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -16562,17 +21270,48 @@ func (v *SessionConfigSelectGroup) decodeSeq(items []json.RawMessage, buffered b
 
 // A possible value for a session configuration option.
 type SessionConfigSelectOption struct {
+	// Unique identifier for this option value.
+	Value SessionConfigValueId `json:"value"`
+	// Human-readable label for this option value.
+	Name string `json:"name"`
+	// Optional description for this option value.
+	Description *string `json:"description,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Optional description for this option value.
-	Description *string `json:"description,omitempty"`
-	// Human-readable label for this option value.
-	Name string `json:"name"`
-	// Unique identifier for this option value.
-	Value SessionConfigValueId `json:"value"`
+}
+
+func (v SessionConfigSelectOption) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionConfigSelectOption) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionConfigSelectOption) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"value\":"...)
+	b = appendString(b, string(v.Value))
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionConfigSelectOption) nullError() error {
@@ -16606,21 +21345,21 @@ func (v *SessionConfigSelectOption) decodeFields(data []byte, raws rawObject, bu
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "description":
-			if err := decodeValue(raw, &v.Description, true, true); err != nil {
-				v.Description = nil
+		case "value":
+			if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
+				return err
 			}
 		case "name":
 			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
 				return err
 			}
-		case "value":
-			if err := decodeValue(raw, &v.Value, false, buffered); err != nil {
-				return err
+		case "description":
+			if err := decodeValue(raw, &v.Description, true, true); err != nil {
+				v.Description = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -16672,19 +21411,59 @@ func (v *SessionConfigSelectOption) decodeSeq(items []json.RawMessage, buffered 
 // Possible values for a session configuration option.
 type SessionConfigSelectOptions any
 
-// validSessionConfigSelectOptions reports whether raw matches an arm of SessionConfigSelectOptions.
-func validSessionConfigSelectOptions(raw json.RawMessage) error {
-	if decodeList(raw, new([]SessionConfigSelectOption), false, false, func(raw json.RawMessage, dst *SessionConfigSelectOption) error {
+// decodeSessionConfigSelectOptionsUnion decodes raw as the first arm of SessionConfigSelectOptions it matches, as serde
+// decodes an untagged enum: a string, an integer of the arm's type, a float64,
+// a bool, nil for null, a list of the arm's item type, or the raw JSON of an
+// unconstrained arm.
+func decodeSessionConfigSelectOptionsUnion(raw json.RawMessage) (SessionConfigSelectOptions, error) {
+	if value := []SessionConfigSelectOption(nil); decodeList(raw, &value, false, false, func(raw json.RawMessage, dst *SessionConfigSelectOption) error {
 		return decodeValue(raw, dst, false, true)
 	}) == nil {
-		return nil
+		return value, nil
 	}
-	if decodeList(raw, new([]SessionConfigSelectGroup), false, false, func(raw json.RawMessage, dst *SessionConfigSelectGroup) error {
+	if value := []SessionConfigSelectGroup(nil); decodeList(raw, &value, false, false, func(raw json.RawMessage, dst *SessionConfigSelectGroup) error {
 		return decodeValue(raw, dst, false, true)
 	}) == nil {
-		return nil
+		return value, nil
 	}
-	return errors.New("data did not match any variant of untagged enum SessionConfigSelectOptions")
+	return nil, errors.New("data did not match any variant of untagged enum SessionConfigSelectOptions")
+}
+
+// appendSessionConfigSelectOptionsUnion writes a SessionConfigSelectOptions value as the Rust arm holding it.
+func appendSessionConfigSelectOptionsUnion(b []byte, v SessionConfigSelectOptions) ([]byte, error) {
+	var err error
+	_ = err
+	switch x := v.(type) {
+	case nil:
+		return append(b, "null"...), nil
+	case json.RawMessage:
+		return appendRaw(b, x)
+	case []SessionConfigSelectOption:
+		b = append(b, '[')
+		for i0 := range x {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = x[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+		return b, nil
+	case []SessionConfigSelectGroup:
+		b = append(b, '[')
+		for i0 := range x {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = x[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+		return b, nil
+	}
+	return appendAny(b, v)
 }
 
 // Unique identifier for a session configuration option value.
@@ -16698,6 +21477,29 @@ type SessionDeleteCapabilities struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionDeleteCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionDeleteCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionDeleteCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionDeleteCapabilities) nullError() error {
@@ -16763,6 +21565,29 @@ type SessionForkCapabilities struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v SessionForkCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionForkCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionForkCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*SessionForkCapabilities) nullError() error {
 	return errors.New("invalid type: null, expected struct SessionForkCapabilities")
 }
@@ -16820,30 +21645,80 @@ type SessionId string
 
 // Information about a session returned by session/list
 type SessionInfo struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// Unique identifier for the session
+	SessionID SessionId `json:"sessionId"`
+	// The working directory for this session. Must be an absolute path.
+	Cwd string `json:"cwd"`
 	// Additional workspace roots reported for this session. Each path must be absolute.
 	// When present, this is the complete ordered additional-root list reported
 	// by the Agent. Omitted and empty values are equivalent: the response
 	// reports no additional roots.
 	AdditionalDirectories []string `json:"additionalDirectories,omitempty"`
+	// Human-readable title for the session
+	Title *string `json:"title,omitempty"`
+	// ISO 8601 timestamp of last activity
+	UpdatedAt *string `json:"updatedAt,omitempty"`
 	// UNSTABLE
 	// This capability is not part of the spec yet, and may be removed or changed at any point.
 	// Whether the session is archived.
 	// Optional. Omitted and null are equivalent and mean the archive state is not reported.
 	// Agents that advertise the sessionCapabilities.archive capability MUST include it on every listed session.
 	Archived *bool `json:"archived,omitempty"`
-	// The working directory for this session. Must be an absolute path.
-	Cwd string `json:"cwd"`
-	// Unique identifier for the session
-	SessionID SessionId `json:"sessionId"`
-	// Human-readable title for the session
-	Title *string `json:"title,omitempty"`
-	// ISO 8601 timestamp of last activity
-	UpdatedAt *string `json:"updatedAt,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionInfo) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionInfo) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionInfo) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"cwd\":"...)
+	b = appendString(b, v.Cwd)
+	if len(v.AdditionalDirectories) > 0 {
+		b = append(b, ",\"additionalDirectories\":"...)
+		b = append(b, '[')
+		for i0 := range v.AdditionalDirectories {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.AdditionalDirectories[i0])
+		}
+		b = append(b, ']')
+	}
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, (*v.Title))
+	}
+	if v.UpdatedAt != nil {
+		b = append(b, ",\"updatedAt\":"...)
+		b = appendString(b, (*v.UpdatedAt))
+	}
+	if v.Archived != nil {
+		b = append(b, ",\"archived\":"...)
+		b = strconv.AppendBool(b, (*v.Archived))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionInfo) nullError() error {
@@ -16875,27 +21750,19 @@ func (v *SessionInfo) decodeFields(data []byte, raws rawObject, buffered bool) e
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+				return err
+			}
+		case "cwd":
+			if err := decodePath(raw, &v.Cwd, false); err != nil {
+				return err
 			}
 		case "additionalDirectories":
 			if err := decodeList(raw, &v.AdditionalDirectories, false, true, func(raw json.RawMessage, dst *string) error {
 				return decodePath(raw, dst, false)
 			}); err != nil {
 				v.AdditionalDirectories = nil
-			}
-		case "archived":
-			if err := decodeValue(raw, &v.Archived, true, true); err != nil {
-				v.Archived = nil
-			}
-		case "cwd":
-			if err := decodePath(raw, &v.Cwd, false); err != nil {
-				return err
-			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
-				return err
 			}
 		case "title":
 			if err := decodeValue(raw, &v.Title, true, true); err != nil {
@@ -16904,6 +21771,14 @@ func (v *SessionInfo) decodeFields(data []byte, raws rawObject, buffered bool) e
 		case "updatedAt":
 			if err := decodeValue(raw, &v.UpdatedAt, true, true); err != nil {
 				v.UpdatedAt = nil
+			}
+		case "archived":
+			if err := decodeValue(raw, &v.Archived, true, true); err != nil {
+				v.Archived = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -16976,15 +21851,52 @@ func (v *SessionInfo) decodeSeq(items []json.RawMessage, buffered bool) error {
 // Agents send this notification to update session information like title or custom metadata.
 // Clients can use it to keep session titles and state current.
 type SessionInfoUpdate struct {
+	// Human-readable title for the session. Set to null to clear.
+	Title Nullable[string] `json:"title,omitzero"`
+	// ISO 8601 timestamp of last activity. Set to null to clear.
+	UpdatedAt Nullable[string] `json:"updatedAt,omitzero"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Human-readable title for the session. Set to null to clear.
-	Title Nullable[string] `json:"title,omitzero"`
-	// ISO 8601 timestamp of last activity. Set to null to clear.
-	UpdatedAt Nullable[string] `json:"updatedAt,omitzero"`
+}
+
+func (v SessionInfoUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionInfoUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionInfoUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	switch {
+	case v.Title.Set && !v.Title.Null:
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, v.Title.Value)
+	case v.Title.Set && v.Title.Null:
+		b = append(b, ",\"title\":null"...)
+	}
+	switch {
+	case v.UpdatedAt.Set && !v.UpdatedAt.Null:
+		b = append(b, ",\"updatedAt\":"...)
+		b = appendString(b, v.UpdatedAt.Value)
+	case v.UpdatedAt.Set && v.UpdatedAt.Null:
+		b = append(b, ",\"updatedAt\":null"...)
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionInfoUpdate) nullError() error {
@@ -17013,10 +21925,6 @@ func (v *SessionInfoUpdate) decodeFields(data []byte, raws rawObject, buffered b
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "title":
 			if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
 				return decodeValue(raw, dst, false, true)
@@ -17028,6 +21936,10 @@ func (v *SessionInfoUpdate) decodeFields(data []byte, raws rawObject, buffered b
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
 				v.UpdatedAt = Nullable[string]{}
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -17072,6 +21984,29 @@ type SessionListCapabilities struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionListCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionListCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionListCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionListCapabilities) nullError() error {
@@ -17127,19 +22062,11 @@ func (v *SessionListCapabilities) decodeSeq(items []json.RawMessage, buffered bo
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // An upsert for an inter-session message.
 type SessionMessage struct {
-	// Omitted leaves metadata unchanged. null removes it.
-	// Implementations MUST NOT make assumptions about values in _meta.
-	Meta Nullable[Meta] `json:"_meta,omitzero"`
-	// Omitted leaves content unchanged. null or [] clears it.
-	// A non-empty array replaces all content.
-	Content Nullable[[]ContentBlock] `json:"content,omitzero"`
 	// Identifier of this message within the enclosing session's transcript.
 	MessageID MessageId `json:"messageId"`
-	// On an outgoing view, the messageId of the same message's incoming view in the
-	// recipient's transcript.
-	// Omitted leaves the stored value unchanged. null clears it. A value replaces it. It can arrive
-	// after the message starts streaming.
-	RecipientMessageID Nullable[MessageId] `json:"recipientMessageId,omitzero"`
+	// The sending session.
+	// Omitted leaves the stored value unchanged. null clears it. A value replaces it.
+	SenderSessionID Nullable[SessionId] `json:"senderSessionId,omitzero"`
 	// The receiving session.
 	// Omitted leaves the stored value unchanged. null clears it. A value replaces it.
 	RecipientSessionID Nullable[SessionId] `json:"recipientSessionId,omitzero"`
@@ -17148,9 +22075,89 @@ type SessionMessage struct {
 	// Omitted leaves the stored value unchanged. null clears it. A value replaces it. It can arrive
 	// after the message starts streaming.
 	SenderMessageID Nullable[MessageId] `json:"senderMessageId,omitzero"`
-	// The sending session.
-	// Omitted leaves the stored value unchanged. null clears it. A value replaces it.
-	SenderSessionID Nullable[SessionId] `json:"senderSessionId,omitzero"`
+	// On an outgoing view, the messageId of the same message's incoming view in the
+	// recipient's transcript.
+	// Omitted leaves the stored value unchanged. null clears it. A value replaces it. It can arrive
+	// after the message starts streaming.
+	RecipientMessageID Nullable[MessageId] `json:"recipientMessageId,omitzero"`
+	// Omitted leaves content unchanged. null or [] clears it.
+	// A non-empty array replaces all content.
+	Content Nullable[[]ContentBlock] `json:"content,omitzero"`
+	// Omitted leaves metadata unchanged. null removes it.
+	// Implementations MUST NOT make assumptions about values in _meta.
+	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v SessionMessage) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionMessage) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionMessage) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"messageId\":"...)
+	b = appendString(b, string(v.MessageID))
+	switch {
+	case v.SenderSessionID.Set && !v.SenderSessionID.Null:
+		b = append(b, ",\"senderSessionId\":"...)
+		b = appendString(b, string(v.SenderSessionID.Value))
+	case v.SenderSessionID.Set && v.SenderSessionID.Null:
+		b = append(b, ",\"senderSessionId\":null"...)
+	}
+	switch {
+	case v.RecipientSessionID.Set && !v.RecipientSessionID.Null:
+		b = append(b, ",\"recipientSessionId\":"...)
+		b = appendString(b, string(v.RecipientSessionID.Value))
+	case v.RecipientSessionID.Set && v.RecipientSessionID.Null:
+		b = append(b, ",\"recipientSessionId\":null"...)
+	}
+	switch {
+	case v.SenderMessageID.Set && !v.SenderMessageID.Null:
+		b = append(b, ",\"senderMessageId\":"...)
+		b = appendString(b, string(v.SenderMessageID.Value))
+	case v.SenderMessageID.Set && v.SenderMessageID.Null:
+		b = append(b, ",\"senderMessageId\":null"...)
+	}
+	switch {
+	case v.RecipientMessageID.Set && !v.RecipientMessageID.Null:
+		b = append(b, ",\"recipientMessageId\":"...)
+		b = appendString(b, string(v.RecipientMessageID.Value))
+	case v.RecipientMessageID.Set && v.RecipientMessageID.Null:
+		b = append(b, ",\"recipientMessageId\":null"...)
+	}
+	switch {
+	case v.Content.Set && !v.Content.Null:
+		b = append(b, ",\"content\":"...)
+		b = append(b, '[')
+		for i0 := range v.Content.Value {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.Content.Value[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	case v.Content.Set && v.Content.Null:
+		b = append(b, ",\"content\":null"...)
+	}
+	switch {
+	case v.Meta.Set && !v.Meta.Null:
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta.Value); err != nil {
+			return nil, err
+		}
+	case v.Meta.Set && v.Meta.Null:
+		b = append(b, ",\"_meta\":null"...)
+	}
+	return b, nil
 }
 
 func (*SessionMessage) nullError() error {
@@ -17182,29 +22189,15 @@ func (v *SessionMessage) decodeFields(data []byte, raws rawObject, buffered bool
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
-				return decodeValue(raw, dst, false, true)
-			}); err != nil {
-				v.Meta = Nullable[Meta]{}
-			}
-		case "content":
-			if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ContentBlock) error {
-				return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
-					return decodeValue(raw, dst, false, true)
-				})
-			}); err != nil {
-				v.Content = Nullable[[]ContentBlock]{}
-			}
 		case "messageId":
 			if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
 				return err
 			}
-		case "recipientMessageId":
-			if err := decodeNullable(raw, &v.RecipientMessageID, func(raw json.RawMessage, dst *MessageId) error {
+		case "senderSessionId":
+			if err := decodeNullable(raw, &v.SenderSessionID, func(raw json.RawMessage, dst *SessionId) error {
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
-				v.RecipientMessageID = Nullable[MessageId]{}
+				v.SenderSessionID = Nullable[SessionId]{}
 			}
 		case "recipientSessionId":
 			if err := decodeNullable(raw, &v.RecipientSessionID, func(raw json.RawMessage, dst *SessionId) error {
@@ -17218,11 +22211,25 @@ func (v *SessionMessage) decodeFields(data []byte, raws rawObject, buffered bool
 			}); err != nil {
 				v.SenderMessageID = Nullable[MessageId]{}
 			}
-		case "senderSessionId":
-			if err := decodeNullable(raw, &v.SenderSessionID, func(raw json.RawMessage, dst *SessionId) error {
+		case "recipientMessageId":
+			if err := decodeNullable(raw, &v.RecipientMessageID, func(raw json.RawMessage, dst *MessageId) error {
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
-				v.SenderSessionID = Nullable[SessionId]{}
+				v.RecipientMessageID = Nullable[MessageId]{}
+			}
+		case "content":
+			if err := decodeNullable(raw, &v.Content, func(raw json.RawMessage, dst *[]ContentBlock) error {
+				return decodeList(raw, dst, false, true, func(raw json.RawMessage, dst *ContentBlock) error {
+					return decodeValue(raw, dst, false, true)
+				})
+			}); err != nil {
+				v.Content = Nullable[[]ContentBlock]{}
+			}
+		case "_meta":
+			if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+				return decodeValue(raw, dst, false, true)
+			}); err != nil {
+				v.Meta = Nullable[Meta]{}
 			}
 		}
 	}
@@ -17304,13 +22311,42 @@ func (v *SessionMessage) decodeSeq(items []json.RawMessage, buffered bool) error
 // A chunk carries only content. The message's participants and references come from
 // session_message upserts, which can arrive before, between, or after its chunks.
 type SessionMessageChunk struct {
+	// Identifier of this message within the enclosing session's transcript.
+	MessageID MessageId `json:"messageId"`
+	// A single content block appended to the message.
+	Content ContentBlock `json:"content"`
 	// Optional and nullable chunk-scoped metadata. Omitted or null means none.
 	// Implementations MUST NOT make assumptions about values in _meta.
 	Meta Meta `json:"_meta,omitempty"`
-	// A single content block appended to the message.
-	Content ContentBlock `json:"content"`
-	// Identifier of this message within the enclosing session's transcript.
-	MessageID MessageId `json:"messageId"`
+}
+
+func (v SessionMessageChunk) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionMessageChunk) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionMessageChunk) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"messageId\":"...)
+	b = appendString(b, string(v.MessageID))
+	b = append(b, ",\"content\":"...)
+	if b, err = v.Content.appendJSON(b); err != nil {
+		return nil, err
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionMessageChunk) nullError() error {
@@ -17342,17 +22378,17 @@ func (v *SessionMessageChunk) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "messageId":
+			if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
+				return err
 			}
 		case "content":
 			if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
 				return err
 			}
-		case "messageId":
-			if err := decodeValue(raw, &v.MessageID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -17398,17 +22434,48 @@ func (v *SessionMessageChunk) decodeSeq(items []json.RawMessage, buffered bool) 
 // A mode the agent can operate in.
 // See protocol docs: Session Modes
 type SessionMode struct {
+	// Stable identifier used to refer to this protocol object in later messages.
+	ID SessionModeId `json:"id"`
+	// Human-readable name shown for this protocol object.
+	Name string `json:"name"`
+	// Optional human-readable details shown with this protocol object.
+	Description *string `json:"description,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Optional human-readable details shown with this protocol object.
-	Description *string `json:"description,omitempty"`
-	// Stable identifier used to refer to this protocol object in later messages.
-	ID SessionModeId `json:"id"`
-	// Human-readable name shown for this protocol object.
-	Name string `json:"name"`
+}
+
+func (v SessionMode) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionMode) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionMode) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"id\":"...)
+	b = appendString(b, string(v.ID))
+	b = append(b, ",\"name\":"...)
+	b = appendString(b, v.Name)
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionMode) nullError() error {
@@ -17440,14 +22507,6 @@ func (v *SessionMode) decodeFields(data []byte, raws rawObject, buffered bool) e
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "description":
-			if err := decodeValue(raw, &v.Description, true, true); err != nil {
-				v.Description = nil
-			}
 		case "id":
 			if err := decodeValue(raw, &v.ID, false, buffered); err != nil {
 				return err
@@ -17455,6 +22514,14 @@ func (v *SessionMode) decodeFields(data []byte, raws rawObject, buffered bool) e
 		case "name":
 			if err := decodeValue(raw, &v.Name, false, buffered); err != nil {
 				return err
+			}
+		case "description":
+			if err := decodeValue(raw, &v.Description, true, true); err != nil {
+				v.Description = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -17508,15 +22575,51 @@ type SessionModeId string
 
 // The set of modes and the one currently active.
 type SessionModeState struct {
+	// The current mode the Agent is in.
+	CurrentModeID SessionModeId `json:"currentModeId"`
+	// The set of modes that the Agent can operate in
+	AvailableModes []SessionMode `json:"availableModes"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The set of modes that the Agent can operate in
-	AvailableModes []SessionMode `json:"availableModes"`
-	// The current mode the Agent is in.
-	CurrentModeID SessionModeId `json:"currentModeId"`
+}
+
+func (v SessionModeState) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionModeState) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionModeState) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"currentModeId\":"...)
+	b = appendString(b, string(v.CurrentModeID))
+	b = append(b, ",\"availableModes\":"...)
+	b = append(b, '[')
+	for i0 := range v.AvailableModes {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.AvailableModes[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionModeState) nullError() error {
@@ -17548,9 +22651,9 @@ func (v *SessionModeState) decodeFields(data []byte, raws rawObject, buffered bo
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "currentModeId":
+			if err := decodeValue(raw, &v.CurrentModeID, false, buffered); err != nil {
+				return err
 			}
 		case "availableModes":
 			if err := decodeList(raw, &v.AvailableModes, false, true, func(raw json.RawMessage, dst *SessionMode) error {
@@ -17558,9 +22661,9 @@ func (v *SessionModeState) decodeFields(data []byte, raws rawObject, buffered bo
 			}); err != nil {
 				v.AvailableModes = []SessionMode{}
 			}
-		case "currentModeId":
-			if err := decodeValue(raw, &v.CurrentModeID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -17609,15 +22712,44 @@ func (v *SessionModeState) decodeSeq(items []json.RawMessage, buffered bool) err
 // Used to stream real-time progress and results during prompt processing.
 // See protocol docs: Agent Reports Output
 type SessionNotification struct {
+	// The ID of the session this update pertains to.
+	SessionID SessionId `json:"sessionId"`
+	// The actual update content.
+	Update SessionUpdate `json:"update"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the session this update pertains to.
-	SessionID SessionId `json:"sessionId"`
-	// The actual update content.
-	Update SessionUpdate `json:"update"`
+}
+
+func (v SessionNotification) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionNotification) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionNotification) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"update\":"...)
+	if b, err = v.Update.appendJSON(b); err != nil {
+		return nil, err
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionNotification) nullError() error {
@@ -17649,10 +22781,6 @@ func (v *SessionNotification) decodeFields(data []byte, raws rawObject, buffered
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
@@ -17660,6 +22788,10 @@ func (v *SessionNotification) decodeFields(data []byte, raws rawObject, buffered
 		case "update":
 			if err := decodeValue(raw, &v.Update, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -17710,6 +22842,29 @@ type SessionResumeCapabilities struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionResumeCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionResumeCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionResumeCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionResumeCapabilities) nullError() error {
@@ -17817,6 +22972,29 @@ type SessionStatusCapabilities struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v SessionStatusCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionStatusCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionStatusCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*SessionStatusCapabilities) nullError() error {
 	return errors.New("invalid type: null, expected struct SessionStatusCapabilities")
 }
@@ -17876,13 +23054,38 @@ func (v *SessionStatusCapabilities) decodeSeq(items []json.RawMessage, buffered 
 // close, or change the session, and does not attach the requesting connection to it.
 // A session the Agent does not know gets -32002 with the requested sessionId in data.
 type SessionStatusRequest struct {
+	// The ID of the session to check.
+	SessionID SessionId `json:"sessionId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the session to check.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v SessionStatusRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionStatusRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionStatusRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionStatusRequest) nullError() error {
@@ -17914,13 +23117,13 @@ func (v *SessionStatusRequest) decodeFields(data []byte, raws rawObject, buffere
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -17958,14 +23161,39 @@ func (v *SessionStatusRequest) decodeSeq(items []json.RawMessage, buffered bool)
 // The result is a snapshot. A session reported open may be closed or evicted before
 // the Client's next request.
 type SessionStatusResponse struct {
+	// Whether the Agent has the session in memory.
+	// Required. Clients MUST treat a value they do not recognize as saved.
+	Status SessionStatus `json:"status"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Whether the Agent has the session in memory.
-	// Required. Clients MUST treat a value they do not recognize as saved.
-	Status SessionStatus `json:"status"`
+}
+
+func (v SessionStatusResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionStatusResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionStatusResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"status\":"...)
+	b = appendString(b, string(v.Status))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionStatusResponse) nullError() error {
@@ -17997,13 +23225,13 @@ func (v *SessionStatusResponse) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "status":
 			if err := decodeValue(raw, &v.Status, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -18041,14 +23269,43 @@ func (v *SessionStatusResponse) decodeSeq(items []json.RawMessage, buffered bool
 // Supplying {} means the agent supports systemPrompt on session lifecycle
 // requests in append mode.
 type SessionSystemPromptCapabilities struct {
+	// Delivery modes the agent supports in addition to append.
+	// Optional. Omitted or null both mean the agent supports only append.
+	Mode *SessionSystemPromptModeCapabilities `json:"mode,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Delivery modes the agent supports in addition to append.
-	// Optional. Omitted or null both mean the agent supports only append.
-	Mode *SessionSystemPromptModeCapabilities `json:"mode,omitempty"`
+}
+
+func (v SessionSystemPromptCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionSystemPromptCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionSystemPromptCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Mode != nil {
+		b = append(b, ",\"mode\":"...)
+		if b, err = (*v.Mode).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionSystemPromptCapabilities) nullError() error {
@@ -18079,13 +23336,13 @@ func (v *SessionSystemPromptCapabilities) decodeFields(data []byte, raws rawObje
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "mode":
 			if err := decodePtr(raw, &v.Mode, true, true); err != nil {
 				v.Mode = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -18118,16 +23375,45 @@ func (v *SessionSystemPromptCapabilities) decodeSeq(items []json.RawMessage, buf
 // append has no entry because every agent advertising
 // sessionCapabilities.systemPrompt supports it.
 type SessionSystemPromptModeCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// Whether the agent supports override mode.
 	// Optional. Omitted or null both mean the agent does not advertise support.
 	// Supplying {} means the agent supports replacing its built-in default
 	// instructions with the client-provided system prompt.
 	Override *SessionSystemPromptOverrideCapabilities `json:"override,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionSystemPromptModeCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionSystemPromptModeCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionSystemPromptModeCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Override != nil {
+		b = append(b, ",\"override\":"...)
+		if b, err = (*v.Override).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionSystemPromptModeCapabilities) nullError() error {
@@ -18158,13 +23444,13 @@ func (v *SessionSystemPromptModeCapabilities) decodeFields(data []byte, raws raw
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "override":
 			if err := decodePtr(raw, &v.Override, true, true); err != nil {
 				v.Override = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -18202,6 +23488,31 @@ type SessionSystemPromptOverrideCapabilities struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionSystemPromptOverrideCapabilities) MarshalJSON() ([]byte, error) {
+	return v.appendJSON(nil)
+}
+
+func (v *SessionSystemPromptOverrideCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionSystemPromptOverrideCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionSystemPromptOverrideCapabilities) nullError() error {
@@ -18266,6 +23577,29 @@ type SessionTitleCapabilities struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SessionTitleCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionTitleCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionTitleCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SessionTitleCapabilities) nullError() error {
@@ -18370,8 +23704,18 @@ type SessionUpdate struct {
 	SessionMessageChunk     *SessionMessageChunk     `json:"-"`
 }
 
-func (v SessionUpdate) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v SessionUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SessionUpdate) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SessionUpdate) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.UserMessageChunk != nil {
 		set++
@@ -18433,349 +23777,106 @@ func (v SessionUpdate) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "SessionUpdate", set)
 	}
-	if v.UserMessageChunk != nil {
-		if tag, err := json.Marshal("user_message_chunk"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.UserMessageChunk)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.UserMessageChunk != nil:
+		b = append(b, ",\"sessionUpdate\":\"user_message_chunk\""...)
+		if b, err = v.UserMessageChunk.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
+	case v.AgentMessageChunk != nil:
+		b = append(b, ",\"sessionUpdate\":\"agent_message_chunk\""...)
+		if b, err = v.AgentMessageChunk.appendMembers(b); err != nil {
+			return nil, err
 		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.AgentThoughtChunk != nil:
+		b = append(b, ",\"sessionUpdate\":\"agent_thought_chunk\""...)
+		if b, err = v.AgentThoughtChunk.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.ToolCall != nil:
+		b = append(b, ",\"sessionUpdate\":\"tool_call\""...)
+		if b, err = v.ToolCall.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.ToolCallUpdate != nil:
+		b = append(b, ",\"sessionUpdate\":\"tool_call_update\""...)
+		if b, err = v.ToolCallUpdate.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.Plan != nil:
+		b = append(b, ",\"sessionUpdate\":\"plan\""...)
+		if b, err = v.Plan.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.PlanUpdate != nil:
+		b = append(b, ",\"sessionUpdate\":\"plan_update\""...)
+		if b, err = v.PlanUpdate.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.PlanRemoved != nil:
+		b = append(b, ",\"sessionUpdate\":\"plan_removed\""...)
+		if b, err = v.PlanRemoved.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.AvailableCommandsUpdate != nil:
+		b = append(b, ",\"sessionUpdate\":\"available_commands_update\""...)
+		if b, err = v.AvailableCommandsUpdate.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.CurrentModeUpdate != nil:
+		b = append(b, ",\"sessionUpdate\":\"current_mode_update\""...)
+		if b, err = v.CurrentModeUpdate.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.ConfigOptionUpdate != nil:
+		b = append(b, ",\"sessionUpdate\":\"config_option_update\""...)
+		if b, err = v.ConfigOptionUpdate.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.SessionInfoUpdate != nil:
+		b = append(b, ",\"sessionUpdate\":\"session_info_update\""...)
+		if b, err = v.SessionInfoUpdate.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.UsageUpdate != nil:
+		b = append(b, ",\"sessionUpdate\":\"usage_update\""...)
+		if b, err = v.UsageUpdate.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.Notice != nil:
+		b = append(b, ",\"sessionUpdate\":\"notice\""...)
+		if b, err = v.Notice.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.CompactionUpdate != nil:
+		b = append(b, ",\"sessionUpdate\":\"compaction_update\""...)
+		if b, err = v.CompactionUpdate.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.CompactionSummaryChunk != nil:
+		b = append(b, ",\"sessionUpdate\":\"compaction_summary_chunk\""...)
+		if b, err = v.CompactionSummaryChunk.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.SubagentUpdate != nil:
+		b = append(b, ",\"sessionUpdate\":\"subagent_update\""...)
+		if b, err = v.SubagentUpdate.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.SessionMessage != nil:
+		b = append(b, ",\"sessionUpdate\":\"session_message\""...)
+		if b, err = v.SessionMessage.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.SessionMessageChunk != nil:
+		b = append(b, ",\"sessionUpdate\":\"session_message_chunk\""...)
+		if b, err = v.SessionMessageChunk.appendMembers(b); err != nil {
+			return nil, err
 		}
 	}
-	if v.AgentMessageChunk != nil {
-		if tag, err := json.Marshal("agent_message_chunk"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.AgentMessageChunk)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.AgentThoughtChunk != nil {
-		if tag, err := json.Marshal("agent_thought_chunk"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.AgentThoughtChunk)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.ToolCall != nil {
-		if tag, err := json.Marshal("tool_call"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.ToolCall)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.ToolCallUpdate != nil {
-		if tag, err := json.Marshal("tool_call_update"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.ToolCallUpdate)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Plan != nil {
-		if tag, err := json.Marshal("plan"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.Plan)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.PlanUpdate != nil {
-		if tag, err := json.Marshal("plan_update"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.PlanUpdate)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.PlanRemoved != nil {
-		if tag, err := json.Marshal("plan_removed"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.PlanRemoved)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.AvailableCommandsUpdate != nil {
-		if tag, err := json.Marshal("available_commands_update"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.AvailableCommandsUpdate)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.CurrentModeUpdate != nil {
-		if tag, err := json.Marshal("current_mode_update"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.CurrentModeUpdate)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.ConfigOptionUpdate != nil {
-		if tag, err := json.Marshal("config_option_update"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.ConfigOptionUpdate)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.SessionInfoUpdate != nil {
-		if tag, err := json.Marshal("session_info_update"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.SessionInfoUpdate)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.UsageUpdate != nil {
-		if tag, err := json.Marshal("usage_update"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.UsageUpdate)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Notice != nil {
-		if tag, err := json.Marshal("notice"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.Notice)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.CompactionUpdate != nil {
-		if tag, err := json.Marshal("compaction_update"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.CompactionUpdate)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.CompactionSummaryChunk != nil {
-		if tag, err := json.Marshal("compaction_summary_chunk"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.CompactionSummaryChunk)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.SubagentUpdate != nil {
-		if tag, err := json.Marshal("subagent_update"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.SubagentUpdate)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.SessionMessage != nil {
-		if tag, err := json.Marshal("session_message"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.SessionMessage)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.SessionMessageChunk != nil {
-		if tag, err := json.Marshal("session_message_chunk"); err != nil {
-			return nil, err
-		} else {
-			obj["sessionUpdate"] = tag
-		}
-		payload, err := json.Marshal(v.SessionMessageChunk)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SessionUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var sessionUpdateTags = []string{"user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan", "plan_update", "plan_removed", "available_commands_update", "current_mode_update", "config_option_update", "session_info_update", "usage_update", "notice", "compaction_update", "compaction_summary_chunk", "subagent_update", "session_message", "session_message_chunk"}
@@ -19084,11 +24185,8 @@ func (v *SessionUpdate) decodeSeq(items []json.RawMessage, buffered bool) error 
 // Request parameters for providers/set.
 // Replaces the full configuration for one provider ID.
 type SetProviderRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// Provider ID to configure.
+	ProviderID ProviderId `json:"providerId"`
 	// Protocol type for this provider.
 	APIType LlmProtocol `json:"apiType"`
 	// Base URL for requests sent through this provider.
@@ -19096,8 +24194,54 @@ type SetProviderRequest struct {
 	// Full headers map for this provider.
 	// May include authorization, routing, or other integration-specific headers.
 	Headers map[string]string `json:"headers,omitempty"`
-	// Provider ID to configure.
-	ProviderID ProviderId `json:"providerId"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SetProviderRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SetProviderRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SetProviderRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"providerId\":"...)
+	b = appendString(b, string(v.ProviderID))
+	b = append(b, ",\"apiType\":"...)
+	b = appendString(b, string(v.APIType))
+	b = append(b, ",\"baseUrl\":"...)
+	b = appendString(b, v.BaseURL)
+	if len(v.Headers) > 0 {
+		b = append(b, ",\"headers\":"...)
+		b = append(b, '{')
+		for n, k0 := range sortedKeys(v.Headers) {
+			if n > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, k0)
+			b = append(b, ':')
+			item0 := v.Headers[k0]
+			b = appendString(b, item0)
+		}
+		b = append(b, '}')
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SetProviderRequest) nullError() error {
@@ -19129,9 +24273,9 @@ func (v *SetProviderRequest) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "providerId":
+			if err := decodeValue(raw, &v.ProviderID, false, buffered); err != nil {
+				return err
 			}
 		case "apiType":
 			if err := decodeValue(raw, &v.APIType, false, buffered); err != nil {
@@ -19147,9 +24291,9 @@ func (v *SetProviderRequest) decodeFields(data []byte, raws rawObject, buffered 
 			}); err != nil {
 				return err
 			}
-		case "providerId":
-			if err := decodeValue(raw, &v.ProviderID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -19222,6 +24366,29 @@ type SetProviderResponse struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v SetProviderResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SetProviderResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SetProviderResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*SetProviderResponse) nullError() error {
 	return errors.New("invalid type: null, expected struct Wire")
 }
@@ -19283,22 +24450,41 @@ const (
 // derived from the payload on encode; setting it by hand has no effect.
 type SetSessionConfigOptionRequest struct {
 	Kind SetSessionConfigOptionRequestKind `json:"-"`
+	// The ID of the session to set the configuration option for.
+	SessionID SessionId `json:"sessionId"`
+	// The ID of the configuration option to set.
+	ConfigID SessionConfigId `json:"configId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the configuration option to set.
-	ConfigID SessionConfigId `json:"configId"`
-	// The ID of the session to set the configuration option for.
-	SessionID SessionId                             `json:"sessionId"`
-	ValueID   *SetSessionConfigOptionRequestValueID `json:"-"`
-	Boolean   *SetSessionConfigOptionRequestBoolean `json:"-"`
+	Meta    Meta                                  `json:"_meta,omitempty"`
+	ValueID *SetSessionConfigOptionRequestValueID `json:"-"`
+	Boolean *SetSessionConfigOptionRequestBoolean `json:"-"`
 }
 
 type SetSessionConfigOptionRequestValueID struct {
 	// The value ID.
 	Value SessionConfigValueId `json:"value"`
+}
+
+func (v SetSessionConfigOptionRequestValueID) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SetSessionConfigOptionRequestValueID) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SetSessionConfigOptionRequestValueID) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"value\":"...)
+	b = appendString(b, string(v.Value))
+	return b, nil
 }
 
 func (*SetSessionConfigOptionRequestValueID) nullError() error {
@@ -19365,6 +24551,25 @@ type SetSessionConfigOptionRequestBoolean struct {
 	Value bool `json:"value"`
 }
 
+func (v SetSessionConfigOptionRequestBoolean) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SetSessionConfigOptionRequestBoolean) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SetSessionConfigOptionRequestBoolean) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"value\":"...)
+	b = strconv.AppendBool(b, v.Value)
+	return b, nil
+}
+
 func (*SetSessionConfigOptionRequestBoolean) nullError() error {
 	return errors.New("invalid type: null, expected struct SetSessionConfigOptionRequestBoolean")
 }
@@ -19424,18 +24629,18 @@ func (v *SetSessionConfigOptionRequestBoolean) decodeSeq(items []json.RawMessage
 	return nil
 }
 
-// setSessionConfigOptionRequestShadow mirrors SetSessionConfigOptionRequest without its union methods, for encoding common fields.
-type setSessionConfigOptionRequestShadow SetSessionConfigOptionRequest
+func (v SetSessionConfigOptionRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
 
-func (v SetSessionConfigOptionRequest) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
-	if common, err := json.Marshal(setSessionConfigOptionRequestShadow(v)); err != nil {
+func (v *SetSessionConfigOptionRequest) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
 		return nil, err
-	} else if len(common) > 2 {
-		if err := json.Unmarshal(common, &obj); err != nil {
-			return nil, err
-		}
 	}
+	return closeObject(b, start), nil
+}
+
+func (v *SetSessionConfigOptionRequest) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.ValueID != nil {
 		set++
@@ -19446,38 +24651,30 @@ func (v SetSessionConfigOptionRequest) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "SetSessionConfigOptionRequest", set)
 	}
-	if v.ValueID != nil {
-		payload, err := json.Marshal(v.ValueID)
-		if err != nil {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"configId\":"...)
+	b = appendString(b, string(v.ConfigID))
+	switch {
+	case v.ValueID != nil:
+		if b, err = v.ValueID.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SetSessionConfigOptionRequest payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.Boolean != nil:
+		b = append(b, ",\"type\":\"boolean\""...)
+		if b, err = v.Boolean.appendMembers(b); err != nil {
+			return nil, err
 		}
 	}
-	if v.Boolean != nil {
-		if tag, err := json.Marshal("boolean"); err != nil {
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
 			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Boolean)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("SetSessionConfigOptionRequest payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
 		}
 	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var setSessionConfigOptionRequestTags = []string{"boolean"}
@@ -19506,17 +24703,17 @@ func (v *SetSessionConfigOptionRequest) decodeFields(data []byte, raws rawObject
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+				return err
 			}
 		case "configId":
 			if err := decodeValue(raw, &v.ConfigID, false, buffered); err != nil {
 				return err
 			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -19556,13 +24753,47 @@ func (v *SetSessionConfigOptionRequest) decodeFields(data []byte, raws rawObject
 
 // Response to session/set_config_option method.
 type SetSessionConfigOptionResponse struct {
+	// The full set of configuration options and their current values.
+	ConfigOptions []SessionConfigOption `json:"configOptions"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The full set of configuration options and their current values.
-	ConfigOptions []SessionConfigOption `json:"configOptions"`
+}
+
+func (v SetSessionConfigOptionResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SetSessionConfigOptionResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SetSessionConfigOptionResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"configOptions\":"...)
+	b = append(b, '[')
+	for i0 := range v.ConfigOptions {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.ConfigOptions[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SetSessionConfigOptionResponse) nullError() error {
@@ -19596,15 +24827,15 @@ func (v *SetSessionConfigOptionResponse) decodeFields(data []byte, raws rawObjec
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "configOptions":
 			if err := decodeList(raw, &v.ConfigOptions, false, true, func(raw json.RawMessage, dst *SessionConfigOption) error {
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
 				v.ConfigOptions = []SessionConfigOption{}
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -19640,15 +24871,42 @@ func (v *SetSessionConfigOptionResponse) decodeSeq(items []json.RawMessage, buff
 
 // Request parameters for setting a session mode.
 type SetSessionModeRequest struct {
+	// The ID of the session to set the mode for.
+	SessionID SessionId `json:"sessionId"`
+	// The ID of the mode to set.
+	ModeID SessionModeId `json:"modeId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the mode to set.
-	ModeID SessionModeId `json:"modeId"`
-	// The ID of the session to set the mode for.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v SetSessionModeRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SetSessionModeRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SetSessionModeRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"modeId\":"...)
+	b = appendString(b, string(v.ModeID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SetSessionModeRequest) nullError() error {
@@ -19680,17 +24938,17 @@ func (v *SetSessionModeRequest) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+				return err
 			}
 		case "modeId":
 			if err := decodeValue(raw, &v.ModeID, false, buffered); err != nil {
 				return err
 			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -19740,6 +24998,29 @@ type SetSessionModeResponse struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SetSessionModeResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SetSessionModeResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SetSessionModeResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SetSessionModeResponse) nullError() error {
@@ -19800,11 +25081,6 @@ func (v *SetSessionModeResponse) decodeSeq(items []json.RawMessage, buffered boo
 // The Agent responds only after it has stored the title. After a successful response, the
 // Agent SHOULD NOT replace the title with one it generates automatically.
 type SetSessionTitleRequest struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// The ID of the session to retitle.
 	SessionID SessionId `json:"sessionId"`
 	// The new title for the session.
@@ -19813,6 +25089,38 @@ type SetSessionTitleRequest struct {
 	// truncating it. The Agent rejects a title that fails its validation, including one
 	// that is empty after normalization, with -32602.
 	Title string `json:"title"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SetSessionTitleRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SetSessionTitleRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SetSessionTitleRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"title\":"...)
+	b = appendString(b, v.Title)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SetSessionTitleRequest) nullError() error {
@@ -19844,10 +25152,6 @@ func (v *SetSessionTitleRequest) decodeFields(data []byte, raws rawObject, buffe
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
@@ -19855,6 +25159,10 @@ func (v *SetSessionTitleRequest) decodeFields(data []byte, raws rawObject, buffe
 		case "title":
 			if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -19901,15 +25209,40 @@ func (v *SetSessionTitleRequest) decodeSeq(items []json.RawMessage, buffered boo
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Response from setting the title of a session.
 type SetSessionTitleResponse struct {
+	// The title the Agent stored.
+	// This differs from the requested title if the Agent normalized it. Clients SHOULD
+	// display this value rather than the one they sent.
+	Title string `json:"title"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The title the Agent stored.
-	// This differs from the requested title if the Agent normalized it. Clients SHOULD
-	// display this value rather than the one they sent.
-	Title string `json:"title"`
+}
+
+func (v SetSessionTitleResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SetSessionTitleResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SetSessionTitleResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"title\":"...)
+	b = appendString(b, v.Title)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SetSessionTitleResponse) nullError() error {
@@ -19941,13 +25274,13 @@ func (v *SetSessionTitleResponse) decodeFields(data []byte, raws rawObject, buff
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "title":
 			if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -20011,8 +25344,18 @@ type StateUpdateOther struct{ Raw json.RawMessage }
 
 func (v StateUpdateOther) MarshalJSON() ([]byte, error) { return v.Raw, nil }
 
-func (v StateUpdate) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v StateUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *StateUpdate) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *StateUpdate) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Running != nil {
 		set++
@@ -20032,82 +25375,35 @@ func (v StateUpdate) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "StateUpdate", set)
 	}
-	if v.Running != nil {
-		if tag, err := json.Marshal("running"); err != nil {
-			return nil, err
-		} else {
-			obj["state"] = tag
-		}
-		payload, err := json.Marshal(v.Running)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Running != nil:
+		b = append(b, ",\"state\":\"running\""...)
+		if b, err = v.Running.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("StateUpdate payload: %w", err)
+	case v.Idle != nil:
+		b = append(b, ",\"state\":\"idle\""...)
+		if b, err = v.Idle.appendMembers(b); err != nil {
+			return nil, err
 		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.RequiresAction != nil:
+		b = append(b, ",\"state\":\"requires_action\""...)
+		if b, err = v.RequiresAction.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.Unknown != nil:
+		b = append(b, ",\"state\":\"unknown\""...)
+		if b, err = v.Unknown.appendMembers(b); err != nil {
+			return nil, err
+		}
+	case v.Other != nil:
+		if b, err = appendOpenMembers(b, v.Other.Raw, "state", nil, nil, nil); err != nil {
+			return nil, err
 		}
 	}
-	if v.Idle != nil {
-		if tag, err := json.Marshal("idle"); err != nil {
-			return nil, err
-		} else {
-			obj["state"] = tag
-		}
-		payload, err := json.Marshal(v.Idle)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("StateUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.RequiresAction != nil {
-		if tag, err := json.Marshal("requires_action"); err != nil {
-			return nil, err
-		} else {
-			obj["state"] = tag
-		}
-		payload, err := json.Marshal(v.RequiresAction)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("StateUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Unknown != nil {
-		if tag, err := json.Marshal("unknown"); err != nil {
-			return nil, err
-		} else {
-			obj["state"] = tag
-		}
-		payload, err := json.Marshal(v.Unknown)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("StateUpdate payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Other != nil {
-		return v.Other.Raw, nil
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var stateUpdateTags = []string{"running", "idle", "requires_action", "unknown"}
@@ -20314,14 +25610,46 @@ func (v *StringFormat) decodeJSON(data []byte, _ bool) error { return v.Unmarsha
 
 // String item schema for multi-select enum properties.
 type StringMultiSelectItems struct {
+	// Allowed enum values.
+	Enum []string `json:"enum"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Allowed enum values.
-	Enum []string `json:"enum"`
+}
+
+func (v StringMultiSelectItems) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *StringMultiSelectItems) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *StringMultiSelectItems) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"enum\":"...)
+	b = append(b, '[')
+	for i0 := range v.Enum {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		b = appendString(b, v.Enum[i0])
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*StringMultiSelectItems) nullError() error {
@@ -20353,15 +25681,15 @@ func (v *StringMultiSelectItems) decodeFields(data []byte, raws rawObject, buffe
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "enum":
 			if err := decodeList(raw, &v.Enum, false, false, func(raw json.RawMessage, dst *string) error {
 				return decodeValue(raw, dst, false, buffered)
 			}); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -20399,41 +25727,116 @@ func (v *StringMultiSelectItems) decodeSeq(items []json.RawMessage, buffered boo
 // When enum or oneOf is set, this represents a single-select enum
 // with "type": "string".
 type StringPropertySchema struct {
+	// Optional title for the property.
+	// Optional. Omitted and null are equivalent and mean no title is provided.
+	Title *string `json:"title,omitempty"`
+	// Human-readable description.
+	// Optional. Omitted and null are equivalent and mean no description is provided.
+	Description *string `json:"description,omitempty"`
+	// Minimum string length.
+	// Optional. Omitted and null are equivalent and mean there is no minimum length constraint.
+	MinLength *uint32 `json:"minLength,omitempty"`
+	// Maximum string length.
+	// Optional. Omitted and null are equivalent and mean there is no maximum length constraint.
+	MaxLength *uint32 `json:"maxLength,omitempty"`
+	// Pattern the string must match.
+	// Optional. Omitted and null are equivalent and mean there is no pattern constraint.
+	Pattern *string `json:"pattern,omitempty"`
+	// String format.
+	// Optional. Omitted and null are equivalent and mean there is no format constraint.
+	Format *StringFormat `json:"format,omitempty"`
+	// Default value.
+	// Optional. Omitted and null are equivalent and mean no default value is provided.
+	Default *string `json:"default,omitempty"`
+	// Enum values for untitled single-select enums.
+	// Optional. Omitted and null are equivalent and mean no untitled single-select choices are
+	// declared by enum.
+	Enum []string `json:"enum,omitempty"`
+	// Titled enum options for titled single-select enums.
+	// Optional. Omitted and null are equivalent and mean no titled single-select choices are
+	// declared by oneOf.
+	OneOf []EnumOption `json:"oneOf,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Default value.
-	// Optional. Omitted and null are equivalent and mean no default value is provided.
-	Default *string `json:"default,omitempty"`
-	// Human-readable description.
-	// Optional. Omitted and null are equivalent and mean no description is provided.
-	Description *string `json:"description,omitempty"`
-	// Enum values for untitled single-select enums.
-	// Optional. Omitted and null are equivalent and mean no untitled single-select choices are
-	// declared by enum.
-	Enum []string `json:"enum,omitempty"`
-	// String format.
-	// Optional. Omitted and null are equivalent and mean there is no format constraint.
-	Format *StringFormat `json:"format,omitempty"`
-	// Maximum string length.
-	// Optional. Omitted and null are equivalent and mean there is no maximum length constraint.
-	MaxLength *uint32 `json:"maxLength,omitempty"`
-	// Minimum string length.
-	// Optional. Omitted and null are equivalent and mean there is no minimum length constraint.
-	MinLength *uint32 `json:"minLength,omitempty"`
-	// Titled enum options for titled single-select enums.
-	// Optional. Omitted and null are equivalent and mean no titled single-select choices are
-	// declared by oneOf.
-	OneOf []EnumOption `json:"oneOf,omitempty"`
-	// Pattern the string must match.
-	// Optional. Omitted and null are equivalent and mean there is no pattern constraint.
-	Pattern *string `json:"pattern,omitempty"`
-	// Optional title for the property.
-	// Optional. Omitted and null are equivalent and mean no title is provided.
-	Title *string `json:"title,omitempty"`
+}
+
+func (v StringPropertySchema) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *StringPropertySchema) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *StringPropertySchema) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, (*v.Title))
+	}
+	if v.Description != nil {
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, (*v.Description))
+	}
+	if v.MinLength != nil {
+		b = append(b, ",\"minLength\":"...)
+		b = strconv.AppendUint(b, uint64((*v.MinLength)), 10)
+	}
+	if v.MaxLength != nil {
+		b = append(b, ",\"maxLength\":"...)
+		b = strconv.AppendUint(b, uint64((*v.MaxLength)), 10)
+	}
+	if v.Pattern != nil {
+		b = append(b, ",\"pattern\":"...)
+		b = appendString(b, (*v.Pattern))
+	}
+	if v.Format != nil {
+		b = append(b, ",\"format\":"...)
+		b = appendString(b, string((*v.Format)))
+	}
+	if v.Default != nil {
+		b = append(b, ",\"default\":"...)
+		b = appendString(b, (*v.Default))
+	}
+	if v.Enum != nil {
+		b = append(b, ",\"enum\":"...)
+		b = append(b, '[')
+		for i0 := range v.Enum {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.Enum[i0])
+		}
+		b = append(b, ']')
+	}
+	if v.OneOf != nil {
+		b = append(b, ",\"oneOf\":"...)
+		b = append(b, '[')
+		for i0 := range v.OneOf {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.OneOf[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*StringPropertySchema) nullError() error {
@@ -20462,34 +25865,38 @@ func (v *StringPropertySchema) decodeFields(data []byte, raws rawObject, buffere
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "default":
-			if err := decodeValue(raw, &v.Default, true, true); err != nil {
-				v.Default = nil
+		case "title":
+			if err := decodeValue(raw, &v.Title, true, true); err != nil {
+				v.Title = nil
 			}
 		case "description":
 			if err := decodeValue(raw, &v.Description, true, true); err != nil {
 				v.Description = nil
 			}
-		case "enum":
-			if err := decodeList(raw, &v.Enum, true, false, func(raw json.RawMessage, dst *string) error {
-				return decodeValue(raw, dst, false, buffered)
-			}); err != nil {
-				return err
-			}
-		case "format":
-			if err := decodeValue(raw, &v.Format, true, buffered); err != nil {
+		case "minLength":
+			if err := decodeValue(raw, &v.MinLength, true, buffered); err != nil {
 				return err
 			}
 		case "maxLength":
 			if err := decodeValue(raw, &v.MaxLength, true, buffered); err != nil {
 				return err
 			}
-		case "minLength":
-			if err := decodeValue(raw, &v.MinLength, true, buffered); err != nil {
+		case "pattern":
+			if err := decodeValue(raw, &v.Pattern, true, buffered); err != nil {
+				return err
+			}
+		case "format":
+			if err := decodeValue(raw, &v.Format, true, buffered); err != nil {
+				return err
+			}
+		case "default":
+			if err := decodeValue(raw, &v.Default, true, true); err != nil {
+				v.Default = nil
+			}
+		case "enum":
+			if err := decodeList(raw, &v.Enum, true, false, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, buffered)
+			}); err != nil {
 				return err
 			}
 		case "oneOf":
@@ -20498,13 +25905,9 @@ func (v *StringPropertySchema) decodeFields(data []byte, raws rawObject, buffere
 			}); err != nil {
 				return err
 			}
-		case "pattern":
-			if err := decodeValue(raw, &v.Pattern, true, buffered); err != nil {
-				return err
-			}
-		case "title":
-			if err := decodeValue(raw, &v.Title, true, true); err != nil {
-				v.Title = nil
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -20597,6 +26000,29 @@ type SubagentCapabilities struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v SubagentCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SubagentCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SubagentCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*SubagentCapabilities) nullError() error {
 	return errors.New("invalid type: null, expected struct SubagentCapabilities")
 }
@@ -20652,14 +26078,43 @@ func (v *SubagentCapabilities) decodeSeq(items []json.RawMessage, buffered bool)
 // A mutation requires an explicit per-child capability. Support for the method
 // on ordinary sessions does not grant support on a child.
 type SubagentSessionCapabilities struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	Meta Meta `json:"_meta,omitempty"`
 	// Permits the client to cancel this child's current work without ending
 	// the session. Omitted or null means unsupported. An object (including
 	// {}) means supported.
 	Cancel *SessionCancelCapabilities `json:"cancel,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SubagentSessionCapabilities) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SubagentSessionCapabilities) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SubagentSessionCapabilities) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Cancel != nil {
+		b = append(b, ",\"cancel\":"...)
+		if b, err = (*v.Cancel).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SubagentSessionCapabilities) nullError() error {
@@ -20690,13 +26145,13 @@ func (v *SubagentSessionCapabilities) decodeFields(data []byte, raws rawObject, 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "cancel":
 			if err := decodePtr(raw, &v.Cancel, true, true); err != nil {
 				v.Cancel = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -20737,12 +26192,35 @@ func (v *SubagentSessionCapabilities) decodeSeq(items []json.RawMessage, buffere
 // Only the subagent session ID is required. Omitted patch fields keep their
 // …
 type SubagentUpdate struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	// Omitted means unchanged. null removes the metadata.
-	Meta Nullable[Meta] `json:"_meta,omitzero"`
+	// The opaque session ID identifying the child in all ACP messages.
+	SessionID SessionId `json:"sessionId"`
+	// The parent's human-readable display title for this child. It need not be unique.
+	// Omitted means unchanged. null clears it. If unset, the Client chooses
+	// a fallback presentation.
+	Title Nullable[string] `json:"title,omitzero"`
+	// The parent's human-readable description of the child's role or purpose.
+	// Omitted means unchanged. null clears it. If unset, the Client chooses
+	// a fallback presentation. This is current display metadata, not the
+	// history of instructions sent to the child.
+	Description Nullable[string] `json:"description,omitzero"`
+	// Client-initiated session mutations permitted for this subagent session.
+	// Omitted means unchanged. null clears the capability set and disables
+	// child mutations. If never supplied, no session mutations are permitted.
+	// Read-only operations retain their normal protocol semantics and capability
+	// requirements. A concrete object replaces the whole capability set.
+	Capabilities Nullable[SubagentSessionCapabilities] `json:"capabilities,omitzero"`
+	// Current state snapshot for the child session.
+	// Omitted means unchanged. null clears the current activity without
+	// asserting idle or sending an unknown snapshot. A concrete state
+	// replaces the previous state object wholesale. If never supplied, the
+	// current activity is unset/unconfirmed.
+	State Nullable[StateUpdate] `json:"state,omitzero"`
+	// The child's working directory. Must be an absolute path.
+	// Optional and nullable. Omitted means unchanged. null clears the
+	// reported value. While unset, the child inherits its immediate parent's
+	// effective working directory. Clients use this value for the child's
+	// root set and as the default terminal working directory.
+	Cwd Nullable[string] `json:"cwd,omitzero"`
 	// Additional workspace roots for the child. Each path must be absolute.
 	// Optional and nullable. Omitted means unchanged. null clears the
 	// reported value. While unset, the child inherits its immediate parent's
@@ -20750,35 +26228,93 @@ type SubagentUpdate struct {
 	// array replaces the whole list. [] reports no additional directories.
 	// Clients use these values for the child's root set.
 	AdditionalDirectories Nullable[[]string] `json:"additionalDirectories,omitzero"`
-	// Client-initiated session mutations permitted for this subagent session.
-	// Omitted means unchanged. null clears the capability set and disables
-	// child mutations. If never supplied, no session mutations are permitted.
-	// Read-only operations retain their normal protocol semantics and capability
-	// requirements. A concrete object replaces the whole capability set.
-	Capabilities Nullable[SubagentSessionCapabilities] `json:"capabilities,omitzero"`
-	// The child's working directory. Must be an absolute path.
-	// Optional and nullable. Omitted means unchanged. null clears the
-	// reported value. While unset, the child inherits its immediate parent's
-	// effective working directory. Clients use this value for the child's
-	// root set and as the default terminal working directory.
-	Cwd Nullable[string] `json:"cwd,omitzero"`
-	// The parent's human-readable description of the child's role or purpose.
-	// Omitted means unchanged. null clears it. If unset, the Client chooses
-	// a fallback presentation. This is current display metadata, not the
-	// history of instructions sent to the child.
-	Description Nullable[string] `json:"description,omitzero"`
-	// The opaque session ID identifying the child in all ACP messages.
-	SessionID SessionId `json:"sessionId"`
-	// Current state snapshot for the child session.
-	// Omitted means unchanged. null clears the current activity without
-	// asserting idle or sending an unknown snapshot. A concrete state
-	// replaces the previous state object wholesale. If never supplied, the
-	// current activity is unset/unconfirmed.
-	State Nullable[StateUpdate] `json:"state,omitzero"`
-	// The parent's human-readable display title for this child. It need not be unique.
-	// Omitted means unchanged. null clears it. If unset, the Client chooses
-	// a fallback presentation.
-	Title Nullable[string] `json:"title,omitzero"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	// Omitted means unchanged. null removes the metadata.
+	Meta Nullable[Meta] `json:"_meta,omitzero"`
+}
+
+func (v SubagentUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SubagentUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SubagentUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	switch {
+	case v.Title.Set && !v.Title.Null:
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, v.Title.Value)
+	case v.Title.Set && v.Title.Null:
+		b = append(b, ",\"title\":null"...)
+	}
+	switch {
+	case v.Description.Set && !v.Description.Null:
+		b = append(b, ",\"description\":"...)
+		b = appendString(b, v.Description.Value)
+	case v.Description.Set && v.Description.Null:
+		b = append(b, ",\"description\":null"...)
+	}
+	switch {
+	case v.Capabilities.Set && !v.Capabilities.Null:
+		b = append(b, ",\"capabilities\":"...)
+		if b, err = v.Capabilities.Value.appendJSON(b); err != nil {
+			return nil, err
+		}
+	case v.Capabilities.Set && v.Capabilities.Null:
+		b = append(b, ",\"capabilities\":null"...)
+	}
+	switch {
+	case v.State.Set && !v.State.Null:
+		b = append(b, ",\"state\":"...)
+		if b, err = v.State.Value.appendJSON(b); err != nil {
+			return nil, err
+		}
+	case v.State.Set && v.State.Null:
+		b = append(b, ",\"state\":null"...)
+	}
+	switch {
+	case v.Cwd.Set && !v.Cwd.Null:
+		b = append(b, ",\"cwd\":"...)
+		b = appendString(b, v.Cwd.Value)
+	case v.Cwd.Set && v.Cwd.Null:
+		b = append(b, ",\"cwd\":null"...)
+	}
+	switch {
+	case v.AdditionalDirectories.Set && !v.AdditionalDirectories.Null:
+		b = append(b, ",\"additionalDirectories\":"...)
+		b = append(b, '[')
+		for i0 := range v.AdditionalDirectories.Value {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			b = appendString(b, v.AdditionalDirectories.Value[i0])
+		}
+		b = append(b, ']')
+	case v.AdditionalDirectories.Set && v.AdditionalDirectories.Null:
+		b = append(b, ",\"additionalDirectories\":null"...)
+	}
+	switch {
+	case v.Meta.Set && !v.Meta.Null:
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta.Value); err != nil {
+			return nil, err
+		}
+	case v.Meta.Set && v.Meta.Null:
+		b = append(b, ",\"_meta\":null"...)
+	}
+	return b, nil
 }
 
 func (*SubagentUpdate) nullError() error {
@@ -20810,11 +26346,39 @@ func (v *SubagentUpdate) decodeFields(data []byte, raws rawObject, buffered bool
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+				return err
+			}
+		case "title":
+			if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
-				v.Meta = Nullable[Meta]{}
+				v.Title = Nullable[string]{}
+			}
+		case "description":
+			if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
+				return decodeValue(raw, dst, false, true)
+			}); err != nil {
+				v.Description = Nullable[string]{}
+			}
+		case "capabilities":
+			if err := decodeNullable(raw, &v.Capabilities, func(raw json.RawMessage, dst *SubagentSessionCapabilities) error {
+				return decodeValue(raw, dst, false, true)
+			}); err != nil {
+				v.Capabilities = Nullable[SubagentSessionCapabilities]{}
+			}
+		case "state":
+			if err := decodeNullable(raw, &v.State, func(raw json.RawMessage, dst *StateUpdate) error {
+				return decodeValue(raw, dst, false, true)
+			}); err != nil {
+				v.State = Nullable[StateUpdate]{}
+			}
+		case "cwd":
+			if err := decodeNullable(raw, &v.Cwd, func(raw json.RawMessage, dst *string) error {
+				return decodePath(raw, dst, false)
+			}); err != nil {
+				return err
 			}
 		case "additionalDirectories":
 			if err := decodeNullable(raw, &v.AdditionalDirectories, func(raw json.RawMessage, dst *[]string) error {
@@ -20824,39 +26388,11 @@ func (v *SubagentUpdate) decodeFields(data []byte, raws rawObject, buffered bool
 			}); err != nil {
 				return err
 			}
-		case "capabilities":
-			if err := decodeNullable(raw, &v.Capabilities, func(raw json.RawMessage, dst *SubagentSessionCapabilities) error {
+		case "_meta":
+			if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
-				v.Capabilities = Nullable[SubagentSessionCapabilities]{}
-			}
-		case "cwd":
-			if err := decodeNullable(raw, &v.Cwd, func(raw json.RawMessage, dst *string) error {
-				return decodePath(raw, dst, false)
-			}); err != nil {
-				return err
-			}
-		case "description":
-			if err := decodeNullable(raw, &v.Description, func(raw json.RawMessage, dst *string) error {
-				return decodeValue(raw, dst, false, true)
-			}); err != nil {
-				v.Description = Nullable[string]{}
-			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
-				return err
-			}
-		case "state":
-			if err := decodeNullable(raw, &v.State, func(raw json.RawMessage, dst *StateUpdate) error {
-				return decodeValue(raw, dst, false, true)
-			}); err != nil {
-				v.State = Nullable[StateUpdate]{}
-			}
-		case "title":
-			if err := decodeNullable(raw, &v.Title, func(raw json.RawMessage, dst *string) error {
-				return decodeValue(raw, dst, false, true)
-			}); err != nil {
-				v.Title = Nullable[string]{}
+				v.Meta = Nullable[Meta]{}
 			}
 		}
 	}
@@ -20949,11 +26485,10 @@ func (v *SubagentUpdate) decodeSeq(items []json.RawMessage, buffered bool) error
 // return an error instead of creating, loading, resuming, or forking the
 // session.
 type SystemPrompt struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
+	// How the Agent combines content with its own instructions.
+	// Required. Agents MUST return an error for a mode they do not support rather than
+	// treating it as append or override.
+	Mode SystemPromptMode `json:"mode"`
 	// The system prompt content.
 	// Agents advertising the capability MUST accept text content blocks.
 	// Clients MUST NOT send other content block types until a future
@@ -20962,10 +26497,47 @@ type SystemPrompt struct {
 	// Clients MUST NOT send an empty array. Agents MAY reject one with
 	// -32602 without creating, loading, resuming, or forking the session.
 	Content []ContentBlock `json:"content"`
-	// How the Agent combines content with its own instructions.
-	// Required. Agents MUST return an error for a mode they do not support rather than
-	// treating it as append or override.
-	Mode SystemPromptMode `json:"mode"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v SystemPrompt) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *SystemPrompt) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *SystemPrompt) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"mode\":"...)
+	b = appendString(b, string(v.Mode))
+	b = append(b, ",\"content\":"...)
+	b = append(b, '[')
+	for i0 := range v.Content {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.Content[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*SystemPrompt) nullError() error {
@@ -20997,9 +26569,9 @@ func (v *SystemPrompt) decodeFields(data []byte, raws rawObject, buffered bool) 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "mode":
+			if err := decodeValue(raw, &v.Mode, false, buffered); err != nil {
+				return err
 			}
 		case "content":
 			if err := decodeList(raw, &v.Content, false, false, func(raw json.RawMessage, dst *ContentBlock) error {
@@ -21007,9 +26579,9 @@ func (v *SystemPrompt) decodeFields(data []byte, raws rawObject, buffered bool) 
 			}); err != nil {
 				return err
 			}
-		case "mode":
-			if err := decodeValue(raw, &v.Mode, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -21108,13 +26680,38 @@ func (v *SystemPromptMode) decodeJSON(data []byte, _ bool) error { return v.Unma
 // The terminal must be added before calling terminal/release.
 // See protocol docs: Terminal
 type Terminal struct {
+	// Identifier of the terminal instance to embed in the content stream.
+	TerminalID TerminalId `json:"terminalId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Identifier of the terminal instance to embed in the content stream.
-	TerminalID TerminalId `json:"terminalId"`
+}
+
+func (v Terminal) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *Terminal) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *Terminal) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"terminalId\":"...)
+	b = appendString(b, string(v.TerminalID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*Terminal) nullError() error { return errors.New("invalid type: null, expected struct Terminal") }
@@ -21144,13 +26741,13 @@ func (v *Terminal) decodeFields(data []byte, raws rawObject, buffered bool) erro
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "terminalId":
 			if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -21184,15 +26781,46 @@ func (v *Terminal) decodeSeq(items []json.RawMessage, buffered bool) error {
 
 // Exit status of a terminal command.
 type TerminalExitStatus struct {
+	// The process exit code (may be null if terminated by signal).
+	ExitCode *uint32 `json:"exitCode,omitempty"`
+	// The signal that terminated the process (may be null if exited normally).
+	Signal *string `json:"signal,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The process exit code (may be null if terminated by signal).
-	ExitCode *uint32 `json:"exitCode,omitempty"`
-	// The signal that terminated the process (may be null if exited normally).
-	Signal *string `json:"signal,omitempty"`
+}
+
+func (v TerminalExitStatus) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *TerminalExitStatus) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *TerminalExitStatus) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.ExitCode != nil {
+		b = append(b, ",\"exitCode\":"...)
+		b = strconv.AppendUint(b, uint64((*v.ExitCode)), 10)
+	}
+	if v.Signal != nil {
+		b = append(b, ",\"signal\":"...)
+		b = appendString(b, (*v.Signal))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*TerminalExitStatus) nullError() error {
@@ -21221,10 +26849,6 @@ func (v *TerminalExitStatus) decodeFields(data []byte, raws rawObject, buffered 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "exitCode":
 			if err := decodeValue(raw, &v.ExitCode, true, true); err != nil {
 				v.ExitCode = nil
@@ -21232,6 +26856,10 @@ func (v *TerminalExitStatus) decodeFields(data []byte, raws rawObject, buffered 
 		case "signal":
 			if err := decodeValue(raw, &v.Signal, true, true); err != nil {
 				v.Signal = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -21269,15 +26897,42 @@ type TerminalId string
 
 // Request to get the current output and status of a terminal.
 type TerminalOutputRequest struct {
+	// The session ID for this request.
+	SessionID SessionId `json:"sessionId"`
+	// The ID of the terminal to get output from.
+	TerminalID TerminalId `json:"terminalId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The session ID for this request.
-	SessionID SessionId `json:"sessionId"`
-	// The ID of the terminal to get output from.
-	TerminalID TerminalId `json:"terminalId"`
+}
+
+func (v TerminalOutputRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *TerminalOutputRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *TerminalOutputRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"terminalId\":"...)
+	b = appendString(b, string(v.TerminalID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*TerminalOutputRequest) nullError() error {
@@ -21309,10 +26964,6 @@ func (v *TerminalOutputRequest) decodeFields(data []byte, raws rawObject, buffer
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
@@ -21320,6 +26971,10 @@ func (v *TerminalOutputRequest) decodeFields(data []byte, raws rawObject, buffer
 		case "terminalId":
 			if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -21364,17 +27019,50 @@ func (v *TerminalOutputRequest) decodeSeq(items []json.RawMessage, buffered bool
 
 // Response containing the terminal output and exit status.
 type TerminalOutputResponse struct {
+	// The terminal output captured so far.
+	Output string `json:"output"`
+	// Whether the output was truncated due to byte limits.
+	Truncated bool `json:"truncated"`
+	// Exit status if the command has completed.
+	ExitStatus *TerminalExitStatus `json:"exitStatus,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Exit status if the command has completed.
-	ExitStatus *TerminalExitStatus `json:"exitStatus,omitempty"`
-	// The terminal output captured so far.
-	Output string `json:"output"`
-	// Whether the output was truncated due to byte limits.
-	Truncated bool `json:"truncated"`
+}
+
+func (v TerminalOutputResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *TerminalOutputResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *TerminalOutputResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"output\":"...)
+	b = appendString(b, v.Output)
+	b = append(b, ",\"truncated\":"...)
+	b = strconv.AppendBool(b, v.Truncated)
+	if v.ExitStatus != nil {
+		b = append(b, ",\"exitStatus\":"...)
+		if b, err = (*v.ExitStatus).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*TerminalOutputResponse) nullError() error {
@@ -21406,14 +27094,6 @@ func (v *TerminalOutputResponse) decodeFields(data []byte, raws rawObject, buffe
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "exitStatus":
-			if err := decodePtr(raw, &v.ExitStatus, true, true); err != nil {
-				v.ExitStatus = nil
-			}
 		case "output":
 			if err := decodeValue(raw, &v.Output, false, buffered); err != nil {
 				return err
@@ -21421,6 +27101,14 @@ func (v *TerminalOutputResponse) decodeFields(data []byte, raws rawObject, buffe
 		case "truncated":
 			if err := decodeValue(raw, &v.Truncated, false, buffered); err != nil {
 				return err
+			}
+		case "exitStatus":
+			if err := decodePtr(raw, &v.ExitStatus, true, true); err != nil {
+				v.ExitStatus = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -21471,15 +27159,46 @@ func (v *TerminalOutputResponse) decodeSeq(items []json.RawMessage, buffered boo
 
 // Text provided to or from an LLM.
 type TextContent struct {
+	// Optional annotations that help clients decide how to display or route this content.
+	Annotations *Annotations `json:"annotations,omitempty"`
+	// Text payload carried by this content block.
+	Text string `json:"text"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Optional annotations that help clients decide how to display or route this content.
-	Annotations *Annotations `json:"annotations,omitempty"`
-	// Text payload carried by this content block.
-	Text string `json:"text"`
+}
+
+func (v TextContent) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *TextContent) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *TextContent) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Annotations != nil {
+		b = append(b, ",\"annotations\":"...)
+		if b, err = (*v.Annotations).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ",\"text\":"...)
+	b = appendString(b, v.Text)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*TextContent) nullError() error {
@@ -21511,10 +27230,6 @@ func (v *TextContent) decodeFields(data []byte, raws rawObject, buffered bool) e
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "annotations":
 			if err := decodePtr(raw, &v.Annotations, true, true); err != nil {
 				v.Annotations = nil
@@ -21522,6 +27237,10 @@ func (v *TextContent) decodeFields(data []byte, raws rawObject, buffered bool) e
 		case "text":
 			if err := decodeValue(raw, &v.Text, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -21561,17 +27280,48 @@ func (v *TextContent) decodeSeq(items []json.RawMessage, buffered bool) error {
 
 // Text-based resource contents.
 type TextResourceContents struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
 	// MIME type describing the encoded media payload.
 	MimeType *string `json:"mimeType,omitempty"`
 	// Text payload carried by this content block.
 	Text string `json:"text"`
 	// URI associated with this resource or media payload.
 	URI string `json:"uri"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v TextResourceContents) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *TextResourceContents) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *TextResourceContents) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.MimeType != nil {
+		b = append(b, ",\"mimeType\":"...)
+		b = appendString(b, (*v.MimeType))
+	}
+	b = append(b, ",\"text\":"...)
+	b = appendString(b, v.Text)
+	b = append(b, ",\"uri\":"...)
+	b = appendString(b, v.URI)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*TextResourceContents) nullError() error {
@@ -21603,10 +27353,6 @@ func (v *TextResourceContents) decodeFields(data []byte, raws rawObject, buffere
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "mimeType":
 			if err := decodeValue(raw, &v.MimeType, true, true); err != nil {
 				v.MimeType = nil
@@ -21618,6 +27364,10 @@ func (v *TextResourceContents) decodeFields(data []byte, raws rawObject, buffere
 		case "uri":
 			if err := decodeValue(raw, &v.URI, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -21668,14 +27418,48 @@ func (v *TextResourceContents) decodeSeq(items []json.RawMessage, buffered bool)
 
 // Items definition for titled multi-select enum properties.
 type TitledMultiSelectItems struct {
+	// Titled enum options.
+	AnyOf []EnumOption `json:"anyOf"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// Optional. Omitted and null are equivalent and mean no metadata.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Titled enum options.
-	AnyOf []EnumOption `json:"anyOf"`
+}
+
+func (v TitledMultiSelectItems) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *TitledMultiSelectItems) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *TitledMultiSelectItems) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"anyOf\":"...)
+	b = append(b, '[')
+	for i0 := range v.AnyOf {
+		if i0 > 0 {
+			b = append(b, ',')
+		}
+		if b, err = v.AnyOf[i0].appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	b = append(b, ']')
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*TitledMultiSelectItems) nullError() error {
@@ -21707,15 +27491,15 @@ func (v *TitledMultiSelectItems) decodeFields(data []byte, raws rawObject, buffe
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "anyOf":
 			if err := decodeList(raw, &v.AnyOf, false, false, func(raw json.RawMessage, dst *EnumOption) error {
 				return decodeValue(raw, dst, false, buffered)
 			}); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -21754,33 +27538,110 @@ func (v *TitledMultiSelectItems) decodeSeq(items []json.RawMessage, buffered boo
 // such as reading files, executing code, or fetching data from external sources.
 // See protocol docs: Tool Calls
 type ToolCall struct {
+	// Unique identifier for this tool call within the session.
+	ToolCallID ToolCallId `json:"toolCallId"`
+	// Human-readable title describing what the tool is doing.
+	Title string `json:"title"`
+	// Programmatic name of the tool being invoked.
+	// This field is optional. Omitting it or sending null both mean that no
+	// tool name is available.
+	Name *string `json:"name,omitempty"`
+	// The category of tool being invoked.
+	// Helps clients choose appropriate icons and UI treatment.
+	Kind *ToolKind `json:"kind,omitempty"`
+	// Current execution status of the tool call.
+	Status *ToolCallStatus `json:"status,omitempty"`
+	// Content produced by the tool call.
+	Content []ToolCallContent `json:"content,omitempty"`
+	// File locations affected by this tool call.
+	// Enables "follow-along" features in clients.
+	Locations []ToolCallLocation `json:"locations,omitempty"`
+	// Raw input parameters sent to the tool.
+	RawInput json.RawMessage `json:"rawInput,omitempty"`
+	// Raw output returned by the tool.
+	RawOutput json.RawMessage `json:"rawOutput,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Content produced by the tool call.
-	Content []ToolCallContent `json:"content,omitempty"`
-	// The category of tool being invoked.
-	// Helps clients choose appropriate icons and UI treatment.
-	Kind *ToolKind `json:"kind,omitempty"`
-	// File locations affected by this tool call.
-	// Enables "follow-along" features in clients.
-	Locations []ToolCallLocation `json:"locations,omitempty"`
-	// Programmatic name of the tool being invoked.
-	// This field is optional. Omitting it or sending null both mean that no
-	// tool name is available.
-	Name *string `json:"name,omitempty"`
-	// Raw input parameters sent to the tool.
-	RawInput json.RawMessage `json:"rawInput,omitempty"`
-	// Raw output returned by the tool.
-	RawOutput json.RawMessage `json:"rawOutput,omitempty"`
-	// Current execution status of the tool call.
-	Status *ToolCallStatus `json:"status,omitempty"`
-	// Human-readable title describing what the tool is doing.
-	Title string `json:"title"`
-	// Unique identifier for this tool call within the session.
-	ToolCallID ToolCallId `json:"toolCallId"`
+}
+
+func (v ToolCall) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ToolCall) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ToolCall) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"toolCallId\":"...)
+	b = appendString(b, string(v.ToolCallID))
+	b = append(b, ",\"title\":"...)
+	b = appendString(b, v.Title)
+	if v.Name != nil {
+		b = append(b, ",\"name\":"...)
+		b = appendString(b, (*v.Name))
+	}
+	if v.Kind != nil && *v.Kind != "other" {
+		b = append(b, ",\"kind\":"...)
+		b = appendString(b, string((*v.Kind)))
+	}
+	if v.Status != nil && *v.Status != "pending" {
+		b = append(b, ",\"status\":"...)
+		b = appendString(b, string((*v.Status)))
+	}
+	if len(v.Content) > 0 {
+		b = append(b, ",\"content\":"...)
+		b = append(b, '[')
+		for i0 := range v.Content {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.Content[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if len(v.Locations) > 0 {
+		b = append(b, ",\"locations\":"...)
+		b = append(b, '[')
+		for i0 := range v.Locations {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.Locations[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.RawInput != nil {
+		b = append(b, ",\"rawInput\":"...)
+		if b, err = appendRaw(b, v.RawInput); err != nil {
+			return nil, err
+		}
+	}
+	if v.RawOutput != nil {
+		b = append(b, ",\"rawOutput\":"...)
+		if b, err = appendRaw(b, v.RawOutput); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ToolCall) nullError() error { return errors.New("invalid type: null, expected struct ToolCall") }
@@ -21810,9 +27671,25 @@ func (v *ToolCall) decodeFields(data []byte, raws rawObject, buffered bool) erro
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "toolCallId":
+			if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
+				return err
+			}
+		case "title":
+			if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
+				return err
+			}
+		case "name":
+			if err := decodeValue(raw, &v.Name, true, true); err != nil {
+				v.Name = nil
+			}
+		case "kind":
+			if err := decodeValue(raw, &v.Kind, false, true); err != nil {
+				v.Kind = nil
+			}
+		case "status":
+			if err := decodeValue(raw, &v.Status, false, true); err != nil {
+				v.Status = nil
 			}
 		case "content":
 			if err := decodeList(raw, &v.Content, false, true, func(raw json.RawMessage, dst *ToolCallContent) error {
@@ -21820,39 +27697,27 @@ func (v *ToolCall) decodeFields(data []byte, raws rawObject, buffered bool) erro
 			}); err != nil {
 				v.Content = nil
 			}
-		case "kind":
-			if err := decodeValue(raw, &v.Kind, false, true); err != nil {
-				v.Kind = nil
-			}
 		case "locations":
 			if err := decodeList(raw, &v.Locations, false, true, func(raw json.RawMessage, dst *ToolCallLocation) error {
 				return decodeValue(raw, dst, false, true)
 			}); err != nil {
 				v.Locations = nil
 			}
-		case "name":
-			if err := decodeValue(raw, &v.Name, true, true); err != nil {
-				v.Name = nil
-			}
 		case "rawInput":
-			if err := decodeValue(raw, &v.RawInput, true, true); err != nil {
+			if isNull(raw) {
+				v.RawInput = nil
+			} else if err := decodeValue(raw, &v.RawInput, true, true); err != nil {
 				v.RawInput = nil
 			}
 		case "rawOutput":
-			if err := decodeValue(raw, &v.RawOutput, true, true); err != nil {
+			if isNull(raw) {
+				v.RawOutput = nil
+			} else if err := decodeValue(raw, &v.RawOutput, true, true); err != nil {
 				v.RawOutput = nil
 			}
-		case "status":
-			if err := decodeValue(raw, &v.Status, false, true); err != nil {
-				v.Status = nil
-			}
-		case "title":
-			if err := decodeValue(raw, &v.Title, false, buffered); err != nil {
-				return err
-			}
-		case "toolCallId":
-			if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -21919,13 +27784,17 @@ func (v *ToolCall) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 7 {
 		raw := items[7]
-		if err := decodeValue(raw, &v.RawInput, true, true); err != nil {
+		if isNull(raw) {
+			v.RawInput = nil
+		} else if err := decodeValue(raw, &v.RawInput, true, true); err != nil {
 			v.RawInput = nil
 		}
 	}
 	if len(items) > 8 {
 		raw := items[8]
-		if err := decodeValue(raw, &v.RawOutput, true, true); err != nil {
+		if isNull(raw) {
+			v.RawOutput = nil
+		} else if err := decodeValue(raw, &v.RawOutput, true, true); err != nil {
 			v.RawOutput = nil
 		}
 	}
@@ -21963,8 +27832,18 @@ type ToolCallContent struct {
 	Terminal *Terminal           `json:"-"`
 }
 
-func (v ToolCallContent) MarshalJSON() ([]byte, error) {
-	obj := map[string]json.RawMessage{}
+func (v ToolCallContent) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ToolCallContent) appendJSON(b []byte) ([]byte, error) {
+	var err error
+	start := len(b)
+	if b, err = v.appendMembers(b); err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ToolCallContent) appendMembers(b []byte) ([]byte, error) {
 	set := 0
 	if v.Content != nil {
 		set++
@@ -21978,61 +27857,26 @@ func (v ToolCallContent) MarshalJSON() ([]byte, error) {
 	if set != 1 {
 		return nil, fmt.Errorf("%s: exactly one variant must be set, have %d", "ToolCallContent", set)
 	}
-	if v.Content != nil {
-		if tag, err := json.Marshal("content"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Content)
-		if err != nil {
+	var err error
+	_ = err
+	switch {
+	case v.Content != nil:
+		b = append(b, ",\"type\":\"content\""...)
+		if b, err = v.Content.appendMembers(b); err != nil {
 			return nil, err
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ToolCallContent payload: %w", err)
+	case v.Diff != nil:
+		b = append(b, ",\"type\":\"diff\""...)
+		if b, err = v.Diff.appendMembers(b); err != nil {
+			return nil, err
 		}
-		for k, raw := range fields {
-			obj[k] = raw
+	case v.Terminal != nil:
+		b = append(b, ",\"type\":\"terminal\""...)
+		if b, err = v.Terminal.appendMembers(b); err != nil {
+			return nil, err
 		}
 	}
-	if v.Diff != nil {
-		if tag, err := json.Marshal("diff"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Diff)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ToolCallContent payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	if v.Terminal != nil {
-		if tag, err := json.Marshal("terminal"); err != nil {
-			return nil, err
-		} else {
-			obj["type"] = tag
-		}
-		payload, err := json.Marshal(v.Terminal)
-		if err != nil {
-			return nil, err
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(payload, &fields); err != nil {
-			return nil, fmt.Errorf("ToolCallContent payload: %w", err)
-		}
-		for k, raw := range fields {
-			obj[k] = raw
-		}
-	}
-	return json.Marshal(obj)
+	return b, nil
 }
 
 var toolCallContentTags = []string{"content", "diff", "terminal"}
@@ -22152,15 +27996,44 @@ type ToolCallId string
 // which files the agent is working with in real-time.
 // See protocol docs: Following the Agent
 type ToolCallLocation struct {
+	// The absolute file path being accessed or modified.
+	Path string `json:"path"`
+	// Optional 1-based line number within the file.
+	Line *uint32 `json:"line,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Optional 1-based line number within the file.
-	Line *uint32 `json:"line,omitempty"`
-	// The absolute file path being accessed or modified.
-	Path string `json:"path"`
+}
+
+func (v ToolCallLocation) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ToolCallLocation) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ToolCallLocation) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"path\":"...)
+	b = appendString(b, v.Path)
+	if v.Line != nil {
+		b = append(b, ",\"line\":"...)
+		b = strconv.AppendUint(b, uint64((*v.Line)), 10)
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ToolCallLocation) nullError() error {
@@ -22192,17 +28065,17 @@ func (v *ToolCallLocation) decodeFields(data []byte, raws rawObject, buffered bo
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
+		case "path":
+			if err := decodePath(raw, &v.Path, false); err != nil {
+				return err
 			}
 		case "line":
 			if err := decodeValue(raw, &v.Line, true, true); err != nil {
 				v.Line = nil
 			}
-		case "path":
-			if err := decodePath(raw, &v.Path, false); err != nil {
-				return err
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -22287,31 +28160,110 @@ func (v *ToolCallStatus) decodeJSON(data []byte, _ bool) error { return v.Unmars
 // the tool call ID are optional - only changed fields need to be included.
 // See protocol docs: Updating
 type ToolCallUpdate struct {
+	// The ID of the tool call being updated.
+	ToolCallID ToolCallId `json:"toolCallId"`
+	// Update the tool kind.
+	Kind *ToolKind `json:"kind,omitempty"`
+	// Update the execution status.
+	Status *ToolCallStatus `json:"status,omitempty"`
+	// Update the human-readable title.
+	Title *string `json:"title,omitempty"`
+	// Update the programmatic name of the tool being invoked.
+	// This field is optional. Omitting it or sending null both mean that
+	// the existing name is left unchanged.
+	Name *string `json:"name,omitempty"`
+	// Replace the content collection.
+	Content []ToolCallContent `json:"content,omitempty"`
+	// Replace the locations collection.
+	Locations []ToolCallLocation `json:"locations,omitempty"`
+	// Update the raw input.
+	RawInput json.RawMessage `json:"rawInput,omitempty"`
+	// Update the raw output.
+	RawOutput json.RawMessage `json:"rawOutput,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Replace the content collection.
-	Content []ToolCallContent `json:"content,omitempty"`
-	// Update the tool kind.
-	Kind *ToolKind `json:"kind,omitempty"`
-	// Replace the locations collection.
-	Locations []ToolCallLocation `json:"locations,omitempty"`
-	// Update the programmatic name of the tool being invoked.
-	// This field is optional. Omitting it or sending null both mean that
-	// the existing name is left unchanged.
-	Name *string `json:"name,omitempty"`
-	// Update the raw input.
-	RawInput json.RawMessage `json:"rawInput,omitempty"`
-	// Update the raw output.
-	RawOutput json.RawMessage `json:"rawOutput,omitempty"`
-	// Update the execution status.
-	Status *ToolCallStatus `json:"status,omitempty"`
-	// Update the human-readable title.
-	Title *string `json:"title,omitempty"`
-	// The ID of the tool call being updated.
-	ToolCallID ToolCallId `json:"toolCallId"`
+}
+
+func (v ToolCallUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *ToolCallUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *ToolCallUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"toolCallId\":"...)
+	b = appendString(b, string(v.ToolCallID))
+	if v.Kind != nil {
+		b = append(b, ",\"kind\":"...)
+		b = appendString(b, string((*v.Kind)))
+	}
+	if v.Status != nil {
+		b = append(b, ",\"status\":"...)
+		b = appendString(b, string((*v.Status)))
+	}
+	if v.Title != nil {
+		b = append(b, ",\"title\":"...)
+		b = appendString(b, (*v.Title))
+	}
+	if v.Name != nil {
+		b = append(b, ",\"name\":"...)
+		b = appendString(b, (*v.Name))
+	}
+	if v.Content != nil {
+		b = append(b, ",\"content\":"...)
+		b = append(b, '[')
+		for i0 := range v.Content {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.Content[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.Locations != nil {
+		b = append(b, ",\"locations\":"...)
+		b = append(b, '[')
+		for i0 := range v.Locations {
+			if i0 > 0 {
+				b = append(b, ',')
+			}
+			if b, err = v.Locations[i0].appendJSON(b); err != nil {
+				return nil, err
+			}
+		}
+		b = append(b, ']')
+	}
+	if v.RawInput != nil {
+		b = append(b, ",\"rawInput\":"...)
+		if b, err = appendRaw(b, v.RawInput); err != nil {
+			return nil, err
+		}
+	}
+	if v.RawOutput != nil {
+		b = append(b, ",\"rawOutput\":"...)
+		if b, err = appendRaw(b, v.RawOutput); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*ToolCallUpdate) nullError() error {
@@ -22336,37 +28288,13 @@ func (v *ToolCallUpdate) decodeFields(data []byte, raws rawObject, buffered bool
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "content":
-			if err := decodeList(raw, &v.Content, true, true, func(raw json.RawMessage, dst *ToolCallContent) error {
-				return decodeValue(raw, dst, false, true)
-			}); err != nil {
-				v.Content = nil
+		case "toolCallId":
+			if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
+				return err
 			}
 		case "kind":
 			if err := decodeValue(raw, &v.Kind, true, true); err != nil {
 				v.Kind = nil
-			}
-		case "locations":
-			if err := decodeList(raw, &v.Locations, true, true, func(raw json.RawMessage, dst *ToolCallLocation) error {
-				return decodeValue(raw, dst, false, true)
-			}); err != nil {
-				v.Locations = nil
-			}
-		case "name":
-			if err := decodeValue(raw, &v.Name, true, true); err != nil {
-				v.Name = nil
-			}
-		case "rawInput":
-			if err := decodeValue(raw, &v.RawInput, true, true); err != nil {
-				v.RawInput = nil
-			}
-		case "rawOutput":
-			if err := decodeValue(raw, &v.RawOutput, true, true); err != nil {
-				v.RawOutput = nil
 			}
 		case "status":
 			if err := decodeValue(raw, &v.Status, true, true); err != nil {
@@ -22376,9 +28304,37 @@ func (v *ToolCallUpdate) decodeFields(data []byte, raws rawObject, buffered bool
 			if err := decodeValue(raw, &v.Title, true, true); err != nil {
 				v.Title = nil
 			}
-		case "toolCallId":
-			if err := decodeValue(raw, &v.ToolCallID, false, buffered); err != nil {
-				return err
+		case "name":
+			if err := decodeValue(raw, &v.Name, true, true); err != nil {
+				v.Name = nil
+			}
+		case "content":
+			if err := decodeList(raw, &v.Content, true, true, func(raw json.RawMessage, dst *ToolCallContent) error {
+				return decodeValue(raw, dst, false, true)
+			}); err != nil {
+				v.Content = nil
+			}
+		case "locations":
+			if err := decodeList(raw, &v.Locations, true, true, func(raw json.RawMessage, dst *ToolCallLocation) error {
+				return decodeValue(raw, dst, false, true)
+			}); err != nil {
+				v.Locations = nil
+			}
+		case "rawInput":
+			if isNull(raw) {
+				v.RawInput = nil
+			} else if err := decodeValue(raw, &v.RawInput, true, true); err != nil {
+				v.RawInput = nil
+			}
+		case "rawOutput":
+			if isNull(raw) {
+				v.RawOutput = nil
+			} else if err := decodeValue(raw, &v.RawOutput, true, true); err != nil {
+				v.RawOutput = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -22453,13 +28409,38 @@ func (v *ToolKind) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSO
 // Unarchiving a session that is not archived succeeds. A session that does not exist
 // gets -32002.
 type UnarchiveSessionRequest struct {
+	// The ID of the session to unarchive.
+	SessionID SessionId `json:"sessionId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The ID of the session to unarchive.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v UnarchiveSessionRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *UnarchiveSessionRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *UnarchiveSessionRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*UnarchiveSessionRequest) nullError() error {
@@ -22491,13 +28472,13 @@ func (v *UnarchiveSessionRequest) decodeFields(data []byte, raws rawObject, buff
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -22538,6 +28519,29 @@ type UnarchiveSessionResponse struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v UnarchiveSessionResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *UnarchiveSessionResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *UnarchiveSessionResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*UnarchiveSessionResponse) nullError() error {
@@ -22605,6 +28609,29 @@ type UnknownStateUpdate struct {
 	Meta Meta `json:"_meta,omitempty"`
 }
 
+func (v UnknownStateUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *UnknownStateUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *UnknownStateUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (*UnknownStateUpdate) nullError() error {
 	return errors.New("invalid type: null, expected struct UnknownStateUpdate")
 }
@@ -22656,13 +28683,38 @@ func (v *UnknownStateUpdate) decodeSeq(items []json.RawMessage, buffered bool) e
 
 // All text that was typed after the command name is provided as input.
 type UnstructuredCommandInput struct {
+	// A hint to display when the input hasn't been provided yet
+	Hint string `json:"hint"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// A hint to display when the input hasn't been provided yet
-	Hint string `json:"hint"`
+}
+
+func (v UnstructuredCommandInput) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *UnstructuredCommandInput) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *UnstructuredCommandInput) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"hint\":"...)
+	b = appendString(b, v.Hint)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*UnstructuredCommandInput) nullError() error {
@@ -22694,13 +28746,13 @@ func (v *UnstructuredCommandInput) decodeFields(data []byte, raws rawObject, buf
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "hint":
 			if err := decodeValue(raw, &v.Hint, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -22736,23 +28788,64 @@ func (v *UnstructuredCommandInput) decodeSeq(items []json.RawMessage, buffered b
 // This capability is not part of the spec yet, and may be removed or changed at any point.
 // Token usage information for a prompt turn.
 type Usage struct {
-	// The _meta property is reserved by ACP to allow clients and agents to attach additional
-	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
-	// these keys.
-	// See protocol docs: Extensibility
-	Meta Meta `json:"_meta,omitempty"`
-	// Total cache read tokens.
-	CachedReadTokens *uint64 `json:"cachedReadTokens,omitempty"`
-	// Total cache write tokens.
-	CachedWriteTokens *uint64 `json:"cachedWriteTokens,omitempty"`
+	// Sum of all token types across session.
+	TotalTokens uint64 `json:"totalTokens"`
 	// Total input tokens across all turns.
 	InputTokens uint64 `json:"inputTokens"`
 	// Total output tokens across all turns.
 	OutputTokens uint64 `json:"outputTokens"`
 	// Total thought/reasoning tokens
 	ThoughtTokens *uint64 `json:"thoughtTokens,omitempty"`
-	// Sum of all token types across session.
-	TotalTokens uint64 `json:"totalTokens"`
+	// Total cache read tokens.
+	CachedReadTokens *uint64 `json:"cachedReadTokens,omitempty"`
+	// Total cache write tokens.
+	CachedWriteTokens *uint64 `json:"cachedWriteTokens,omitempty"`
+	// The _meta property is reserved by ACP to allow clients and agents to attach additional
+	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+	// these keys.
+	// See protocol docs: Extensibility
+	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v Usage) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *Usage) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *Usage) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"totalTokens\":"...)
+	b = strconv.AppendUint(b, uint64(v.TotalTokens), 10)
+	b = append(b, ",\"inputTokens\":"...)
+	b = strconv.AppendUint(b, uint64(v.InputTokens), 10)
+	b = append(b, ",\"outputTokens\":"...)
+	b = strconv.AppendUint(b, uint64(v.OutputTokens), 10)
+	if v.ThoughtTokens != nil {
+		b = append(b, ",\"thoughtTokens\":"...)
+		b = strconv.AppendUint(b, uint64((*v.ThoughtTokens)), 10)
+	}
+	if v.CachedReadTokens != nil {
+		b = append(b, ",\"cachedReadTokens\":"...)
+		b = strconv.AppendUint(b, uint64((*v.CachedReadTokens)), 10)
+	}
+	if v.CachedWriteTokens != nil {
+		b = append(b, ",\"cachedWriteTokens\":"...)
+		b = strconv.AppendUint(b, uint64((*v.CachedWriteTokens)), 10)
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*Usage) nullError() error { return errors.New("invalid type: null, expected struct Usage") }
@@ -22782,17 +28875,9 @@ func (v *Usage) decodeFields(data []byte, raws rawObject, buffered bool) error {
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "cachedReadTokens":
-			if err := decodeValue(raw, &v.CachedReadTokens, true, true); err != nil {
-				v.CachedReadTokens = nil
-			}
-		case "cachedWriteTokens":
-			if err := decodeValue(raw, &v.CachedWriteTokens, true, true); err != nil {
-				v.CachedWriteTokens = nil
+		case "totalTokens":
+			if err := decodeValue(raw, &v.TotalTokens, false, buffered); err != nil {
+				return err
 			}
 		case "inputTokens":
 			if err := decodeValue(raw, &v.InputTokens, false, buffered); err != nil {
@@ -22806,9 +28891,17 @@ func (v *Usage) decodeFields(data []byte, raws rawObject, buffered bool) error {
 			if err := decodeValue(raw, &v.ThoughtTokens, true, true); err != nil {
 				v.ThoughtTokens = nil
 			}
-		case "totalTokens":
-			if err := decodeValue(raw, &v.TotalTokens, false, buffered); err != nil {
-				return err
+		case "cachedReadTokens":
+			if err := decodeValue(raw, &v.CachedReadTokens, true, true); err != nil {
+				v.CachedReadTokens = nil
+			}
+		case "cachedWriteTokens":
+			if err := decodeValue(raw, &v.CachedWriteTokens, true, true); err != nil {
+				v.CachedWriteTokens = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -22882,17 +28975,50 @@ func (v *Usage) decodeSeq(items []json.RawMessage, buffered bool) error {
 
 // Context window and cost update for a session.
 type UsageUpdate struct {
+	// Tokens currently in context.
+	Used uint64 `json:"used"`
+	// Total context window size in tokens.
+	Size uint64 `json:"size"`
+	// Cumulative session cost (optional).
+	Cost *Cost `json:"cost,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// Cumulative session cost (optional).
-	Cost *Cost `json:"cost,omitempty"`
-	// Total context window size in tokens.
-	Size uint64 `json:"size"`
-	// Tokens currently in context.
-	Used uint64 `json:"used"`
+}
+
+func (v UsageUpdate) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *UsageUpdate) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *UsageUpdate) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"used\":"...)
+	b = strconv.AppendUint(b, uint64(v.Used), 10)
+	b = append(b, ",\"size\":"...)
+	b = strconv.AppendUint(b, uint64(v.Size), 10)
+	if v.Cost != nil {
+		b = append(b, ",\"cost\":"...)
+		if b, err = (*v.Cost).appendJSON(b); err != nil {
+			return nil, err
+		}
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*UsageUpdate) nullError() error {
@@ -22924,21 +29050,21 @@ func (v *UsageUpdate) decodeFields(data []byte, raws rawObject, buffered bool) e
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "cost":
-			if err := decodePtr(raw, &v.Cost, true, true); err != nil {
-				v.Cost = nil
+		case "used":
+			if err := decodeValue(raw, &v.Used, false, buffered); err != nil {
+				return err
 			}
 		case "size":
 			if err := decodeValue(raw, &v.Size, false, buffered); err != nil {
 				return err
 			}
-		case "used":
-			if err := decodeValue(raw, &v.Used, false, buffered); err != nil {
-				return err
+		case "cost":
+			if err := decodePtr(raw, &v.Cost, true, true); err != nil {
+				v.Cost = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -22989,15 +29115,42 @@ func (v *UsageUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
 
 // Request to wait for a terminal command to exit.
 type WaitForTerminalExitRequest struct {
+	// The session ID for this request.
+	SessionID SessionId `json:"sessionId"`
+	// The ID of the terminal to wait for.
+	TerminalID TerminalId `json:"terminalId"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The session ID for this request.
-	SessionID SessionId `json:"sessionId"`
-	// The ID of the terminal to wait for.
-	TerminalID TerminalId `json:"terminalId"`
+}
+
+func (v WaitForTerminalExitRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *WaitForTerminalExitRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *WaitForTerminalExitRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"terminalId\":"...)
+	b = appendString(b, string(v.TerminalID))
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*WaitForTerminalExitRequest) nullError() error {
@@ -23031,10 +29184,6 @@ func (v *WaitForTerminalExitRequest) decodeFields(data []byte, raws rawObject, b
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "sessionId":
 			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
@@ -23042,6 +29191,10 @@ func (v *WaitForTerminalExitRequest) decodeFields(data []byte, raws rawObject, b
 		case "terminalId":
 			if err := decodeValue(raw, &v.TerminalID, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -23086,15 +29239,46 @@ func (v *WaitForTerminalExitRequest) decodeSeq(items []json.RawMessage, buffered
 
 // Response containing the exit status of a terminal command.
 type WaitForTerminalExitResponse struct {
+	// The process exit code (may be null if terminated by signal).
+	ExitCode *uint32 `json:"exitCode,omitempty"`
+	// The signal that terminated the process (may be null if exited normally).
+	Signal *string `json:"signal,omitempty"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The process exit code (may be null if terminated by signal).
-	ExitCode *uint32 `json:"exitCode,omitempty"`
-	// The signal that terminated the process (may be null if exited normally).
-	Signal *string `json:"signal,omitempty"`
+}
+
+func (v WaitForTerminalExitResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *WaitForTerminalExitResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *WaitForTerminalExitResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.ExitCode != nil {
+		b = append(b, ",\"exitCode\":"...)
+		b = strconv.AppendUint(b, uint64((*v.ExitCode)), 10)
+	}
+	if v.Signal != nil {
+		b = append(b, ",\"signal\":"...)
+		b = appendString(b, (*v.Signal))
+	}
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*WaitForTerminalExitResponse) nullError() error {
@@ -23118,10 +29302,6 @@ func (v *WaitForTerminalExitResponse) decodeFields(data []byte, raws rawObject, 
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
 		case "exitCode":
 			if err := decodeValue(raw, &v.ExitCode, true, true); err != nil {
 				v.ExitCode = nil
@@ -23129,6 +29309,10 @@ func (v *WaitForTerminalExitResponse) decodeFields(data []byte, raws rawObject, 
 		case "signal":
 			if err := decodeValue(raw, &v.Signal, true, true); err != nil {
 				v.Signal = nil
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -23138,17 +29322,46 @@ func (v *WaitForTerminalExitResponse) decodeFields(data []byte, raws rawObject, 
 // Request to write content to a text file.
 // Only available if the client supports the fs.writeTextFile capability.
 type WriteTextFileRequest struct {
+	// The session ID for this request.
+	SessionID SessionId `json:"sessionId"`
+	// Absolute path to the file to write.
+	Path string `json:"path"`
+	// The text content to write to the file.
+	Content string `json:"content"`
 	// The _meta property is reserved by ACP to allow clients and agents to attach additional
 	// metadata to their interactions. Implementations MUST NOT make assumptions about values at
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
-	// The text content to write to the file.
-	Content string `json:"content"`
-	// Absolute path to the file to write.
-	Path string `json:"path"`
-	// The session ID for this request.
-	SessionID SessionId `json:"sessionId"`
+}
+
+func (v WriteTextFileRequest) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *WriteTextFileRequest) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *WriteTextFileRequest) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	b = append(b, ",\"sessionId\":"...)
+	b = appendString(b, string(v.SessionID))
+	b = append(b, ",\"path\":"...)
+	b = appendString(b, v.Path)
+	b = append(b, ",\"content\":"...)
+	b = appendString(b, v.Content)
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*WriteTextFileRequest) nullError() error {
@@ -23180,21 +29393,21 @@ func (v *WriteTextFileRequest) decodeFields(data []byte, raws rawObject, buffere
 	for _, m := range raws {
 		raw := m.raw
 		switch string(m.key) {
-		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
-				v.Meta = nil
-			}
-		case "content":
-			if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
+		case "sessionId":
+			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
 				return err
 			}
 		case "path":
 			if err := decodePath(raw, &v.Path, false); err != nil {
 				return err
 			}
-		case "sessionId":
-			if err := decodeValue(raw, &v.SessionID, false, buffered); err != nil {
+		case "content":
+			if err := decodeValue(raw, &v.Content, false, buffered); err != nil {
 				return err
+			}
+		case "_meta":
+			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+				v.Meta = nil
 			}
 		}
 	}
@@ -23255,6 +29468,29 @@ type WriteTextFileResponse struct {
 	// these keys.
 	// See protocol docs: Extensibility
 	Meta Meta `json:"_meta,omitempty"`
+}
+
+func (v WriteTextFileResponse) MarshalJSON() ([]byte, error) { return v.appendJSON(nil) }
+
+func (v *WriteTextFileResponse) appendJSON(b []byte) ([]byte, error) {
+	start := len(b)
+	b, err := v.appendMembers(b)
+	if err != nil {
+		return nil, err
+	}
+	return closeObject(b, start), nil
+}
+
+func (v *WriteTextFileResponse) appendMembers(b []byte) ([]byte, error) {
+	var err error
+	_ = err
+	if v.Meta != nil {
+		b = append(b, ",\"_meta\":"...)
+		if b, err = appendAny(b, v.Meta); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 func (*WriteTextFileResponse) nullError() error {

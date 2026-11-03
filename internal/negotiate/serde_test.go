@@ -44,8 +44,7 @@ func TestValidateV2MatchesTheReferenceRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: V2Params: %v", params, err)
 		}
-		if string(normalized) != `{"info":{"name":"c","version":"1"},"protocolVersion":2}` &&
-			string(normalized) != `{"capabilities":{},"info":{"name":"c","version":"1"},"protocolVersion":2}` {
+		if string(normalized) != `{"protocolVersion":2,"info":{"name":"c","version":"1"},"capabilities":{}}` {
 			t.Fatalf("%s: normalized = %s", params, normalized)
 		}
 	}
@@ -69,17 +68,17 @@ func TestInitializeKeysMatchExactly(t *testing.T) {
 		v1     bool
 		want   string
 	}{
-		{"exact v2 Info", `{"protocolVersion":2,"info":{"name":"c","version":"1"},"Info":5}`, false, `{"info":{"name":"c","version":"1"},"protocolVersion":2}`},
-		{"exact v2 nested", `{"protocolVersion":2,"info":{"name":"c","version":"1","Title":"t"},"capabilities":{"Auth":{"terminal":{}}}}`, false, `{"capabilities":{},"info":{"name":"c","version":"1"},"protocolVersion":2}`},
+		{"exact v2 Info", `{"protocolVersion":2,"info":{"name":"c","version":"1"},"Info":5}`, false, `{"protocolVersion":2,"info":{"name":"c","version":"1"},"capabilities":{}}`},
+		{"exact v2 nested", `{"protocolVersion":2,"info":{"name":"c","version":"1","Title":"t"},"capabilities":{"Auth":{"terminal":{}}}}`, false, `{"protocolVersion":2,"info":{"name":"c","version":"1"},"capabilities":{}}`},
 		// Rust's DefaultOnError applies at every level: a bad nested member
 		// leaves the rest of its capability in place (confirmed with the
 		// reference probe).
-		{"exact v2 nested leniency", `{"protocolVersion":2,"info":{"name":"c","version":"1"},"capabilities":{"auth":{"terminal":"bad","_meta":{"k":1}},"elicitation":{"form":"bad","url":{}}}}`, false, `{"capabilities":{"auth":{"_meta":{"k":1}},"elicitation":{"url":{}}},"info":{"name":"c","version":"1"},"protocolVersion":2}`},
-		{"newer v2 nested leniency", `{"protocolVersion":9,"info":{"name":"c","version":"1"},"capabilities":{"auth":{"terminal":{"_meta":"bad"}},"elicitation":{"form":{"_meta":3}}}}`, false, `{"capabilities":{"auth":{"terminal":{}},"elicitation":{"form":{}}},"info":{"name":"c","version":"1"},"protocolVersion":2}`},
-		{"newer v2 Capabilities", `{"protocolVersion":3,"info":{"name":"c","version":"1"},"Capabilities":{"auth":{"terminal":{}}},"PROTOCOLVERSION":"x"}`, false, `{"info":{"name":"c","version":"1"},"protocolVersion":2}`},
-		{"exact v1 ClientCapabilities", `{"protocolVersion":1,"ClientCapabilities":{"fs":{"readTextFile":true}}}`, true, `{"protocolVersion":1}`},
-		{"exact v1 nested", `{"protocolVersion":1,"clientCapabilities":{"FS":{"readTextFile":true},"fs":{"ReadTextFile":true}}}`, true, `{"clientCapabilities":{"fs":{}},"protocolVersion":1}`},
-		{"newer v1 Capabilities", `{"protocolVersion":3,"Capabilities":{"auth":{"terminal":{}}},"Info":{"name":"c","version":"1"}}`, true, `{"clientCapabilities":{"session":{"configOptions":{"boolean":{}}}},"protocolVersion":1}`},
+		{"exact v2 nested leniency", `{"protocolVersion":2,"info":{"name":"c","version":"1"},"capabilities":{"auth":{"terminal":"bad","_meta":{"k":1}},"elicitation":{"form":"bad","url":{}}}}`, false, `{"protocolVersion":2,"info":{"name":"c","version":"1"},"capabilities":{"auth":{"_meta":{"k":1}},"elicitation":{"url":{}}}}`},
+		{"newer v2 nested leniency", `{"protocolVersion":9,"info":{"name":"c","version":"1"},"capabilities":{"auth":{"terminal":{"_meta":"bad"}},"elicitation":{"form":{"_meta":3}}}}`, false, `{"protocolVersion":2,"info":{"name":"c","version":"1"},"capabilities":{"auth":{"terminal":{}},"elicitation":{"form":{}}}}`},
+		{"newer v2 Capabilities", `{"protocolVersion":3,"info":{"name":"c","version":"1"},"Capabilities":{"auth":{"terminal":{}}},"PROTOCOLVERSION":"x"}`, false, `{"protocolVersion":2,"info":{"name":"c","version":"1"},"capabilities":{}}`},
+		{"exact v1 ClientCapabilities", `{"protocolVersion":1,"ClientCapabilities":{"fs":{"readTextFile":true}}}`, true, `{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"auth":{"terminal":false}}}`},
+		{"exact v1 nested", `{"protocolVersion":1,"clientCapabilities":{"FS":{"readTextFile":true},"fs":{"ReadTextFile":true}}}`, true, `{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"auth":{"terminal":false}}}`},
+		{"newer v1 Capabilities", `{"protocolVersion":3,"Capabilities":{"auth":{"terminal":{}}},"Info":{"name":"c","version":"1"}}`, true, `{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"session":{"configOptions":{"boolean":{}}},"auth":{"terminal":false}}}`},
 	} {
 		negotiate := V2Params
 		if test.v1 {

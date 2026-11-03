@@ -83,6 +83,9 @@ func TestUntaggedUnionSupportsInlineObjectVariants(t *testing.T) {
 // mode-specific properties declared beside an untagged anyOf of scope refs
 // must become common fields, not be dropped.
 func TestUntaggedUnionLiftsSharedProperties(t *testing.T) {
+	// Rust flattens the scope before the mode's own fields.
+	flattenAfter["UrlMode"] = ""
+	defer delete(flattenAfter, "UrlMode")
 	object := json.RawMessage(`"object"`)
 	scope := func(key string) *rawSchema {
 		return &rawSchema{
@@ -134,7 +137,7 @@ func TestUntaggedUnionLiftsSharedProperties(t *testing.T) {
 	for _, want := range []string{
 		"`json:\"url\"`",
 		"`json:\"note,omitempty\"`",
-		"type urlModeShadow UrlMode",
+		"func (v *UrlMode) appendMembers(b []byte) ([]byte, error) {",
 		"if raw, ok := raws.get(\"url\"); ok {",
 		"return missingField(\"url\")",
 	} {

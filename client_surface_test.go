@@ -103,8 +103,8 @@ func TestClientLifecycleMethodsHaveIndependentWireFixtures(t *testing.T) {
 		assertJSONKey(t, request.Params, "additionalDirectories", `["`+hostRoot+`/tmp/extra"]`)
 		assertJSONEqual(t, request.Params, "mcpServers", `[
 			{"name":"local","command":"`+hostRoot+`/usr/bin/mcp","args":["--stdio"],"env":[{"name":"MCP_ENV","value":"1"}]},
-			{"type":"http","name":"remote","url":"https://example.test/mcp","headers":null},
-			{"type":"sse","name":"events","url":"https://example.test/sse","headers":null}
+			{"type":"http","name":"remote","url":"https://example.test/mcp","headers":[]},
+			{"type":"sse","name":"events","url":"https://example.test/sse","headers":[]}
 		]`)
 	})
 

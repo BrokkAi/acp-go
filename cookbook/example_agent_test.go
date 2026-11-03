@@ -129,9 +129,10 @@ func Example_buildingAnAgent() {
 		acp.SessionUpdates(func(update acp.Update) error {
 			switch {
 			case update.Update.ToolCall != nil:
-				status := "no status"
+				// The wire leaves out the default status, pending.
+				status := schema.ToolCallStatusPending
 				if update.Update.ToolCall.Status != nil {
-					status = string(*update.Update.ToolCall.Status)
+					status = *update.Update.ToolCall.Status
 				}
 				fmt.Println("tool call:", update.Update.ToolCall.Title, status)
 			case update.Update.ToolCallUpdate != nil && update.Update.ToolCallUpdate.Status != nil:

@@ -1,14 +1,16 @@
-// Package hintcheck checks generated schema types against decode outcomes
-// captured from the Rust schema crate.
+// Package hintcheck checks generated schema types against decode and encode
+// outcomes captured from the Rust schema crate.
 //
 // cmd/acpgen generates, for each schema package, decode cases that exercise
 // the schema's x-deserialize-* hints, required fields, enums, unions, and the
-// array form of structs (hints_gen_test.go). scripts/capture_hint_fixtures.py
+// array form of structs, and encode cases for every def, f64, empty list,
+// raw JSON value, and union arm (hints_gen_test.go). scripts/capture_hint_fixtures.py
 // runs those cases through a probe built on the Rust schema crate and records
 // each outcome in the package's testdata/hints_rust.json. Run decodes every
 // case with the Go type and requires the same outcome: where Rust fails, an
 // error with serde's exact text, which the agent runtimes send to peers in
-// -32602 answers; otherwise the same value.
+// -32602 answers; otherwise the same value, encoded byte for byte as
+// serde_json::to_string encodes the Rust value.
 package hintcheck
 
 import (
@@ -20,6 +22,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/BrokkAi/acp-go/internal/serdewire"
 )
 
 var dump = flag.String("hints.dump", "", "write the deserialize-hint cases as Rust probe requests to this file and skip the checks")
@@ -61,11 +65,13 @@ type Fixtures struct {
 }
 
 // Outcome is the Rust result of decoding one case's input: the re-encoded
-// value, or the decode error.
+// value, both parsed (OK) and as serde_json::to_string wrote it (Encoded), or
+// the decode error.
 type Outcome struct {
-	Input string          `json:"input"`
-	OK    json.RawMessage `json:"ok,omitempty"`
-	Error string          `json:"error,omitempty"`
+	Input   string          `json:"input"`
+	OK      json.RawMessage `json:"ok,omitempty"`
+	Encoded string          `json:"encoded,omitempty"`
+	Error   string          `json:"error,omitempty"`
 }
 
 // Request is one line of the probe input written by -hints.dump.
@@ -119,7 +125,9 @@ func Run(t *testing.T, s Suite) {
 
 // check decodes the input and, where Rust rejects it, requires Rust's error.
 // Where Rust accepts it, it also decodes the Rust re-encoding and requires the
-// two Go values to be the same.
+// two Go values to be the same, and requires json.Marshal of the decoded
+// value to be byte for byte what serde_json::to_string wrote: the same
+// members, in the same order, with the same number formatting.
 func (s Suite) check(t *testing.T, c Case, want Outcome) {
 	got := reflect.New(c.Type)
 	err := json.Unmarshal([]byte(c.Input), got.Interface())
@@ -144,7 +152,38 @@ func (s Suite) check(t *testing.T, c Case, want Outcome) {
 		encoded, _ := json.Marshal(got.Interface())
 		t.Fatalf("decoded value differs from Rust at %s\ninput: %s\n   go: %s\n rust: %s", path, c.Input, encoded, want.OK)
 	}
+	encoded, err := json.Marshal(got.Interface())
+	if err != nil {
+		t.Fatalf("Go cannot encode what it decoded: %v\ninput: %s", err, c.Input)
+	}
+	if !strings.ContainsAny(want.Encoded, htmlEscaped) && string(encoded) != want.Encoded {
+		t.Fatalf("Go encodes the decoded value differently from Rust\ninput: %s\n   go: %s\n rust: %s", c.Input, encoded, want.Encoded)
+	}
+	// json.Marshal escapes <, >, &, U+2028 and U+2029 in any MarshalJSON
+	// output (U+2028 and U+2029 even without HTML escaping); the generated
+	// MarshalJSON writes them as serde_json does.
+	if m, ok := got.Interface().(json.Marshaler); ok {
+		direct, err := m.MarshalJSON()
+		if err != nil {
+			t.Fatalf("Go cannot encode what it decoded: %v\ninput: %s", err, c.Input)
+		}
+		if string(direct) != want.Encoded {
+			t.Fatalf("MarshalJSON encodes the decoded value differently from Rust\ninput: %s\n   go: %s\n rust: %s", c.Input, direct, want.Encoded)
+		}
+	}
+	// acp.Connection writes typed params and results as serdewire writes
+	// json.Marshal output; that must not change the encoding either.
+	frame, err := serdewire.MarshalTyped(got.Interface())
+	if err != nil {
+		t.Fatalf("the frame writer cannot encode what Go decoded: %v\ninput: %s", err, c.Input)
+	}
+	if string(frame) != want.Encoded {
+		t.Fatalf("the frame writer encodes the decoded value differently from Rust\ninput: %s\n   go: %s\n rust: %s", c.Input, frame, want.Encoded)
+	}
 }
+
+// htmlEscaped are the characters json.Marshal escapes and serde_json does not.
+const htmlEscaped = "<>&\u2028\u2029"
 
 // diff compares two values of one generated type field by field and returns
 // the path of the first difference, or "". A value Go leaves unset equals the
@@ -201,8 +240,10 @@ func (s Suite) diff(a, b reflect.Value, owner, key string) string {
 			}
 		}
 		return ""
-	case a.Type() == reflect.TypeOf(json.RawMessage(nil)):
-		return sameJSON(a.Interface(), b.Interface(), path)
+	case a.Kind() == reflect.Slice && a.Type().Elem().Kind() == reflect.Uint8:
+		// Raw JSON holds the wire text, which Rust holds parsed; its floats,
+		// like decoded floats, are compared by the encoding check.
+		return ""
 	case a.Kind() == reflect.Slice:
 		if a.Len() == 0 && b.Len() == 0 {
 			return ""
@@ -234,7 +275,16 @@ func (s Suite) diff(a, b reflect.Value, owner, key string) string {
 		}
 		return ""
 	case a.Kind() == reflect.Interface:
+		if _, raw := a.Interface().(json.RawMessage); raw {
+			return "" // as for a raw JSON field
+		}
 		return sameJSON(a.Interface(), b.Interface(), path)
+	}
+	if a.Kind() == reflect.Float64 {
+		// Reading Rust's shortest output back through serde_json's inexact
+		// float parsing need not give the float Rust held, so the decoded
+		// floats are compared by the byte-for-byte encoding check instead.
+		return ""
 	}
 	if !reflect.DeepEqual(a.Interface(), b.Interface()) {
 		return path
