@@ -641,7 +641,7 @@ series, minor releases may contain breaking API changes.
   [docs/schema-pin-workflow.md](docs/schema-pin-workflow.md#encode-rules).
 - **Breaking (API):** `Meta`, in all four schema packages, is the new
   `jsonvalue.Object` instead of a `map[string]any`, so `_meta` round-trips as
-  the reference SDK's `serde_json::Map` (built with `preserve_order`) does.
+  the reference SDK's `serde_json::Map` (built with `preserve_order`) does (#107).
   `jsonvalue` is a new standard-library package holding untyped JSON as
   `serde_json::Value` holds it:
   - `Object` is an ordered `[]Member` of `{Key, Value}`: `nil` is no object
@@ -677,7 +677,7 @@ series, minor releases may contain breaking API changes.
   `baggage`.
 - **Breaking (wire):** a `_meta`, and every other `Meta`, is written as
   `serde_json::to_string` writes the `serde_json::Map` Rust decodes from the
-  same input, checked byte for byte against the pinned crate by
+  same input (#107), checked byte for byte against the pinned crate by
   `TestDeserializeHints` (a `Meta` itself and every `_meta` field) and through
   `acp.Connection` by `TestTypedFramesMatchTheRustEncoding`:
   - members keep their wire order instead of being sorted, and a repeated key
