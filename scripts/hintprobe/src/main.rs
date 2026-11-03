@@ -2,10 +2,14 @@
 //! outcome, so the Go decoders can be compared with it.
 //!
 //! Reads one request per line, `{"id", "pkg", "type", "input"}`, and writes
-//! one response per line: `{"id", "ok": <re-encoded value>, "encoded":
-//! <the exact serde_json::to_string output>}`,
-//! `{"id", "error": <message>}`, or `{"id", "missing": true}` for a type the
-//! dispatch table does not know.
+//! one response per line: `{"id", "encoded": <the exact serde_json::to_string
+//! output, as a string>}`, `{"id", "error": <message>}`, or `{"id", "missing":
+//! true}` for a type the dispatch table does not know.
+//!
+//! The re-encoding is only ever carried as a string: parsing it again, in
+//! Rust or in the capture script, could reorder an object's members (a
+//! `_meta` keeps its wire order) or change a float, as serde_json's float
+//! parsing is not exact.
 
 use std::io::{BufRead, Write};
 
@@ -43,13 +47,7 @@ fn main() {
         };
         let resp = match result {
             None => serde_json::json!({"id": id, "missing": true}).to_string(),
-            // The re-encoding is written as is, not parsed into a Value
-            // again: serde_json's float parsing is not exact, so a second
-            // parse could change a number.
-            Some(Ok(encoded)) => {
-                let quoted = serde_json::to_string(&encoded).expect("encode string");
-                format!("{{\"id\":{id},\"ok\":{encoded},\"encoded\":{quoted}}}")
-            }
+            Some(Ok(encoded)) => serde_json::json!({"id": id, "encoded": encoded}).to_string(),
             Some(Err(error)) => serde_json::json!({"id": id, "error": error}).to_string(),
         };
         writeln!(out, "{resp}").expect("write response");

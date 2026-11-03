@@ -6,8 +6,10 @@ cmd/acpgen generates decode cases for every schema package
 `go test -run TestDeserializeHints -args -hints.dump=...`, decodes each one with
 a probe built on the pinned Rust schema crate (scripts/hintprobe), and writes
 the outcomes to the package's testdata/hints_rust.json, which the generated
-test compares the Go decoders and encoders with: the decode error, or the
-re-encoded value and the exact serde_json::to_string output.
+test compares the Go decoders and encoders with: the decode error, or the exact
+serde_json::to_string output of the decoded value, kept as the string the probe
+wrote and never parsed again, so the member order of a _meta and the digits of
+its numbers stay exactly as Rust wrote them.
 
 Run it from any directory after regenerating the schema packages. It needs
 cargo; the probe pins the crate versions the reference Rust SDK resolves.
@@ -119,8 +121,7 @@ def fixtures(header, requests, responses):
         if resp.get("missing"):
             raise ValueError(f"the probe has no Rust type {req['pkg']}::{req['type']} for {req['id']}")
         outcome = {"input": req["input"]}
-        if "ok" in resp:
-            outcome["ok"] = resp["ok"]
+        if "encoded" in resp:
             outcome["encoded"] = resp["encoded"]
         else:
             outcome["error"] = resp["error"]

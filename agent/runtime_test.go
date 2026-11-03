@@ -379,7 +379,7 @@ func TestRuntimeNegotiatesV1ForEveryValidVersion(t *testing.T) {
 					capabilities.Terminal != nil && *capabilities.Terminal {
 					t.Fatalf("v1-only capabilities enabled: %+v", capabilities)
 				}
-				if request.Meta["trace"] != "x" {
+				if trace, _ := request.Meta.Get("trace"); trace != "x" {
 					t.Fatalf("_meta = %v", request.Meta)
 				}
 			},

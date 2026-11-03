@@ -3,6 +3,8 @@ package tracecontext
 import (
 	"encoding/hex"
 	"strings"
+
+	"github.com/BrokkAi/acp-go/jsonvalue"
 )
 
 // Root-level _meta keys reserved for W3C Trace Context by the ACP
@@ -29,13 +31,13 @@ func (tc Context) Empty() bool {
 }
 
 // FromMeta extracts the reserved W3C trace-context keys from a generated _meta
-// map such as schema.Meta or v2.Meta.
+// object such as schema.Meta or v2.Meta (both a jsonvalue.Object).
 //
 // It reports whether any of the three keys held a non-empty string. Non-string
 // values are ignored rather than removed, so a peer that stores unrelated data
 // at a reserved key is left untouched. Decoding a v2 Nullable[Meta] field first
 // (for example request.Meta.Value) remains the caller's responsibility.
-func FromMeta(meta map[string]any) (Context, bool) {
+func FromMeta(meta jsonvalue.Object) (Context, bool) {
 	tc := Context{
 		Traceparent: metaString(meta, TraceparentKey),
 		Tracestate:  metaString(meta, TracestateKey),
@@ -45,34 +47,34 @@ func FromMeta(meta map[string]any) (Context, bool) {
 }
 
 // IntoMeta writes the non-empty fields of tc to the reserved keys of meta and
-// returns the result. A nil map is allocated; otherwise meta is updated in
-// place so a generated Meta keeps its other keys. Fields left empty in tc do
-// not change meta, and an empty tc returns meta unchanged.
-func IntoMeta(meta map[string]any, tc Context) map[string]any {
+// returns the result, so a generated Meta keeps its other keys. A key meta
+// already holds keeps its position; new keys are appended in the order
+// traceparent, tracestate, baggage. A nil meta starts a new object. Fields
+// left empty in tc do not change meta, and an empty tc returns meta
+// unchanged.
+func IntoMeta(meta jsonvalue.Object, tc Context) jsonvalue.Object {
 	if tc.Empty() {
 		return meta
 	}
 	if meta == nil {
-		meta = make(map[string]any, 3)
+		meta = make(jsonvalue.Object, 0, 3)
 	}
 	if tc.Traceparent != "" {
-		meta[TraceparentKey] = tc.Traceparent
+		meta.Set(TraceparentKey, tc.Traceparent)
 	}
 	if tc.Tracestate != "" {
-		meta[TracestateKey] = tc.Tracestate
+		meta.Set(TracestateKey, tc.Tracestate)
 	}
 	if tc.Baggage != "" {
-		meta[BaggageKey] = tc.Baggage
+		meta.Set(BaggageKey, tc.Baggage)
 	}
 	return meta
 }
 
-func metaString(meta map[string]any, key string) string {
-	value, ok := meta[key].(string)
-	if !ok {
-		return ""
-	}
-	return value
+func metaString(meta jsonvalue.Object, key string) string {
+	value, _ := meta.Get(key)
+	s, _ := value.(string)
+	return s
 }
 
 // ValidTraceparent reports whether value is a well-formed W3C traceparent:

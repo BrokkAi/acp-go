@@ -637,10 +637,72 @@ series, minor releases may contain breaking API changes.
   such as `rawInput` were written with different digits. Params forwarded as
   a `json.RawMessage` are still read as wire text.
 
-  `Meta` and other untyped (`any`) values still lose map key order and the
-  integers above 2^53, as `encoding/json` decodes them; an ordered `Meta`
-  type is left to a follow-up. See
+  `Meta` is covered by the next entry. See
   [docs/schema-pin-workflow.md](docs/schema-pin-workflow.md#encode-rules).
+- **Breaking (API):** `Meta`, in all four schema packages, is the new
+  `jsonvalue.Object` instead of a `map[string]any`, so `_meta` round-trips as
+  the reference SDK's `serde_json::Map` (built with `preserve_order`) does.
+  `jsonvalue` is a new standard-library package holding untyped JSON as
+  `serde_json::Value` holds it:
+  - `Object` is an ordered `[]Member` of `{Key, Value}`: `nil` is no object
+    (an absent `_meta`, written as `null` inside another value) and
+    `Object{}` the empty one, as with the map. `Get` reads a member (the last
+    one when a key repeats), `Set` inserts as `Map::insert` does (an existing
+    key keeps its place, a new one is appended), `Delete` removes and keeps
+    the order (`shift_remove`), `SwapDelete` removes as `Map::remove` does
+    with `preserve_order` (`swap_remove`), and `Keys`, `Clone`,
+    `MarshalJSON`, `AppendJSON`, and `UnmarshalJSON` round it out.
+    `ObjectOf(map[string]any)` builds one with sorted keys, so a map always
+    encodes the same way, and each package has `NewMeta` for it; a literal
+    such as `schema.Meta{{Key: "traceparent", Value: tp}}` sets the order.
+  - A decoded value is `nil`, `bool`, `string`, `int64` (an integer that fits
+    `i64`), `uint64` (a larger one that fits `u64`), `float64` (any other
+    number, read as serde_json reads it), `[]any`, or `Object`. Before,
+    encoding/json decoded every number as a `float64` and sorted the keys.
+  - `Append`, `Marshal`, `Parse`, and `IsNull` write and read any of these as
+    serde_json does; a `json.RawMessage` or `json.Number` is read as wire
+    text, a `map[string]any` is written with sorted keys, and other Go values
+    as encoding/json encodes them.
+
+  `schema.Meta` and `v2.Meta` are now the same type (Rust's v1 and v2 `Meta`
+  are both `serde_json::Map`). Reading `meta["k"]` becomes `meta.Get("k")`
+  and a `Meta{"k": v}` literal becomes `Meta{{Key: "k", Value: v}}` or
+  `NewMeta(map[string]any{"k": v})`. The other objects Rust holds as a
+  `serde_json::Map`, the unstable `MessageMcpRequest.params` and
+  `MessageMcpNotification.params`, are a `Meta` too, and so are the `mcp` and
+  `v2/mcp` `MessageRequest.Params`, `MessageNotification.Params`, the
+  `Notify` params, and the params of `MessageClient.Call`.
+  `tracecontext.FromMeta` and `IntoMeta` take and return a `jsonvalue.Object`;
+  `IntoMeta` appends new keys in the order `traceparent`, `tracestate`,
+  `baggage`.
+- **Breaking (wire):** a `_meta`, and every other `Meta`, is written as
+  `serde_json::to_string` writes the `serde_json::Map` Rust decodes from the
+  same input, checked byte for byte against the pinned crate by
+  `TestDeserializeHints` (a `Meta` itself and every `_meta` field) and through
+  `acp.Connection` by `TestTypedFramesMatchTheRustEncoding`:
+  - members keep their wire order instead of being sorted, and a repeated key
+    is written once, at its first position, with its last value;
+  - integers that fit `u64` or `i64` are exact: `9007199254740993` and
+    `12345678901234567890` are no longer rounded through a `float64`, and
+    `-9223372036854775808` and `18446744073709551615` keep their digits;
+  - other numbers are the `f64` serde_json's parse reads, written in its
+    form: `1.0` stays `1.0` (it was `1`), `-0` and `-0.0` are `-0.0`, `1e2` is
+    `100.0`, and `18446744073709551616` is `1.8446744073709552e+19`; a
+    `float64` set in Go is written the same way, so `1.0` is `1.0`;
+  - strings are decoded and written with serde_json's escapes.
+
+  `ApplyMetaUpdate` (v2 upserts) keeps the order Rust's `apply_meta_update`
+  leaves: a patched key keeps its place, a new key is appended in the patch's
+  order, and a removed key's place is taken by the last stored key. The v1
+  `_meta` patch fields (`CompactionUpdate`, `SessionInfoUpdate`, and the
+  unstable `SessionMessage` and `SubagentUpdate`) still replace the stored
+  object whole, now keeping its order. `acp.SessionClientCapabilities`
+  merges `_meta` keys with `Set`, so a later part's key keeps the place it
+  had in an earlier part. A session/update notification with a `_meta`
+  decodes with fewer allocations than before and encodes with up to 5 times
+  fewer (7 instead of 34 for a nested `_meta`), as `Meta` no longer goes
+  through encoding/json; without a `_meta`, the allocation count is
+  unchanged.
 - Frames have no size limit, as in Rust `agent-client-protocol` 5.0.0, whose
   line readers have none (#90). `acp.Connection` (and so `v2.Connection` and
   the agent runtimes), `agentrouter`, `clientrouter`, `proxyrouter`, the HTTP

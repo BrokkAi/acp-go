@@ -64,14 +64,13 @@ type Fixtures struct {
 	Cases    map[string]Outcome `json:"cases"`
 }
 
-// Outcome is the Rust result of decoding one case's input: the re-encoded
-// value, both parsed (OK) and as serde_json::to_string wrote it (Encoded), or
-// the decode error.
+// Outcome is the Rust result of decoding one case's input: the value
+// re-encoded exactly as serde_json::to_string wrote it (Encoded), or the
+// decode error.
 type Outcome struct {
-	Input   string          `json:"input"`
-	OK      json.RawMessage `json:"ok,omitempty"`
-	Encoded string          `json:"encoded,omitempty"`
-	Error   string          `json:"error,omitempty"`
+	Input   string `json:"input"`
+	Encoded string `json:"encoded,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // Request is one line of the probe input written by -hints.dump.
@@ -131,7 +130,7 @@ func Run(t *testing.T, s Suite) {
 func (s Suite) check(t *testing.T, c Case, want Outcome) {
 	got := reflect.New(c.Type)
 	err := json.Unmarshal([]byte(c.Input), got.Interface())
-	if want.OK == nil {
+	if want.Error != "" {
 		if err == nil {
 			encoded, _ := json.Marshal(got.Interface())
 			t.Fatalf("Go accepted what Rust rejects (%s)\ninput: %s\n   go: %s", want.Error, c.Input, encoded)
@@ -142,15 +141,15 @@ func (s Suite) check(t *testing.T, c Case, want Outcome) {
 		return
 	}
 	if err != nil {
-		t.Fatalf("Go rejected what Rust accepts: %v\ninput: %s\n rust: %s", err, c.Input, want.OK)
+		t.Fatalf("Go rejected what Rust accepts: %v\ninput: %s\n rust: %s", err, c.Input, want.Encoded)
 	}
 	rust := reflect.New(c.Type)
-	if err := json.Unmarshal(want.OK, rust.Interface()); err != nil {
-		t.Fatalf("Go cannot decode the Rust re-encoding: %v\n rust: %s", err, want.OK)
+	if err := json.Unmarshal([]byte(want.Encoded), rust.Interface()); err != nil {
+		t.Fatalf("Go cannot decode the Rust re-encoding: %v\n rust: %s", err, want.Encoded)
 	}
 	if path := s.diff(got.Elem(), rust.Elem(), c.Type.Name(), ""); path != "" {
 		encoded, _ := json.Marshal(got.Interface())
-		t.Fatalf("decoded value differs from Rust at %s\ninput: %s\n   go: %s\n rust: %s", path, c.Input, encoded, want.OK)
+		t.Fatalf("decoded value differs from Rust at %s\ninput: %s\n   go: %s\n rust: %s", path, c.Input, encoded, want.Encoded)
 	}
 	encoded, err := json.Marshal(got.Interface())
 	if err != nil {
@@ -277,6 +276,11 @@ func (s Suite) diff(a, b reflect.Value, owner, key string) string {
 	case a.Kind() == reflect.Interface:
 		if _, raw := a.Interface().(json.RawMessage); raw {
 			return "" // as for a raw JSON field
+		}
+		if !a.IsNil() && !b.IsNil() && a.Elem().Type() == b.Elem().Type() {
+			// The values of a decoded Meta (a jsonvalue.Object), compared
+			// member by member and in order.
+			return s.diff(a.Elem(), b.Elem(), owner, key)
 		}
 		return sameJSON(a.Interface(), b.Interface(), path)
 	}

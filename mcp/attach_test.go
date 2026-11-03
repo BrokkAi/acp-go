@@ -70,7 +70,9 @@ func newAttachHost(t *testing.T) *attachHost {
 	return h
 }
 
-func modernParams(params map[string]any) map[string]any {
+func modernParams(params map[string]any) schema.Meta { return schema.NewMeta(modernMap(params)) }
+
+func modernMap(params map[string]any) map[string]any {
 	if params == nil {
 		params = map[string]any{}
 	}
@@ -395,7 +397,7 @@ func TestAttachedNotificationsAreRequestScoped(t *testing.T) {
 	if err != nil || outcome.IsError() {
 		t.Fatalf("outcome = %+v, %v", outcome, err)
 	}
-	if len(notifications) != 2 || notifications[0].RequestID != "progress" || notifications[1].Params["progress"] != float64(2) {
+	if len(notifications) != 2 || notifications[0].RequestID != "progress" || param(notifications[1].Params, "progress") != int64(2) {
 		t.Fatalf("notifications = %+v", notifications)
 	}
 	if err := retained.Notify(context.Background(), "notifications/progress", nil); err == nil {
@@ -429,15 +431,15 @@ func TestAttachedRequestsValidateModernMetadata(t *testing.T) {
 		{"capabilities not an object", "tools/list", map[string]any{"_meta": map[string]any{
 			"io.modelcontextprotocol/protocolVersion": "2026-07-28",
 		}}, `{"code":-32602,"message":"Invalid params","data":"inner params._meta requires io.modelcontextprotocol/clientCapabilities object"}`},
-		{"initialize", "initialize", modernParams(nil),
+		{"initialize", "initialize", modernMap(nil),
 			`{"code":-32601,"message":"Method not found","data":"native MCP requests do not use initialize"}`},
-		{"unknown tool", "tools/call", modernParams(map[string]any{"name": "missing"}),
+		{"unknown tool", "tools/call", modernMap(map[string]any{"name": "missing"}),
 			"{\"code\":-32602,\"message\":\"tool `missing` not found\"}"},
-		{"unparsable call", "tools/call", modernParams(nil),
+		{"unparsable call", "tools/call", modernMap(nil),
 			"{\"code\":-32602,\"message\":\"Invalid MCP request\",\"data\":\"missing field `name`\"}"},
 	}
 	for i, tc := range cases {
-		outcome, err := h.caller.Call(ctx, serverID, string(rune('a'+i)), tc.method, tc.params, nil)
+		outcome, err := h.caller.Call(ctx, serverID, string(rune('a'+i)), tc.method, schema.NewMeta(tc.params), nil)
 		if err != nil {
 			t.Fatalf("%s: outer error %v", tc.name, err)
 		}

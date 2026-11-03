@@ -30,7 +30,7 @@ type MessageNotification struct {
 	ServerID  string
 	RequestID string
 	Method    string
-	Params    map[string]any
+	Params    schema.Meta
 }
 
 // MessageNotificationHandler receives notifications for one active call. It
@@ -63,7 +63,7 @@ func NewMessageClient(connection *acp.Connection) *MessageClient {
 // unique while active for the same server. Cancelling ctx cancels the outer ACP
 // request, and the request is released on return so late notifications are
 // dropped.
-func (c *MessageClient) Call(ctx context.Context, serverID, requestID, method string, params map[string]any, onNotification MessageNotificationHandler) (MessageOutcome, error) {
+func (c *MessageClient) Call(ctx context.Context, serverID, requestID, method string, params schema.Meta, onNotification MessageNotificationHandler) (MessageOutcome, error) {
 	if strings.TrimSpace(serverID) == "" {
 		return MessageOutcome{}, errors.New("mcp/message requires a server ID")
 	}

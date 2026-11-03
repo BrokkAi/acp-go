@@ -148,8 +148,8 @@ func (v Nullable[T]) IsZero() bool { return !v.Set }
 func emitTypes(r *ir, pin, packageName string) []byte {
 	var b strings.Builder
 	b.WriteString(header(pin, "wire types"))
-	b.WriteString("package " + packageName + "\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"errors\"\n\t\"fmt\"\n\t\"reflect\"\n\t\"slices\"\n\t\"sort\"\n\t\"strconv\"\n\t\"strings\"\n\t\"unicode/utf8\"\n\n\t\"github.com/BrokkAi/acp-go/internal/jsonline\"\n\t\"github.com/BrokkAi/acp-go/internal/serdejson\"\n\t\"github.com/BrokkAi/acp-go/internal/serdewire\"\n)\n\n")
-	b.WriteString("// Meta is the reserved _meta channel for extension data.\ntype Meta map[string]any\n\n")
+	b.WriteString("package " + packageName + "\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"errors\"\n\t\"fmt\"\n\t\"reflect\"\n\t\"slices\"\n\t\"sort\"\n\t\"strconv\"\n\t\"strings\"\n\t\"unicode/utf8\"\n\n\t\"github.com/BrokkAi/acp-go/internal/jsonline\"\n\t\"github.com/BrokkAi/acp-go/internal/serdejson\"\n\t\"github.com/BrokkAi/acp-go/internal/serdewire\"\n\t\"github.com/BrokkAi/acp-go/jsonvalue\"\n)\n\n")
+	b.WriteString(metaDecl)
 	// Shared helpers are written once per generated file.
 	unchangedEmitted = false
 	curIR = r
@@ -236,6 +236,28 @@ func emitStruct(b *strings.Builder, td *typeDef) {
 	emitApplyUpdate(b, td)
 }
 
+// metaDecl declares Meta, Rust's Meta = serde_json::Map<String, Value>.
+const metaDecl = `// Meta is the reserved _meta channel for extension data, a JSON object held
+// as Rust holds a serde_json::Map: its members in wire order, a repeated key
+// once at its first position with its last value, integers exact, and every
+// value re-encoded exactly as serde_json writes it. It is a jsonvalue.Object,
+// the same type in every schema package; see jsonvalue for the Go values a
+// decoded Meta holds. The other JSON objects Rust holds as a serde_json::Map
+// are a Meta too. nil is no metadata, and Meta{} an empty object.
+//
+// Build one with NewMeta from a map, whose keys it sorts, or as a literal to
+// choose the order:
+//
+//	meta := Meta{{Key: "traceparent", Value: traceparent}}
+//	meta.Set("count", 3)
+type Meta = jsonvalue.Object
+
+// NewMeta returns the Meta holding the members of values, its keys sorted so
+// the same map always encodes the same way. A nil map returns nil.
+func NewMeta(values map[string]any) Meta { return jsonvalue.ObjectOf(values) }
+
+`
+
 // emitMetaPatch writes ApplyMetaUpdate, the v2 Metadata Patches rule for the
 // top-level _meta of upsert updates, mirroring Rust's apply_meta_update.
 func emitMetaPatch(b *strings.Builder) {
@@ -250,9 +272,12 @@ func emitMetaPatch(b *strings.Builder) {
 // on an entity's first update. Removing every key leaves an empty object,
 // which means the same as no metadata.
 //
-// A patch stores a new map; the previously stored map and the update's map
-// are never modified, so metadata shared with an earlier update or snapshot
-// stays intact.
+// A patch stores a new object; the previously stored object and the update's
+// object are never modified, so metadata shared with an earlier update or
+// snapshot stays intact. Patched keys keep their stored position, new keys
+// are appended in the update's order, and a removed key's place is taken by
+// the last stored key, as serde_json's Map::remove does with preserve_order,
+// so the patched metadata encodes exactly as Rust's.
 //
 // Use this only for the top-level _meta of upsert updates, as their
 // ApplyUpdate methods do. Other _meta fields are not patches.
@@ -265,38 +290,20 @@ func ApplyMetaUpdate(stored *Nullable[Meta], update Nullable[Meta]) {
 		*stored = Nullable[Meta]{Set: true, Null: true}
 		return
 	}
-	meta := make(Meta, len(update.Value))
+	meta := Meta{}
 	if stored.Set && !stored.Null {
-		for key, value := range stored.Value {
-			meta[key] = value
-		}
+		meta = append(meta, stored.Value...)
 	}
-	for key, value := range update.Value {
-		if isJSONNull(value) {
-			delete(meta, key)
+	// The update's members as the wire reads them: a key it repeats once,
+	// with its last value.
+	for _, key := range update.Value.Keys() {
+		if value, _ := update.Value.Get(key); jsonvalue.IsNull(value) {
+			meta.SwapDelete(key)
 		} else {
-			meta[key] = value
+			meta.Set(key, value)
 		}
 	}
 	*stored = Nullable[Meta]{Set: true, Value: meta}
-}
-
-// isJSONNull reports whether a metadata value encodes as JSON null, the
-// removal signal of a metadata patch, so a patch built in Go behaves exactly
-// like the same patch decoded from the wire.
-func isJSONNull(value any) bool {
-	switch v := value.(type) {
-	case nil:
-		return true
-	case bool, float64, string, json.Number:
-		return false
-	case map[string]any:
-		return v == nil
-	case []any:
-		return v == nil
-	}
-	encoded, err := json.Marshal(value)
-	return err == nil && string(encoded) == "null"
 }
 
 `)

@@ -14,8 +14,10 @@ import (
 
 // frameParityTypes are the v1 types whose captured Rust encodings
 // TestTypedFramesMatchTheRustEncoding sends as params: those with f64
-// fields, raw JSON fields, unions of primitives, string escapes, and the
-// session/update notification itself.
+// fields, raw JSON fields, unions of primitives, string escapes, the
+// session/update notification itself, and Meta: a _meta object as such, and
+// every _meta of these types set to one with unsorted and repeated keys, big
+// integers, and floats.
 var frameParityTypes = map[string]reflect.Type{
 	"Annotations":               reflect.TypeFor[schema.Annotations](),
 	"CancelRequestNotification": reflect.TypeFor[schema.CancelRequestNotification](),
@@ -24,6 +26,7 @@ var frameParityTypes = map[string]reflect.Type{
 	"ElicitationAcceptAction":   reflect.TypeFor[schema.ElicitationAcceptAction](),
 	"Error":                     reflect.TypeFor[schema.Error](),
 	"InitializeResponse":        reflect.TypeFor[schema.InitializeResponse](),
+	"Meta":                      reflect.TypeFor[schema.Meta](),
 	"NumberPropertySchema":      reflect.TypeFor[schema.NumberPropertySchema](),
 	"SessionConfigSelect":       reflect.TypeFor[schema.SessionConfigSelect](),
 	"SessionNotification":       reflect.TypeFor[schema.SessionNotification](),

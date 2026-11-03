@@ -17,10 +17,27 @@ import (
 	"github.com/BrokkAi/acp-go/internal/jsonline"
 	"github.com/BrokkAi/acp-go/internal/serdejson"
 	"github.com/BrokkAi/acp-go/internal/serdewire"
+	"github.com/BrokkAi/acp-go/jsonvalue"
 )
 
-// Meta is the reserved _meta channel for extension data.
-type Meta map[string]any
+// Meta is the reserved _meta channel for extension data, a JSON object held
+// as Rust holds a serde_json::Map: its members in wire order, a repeated key
+// once at its first position with its last value, integers exact, and every
+// value re-encoded exactly as serde_json writes it. It is a jsonvalue.Object,
+// the same type in every schema package; see jsonvalue for the Go values a
+// decoded Meta holds. The other JSON objects Rust holds as a serde_json::Map
+// are a Meta too. nil is no metadata, and Meta{} an empty object.
+//
+// Build one with NewMeta from a map, whose keys it sorts, or as a literal to
+// choose the order:
+//
+//	meta := Meta{{Key: "traceparent", Value: traceparent}}
+//	meta.Set("count", 3)
+type Meta = jsonvalue.Object
+
+// NewMeta returns the Meta holding the members of values, its keys sorted so
+// the same map always encodes the same way. A nil map returns nil.
+func NewMeta(values map[string]any) Meta { return jsonvalue.ObjectOf(values) }
 
 // Nullable preserves the difference between an omitted field, an explicit
 // JSON null, and a concrete value. Set controls wire presence; Null requests
@@ -534,6 +551,17 @@ func decodeTag(raw json.RawMessage, buffered bool, tags []string) (string, bool)
 	return "", false
 }
 
+// decodeMeta decodes a Meta as serde_json reads a Map from a Value: null
+// reads as nil where the schema admits it, and anything but an object fails
+// with serde's error.
+func decodeMeta(raw json.RawMessage, dst *Meta, nullOK bool) error {
+	if nullOK && isNull(raw) {
+		*dst = nil
+		return nil
+	}
+	return dst.UnmarshalJSON(raw)
+}
+
 // decodeValue decodes one value, failing on null unless the schema admits it.
 func decodeValue[T any](raw json.RawMessage, dst *T, nullOK, buffered bool) error {
 	if !nullOK && isNull(raw) {
@@ -823,19 +851,10 @@ func appendFloat(b []byte, f float64) []byte {
 	return append(b, serdejson.FormatFloat(f)...)
 }
 
-// appendAny writes an untyped value as serde_json writes the value
-// serde_json::to_value builds for it: encoding/json's encoding, with its
-// strings and numbers in serde_json's form (serdewire.EncodeTyped). Map keys
-// are in encoding/json's sorted order.
+// appendAny writes an untyped value as serde_json writes the
+// serde_json::Value holding it (jsonvalue.Append).
 func appendAny(b []byte, v any) ([]byte, error) {
-	encoded, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	if encoded, err = serdewire.EncodeTyped(encoded); err != nil {
-		return nil, err
-	}
-	return append(b, encoded...), nil
+	return jsonvalue.Append(b, v)
 }
 
 // appendRaw writes raw JSON as serde_json re-encodes the serde_json::Value
@@ -1013,7 +1032,7 @@ func (v *AgentAuthCapabilities) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -1051,7 +1070,7 @@ func (v *AgentAuthCapabilities) decodeFields(data []byte, raws rawObject, buffer
 				v.Logout = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -1069,7 +1088,7 @@ func (v *AgentAuthCapabilities) decodeSeq(items []json.RawMessage, buffered bool
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -1155,7 +1174,7 @@ func (v *AgentCapabilities) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -1209,7 +1228,7 @@ func (v *AgentCapabilities) decodeFields(data []byte, raws rawObject, buffered b
 				v.Auth = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -1251,7 +1270,7 @@ func (v *AgentCapabilities) decodeSeq(items []json.RawMessage, buffered bool) er
 	}
 	if len(items) > 5 {
 		raw := items[5]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -1311,7 +1330,7 @@ func (v *Annotations) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -1359,7 +1378,7 @@ func (v *Annotations) decodeFields(data []byte, raws rawObject, buffered bool) e
 				v.Priority = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -1391,7 +1410,7 @@ func (v *Annotations) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -1442,7 +1461,7 @@ func (v *AudioContent) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.MimeType)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -1491,7 +1510,7 @@ func (v *AudioContent) decodeFields(data []byte, raws rawObject, buffered bool) 
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -1531,7 +1550,7 @@ func (v *AudioContent) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -1580,7 +1599,7 @@ func (v *AuthCapabilities) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -1618,7 +1637,7 @@ func (v *AuthCapabilities) decodeFields(data []byte, raws rawObject, buffered bo
 				v.Terminal = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -1636,7 +1655,7 @@ func (v *AuthCapabilities) decodeSeq(items []json.RawMessage, buffered bool) err
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -1829,7 +1848,7 @@ func (v *AuthMethodAgent) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -1878,7 +1897,7 @@ func (v *AuthMethodAgent) decodeFields(data []byte, raws rawObject, buffered boo
 				v.Description = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -1918,7 +1937,7 @@ func (v *AuthMethodAgent) decodeSeq(items []json.RawMessage, buffered bool) erro
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -2005,7 +2024,7 @@ func (v *AuthMethodTerminal) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -2070,7 +2089,7 @@ func (v *AuthMethodTerminal) decodeFields(data []byte, raws rawObject, buffered 
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -2130,7 +2149,7 @@ func (v *AuthMethodTerminal) decodeSeq(items []json.RawMessage, buffered bool) e
 	}
 	if len(items) > 5 {
 		raw := items[5]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -2171,7 +2190,7 @@ func (v *AuthenticateRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.MethodID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -2212,7 +2231,7 @@ func (v *AuthenticateRequest) decodeFields(data []byte, raws rawObject, buffered
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -2235,7 +2254,7 @@ func (v *AuthenticateRequest) decodeSeq(items []json.RawMessage, buffered bool) 
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -2270,7 +2289,7 @@ func (v *AuthenticateResponse) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -2304,7 +2323,7 @@ func (v *AuthenticateResponse) decodeFields(data []byte, raws rawObject, buffere
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -2316,7 +2335,7 @@ func (v *AuthenticateResponse) decodeSeq(items []json.RawMessage, buffered bool)
 	*v = AuthenticateResponse{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -2367,7 +2386,7 @@ func (v *AvailableCommand) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -2416,7 +2435,7 @@ func (v *AvailableCommand) decodeFields(data []byte, raws rawObject, buffered bo
 				v.Input = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -2456,7 +2475,7 @@ func (v *AvailableCommand) decodeSeq(items []json.RawMessage, buffered bool) err
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -2507,7 +2526,7 @@ func (v *AvailableCommandsUpdate) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -2550,7 +2569,7 @@ func (v *AvailableCommandsUpdate) decodeFields(data []byte, raws rawObject, buff
 				v.AvailableCommands = []AvailableCommand{}
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -2575,7 +2594,7 @@ func (v *AvailableCommandsUpdate) decodeSeq(items []json.RawMessage, buffered bo
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -2624,7 +2643,7 @@ func (v *BlobResourceContents) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.URI)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -2673,7 +2692,7 @@ func (v *BlobResourceContents) decodeFields(data []byte, raws rawObject, buffere
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -2713,7 +2732,7 @@ func (v *BlobResourceContents) decodeSeq(items []json.RawMessage, buffered bool)
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -2749,7 +2768,7 @@ func (v *BooleanConfigOptionCapabilities) appendMembers(b []byte) ([]byte, error
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -2785,7 +2804,7 @@ func (v *BooleanConfigOptionCapabilities) decodeFields(data []byte, raws rawObje
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -2797,7 +2816,7 @@ func (v *BooleanConfigOptionCapabilities) decodeSeq(items []json.RawMessage, buf
 	*v = BooleanConfigOptionCapabilities{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -2854,7 +2873,7 @@ func (v *BooleanPropertySchema) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -2900,7 +2919,7 @@ func (v *BooleanPropertySchema) decodeFields(data []byte, raws rawObject, buffer
 				v.Default = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -2930,7 +2949,7 @@ func (v *BooleanPropertySchema) decodeSeq(items []json.RawMessage, buffered bool
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -2970,7 +2989,7 @@ func (v *CancelNotification) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.SessionID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -3011,7 +3030,7 @@ func (v *CancelNotification) decodeFields(data []byte, raws rawObject, buffered 
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -3034,7 +3053,7 @@ func (v *CancelNotification) decodeSeq(items []json.RawMessage, buffered bool) e
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -3076,7 +3095,7 @@ func (v *CancelRequestNotification) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -3119,7 +3138,7 @@ func (v *CancelRequestNotification) decodeFields(data []byte, raws rawObject, bu
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -3142,7 +3161,7 @@ func (v *CancelRequestNotification) decodeSeq(items []json.RawMessage, buffered 
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -3232,7 +3251,7 @@ func (v *ClientCapabilities) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -3286,7 +3305,7 @@ func (v *ClientCapabilities) decodeFields(data []byte, raws rawObject, buffered 
 				v.Elicitation = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -3328,7 +3347,7 @@ func (v *ClientCapabilities) decodeSeq(items []json.RawMessage, buffered bool) e
 	}
 	if len(items) > 5 {
 		raw := items[5]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -3621,7 +3640,7 @@ func (v *ClientSessionCapabilities) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -3669,7 +3688,7 @@ func (v *ClientSessionCapabilities) decodeFields(data []byte, raws rawObject, bu
 				v.Notices = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -3699,7 +3718,7 @@ func (v *ClientSessionCapabilities) decodeSeq(items []json.RawMessage, buffered 
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -3742,7 +3761,7 @@ func (v *CloseSessionRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.SessionID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -3783,7 +3802,7 @@ func (v *CloseSessionRequest) decodeFields(data []byte, raws rawObject, buffered
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -3806,7 +3825,7 @@ func (v *CloseSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) 
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -3841,7 +3860,7 @@ func (v *CloseSessionResponse) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -3875,7 +3894,7 @@ func (v *CloseSessionResponse) decodeFields(data []byte, raws rawObject, buffere
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -3887,7 +3906,7 @@ func (v *CloseSessionResponse) decodeSeq(items []json.RawMessage, buffered bool)
 	*v = CloseSessionResponse{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -3995,7 +4014,7 @@ func (v *CompactionSummaryChunk) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -4040,7 +4059,7 @@ func (v *CompactionSummaryChunk) decodeFields(data []byte, raws rawObject, buffe
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -4074,7 +4093,7 @@ func (v *CompactionSummaryChunk) decodeSeq(items []json.RawMessage, buffered boo
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -4148,7 +4167,7 @@ func (v *CompactionUpdate) appendMembers(b []byte) ([]byte, error) {
 	switch {
 	case v.Meta.Set && !v.Meta.Null:
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta.Value); err != nil {
+		if b, err = v.Meta.Value.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	case v.Meta.Set && v.Meta.Null:
@@ -4210,7 +4229,7 @@ func (v *CompactionUpdate) decodeFields(data []byte, raws rawObject, buffered bo
 			}
 		case "_meta":
 			if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
-				return decodeValue(raw, dst, false, true)
+				return decodeMeta(raw, dst, false)
 			}); err != nil {
 				v.Meta = Nullable[Meta]{}
 			}
@@ -4264,7 +4283,7 @@ func (v *CompactionUpdate) decodeSeq(items []json.RawMessage, buffered bool) err
 	if len(items) > 4 {
 		raw := items[4]
 		if err := decodeNullable(raw, &v.Meta, func(raw json.RawMessage, dst *Meta) error {
-			return decodeValue(raw, dst, false, true)
+			return decodeMeta(raw, dst, false)
 		}); err != nil {
 			v.Meta = Nullable[Meta]{}
 		}
@@ -4305,7 +4324,7 @@ func (v *CompleteElicitationNotification) appendMembers(b []byte) ([]byte, error
 	b = appendString(b, string(v.ElicitationID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -4348,7 +4367,7 @@ func (v *CompleteElicitationNotification) decodeFields(data []byte, raws rawObje
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -4371,7 +4390,7 @@ func (v *CompleteElicitationNotification) decodeSeq(items []json.RawMessage, buf
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -4419,7 +4438,7 @@ func (v *ConfigOptionUpdate) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -4462,7 +4481,7 @@ func (v *ConfigOptionUpdate) decodeFields(data []byte, raws rawObject, buffered 
 				v.ConfigOptions = []SessionConfigOption{}
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -4487,7 +4506,7 @@ func (v *ConfigOptionUpdate) decodeSeq(items []json.RawMessage, buffered bool) e
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -4528,7 +4547,7 @@ func (v *Content) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -4567,7 +4586,7 @@ func (v *Content) decodeFields(data []byte, raws rawObject, buffered bool) error
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -4590,7 +4609,7 @@ func (v *Content) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -4865,7 +4884,7 @@ func (v *ContentChunk) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -4910,7 +4929,7 @@ func (v *ContentChunk) decodeFields(data []byte, raws rawObject, buffered bool) 
 				v.MessageID = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -4939,7 +4958,7 @@ func (v *ContentChunk) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -4983,7 +5002,7 @@ func (v *Cost) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.Currency)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -5026,7 +5045,7 @@ func (v *Cost) decodeFields(data []byte, raws rawObject, buffered bool) error {
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -5060,7 +5079,7 @@ func (v *Cost) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -5151,7 +5170,7 @@ func (v *CreateElicitationRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.Message)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -5187,7 +5206,7 @@ func (v *CreateElicitationRequest) decodeFields(data []byte, raws rawObject, buf
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -5361,7 +5380,7 @@ func (v *CreateElicitationResponse) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -5392,7 +5411,7 @@ func (v *CreateElicitationResponse) decodeFields(data []byte, raws rawObject, bu
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -5513,7 +5532,7 @@ func (v *CreateTerminalRequest) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -5582,7 +5601,7 @@ func (v *CreateTerminalRequest) decodeFields(data []byte, raws rawObject, buffer
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -5648,7 +5667,7 @@ func (v *CreateTerminalRequest) decodeSeq(items []json.RawMessage, buffered bool
 	}
 	if len(items) > 6 {
 		raw := items[6]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -5687,7 +5706,7 @@ func (v *CreateTerminalResponse) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.TerminalID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -5728,7 +5747,7 @@ func (v *CreateTerminalResponse) decodeFields(data []byte, raws rawObject, buffe
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -5751,7 +5770,7 @@ func (v *CreateTerminalResponse) decodeSeq(items []json.RawMessage, buffered boo
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -5791,7 +5810,7 @@ func (v *CurrentModeUpdate) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.CurrentModeID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -5832,7 +5851,7 @@ func (v *CurrentModeUpdate) decodeFields(data []byte, raws rawObject, buffered b
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -5855,7 +5874,7 @@ func (v *CurrentModeUpdate) decodeSeq(items []json.RawMessage, buffered bool) er
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -5895,7 +5914,7 @@ func (v *DeleteSessionRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.SessionID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -5936,7 +5955,7 @@ func (v *DeleteSessionRequest) decodeFields(data []byte, raws rawObject, buffere
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -5959,7 +5978,7 @@ func (v *DeleteSessionRequest) decodeSeq(items []json.RawMessage, buffered bool)
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -5994,7 +6013,7 @@ func (v *DeleteSessionResponse) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -6028,7 +6047,7 @@ func (v *DeleteSessionResponse) decodeFields(data []byte, raws rawObject, buffer
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -6040,7 +6059,7 @@ func (v *DeleteSessionResponse) decodeSeq(items []json.RawMessage, buffered bool
 	*v = DeleteSessionResponse{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -6091,7 +6110,7 @@ func (v *Diff) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.NewText)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -6138,7 +6157,7 @@ func (v *Diff) decodeFields(data []byte, raws rawObject, buffered bool) error {
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -6178,7 +6197,7 @@ func (v *Diff) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -6326,7 +6345,7 @@ func (v *ElicitationCapabilities) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -6368,7 +6387,7 @@ func (v *ElicitationCapabilities) decodeFields(data []byte, raws rawObject, buff
 				v.URL = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -6392,7 +6411,7 @@ func (v *ElicitationCapabilities) decodeSeq(items []json.RawMessage, buffered bo
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -6500,7 +6519,7 @@ func (v *ElicitationFormCapabilities) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -6536,7 +6555,7 @@ func (v *ElicitationFormCapabilities) decodeFields(data []byte, raws rawObject, 
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -6548,7 +6567,7 @@ func (v *ElicitationFormCapabilities) decodeSeq(items []json.RawMessage, buffere
 	*v = ElicitationFormCapabilities{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -7060,7 +7079,7 @@ func (v *ElicitationSchema) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -7118,7 +7137,7 @@ func (v *ElicitationSchema) decodeFields(data []byte, raws rawObject, buffered b
 				v.Description = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -7164,7 +7183,7 @@ func (v *ElicitationSchema) decodeSeq(items []json.RawMessage, buffered bool) er
 	}
 	if len(items) > 5 {
 		raw := items[5]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -7337,7 +7356,7 @@ func (v *ElicitationUrlCapabilities) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -7373,7 +7392,7 @@ func (v *ElicitationUrlCapabilities) decodeFields(data []byte, raws rawObject, b
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -7385,7 +7404,7 @@ func (v *ElicitationUrlCapabilities) decodeSeq(items []json.RawMessage, buffered
 	*v = ElicitationUrlCapabilities{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -7543,7 +7562,7 @@ func (v *EmbeddedResource) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -7588,7 +7607,7 @@ func (v *EmbeddedResource) decodeFields(data []byte, raws rawObject, buffered bo
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -7617,7 +7636,7 @@ func (v *EmbeddedResource) decodeSeq(items []json.RawMessage, buffered bool) err
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -7752,7 +7771,7 @@ func (v *EnumOption) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -7801,7 +7820,7 @@ func (v *EnumOption) decodeFields(data []byte, raws rawObject, buffered bool) er
 				v.Description = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -7841,7 +7860,7 @@ func (v *EnumOption) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -7884,7 +7903,7 @@ func (v *EnvVariable) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.Value)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -7929,7 +7948,7 @@ func (v *EnvVariable) decodeFields(data []byte, raws rawObject, buffered bool) e
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -7963,7 +7982,7 @@ func (v *EnvVariable) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -8241,7 +8260,7 @@ func (v *FileSystemCapabilities) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -8283,7 +8302,7 @@ func (v *FileSystemCapabilities) decodeFields(data []byte, raws rawObject, buffe
 				v.WriteTextFile = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -8307,7 +8326,7 @@ func (v *FileSystemCapabilities) decodeSeq(items []json.RawMessage, buffered boo
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -8350,7 +8369,7 @@ func (v *HttpHeader) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.Value)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -8395,7 +8414,7 @@ func (v *HttpHeader) decodeFields(data []byte, raws rawObject, buffered bool) er
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -8429,7 +8448,7 @@ func (v *HttpHeader) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -8486,7 +8505,7 @@ func (v *ImageContent) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -8539,7 +8558,7 @@ func (v *ImageContent) decodeFields(data []byte, raws rawObject, buffered bool) 
 				v.URI = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -8585,7 +8604,7 @@ func (v *ImageContent) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 4 {
 		raw := items[4]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -8640,7 +8659,7 @@ func (v *Implementation) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.Version)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -8689,7 +8708,7 @@ func (v *Implementation) decodeFields(data []byte, raws rawObject, buffered bool
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -8729,7 +8748,7 @@ func (v *Implementation) decodeSeq(items []json.RawMessage, buffered bool) error
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -8789,7 +8808,7 @@ func (v *InitializeRequest) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -8838,7 +8857,7 @@ func (v *InitializeRequest) decodeFields(data []byte, raws rawObject, buffered b
 				v.ClientInfo = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -8873,7 +8892,7 @@ func (v *InitializeRequest) decodeSeq(items []json.RawMessage, buffered bool) er
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -8952,7 +8971,7 @@ func (v *InitializeResponse) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -9007,7 +9026,7 @@ func (v *InitializeResponse) decodeFields(data []byte, raws rawObject, buffered 
 				v.AgentInfo = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -9050,7 +9069,7 @@ func (v *InitializeResponse) decodeSeq(items []json.RawMessage, buffered bool) e
 	}
 	if len(items) > 4 {
 		raw := items[4]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -9121,7 +9140,7 @@ func (v *IntegerPropertySchema) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -9175,7 +9194,7 @@ func (v *IntegerPropertySchema) decodeFields(data []byte, raws rawObject, buffer
 				v.Default = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -9217,7 +9236,7 @@ func (v *IntegerPropertySchema) decodeSeq(items []json.RawMessage, buffered bool
 	}
 	if len(items) > 5 {
 		raw := items[5]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -9260,7 +9279,7 @@ func (v *KillTerminalRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.TerminalID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -9305,7 +9324,7 @@ func (v *KillTerminalRequest) decodeFields(data []byte, raws rawObject, buffered
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -9339,7 +9358,7 @@ func (v *KillTerminalRequest) decodeSeq(items []json.RawMessage, buffered bool) 
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -9374,7 +9393,7 @@ func (v *KillTerminalResponse) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -9408,7 +9427,7 @@ func (v *KillTerminalResponse) decodeFields(data []byte, raws rawObject, buffere
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -9420,7 +9439,7 @@ func (v *KillTerminalResponse) decodeSeq(items []json.RawMessage, buffered bool)
 	*v = KillTerminalResponse{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -9468,7 +9487,7 @@ func (v *ListSessionsRequest) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -9510,7 +9529,7 @@ func (v *ListSessionsRequest) decodeFields(data []byte, raws rawObject, buffered
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -9534,7 +9553,7 @@ func (v *ListSessionsRequest) decodeSeq(items []json.RawMessage, buffered bool) 
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -9589,7 +9608,7 @@ func (v *ListSessionsResponse) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -9636,7 +9655,7 @@ func (v *ListSessionsResponse) decodeFields(data []byte, raws rawObject, buffere
 				v.NextCursor = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -9667,7 +9686,7 @@ func (v *ListSessionsResponse) decodeSeq(items []json.RawMessage, buffered bool)
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -9742,7 +9761,7 @@ func (v *LoadSessionRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.SessionID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -9803,7 +9822,7 @@ func (v *LoadSessionRequest) decodeFields(data []byte, raws rawObject, buffered 
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -9862,7 +9881,7 @@ func (v *LoadSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) e
 	}
 	if len(items) > 4 {
 		raw := items[4]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -9921,7 +9940,7 @@ func (v *LoadSessionResponse) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -9965,7 +9984,7 @@ func (v *LoadSessionResponse) decodeFields(data []byte, raws rawObject, buffered
 				v.ConfigOptions = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -9991,7 +10010,7 @@ func (v *LoadSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) 
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -10027,7 +10046,7 @@ func (v *LogoutCapabilities) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -10061,7 +10080,7 @@ func (v *LogoutCapabilities) decodeFields(data []byte, raws rawObject, buffered 
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -10073,7 +10092,7 @@ func (v *LogoutCapabilities) decodeSeq(items []json.RawMessage, buffered bool) e
 	*v = LogoutCapabilities{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -10109,7 +10128,7 @@ func (v *LogoutRequest) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -10143,7 +10162,7 @@ func (v *LogoutRequest) decodeFields(data []byte, raws rawObject, buffered bool)
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -10155,7 +10174,7 @@ func (v *LogoutRequest) decodeSeq(items []json.RawMessage, buffered bool) error 
 	*v = LogoutRequest{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -10190,7 +10209,7 @@ func (v *LogoutResponse) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -10224,7 +10243,7 @@ func (v *LogoutResponse) decodeFields(data []byte, raws rawObject, buffered bool
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -10236,7 +10255,7 @@ func (v *LogoutResponse) decodeSeq(items []json.RawMessage, buffered bool) error
 	*v = LogoutResponse{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -10287,7 +10306,7 @@ func (v *McpCapabilities) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -10329,7 +10348,7 @@ func (v *McpCapabilities) decodeFields(data []byte, raws rawObject, buffered boo
 				v.SSE = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -10353,7 +10372,7 @@ func (v *McpCapabilities) decodeSeq(items []json.RawMessage, buffered bool) erro
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -10575,7 +10594,7 @@ func (v *McpServerHttp) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -10628,7 +10647,7 @@ func (v *McpServerHttp) decodeFields(data []byte, raws rawObject, buffered bool)
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -10677,7 +10696,7 @@ func (v *McpServerHttp) decodeSeq(items []json.RawMessage, buffered bool) error 
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -10733,7 +10752,7 @@ func (v *McpServerSse) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -10786,7 +10805,7 @@ func (v *McpServerSse) decodeFields(data []byte, raws rawObject, buffered bool) 
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -10835,7 +10854,7 @@ func (v *McpServerSse) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -10902,7 +10921,7 @@ func (v *McpServerStdio) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -10963,7 +10982,7 @@ func (v *McpServerStdio) decodeFields(data []byte, raws rawObject, buffered bool
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -11027,7 +11046,7 @@ func (v *McpServerStdio) decodeSeq(items []json.RawMessage, buffered bool) error
 	}
 	if len(items) > 4 {
 		raw := items[4]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -11273,7 +11292,7 @@ func (v *MultiSelectPropertySchema) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -11338,7 +11357,7 @@ func (v *MultiSelectPropertySchema) decodeFields(data []byte, raws rawObject, bu
 				v.Default = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -11393,7 +11412,7 @@ func (v *MultiSelectPropertySchema) decodeSeq(items []json.RawMessage, buffered 
 	}
 	if len(items) > 6 {
 		raw := items[6]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -11462,7 +11481,7 @@ func (v *NewSessionRequest) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -11519,7 +11538,7 @@ func (v *NewSessionRequest) decodeFields(data []byte, raws rawObject, buffered b
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -11567,7 +11586,7 @@ func (v *NewSessionRequest) decodeSeq(items []json.RawMessage, buffered bool) er
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -11632,7 +11651,7 @@ func (v *NewSessionResponse) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -11683,7 +11702,7 @@ func (v *NewSessionResponse) decodeFields(data []byte, raws rawObject, buffered 
 				v.ConfigOptions = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -11720,7 +11739,7 @@ func (v *NewSessionResponse) decodeSeq(items []json.RawMessage, buffered bool) e
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -11774,7 +11793,7 @@ func (v *Notice) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -11821,7 +11840,7 @@ func (v *Notice) decodeFields(data []byte, raws rawObject, buffered bool) error 
 				v.Description = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -11861,7 +11880,7 @@ func (v *Notice) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -11990,7 +12009,7 @@ func (v *NumberPropertySchema) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -12044,7 +12063,7 @@ func (v *NumberPropertySchema) decodeFields(data []byte, raws rawObject, buffere
 				v.Default = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -12086,7 +12105,7 @@ func (v *NumberPropertySchema) decodeSeq(items []json.RawMessage, buffered bool)
 	}
 	if len(items) > 5 {
 		raw := items[5]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -12133,7 +12152,7 @@ func (v *PermissionOption) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.Kind))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -12182,7 +12201,7 @@ func (v *PermissionOption) decodeFields(data []byte, raws rawObject, buffered bo
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -12227,7 +12246,7 @@ func (v *PermissionOption) decodeSeq(items []json.RawMessage, buffered bool) err
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -12324,7 +12343,7 @@ func (v *Plan) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -12365,7 +12384,7 @@ func (v *Plan) decodeFields(data []byte, raws rawObject, buffered bool) error {
 				v.Entries = []PlanEntry{}
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -12390,7 +12409,7 @@ func (v *Plan) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -12441,7 +12460,7 @@ func (v *PlanEntry) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.Status))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -12490,7 +12509,7 @@ func (v *PlanEntry) decodeFields(data []byte, raws rawObject, buffered bool) err
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -12535,7 +12554,7 @@ func (v *PlanEntry) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -12682,7 +12701,7 @@ func (v *PromptCapabilities) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -12728,7 +12747,7 @@ func (v *PromptCapabilities) decodeFields(data []byte, raws rawObject, buffered 
 				v.EmbeddedContext = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -12758,7 +12777,7 @@ func (v *PromptCapabilities) decodeSeq(items []json.RawMessage, buffered bool) e
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -12820,7 +12839,7 @@ func (v *PromptRequest) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -12867,7 +12886,7 @@ func (v *PromptRequest) decodeFields(data []byte, raws rawObject, buffered bool)
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -12903,7 +12922,7 @@ func (v *PromptRequest) decodeSeq(items []json.RawMessage, buffered bool) error 
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -12943,7 +12962,7 @@ func (v *PromptResponse) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.StopReason))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -12984,7 +13003,7 @@ func (v *PromptResponse) decodeFields(data []byte, raws rawObject, buffered bool
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -13007,7 +13026,7 @@ func (v *PromptResponse) decodeSeq(items []json.RawMessage, buffered bool) error
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -13068,7 +13087,7 @@ func (v *ReadTextFileRequest) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -13121,7 +13140,7 @@ func (v *ReadTextFileRequest) decodeFields(data []byte, raws rawObject, buffered
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -13167,7 +13186,7 @@ func (v *ReadTextFileRequest) decodeSeq(items []json.RawMessage, buffered bool) 
 	}
 	if len(items) > 4 {
 		raw := items[4]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -13206,7 +13225,7 @@ func (v *ReadTextFileResponse) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.Content)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -13247,7 +13266,7 @@ func (v *ReadTextFileResponse) decodeFields(data []byte, raws rawObject, buffere
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -13270,7 +13289,7 @@ func (v *ReadTextFileResponse) decodeSeq(items []json.RawMessage, buffered bool)
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -13313,7 +13332,7 @@ func (v *ReleaseTerminalRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.TerminalID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -13358,7 +13377,7 @@ func (v *ReleaseTerminalRequest) decodeFields(data []byte, raws rawObject, buffe
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -13392,7 +13411,7 @@ func (v *ReleaseTerminalRequest) decodeSeq(items []json.RawMessage, buffered boo
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -13427,7 +13446,7 @@ func (v *ReleaseTerminalResponse) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -13461,7 +13480,7 @@ func (v *ReleaseTerminalResponse) decodeFields(data []byte, raws rawObject, buff
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -13473,7 +13492,7 @@ func (v *ReleaseTerminalResponse) decodeSeq(items []json.RawMessage, buffered bo
 	*v = ReleaseTerminalResponse{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -13753,7 +13772,7 @@ func (v *RequestPermissionRequest) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -13804,7 +13823,7 @@ func (v *RequestPermissionRequest) decodeFields(data []byte, raws rawObject, buf
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -13851,7 +13870,7 @@ func (v *RequestPermissionRequest) decodeSeq(items []json.RawMessage, buffered b
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -13892,7 +13911,7 @@ func (v *RequestPermissionResponse) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -13935,7 +13954,7 @@ func (v *RequestPermissionResponse) decodeFields(data []byte, raws rawObject, bu
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -13958,7 +13977,7 @@ func (v *RequestPermissionResponse) decodeSeq(items []json.RawMessage, buffered 
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -14033,7 +14052,7 @@ func (v *ResourceLink) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.URI)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -14098,7 +14117,7 @@ func (v *ResourceLink) decodeFields(data []byte, raws rawObject, buffered bool) 
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -14162,7 +14181,7 @@ func (v *ResourceLink) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 7 {
 		raw := items[7]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -14240,7 +14259,7 @@ func (v *ResumeSessionRequest) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -14301,7 +14320,7 @@ func (v *ResumeSessionRequest) decodeFields(data []byte, raws rawObject, buffere
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -14355,7 +14374,7 @@ func (v *ResumeSessionRequest) decodeSeq(items []json.RawMessage, buffered bool)
 	}
 	if len(items) > 4 {
 		raw := items[4]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -14414,7 +14433,7 @@ func (v *ResumeSessionResponse) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -14458,7 +14477,7 @@ func (v *ResumeSessionResponse) decodeFields(data []byte, raws rawObject, buffer
 				v.ConfigOptions = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -14484,7 +14503,7 @@ func (v *ResumeSessionResponse) decodeSeq(items []json.RawMessage, buffered bool
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -14558,7 +14577,7 @@ func (v *SelectedPermissionOutcome) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.OptionID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -14601,7 +14620,7 @@ func (v *SelectedPermissionOutcome) decodeFields(data []byte, raws rawObject, bu
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -14624,7 +14643,7 @@ func (v *SelectedPermissionOutcome) decodeSeq(items []json.RawMessage, buffered 
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -14665,7 +14684,7 @@ func (v *SessionAdditionalDirectoriesCapabilities) appendMembers(b []byte) ([]by
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -14701,7 +14720,7 @@ func (v *SessionAdditionalDirectoriesCapabilities) decodeFields(data []byte, raw
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -14713,7 +14732,7 @@ func (v *SessionAdditionalDirectoriesCapabilities) decodeSeq(items []json.RawMes
 	*v = SessionAdditionalDirectoriesCapabilities{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -14806,7 +14825,7 @@ func (v *SessionCapabilities) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -14860,7 +14879,7 @@ func (v *SessionCapabilities) decodeFields(data []byte, raws rawObject, buffered
 				v.Close = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -14902,7 +14921,7 @@ func (v *SessionCapabilities) decodeSeq(items []json.RawMessage, buffered bool) 
 	}
 	if len(items) > 5 {
 		raw := items[5]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -14938,7 +14957,7 @@ func (v *SessionCloseCapabilities) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -14972,7 +14991,7 @@ func (v *SessionCloseCapabilities) decodeFields(data []byte, raws rawObject, buf
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -14984,7 +15003,7 @@ func (v *SessionCloseCapabilities) decodeSeq(items []json.RawMessage, buffered b
 	*v = SessionCloseCapabilities{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -15162,7 +15181,7 @@ func (v *SessionConfigOption) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -15210,7 +15229,7 @@ func (v *SessionConfigOption) decodeFields(data []byte, raws rawObject, buffered
 				v.Category = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -15339,7 +15358,7 @@ func (v *SessionConfigOptionsCapabilities) appendMembers(b []byte) ([]byte, erro
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -15379,7 +15398,7 @@ func (v *SessionConfigOptionsCapabilities) decodeFields(data []byte, raws rawObj
 				v.Boolean = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -15397,7 +15416,7 @@ func (v *SessionConfigOptionsCapabilities) decodeSeq(items []json.RawMessage, bu
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -15556,7 +15575,7 @@ func (v *SessionConfigSelectGroup) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -15607,7 +15626,7 @@ func (v *SessionConfigSelectGroup) decodeFields(data []byte, raws rawObject, buf
 				v.Options = []SessionConfigSelectOption{}
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -15654,7 +15673,7 @@ func (v *SessionConfigSelectGroup) decodeSeq(items []json.RawMessage, buffered b
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -15703,7 +15722,7 @@ func (v *SessionConfigSelectOption) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -15754,7 +15773,7 @@ func (v *SessionConfigSelectOption) decodeFields(data []byte, raws rawObject, bu
 				v.Description = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -15794,7 +15813,7 @@ func (v *SessionConfigSelectOption) decodeSeq(items []json.RawMessage, buffered 
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -15891,7 +15910,7 @@ func (v *SessionDeleteCapabilities) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -15927,7 +15946,7 @@ func (v *SessionDeleteCapabilities) decodeFields(data []byte, raws rawObject, bu
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -15939,7 +15958,7 @@ func (v *SessionDeleteCapabilities) decodeSeq(items []json.RawMessage, buffered 
 	*v = SessionDeleteCapabilities{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -16016,7 +16035,7 @@ func (v *SessionInfo) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -16075,7 +16094,7 @@ func (v *SessionInfo) decodeFields(data []byte, raws rawObject, buffered bool) e
 				v.UpdatedAt = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -16129,7 +16148,7 @@ func (v *SessionInfo) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 5 {
 		raw := items[5]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -16184,7 +16203,7 @@ func (v *SessionInfoUpdate) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -16230,7 +16249,7 @@ func (v *SessionInfoUpdate) decodeFields(data []byte, raws rawObject, buffered b
 				v.UpdatedAt = Nullable[string]{}
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -16258,7 +16277,7 @@ func (v *SessionInfoUpdate) decodeSeq(items []json.RawMessage, buffered bool) er
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -16294,7 +16313,7 @@ func (v *SessionListCapabilities) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -16328,7 +16347,7 @@ func (v *SessionListCapabilities) decodeFields(data []byte, raws rawObject, buff
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -16340,7 +16359,7 @@ func (v *SessionListCapabilities) decodeSeq(items []json.RawMessage, buffered bo
 	*v = SessionListCapabilities{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -16390,7 +16409,7 @@ func (v *SessionMode) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -16439,7 +16458,7 @@ func (v *SessionMode) decodeFields(data []byte, raws rawObject, buffered bool) e
 				v.Description = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -16479,7 +16498,7 @@ func (v *SessionMode) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -16534,7 +16553,7 @@ func (v *SessionModeState) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -16581,7 +16600,7 @@ func (v *SessionModeState) decodeFields(data []byte, raws rawObject, buffered bo
 				v.AvailableModes = []SessionMode{}
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -16617,7 +16636,7 @@ func (v *SessionModeState) decodeSeq(items []json.RawMessage, buffered bool) err
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -16664,7 +16683,7 @@ func (v *SessionNotification) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -16709,7 +16728,7 @@ func (v *SessionNotification) decodeFields(data []byte, raws rawObject, buffered
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -16743,7 +16762,7 @@ func (v *SessionNotification) decodeSeq(items []json.RawMessage, buffered bool) 
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -16779,7 +16798,7 @@ func (v *SessionResumeCapabilities) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -16815,7 +16834,7 @@ func (v *SessionResumeCapabilities) decodeFields(data []byte, raws rawObject, bu
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -16827,7 +16846,7 @@ func (v *SessionResumeCapabilities) decodeSeq(items []json.RawMessage, buffered 
 	*v = SessionResumeCapabilities{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -17488,7 +17507,7 @@ func (v *SetSessionConfigOptionRequest) appendMembers(b []byte) ([]byte, error) 
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -17530,7 +17549,7 @@ func (v *SetSessionConfigOptionRequest) decodeFields(data []byte, raws rawObject
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -17607,7 +17626,7 @@ func (v *SetSessionConfigOptionResponse) appendMembers(b []byte) ([]byte, error)
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -17652,7 +17671,7 @@ func (v *SetSessionConfigOptionResponse) decodeFields(data []byte, raws rawObjec
 				v.ConfigOptions = []SessionConfigOption{}
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -17677,7 +17696,7 @@ func (v *SetSessionConfigOptionResponse) decodeSeq(items []json.RawMessage, buff
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -17720,7 +17739,7 @@ func (v *SetSessionModeRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.ModeID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -17765,7 +17784,7 @@ func (v *SetSessionModeRequest) decodeFields(data []byte, raws rawObject, buffer
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -17799,7 +17818,7 @@ func (v *SetSessionModeRequest) decodeSeq(items []json.RawMessage, buffered bool
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -17834,7 +17853,7 @@ func (v *SetSessionModeResponse) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -17868,7 +17887,7 @@ func (v *SetSessionModeResponse) decodeFields(data []byte, raws rawObject, buffe
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -17880,7 +17899,7 @@ func (v *SetSessionModeResponse) decodeSeq(items []json.RawMessage, buffered boo
 	*v = SetSessionModeResponse{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -18015,7 +18034,7 @@ func (v *StringMultiSelectItems) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -18058,7 +18077,7 @@ func (v *StringMultiSelectItems) decodeFields(data []byte, raws rawObject, buffe
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -18083,7 +18102,7 @@ func (v *StringMultiSelectItems) decodeSeq(items []json.RawMessage, buffered boo
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -18202,7 +18221,7 @@ func (v *StringPropertySchema) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -18276,7 +18295,7 @@ func (v *StringPropertySchema) decodeFields(data []byte, raws rawObject, buffere
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -18346,7 +18365,7 @@ func (v *StringPropertySchema) decodeSeq(items []json.RawMessage, buffered bool)
 	}
 	if len(items) > 9 {
 		raw := items[9]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -18387,7 +18406,7 @@ func (v *Terminal) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.TerminalID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -18426,7 +18445,7 @@ func (v *Terminal) decodeFields(data []byte, raws rawObject, buffered bool) erro
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -18449,7 +18468,7 @@ func (v *Terminal) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -18496,7 +18515,7 @@ func (v *TerminalExitStatus) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -18538,7 +18557,7 @@ func (v *TerminalExitStatus) decodeFields(data []byte, raws rawObject, buffered 
 				v.Signal = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -18562,7 +18581,7 @@ func (v *TerminalExitStatus) decodeSeq(items []json.RawMessage, buffered bool) e
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -18608,7 +18627,7 @@ func (v *TerminalOutputRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.TerminalID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -18653,7 +18672,7 @@ func (v *TerminalOutputRequest) decodeFields(data []byte, raws rawObject, buffer
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -18687,7 +18706,7 @@ func (v *TerminalOutputRequest) decodeSeq(items []json.RawMessage, buffered bool
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -18738,7 +18757,7 @@ func (v *TerminalOutputResponse) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -18787,7 +18806,7 @@ func (v *TerminalOutputResponse) decodeFields(data []byte, raws rawObject, buffe
 				v.ExitStatus = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -18827,7 +18846,7 @@ func (v *TerminalOutputResponse) decodeSeq(items []json.RawMessage, buffered boo
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -18874,7 +18893,7 @@ func (v *TextContent) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.Text)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -18919,7 +18938,7 @@ func (v *TextContent) decodeFields(data []byte, raws rawObject, buffered bool) e
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -18948,7 +18967,7 @@ func (v *TextContent) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -18997,7 +19016,7 @@ func (v *TextResourceContents) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.URI)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -19046,7 +19065,7 @@ func (v *TextResourceContents) decodeFields(data []byte, raws rawObject, buffere
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -19086,7 +19105,7 @@ func (v *TextResourceContents) decodeSeq(items []json.RawMessage, buffered bool)
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -19135,7 +19154,7 @@ func (v *TitledMultiSelectItems) appendMembers(b []byte) ([]byte, error) {
 	b = append(b, ']')
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -19178,7 +19197,7 @@ func (v *TitledMultiSelectItems) decodeFields(data []byte, raws rawObject, buffe
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -19203,7 +19222,7 @@ func (v *TitledMultiSelectItems) decodeSeq(items []json.RawMessage, buffered boo
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -19317,7 +19336,7 @@ func (v *ToolCall) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -19396,7 +19415,7 @@ func (v *ToolCall) decodeFields(data []byte, raws rawObject, buffered bool) erro
 				v.RawOutput = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -19480,7 +19499,7 @@ func (v *ToolCall) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 9 {
 		raw := items[9]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -19709,7 +19728,7 @@ func (v *ToolCallLocation) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -19754,7 +19773,7 @@ func (v *ToolCallLocation) decodeFields(data []byte, raws rawObject, buffered bo
 				v.Line = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -19783,7 +19802,7 @@ func (v *ToolCallLocation) decodeSeq(items []json.RawMessage, buffered bool) err
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -19939,7 +19958,7 @@ func (v *ToolCallUpdate) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -20013,7 +20032,7 @@ func (v *ToolCallUpdate) decodeFields(data []byte, raws rawObject, buffered bool
 				v.RawOutput = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -20108,7 +20127,7 @@ func (v *UnstructuredCommandInput) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.Hint)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -20149,7 +20168,7 @@ func (v *UnstructuredCommandInput) decodeFields(data []byte, raws rawObject, buf
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -20172,7 +20191,7 @@ func (v *UnstructuredCommandInput) decodeSeq(items []json.RawMessage, buffered b
 	}
 	if len(items) > 1 {
 		raw := items[1]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -20223,7 +20242,7 @@ func (v *UsageUpdate) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -20272,7 +20291,7 @@ func (v *UsageUpdate) decodeFields(data []byte, raws rawObject, buffered bool) e
 				v.Cost = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -20312,7 +20331,7 @@ func (v *UsageUpdate) decodeSeq(items []json.RawMessage, buffered bool) error {
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -20355,7 +20374,7 @@ func (v *WaitForTerminalExitRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, string(v.TerminalID))
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -20402,7 +20421,7 @@ func (v *WaitForTerminalExitRequest) decodeFields(data []byte, raws rawObject, b
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -20436,7 +20455,7 @@ func (v *WaitForTerminalExitRequest) decodeSeq(items []json.RawMessage, buffered
 	}
 	if len(items) > 2 {
 		raw := items[2]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -20483,7 +20502,7 @@ func (v *WaitForTerminalExitResponse) appendMembers(b []byte) ([]byte, error) {
 	}
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -20520,7 +20539,7 @@ func (v *WaitForTerminalExitResponse) decodeFields(data []byte, raws rawObject, 
 				v.Signal = nil
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -20566,7 +20585,7 @@ func (v *WriteTextFileRequest) appendMembers(b []byte) ([]byte, error) {
 	b = appendString(b, v.Content)
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -20615,7 +20634,7 @@ func (v *WriteTextFileRequest) decodeFields(data []byte, raws rawObject, buffere
 				return err
 			}
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -20660,7 +20679,7 @@ func (v *WriteTextFileRequest) decodeSeq(items []json.RawMessage, buffered bool)
 	}
 	if len(items) > 3 {
 		raw := items[3]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}
@@ -20695,7 +20714,7 @@ func (v *WriteTextFileResponse) appendMembers(b []byte) ([]byte, error) {
 	_ = err
 	if v.Meta != nil {
 		b = append(b, ",\"_meta\":"...)
-		if b, err = appendAny(b, v.Meta); err != nil {
+		if b, err = v.Meta.AppendJSON(b); err != nil {
 			return nil, err
 		}
 	}
@@ -20729,7 +20748,7 @@ func (v *WriteTextFileResponse) decodeFields(data []byte, raws rawObject, buffer
 		raw := m.raw
 		switch string(m.key) {
 		case "_meta":
-			if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+			if err := decodeMeta(raw, &v.Meta, true); err != nil {
 				v.Meta = nil
 			}
 		}
@@ -20741,7 +20760,7 @@ func (v *WriteTextFileResponse) decodeSeq(items []json.RawMessage, buffered bool
 	*v = WriteTextFileResponse{}
 	if len(items) > 0 {
 		raw := items[0]
-		if err := decodeValue(raw, &v.Meta, true, true); err != nil {
+		if err := decodeMeta(raw, &v.Meta, true); err != nil {
 			v.Meta = nil
 		}
 	}

@@ -1469,7 +1469,8 @@ func fieldType(prop string, ps *rawSchema, root *rootSchema, preserveNull bool) 
 
 	case inner.soleType() == "object":
 		if isTrue(inner.Additional) {
-			f.GoType = "map[string]any"
+			// A serde_json::Map, as Rust's Meta is.
+			f.GoType = "Meta"
 		} else {
 			var val *rawSchema
 			if err := json.Unmarshal(inner.Additional, &val); err != nil || val == nil {

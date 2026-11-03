@@ -1,8 +1,6 @@
 package acp
 
 import (
-	"maps"
-
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -37,7 +35,9 @@ func SessionClientCapabilities(parts ...*schema.ClientSessionCapabilities) *sche
 			if combined.Meta == nil {
 				combined.Meta = schema.Meta{}
 			}
-			maps.Copy(combined.Meta, part.Meta)
+			for _, member := range part.Meta {
+				combined.Meta.Set(member.Key, member.Value)
+			}
 		}
 		if part.Compaction != nil {
 			combined.Compaction = part.Compaction

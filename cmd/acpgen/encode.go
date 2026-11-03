@@ -33,9 +33,10 @@ import (
 //     then its other members sorted by key (a flattened BTreeMap).
 //
 // Strings are escaped as serde_json escapes them; json.Marshal then escapes
-// <, >, & and U+2028/U+2029 as it does for any MarshalJSON output. Meta and
-// other untyped values (any) are encoded by encoding/json, in its key order,
-// with their strings and numbers rewritten in serde_json's form.
+// <, >, & and U+2028/U+2029 as it does for any MarshalJSON output. Meta, a
+// jsonvalue.Object, and other untyped values are written as serde_json writes
+// the serde_json::Value holding them (jsonvalue.Append): members in order,
+// integers as they are, and a float64 as an f64.
 //
 // Every struct and union gets MarshalJSON and two unexported methods:
 // appendJSON appends the encoded value, and appendMembers appends its members
@@ -152,7 +153,10 @@ func (e *encoder) value(typ, expr string) {
 	case "float64":
 		e.line("b = appendFloat(b, float64(%s))", expr)
 		return
-	case "any", "Meta", "map[string]any":
+	case "Meta":
+		e.line("if b, err = %s.AppendJSON(b); err != nil {\nreturn nil, err\n}", expr)
+		return
+	case "any", "map[string]any":
 		e.line("if b, err = appendAny(b, %s); err != nil {\nreturn nil, err\n}", expr)
 		return
 	case "json.RawMessage":
@@ -622,19 +626,10 @@ func appendFloat(b []byte, f float64) []byte {
 	return append(b, serdejson.FormatFloat(f)...)
 }
 
-// appendAny writes an untyped value as serde_json writes the value
-// serde_json::to_value builds for it: encoding/json's encoding, with its
-// strings and numbers in serde_json's form (serdewire.EncodeTyped). Map keys
-// are in encoding/json's sorted order.
+// appendAny writes an untyped value as serde_json writes the
+// serde_json::Value holding it (jsonvalue.Append).
 func appendAny(b []byte, v any) ([]byte, error) {
-	encoded, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	if encoded, err = serdewire.EncodeTyped(encoded); err != nil {
-		return nil, err
-	}
-	return append(b, encoded...), nil
+	return jsonvalue.Append(b, v)
 }
 
 // appendRaw writes raw JSON as serde_json re-encodes the serde_json::Value

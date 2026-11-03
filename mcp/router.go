@@ -23,11 +23,11 @@ type MessageRequest struct {
 	ServerID  string
 	RequestID string
 	Method    string
-	Params    map[string]any
+	Params    schema.Meta
 	// RawParams is the inner params object exactly as received, or nil when
 	// the request carried none or null. Params is decoded from it.
 	RawParams json.RawMessage
-	Notify    func(method string, params map[string]any) error
+	Notify    func(method string, params schema.Meta) error
 }
 
 // MessageService serves the mcp/message requests of one registered server ID.
@@ -125,7 +125,7 @@ func (r *MessageRouter) Handle(next acp.Handler) acp.Handler {
 type messageService struct{ service MessageService }
 
 func (s messageService) Execute(ctx context.Context, request mcpserver.Request, rc *mcpserver.RequestContext) (mcpserver.Outcome, error) {
-	var params map[string]any
+	var params schema.Meta
 	if request.Params != nil {
 		if err := json.Unmarshal(request.Params, &params); err != nil {
 			return mcpserver.Outcome{}, err
@@ -137,7 +137,7 @@ func (s messageService) Execute(ctx context.Context, request mcpserver.Request, 
 		Method:    request.Method,
 		Params:    params,
 		RawParams: request.Params,
-		Notify: func(method string, params map[string]any) error {
+		Notify: func(method string, params schema.Meta) error {
 			var value any
 			if params != nil {
 				value = params
@@ -197,11 +197,9 @@ var codec = mcpserver.Codec{
 		return schema.MessageMcpResponse{Result: &schema.MessageMcpResponseResult{Result: result}}, nil
 	},
 	Notification: func(serverID, requestID, method string, params json.RawMessage) (any, error) {
-		var decoded map[string]any
+		var decoded schema.Meta
 		if params != nil {
-			decoder := json.NewDecoder(bytes.NewReader(params))
-			decoder.UseNumber()
-			if err := decoder.Decode(&decoded); err != nil {
+			if err := json.Unmarshal(params, &decoded); err != nil {
 				return nil, err
 			}
 		}
