@@ -172,9 +172,12 @@ only remaining work.
   - MCP-over-ACP (session options and the request-scoped `mcp/message` mover),
   - end-turn token usage,
   - bidirectional `mcp/message` request/notification registry metadata,
-  - generated types, without facades yet, for subagents and
-    proxy chains (`proxy/initialize` and `proxy/successor`, registered as
-    `SideProxy`).
+  - subagent sessions: the v1 client capability and `unstable.Initialize`,
+    `SubagentTree` with the restricted-child allowlist, single-child cancel,
+    and restore, close, and connection-loss invalidation, agent-side update
+    senders, and the v1 runtime's capability gate (#60),
+  - generated types, without facades yet, for proxy chains
+    (`proxy/initialize` and `proxy/successor`, registered as `SideProxy`).
 - Session notices and compaction on the stable surfaces (#57): v1 client
   capability helpers, update constructors, `acp.SessionProjection`, and the
   agent runtime's capability gate; draft-v2 constructors and notice and
@@ -247,11 +250,11 @@ standard-library-only and behind its own package or command.
 ### 3. Schema crate 1.15.1 follow-ups
 
 The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
-them is tracked separately: subagents (#60), the proxy-chain method rename
-(#69), and v2 background work with `tool_call/cancel`/`terminal/cancel`
-(#70). Unstable session archive/status/title (#71), client-provided system
-prompts (#58), `-32022` version negotiation (#62), and unstable auth status
-(#72) are delivered.
+them is tracked separately: the proxy-chain method rename (#69) and v2
+background work with `tool_call/cancel`/`terminal/cancel` (#70). Unstable
+session archive/status/title (#71), client-provided system prompts (#58),
+`-32022` version negotiation (#62), unstable auth status (#72), and subagent
+sessions (#60) are delivered.
 
 ## Guardrails
 

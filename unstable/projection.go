@@ -19,7 +19,10 @@ import (
 // It folds updates in wire order, exactly as the client observes them, and keeps
 // the reference rules: a full plan replaces the previous plan, plan_update
 // replaces the plan payload, plan_removed clears it, and the latest usage update
-// wins. Notices and compactions follow acp.SessionProjection.
+// wins. Notices and compactions follow acp.SessionProjection. Subagent
+// associations and session-directed messages go to the SubagentTree that
+// Subagents returns. Plans and usage are kept per session ID, so a child
+// session's own plan and usage_update are read with the child's ID.
 
 // PlanState is the latest plan payload for one session: either the entries of a
 // plan update or the content of a plan_update, whichever arrived last.
@@ -41,25 +44,35 @@ type UsageState struct {
 
 // Projection folds optional session updates into per-session derived state.
 type Projection struct {
-	mu     sync.Mutex
-	plans  map[string]PlanState
-	usage  map[string]UsageState
-	stable *acp.SessionProjection
+	mu        sync.Mutex
+	plans     map[string]PlanState
+	usage     map[string]UsageState
+	stable    *acp.SessionProjection
+	subagents *SubagentTree
 }
 
 // NewProjection returns an empty projection.
 func NewProjection() *Projection {
 	return &Projection{
-		plans:  make(map[string]PlanState),
-		usage:  make(map[string]UsageState),
-		stable: acp.NewSessionProjection(),
+		plans:     make(map[string]PlanState),
+		usage:     make(map[string]UsageState),
+		stable:    acp.NewSessionProjection(),
+		subagents: NewSubagentTree(),
 	}
+}
+
+// Subagents returns the projection's subagent tree, which folds the
+// subagent_update, session_message, and session_message_chunk updates the
+// projection observes.
+func (p *Projection) Subagents() *SubagentTree {
+	return p.subagents
 }
 
 // Notifications adapts session/update notifications into Observe calls. It
 // decodes the unstable schema, so the optional update kinds stay visible; other
 // notifications are ignored. It returns the error when a notice or
-// compaction does not convert to its stable form instead of dropping it.
+// compaction does not convert to its stable form, or an association the
+// subagent tree refuses, instead of dropping it.
 func (p *Projection) Notifications() acp.Notifications {
 	return func(method string, raw json.RawMessage) error {
 		if method != schema.SessionUpdateMethodName {
@@ -77,12 +90,16 @@ func (p *Projection) Notifications() acp.Notifications {
 // the stable acp.SessionProjection in their stable v1 form. Both schemas are
 // ACP v1, so every update that decodes from the wire converts; Observe skips
 // one that cannot be encoded, such as a content block with no variant set,
-// which no peer could have sent. Notifications reports that case as an error.
+// which no peer could have sent, and an association SubagentTree.Observe
+// refuses. Notifications reports both as errors.
 func (p *Projection) Observe(sessionID string, update schema.SessionUpdate) {
 	_ = p.observe(sessionID, update)
 }
 
 func (p *Projection) observe(sessionID string, update schema.SessionUpdate) error {
+	if update.SubagentUpdate != nil || update.SessionMessage != nil || update.SessionMessageChunk != nil {
+		return p.subagents.Observe(schema.SessionId(sessionID), update)
+	}
 	if update.Notice != nil || update.CompactionUpdate != nil || update.CompactionSummaryChunk != nil {
 		stable, err := stableUpdate(update)
 		if err != nil {

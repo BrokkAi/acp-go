@@ -24,6 +24,7 @@ func init() {
 	rpcctl.WithIncomingResponseGuard = func(guard rpcctl.IncomingResponseGuard) any {
 		return ConnectOption(func(c *Connection) { c.inResponse = guard })
 	}
+	rpcctl.V1InitializeResult = checkV1Selection
 	rpcctl.QueueNotification = func(connection any, ctx context.Context, method string, params any) (func(context.Context) error, error) {
 		c, ok := connection.(*Connection)
 		if !ok || c == nil {

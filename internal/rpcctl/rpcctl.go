@@ -117,3 +117,27 @@ func AcceptsLowerVersion(ctx context.Context) bool {
 	accepts, _ := ctx.Value(acceptsLowerKey{}).(bool)
 	return accepts
 }
+
+type settledKey struct{}
+
+// WithSettled marks a Call context so that settled runs, with the call's
+// method and error, each time a call made with the context is settled: on
+// the connection's read loop for a response, in wire order with the
+// notifications around it and before the caller receives the result, or with
+// the write error for a request that was admitted but never written. Every
+// call made with the context reports, so settled picks the call it is
+// interested in by method. It must return promptly. A call whose caller
+// stopped waiting before the response arrived may never settle.
+func WithSettled(ctx context.Context, settled func(method string, err error)) context.Context {
+	return context.WithValue(ctx, settledKey{}, settled)
+}
+
+// Settled returns the function WithSettled put on ctx, or nil.
+func Settled(ctx context.Context) func(method string, err error) {
+	settled, _ := ctx.Value(settledKey{}).(func(string, error))
+	return settled
+}
+
+// V1InitializeResult checks the protocolVersion of an ACP v1 initialize
+// result as acp.Connection.InitializeWithInfo does. The acp package sets it.
+var V1InitializeResult func(result json.RawMessage) error

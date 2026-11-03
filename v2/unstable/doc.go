@@ -16,6 +16,13 @@ Each checks its advertised capability and request invariants before writing
 to the wire. Requests that carry MCP servers go through
 github.com/BrokkAi/acp-go/v2/mcp instead.
 
+Subagent sessions are baseline in draft v2 and need no capability.
+SubagentTree tracks the parent/child tree, session-directed messages, and
+child work state, mirrored between a child's own state_update and its
+association, and permits only the child mutations an association
+advertises; NotifySubagentUpdate, NotifySubagentState, NotifySessionMessage,
+and NotifySessionMessageChunk send the surface from an agent.
+
 Agents that advertise capabilities.session.systemPrompt serve session/new and
 session/resume with the prompt through a SystemPromptHandler, which Install
 routes to with runtime overrides (session/fork through ForkHandler). The

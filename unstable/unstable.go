@@ -6,6 +6,13 @@ for the auth/status_update notification), and the session lifecycle requests
 that carry a client-provided system prompt (NewSession, LoadSession,
 ResumeSession, and ForkSession).
 
+Subagent sessions have a client side, SubagentTree (also carried by
+Projection), which tracks the parent/child tree, session-directed messages,
+and child work state, and permits only the child mutations an association
+advertises; and an agent side, NotifySubagentUpdate, NotifySubagentState,
+NotifySessionMessage, and NotifySessionMessageChunk. In v1 the client
+advertises SubagentsClientCapabilities, sent with Initialize.
+
 Every method here lives behind its own package import because the ACP release
 marks the surface unstable and may change or remove it. Nothing in this package
 is reachable from the stable `acp` or `v2` facades, and the generated bindings

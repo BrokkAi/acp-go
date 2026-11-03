@@ -13,6 +13,7 @@ import (
 	"github.com/BrokkAi/acp-go/internal/negotiate"
 	"github.com/BrokkAi/acp-go/internal/rpcctl"
 	"github.com/BrokkAi/acp-go/schema"
+	unstableschema "github.com/BrokkAi/acp-go/schema/unstable"
 )
 
 // Runtime owns the JSON-RPC loop for an Agent implementation.
@@ -267,7 +268,7 @@ func (s *server) initialize(ctx context.Context, raw json.RawMessage) (any, erro
 	if s.pending == nil {
 		s.pending = map[string]initializeCommit{}
 	}
-	s.pending[string(id)] = initializeCommit{clientCapabilities: request.ClientCapabilities, agentCapabilities: response.AgentCapabilities, sent: sent}
+	s.pending[string(id)] = initializeCommit{clientCapabilities: request.ClientCapabilities, unstableCapabilities: unstableClientCapabilities(params), agentCapabilities: response.AgentCapabilities, sent: sent}
 	s.mu.Unlock()
 	return json.RawMessage(sent), nil
 }
@@ -292,8 +293,11 @@ func outgoing(method string, params json.RawMessage, notification bool) (json.Ra
 // queued.
 type initializeCommit struct {
 	clientCapabilities *schema.ClientCapabilities
-	agentCapabilities  *schema.AgentCapabilities
-	sent               json.RawMessage
+	// unstableCapabilities are the request's client capabilities read with
+	// the unstable schema, which keeps subagents and plan.
+	unstableCapabilities unstableschema.ClientCapabilities
+	agentCapabilities    *schema.AgentCapabilities
+	sent                 json.RawMessage
 }
 
 // outgoingResponse records an initialization when its response is queued, as
@@ -313,7 +317,7 @@ func (s *server) outgoingResponse(id json.RawMessage, method string, result json
 	if err != nil || !ok {
 		return result, err
 	}
-	s.client.initialize(commit.clientCapabilities)
+	s.client.initialize(commit.clientCapabilities, commit.unstableCapabilities)
 	s.initialized = true
 	s.agentCapabilities = commit.agentCapabilities
 	s.sent = commit.sent

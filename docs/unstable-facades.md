@@ -13,9 +13,9 @@ Next Edit Suggestions (`nes/*`, `document/did*`, and their capabilities) were
 removed from the upstream unstable schema in crate 1.15, so acp-go no longer
 generates or wraps them.
 
-Several unstable surfaces in the 1.15.1 pin are generated but have no facade
-yet: subagents (#60) and proxy chains
-(`proxy/initialize`, `proxy/successor`, registered with `SideProxy`; #69).
+One unstable surface in the 1.15.1 pin is generated but has no facade yet:
+proxy chains (`proxy/initialize`, `proxy/successor`, registered with
+`SideProxy`; #69).
 
 ## Why a separate import
 
@@ -80,7 +80,10 @@ initialization refuse to run.
 | `v2/unstable.SessionStatus` | `capabilities.session.status` | As in v1, plus the optional foreground `State` snapshot. `State` is nil when the agent omits it, sends `null`, or sends a malformed value; nil is not idle, and an idle snapshot is not a new completion. |
 | `v2/unstable.AuthStatus`, `AuthStatusUpdates`, `AuthStatusHandler`, `NotifyAuthStatusUpdate` | `capabilities.auth.status` | Draft-v2 counterparts of the v1 auth-status surface, with the same checks. |
 | `v2/unstable.Install`, `Handle`, `Advertise` | — | The draft-v2 counterparts of `Install`, `Handle`, and `Advertise`. |
-| `Projection` | — | Client-side: folds plan operations and end-turn usage into ordered per-session state, and hands notices and compactions to the stable `acp.SessionProjection` (see below). `Projection.Notifications` adapts `session/update` notifications. |
+| `Projection` | — | Client-side: folds plan operations and end-turn usage into ordered per-session state, hands notices and compactions to the stable `acp.SessionProjection` (see below), and subagent updates to its `SubagentTree` (`Projection.Subagents`). `Projection.Notifications` adapts `session/update` notifications. |
+| `SubagentsClientCapabilities`, `Initialize` | — | v1 client: the `clientCapabilities.subagents` value, and initialize with the unstable client capabilities, validated as `acp.Connection.InitializeWithInfo` validates. See [Subagent sessions](#subagent-sessions). |
+| `SubagentTree` (v1 and draft v2) | `capabilities.cancel` on the child's association, for `Cancel` | Client-side parent/child tree, session-directed messages, the restricted-child allowlist (`CheckClientMethod`), single-child `Cancel`, and `Restore`, `Closed`, and `Disconnected` invalidation. |
+| `NotifySubagentUpdate`, `NotifySubagentState`, `NotifySessionMessage`, `NotifySessionMessageChunk` (v1 and draft v2) | v1: `clientCapabilities.subagents`, checked by the agent runtime's `Client.Notify` | Agent side, with the `*Notification` constructors, the work-state snapshots, and `Value`/`Null` patch fields. |
 
 ## Agent-side dispatch
 
@@ -159,7 +162,10 @@ if err := unstable.Install(runtime, implementation); err != nil { // or v2/unsta
 whose `Overrides` already serves a method it would override. `Handle` and
 `Advertise` remain for wiring by hand, but `Advertise` never announces
 `archive` or `systemPrompt`: an agent that does must also serve the
-`archived` filter or the prompt, which only `Install` wires up. Neither runtime imports the unstable schema.
+`archived` filter or the prompt, which only `Install` wires up. The draft-v2
+runtime does not import the unstable schema; the v1 runtime reads only the
+initialize request with it, for the subagents capability (see
+[Subagent sessions](#subagent-sessions)).
 
 ### Runtime overrides
 
@@ -398,6 +404,150 @@ serves the advertised `loadSession`. The handlers reach the connection's
 client through `agent.ClientFromContext` (`v2/agent.ClientFromContext`), so
 `LoadSessionWithSystemPrompt` can replay the conversation with
 `session/update` before it answers.
+
+## Subagent sessions
+
+Subagent sessions follow the [RFD](https://agentclientprotocol.com/rfds/subagents)
+and the reference SDK's `unstable_subagents` feature, which only enables the
+schema types; the tree and the senders here are acp-go's. An agent exposes a
+child it delegates work to as its own session: `subagent_update` on the parent
+announces and patches the association, the child's own updates use its session
+ID, and `session_message` upserts and `session_message_chunk` appends report
+messages between sessions.
+
+In v1 a client advertises `clientCapabilities.subagents: {}`, and an agent must
+not send any of these updates without it. The stable `acp.Capabilities` cannot
+carry the field, so initialize with `unstable.Initialize`, which sends the
+unstable client capabilities and validates the response as
+`acp.Connection.InitializeWithInfo` does:
+
+```go
+capabilities := unstableschema.ClientCapabilities{Subagents: unstable.SubagentsClientCapabilities()}
+initialization, err := unstable.Initialize(ctx, connection, capabilities, info)
+```
+
+The v1 agent runtime enforces it: its `Client.Notify` refuses the three update
+kinds with `-32601` before writing unless the client's initialize request
+advertised the capability (an omitted, `null`, or malformed value does not),
+whatever the params type, typed or hand-built. It reads the client
+capabilities with the unstable schema and applies the other session-update
+gates to unstable and hand-built params too: `notice`, compaction, and
+boolean config options as for `acp.Update`, and `plan_update` and
+`plan_removed`, which need the unstable `clientCapabilities.plan`. Params that
+do not decode are refused by their `sessionUpdate` tag, in the named and the
+positional form, for every kind the tag alone decides. Draft v2 makes subagents part of
+the baseline session model: there is no capability, and the v2 runtime sends
+them on any connection.
+
+### Client: the subagent tree
+
+`SubagentTree` (`unstable` and `v2/unstable`) folds the updates in receive
+order. `unstable.Projection` carries one (`Projection.Subagents`); in v2,
+compose `tree.Notifications()` with the connection's other handlers.
+
+- **Associations.** `subagent_update` is an upsert keyed by the child's session
+  ID; the outer session is its immediate parent. `title`, `description`,
+  `capabilities`, `state`, `cwd`, `additionalDirectories`, and `_meta` are
+  patches: omitted is unchanged, `null` clears, and a value replaces the
+  whole field. In v2 a concrete `_meta` patches by top-level key
+  (`ApplyMetaUpdate`). `capabilities: {"cancel": null}` disables cancellation.
+  The tree refuses, with an error and without applying any of it, an update
+  that would reparent a child, make a session its own parent, or create a
+  cycle. A relative `cwd` or additional directory is not applied: the rest
+  of the update is, and the directory is reported with an error.
+- **Two views of a child.** `Subagent.Association` keeps every field as last
+  reported, history included, for display. `Subagent.Capabilities` (the
+  effective mutation set) and `Subagent.State` (the confirmed current work
+  state) drive controls and live activity; nil means none permitted and
+  unconfirmed, never idle. In v1 the state comes only from the association;
+  in v2 the child's own `state_update` and the mirrored association `state`
+  are one logical state, and either replaces it. A v2 session's
+  `BackgroundSubagents` lists the `subagent` entries of its current
+  `background` snapshot. Error and cancelled idle snapshots, unknown states,
+  and unknown stop reasons are kept as received.
+- **Directories.** `Directories` resolves a child's effective `cwd` and
+  `additionalDirectories`, each inherited independently from the parent when
+  unset or cleared; record an ordinary session's own with
+  `SetSessionDirectories`. In v1 the result is the child's root set for its
+  filesystem and terminal requests and the default terminal `cwd`; in v2 it
+  is informational.
+- **Messages.** `Messages` and `Message` return a transcript's
+  session-directed messages in first-seen order. A `session_message` upsert's
+  content replaces the accumulated content (`null` and `[]` clear it), chunks
+  append, and sender and recipient come only from upserts, since chunks carry
+  none. `LinkedMessage` follows `senderMessageId`/`recipientMessageId` to the
+  other view, and reports conflicting references as unlinked.
+- **Routing.** Permission, elicitation, filesystem, and terminal requests a
+  child sends carry the child's session ID. `Subagent(id)` attributes them to
+  that child, with its `Parent` and `Root`; do not handle them as the
+  parent's.
+
+### Restricted children
+
+Client-initiated mutations of a child are an allowlist.
+`CheckClientMethod(method, sessionID)` refuses every method on a child except
+`session/cancel`, while the association's current capabilities carry
+`cancel`, and `session/status`, a read-only query. Prompt, load, resume,
+close, delete, fork, mode, configuration, title, archive, v2
+`tool_call/cancel` and `terminal/cancel`, and any future method are refused.
+`Cancel(ctx, connection, childID)` sends `session/cancel` for one child and
+fails before writing otherwise. It cancels the child's current work, not its
+parent or siblings, and changes no state: the child confirms with
+`idle`/`cancelled`. Cancelling any session also cascades, agent-side, to the
+descendant work it waits on; the client learns which descendants stopped
+from their state reports, and cleans up a descendant's pending permission and
+elicitation requests once it reports `idle`/`cancelled`. `Closed(parent)`
+records that the client closed an ordinary session, which ends all its
+descendants' work: it invalidates their controls and state and returns them,
+parents first, so their pending requests can be resolved with the parent's.
+History stays.
+
+### Reconnection
+
+Run a parent `session/load` or `session/resume` (v2: `session/resume`)
+through `Restore`, so the tree can separate history from current state:
+
+```go
+err := tree.Restore(ctx, sessionID, true /* session/load replays */, func(ctx context.Context) error {
+	_, err := unstable.LoadSession(ctx, connection, initialization, request)
+	return err
+})
+```
+
+`Restore` first invalidates every known descendant's capabilities and state,
+and refuses a child (children are never loaded or resumed directly). With
+replay (v1 `session/load`, v2 `replayFrom: {"type": "start"}`), associations
+and v2 state updates received before the successful response are history:
+they update `Association` but never the effective capabilities or current
+state, and the restored transcripts restart empty because the replay sends
+them again. Snapshots after the response are current. Without replay,
+snapshots during the attempt are current, but `CanCancel` stays false until
+the request succeeds. A failed attempt invalidates everything received during
+it. The context `Restore` hands `send` marks the response to the first
+`session/load` or `session/resume` made with it in wire order, with the
+notifications around it, so a snapshot sent right after the response is never
+mistaken for history; `send` must use it, and other calls made with it do not
+mark the boundary. Restoring again while an attempt is in progress starts a
+new attempt and still sends its request; the earlier one then no longer
+changes the tree. `Disconnected` records a lost
+connection: no child keeps a live state or control.
+
+### Agent: senders
+
+`NotifySubagentUpdate`, `NotifySessionMessage`, and
+`NotifySessionMessageChunk` send the three updates through an `agent.Client`
+(`v2/agent.Client`), and the `*Notification` functions build them for replay
+or hand-wiring. `NotifySubagentState` reports a child's work state: in v1 on
+its parent's association, the only v1 path; in v2 as the child's own
+`state_update` followed by the same snapshot mirrored on the association.
+`RunningState`, `RequiresActionState`, `UnknownState`, `IdleState`, and
+`ErrorState` build the snapshots, and `Value` and `Null` the patch fields.
+The senders fail before writing for a blank ID and a relative `cwd` or
+additional directory; like the reference SDK, they leave the rest of the
+RFD's rules for the agent to follow. They do not track announcement order: announce a child before any traffic bearing
+its session ID, report directories that differ from the parent's before
+traffic that depends on them, and, after a replayed resume, send current
+snapshots only after the response.
 
 ## Session updates: projection, not request facades
 
