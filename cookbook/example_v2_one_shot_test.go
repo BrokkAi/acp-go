@@ -37,8 +37,7 @@ func askAgentV2(ctx context.Context, in io.ReadCloser, out io.WriteCloser, direc
 		return acpv2.WorkResult{}, err
 	}
 	handle, err := acpv2.NewSessionHandle(connection, initialization, session, acpv2.SessionHandleOptions{
-		Tracker:     tracker,
-		Permissions: permissions,
+		Tracker: tracker,
 	})
 	if err != nil {
 		return acpv2.WorkResult{}, err

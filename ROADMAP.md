@@ -138,7 +138,11 @@ only remaining work.
     (#59),
   - explicit `SessionHandle`,
   - prompt acceptance, config-option replacement, and close commands,
-  - pending permission cancellation,
+  - pending permission cancellation on the Agent's `$/cancel_request`, with
+    an explicit opt-in to cancel a session's requests locally,
+  - background-work snapshots and per-entity `capabilities.cancel`, with
+    `tool_call/cancel` and `terminal/cancel` gated on them before writing,
+    and `-32602` from agents that serve neither (#70),
   - exact Rust `CancelActiveWork` notification behavior plus an optional
     cancellation-completion barrier that only `cancelled` satisfies,
   - from-start resume replay after preinstalled handlers.
@@ -258,11 +262,11 @@ standard-library-only and behind its own package or command.
 ### 3. Schema crate 1.15.1 follow-ups
 
 The 1.15.1 pin landed the generated types; the behavior Rust 5.0.0 builds on
-them is tracked separately: v2 background work with
-`tool_call/cancel`/`terminal/cancel` (#70). Unstable session archive/status/title
+them is tracked separately and is now delivered: v2 background work with
+`tool_call/cancel`/`terminal/cancel` (#70), unstable session archive/status/title
 (#71), client-provided system prompts (#58), `-32022` version negotiation
 (#62), unstable auth status (#72), subagent sessions (#60), and the proxy-chain
-method rename (#69) are delivered.
+method rename (#69).
 
 ## Guardrails
 

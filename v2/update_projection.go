@@ -2,6 +2,7 @@ package v2
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"slices"
 	"sync"
 
@@ -12,7 +13,8 @@ import (
 // messages, Agent messages, Agent thoughts, tool calls, terminals,
 // compactions, session info, and usage. It also keeps notices, which are live
 // events rather than entities: Notices returns those received since the last
-// DrainNotices. Plans and other session updates are not stored. Live
+// DrainNotices, and the background list of the latest state_update (see
+// Background). Plans and other session updates are not stored. Live
 // delivery and replay go through the same Apply, so replaying the original
 // updates in receive order reproduces the stored state, including removals.
 //
@@ -41,6 +43,10 @@ type UpdateProjection struct {
 	sessionInfo   *schema.SessionInfoUpdate
 	usage         *schema.UsageUpdate
 	notices       []schema.Notice
+	// background is the session's latest background list, valid while
+	// backgroundReported is set.
+	background         []schema.BackgroundWork
+	backgroundReported bool
 }
 
 // EntityKind names a type of session entity. An entity ID is unique only
@@ -162,7 +168,48 @@ func (p *UpdateProjection) Apply(update schema.SessionUpdate) {
 		p.applyUsage(*update.UsageUpdate)
 	case update.Notice != nil:
 		p.notices = append(p.notices, *update.Notice)
+	case update.StateUpdate != nil:
+		p.applyBackground(stateBackground(*update.StateUpdate))
 	}
+}
+
+// stateBackground returns the background list a state_update carries. A
+// custom or future state may carry one too; it is read from the preserved
+// payload, and one that does not decode reads as not reported.
+func stateBackground(state schema.StateUpdate) schema.Nullable[[]schema.BackgroundWork] {
+	switch {
+	case state.Running != nil:
+		return state.Running.Background
+	case state.Idle != nil:
+		return state.Idle.Background
+	case state.RequiresAction != nil:
+		return state.RequiresAction.Background
+	case state.Other != nil:
+		// A running state has only _meta and background, so its decoder
+		// reads exactly the background member of any state payload.
+		var other schema.RunningStateUpdate
+		if json.Unmarshal(state.Other.Raw, &other) == nil {
+			return other.Background
+		}
+	}
+	return schema.Nullable[[]schema.BackgroundWork]{}
+}
+
+// applyBackground records a state_update's background list. A concrete list
+// replaces the previous one. An omitted or null list, which the decoder also
+// produces for a malformed one, is not reported: background work is unknown
+// until a list is reported again.
+func (p *UpdateProjection) applyBackground(background schema.Nullable[[]schema.BackgroundWork]) {
+	if background.Set && !background.Null {
+		p.background = slices.Clip(background.Value)
+		if p.background == nil {
+			p.background = []schema.BackgroundWork{}
+		}
+		p.backgroundReported = true
+		return
+	}
+	p.background = nil
+	p.backgroundReported = false
 }
 
 // ApplyPermissionRequest applies the toolCall of a permission request's
@@ -402,4 +449,91 @@ func lookup[K comparable, V any](p *UpdateProjection, store map[K]*V, id K, snap
 		return zero, false
 	}
 	return snapshot(*stored), true
+}
+
+// Background returns the background list of the latest state_update: the
+// work running independently of foreground work, as received, including
+// items of unknown type. reported is false when that state_update omitted the
+// list, set it to null, or sent a malformed one, and before any state_update
+// has reported one: background work is then unknown, which is not the same
+// as none. A reported empty list means no background work is running. The
+// list is a snapshot; a later state_update replaces it.
+func (p *UpdateProjection) Background() (work []schema.BackgroundWork, reported bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.backgroundReported {
+		return nil, false
+	}
+	return p.background, true
+}
+
+// ToolCallInBackground reports whether the latest reported background list
+// covers the tool call: it lists the tool call, or it lists a terminal that
+// the stored tool call references in its content. It reports false when
+// background work is not reported.
+func (p *UpdateProjection) ToolCallInBackground(id schema.ToolCallId) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.backgroundReported && p.toolCallInBackgroundLocked(id)
+}
+
+// TerminalInBackground reports whether the latest reported background list
+// lists the terminal. It reports false when background work is not reported.
+func (p *UpdateProjection) TerminalInBackground(id schema.TerminalId) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.backgroundReported && p.terminalListedLocked(id)
+}
+
+func (p *UpdateProjection) terminalListedLocked(id schema.TerminalId) bool {
+	for _, work := range p.background {
+		if work.Terminal != nil && work.Terminal.TerminalID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *UpdateProjection) toolCallInBackgroundLocked(id schema.ToolCallId) bool {
+	for _, work := range p.background {
+		if work.ToolCall != nil && work.ToolCall.ToolCallID == id {
+			return true
+		}
+	}
+	// Process-backed work is listed as its terminal, never also as the tool
+	// call whose live work it is.
+	if call := p.toolCalls[id]; call != nil {
+		for _, content := range call.Content.Value {
+			if content.Terminal != nil && p.terminalListedLocked(content.Terminal.TerminalID) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// CanCancelToolCall reports whether the stored tool call currently advertises
+// capabilities.cancel, which tool_call/cancel requires. capabilities is a
+// patch: omitted keeps the stored value, null clears it, and an object
+// replaces it whole, so a later update without cancel withdraws it. An
+// unknown tool call cannot be cancelled.
+func (p *UpdateProjection) CanCancelToolCall(id schema.ToolCallId) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	call := p.toolCalls[id]
+	return call != nil && present(call.Capabilities) && call.Capabilities.Value.Cancel != nil
+}
+
+// CanCancelTerminal reports whether the stored terminal currently advertises
+// capabilities.cancel, which terminal/cancel requires, with the same patch
+// rules as CanCancelToolCall. An unknown terminal cannot be cancelled.
+func (p *UpdateProjection) CanCancelTerminal(id schema.TerminalId) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	terminal := p.terminals[id]
+	return terminal != nil && present(terminal.Terminal.Capabilities) && terminal.Terminal.Capabilities.Value.Cancel != nil
+}
+
+func present[T any](field schema.Nullable[T]) bool {
+	return field.Set && !field.Null
 }

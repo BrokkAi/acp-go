@@ -8,9 +8,12 @@ import (
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
-// CancellablePermissions wraps a Permissions host and cancels pending requests
-// when ActiveWork is cancelled. Context cancellation becomes the protocol's
-// cancelled outcome rather than an error response.
+// CancellablePermissions wraps a Permissions host so that a cancelled request
+// is answered with the protocol's cancelled outcome rather than an error
+// response. The Agent cancels a request with $/cancel_request when it stops
+// waiting for it, for example for the foreground work session/cancel ended or
+// for every request on session/close; CancelPermissionRequests cancels a
+// session's requests locally.
 type CancellablePermissions struct {
 	next Permissions
 
@@ -40,6 +43,12 @@ func (h *CancellablePermissions) RequestPermission(ctx context.Context, request 
 	return response, err
 }
 
+// CancelPermissionRequests resolves every pending permission request of the
+// session as cancelled, whatever work it belongs to, and returns how many it
+// cancelled. It is an explicit opt-in: SessionHandle.CancelActiveWork does not
+// call it, because only the Agent knows which work a request belongs to and
+// it cancels the cancelled foreground work's requests with $/cancel_request,
+// leaving those for background work open.
 func (h *CancellablePermissions) CancelPermissionRequests(sessionID SessionID) int {
 	h.mu.Lock()
 	pending := h.cancels[sessionID]

@@ -17,15 +17,14 @@ type SessionHandle struct {
 	initialization Initialization
 	sessionID      SessionID
 	tracker        *SessionTracker
-	permissions    *CancellablePermissions
 }
 
 // SessionHandleOptions connects optional connection-level state to one command
-// handle. Tracker must be installed as a notification handler, and Permissions
-// must be installed as the connection permission host.
+// handle. Tracker must be installed as a notification handler. Permission
+// requests are the connection permission host's, such as
+// CancellablePermissions; the handle does not cancel them.
 type SessionHandleOptions struct {
-	Tracker     *SessionTracker
-	Permissions *CancellablePermissions
+	Tracker *SessionTracker
 }
 
 func NewSessionHandle(connection *Connection, initialization Initialization, session Session, options SessionHandleOptions) (*SessionHandle, error) {
@@ -43,7 +42,6 @@ func NewSessionHandle(connection *Connection, initialization Initialization, ses
 		initialization: initialization,
 		sessionID:      session.SessionID,
 		tracker:        options.Tracker,
-		permissions:    options.Permissions,
 	}, nil
 }
 
@@ -94,13 +92,21 @@ func (s *SessionHandle) WaitForIdle(ctx context.Context) (WorkResult, error) {
 	return work.Wait(ctx)
 }
 
-// CancelActiveWork cancels pending local permission requests and sends the
-// v2 session-wide cancellation notification. Like Rust, it does not wait for
-// idle; use CancelActiveWorkAndWait for a cancellation completion barrier.
+// CancelActiveWork sends the v2 session/cancel notification, which cancels
+// the session's foreground work. Work in the latest background list is not
+// covered and keeps running; cancel it individually with CancelToolCall or
+// CancelTerminal. Like Rust, it does not wait for idle; use
+// CancelActiveWorkAndWait for a cancellation completion barrier.
+//
+// Like Rust's cancel_active_work, it only sends the notification and cancels
+// no permission request locally: only the Agent knows which work a request
+// belongs to. The Agent stops waiting for the cancelled work's requests and
+// cancels each with $/cancel_request, which CancellablePermissions answers
+// with the cancelled outcome; requests for background work stay open. A
+// request's subject is for display, not for choosing which to cancel. Call
+// CancellablePermissions.CancelPermissionRequests to cancel every pending
+// request of the session explicitly.
 func (s *SessionHandle) CancelActiveWork(ctx context.Context) error {
-	if s.permissions != nil {
-		s.permissions.CancelPermissionRequests(s.sessionID)
-	}
 	return s.connection.Notify(ctx, schema.SessionCancelMethodName, schema.CancelSessionNotification{
 		SessionID: s.sessionID,
 	})
@@ -141,6 +147,26 @@ func (s *SessionHandle) CancelActiveWorkAndWait(ctx context.Context) (WorkResult
 		return result, fmt.Errorf("%w (%s): %w", ErrWorkNotCancelled, reason, failure)
 	}
 	return result, fmt.Errorf("%w (%s)", ErrWorkNotCancelled, reason)
+}
+
+// CancelToolCall sends tool_call/cancel for one of the session's tool calls,
+// as SessionTracker.CancelToolCall does; it requires a Tracker. The response
+// does not confirm the cancellation: the tool call's final status does.
+func (s *SessionHandle) CancelToolCall(ctx context.Context, toolCallID schema.ToolCallId) error {
+	if s.tracker == nil {
+		return errors.New("session handle has no SessionTracker")
+	}
+	return s.tracker.CancelToolCall(ctx, s.connection, s.sessionID, toolCallID)
+}
+
+// CancelTerminal sends terminal/cancel for one of the session's terminals,
+// as SessionTracker.CancelTerminal does; it requires a Tracker. The response
+// does not confirm the cancellation: the terminal's exitStatus does.
+func (s *SessionHandle) CancelTerminal(ctx context.Context, terminalID schema.TerminalId) error {
+	if s.tracker == nil {
+		return errors.New("session handle has no SessionTracker")
+	}
+	return s.tracker.CancelTerminal(ctx, s.connection, s.sessionID, terminalID)
 }
 
 func (s *SessionHandle) SetConfigOptionID(ctx context.Context, configID, valueID string) ([]schema.SessionConfigOption, error) {

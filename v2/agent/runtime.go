@@ -55,6 +55,11 @@ type Runtime struct {
 	// connection's Client through ClientFromContext.
 	// github.com/BrokkAi/acp-go/v2/unstable.Install sets the overrides the
 	// unstable facades need, such as session/list with the archived filter.
+	//
+	// tool_call/cancel and terminal/cancel are the runtime's own methods:
+	// an Agent implementing ToolCallCanceller or TerminalCanceller serves
+	// them, an override serves them in its place, and otherwise they answer
+	// -32602 rather than reaching Extensions.
 	Overrides map[string]acp.Handler
 }
 
@@ -220,6 +225,26 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 			return nil, err
 		}
 		return implementation.SetConfigOption(ctx, s.client, request)
+	case schema.ToolCallCancelMethodName:
+		implementation, ok := s.agent.(ToolCallCanceller)
+		if !ok {
+			return nil, unhandledEntityCancel(method, raw)
+		}
+		request, err := rpcparams.Decode[schema.CancelToolCallRequest](raw)
+		if err != nil {
+			return nil, err
+		}
+		return implementation.CancelToolCall(ctx, s.client, request)
+	case schema.TerminalCancelMethodName:
+		implementation, ok := s.agent.(TerminalCanceller)
+		if !ok {
+			return nil, unhandledEntityCancel(method, raw)
+		}
+		request, err := rpcparams.Decode[schema.CancelTerminalRequest](raw)
+		if err != nil {
+			return nil, err
+		}
+		return implementation.CancelTerminal(ctx, s.client, request)
 	default:
 		return s.serveExtension(ctx, method, raw)
 	}

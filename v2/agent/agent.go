@@ -67,3 +67,35 @@ type SessionDeleter interface {
 type ConfigOptionSetter interface {
 	SetConfigOption(context.Context, Client, schema.SetSessionConfigOptionRequest) (schema.SetSessionConfigOptionResponse, error)
 }
+
+// ToolCallCanceller serves tool_call/cancel, which stops one tool call that
+// advertises capabilities.cancel, in the foreground or in the background. The
+// method has no initialize-time capability. An Agent without it answers every
+// tool_call/cancel with -32602 (Invalid params), as the reference SDK's v2
+// agent does, since it has no tool call it can cancel (see
+// ToolCallNotCancellableError).
+//
+// Answer with the empty response once the cancellation is accepted, not once
+// the work has stopped; confirm it with a tool_call_update to a final status,
+// normally cancelled (completed or failed if the work finished first).
+// Answer ToolCallNotCancellableError for a tool call that is unknown,
+// already final, or not cancellable. Cancelling a tool call does not change
+// the foreground state, and the Agent should stop advertising cancel once
+// the tool call is final.
+type ToolCallCanceller interface {
+	CancelToolCall(context.Context, Client, schema.CancelToolCallRequest) (schema.CancelToolCallResponse, error)
+}
+
+// TerminalCanceller serves terminal/cancel, which stops the process of one
+// terminal that advertises capabilities.cancel. An Agent without it answers
+// every terminal/cancel with -32602 (see TerminalNotCancellableError).
+//
+// Answer with the empty response once the cancellation is accepted, and
+// confirm it with a terminal_update that sets exitStatus. Answer
+// TerminalNotCancellableError for a terminal that is unknown, has already
+// exited, or is not cancellable. Cancelling does not release the terminal,
+// whose output stays available, and changes neither the foreground state nor
+// the status of a tool call that references the terminal.
+type TerminalCanceller interface {
+	CancelTerminal(context.Context, Client, schema.CancelTerminalRequest) (schema.CancelTerminalResponse, error)
+}

@@ -46,6 +46,36 @@ series, minor releases may contain breaking API changes.
     `MessageRouter.SetMaxActive`, which answers `-33000` past its limit.
   - `MessageRouter.UnregisterAndWait` and `MessageRequest.RawParams`.
   - v1 `mcp.LoadSession`.
+- Draft v2 background work, `tool_call/cancel`, and `terminal/cancel`, per
+  the v2 prompt lifecycle and Rust `agent-client-protocol` 5.0.0 (#70):
+  - `acpv2.SessionTracker.CancelToolCall` and `.CancelTerminal`, and
+    `SessionHandle.CancelToolCall` and `.CancelTerminal`, send the requests
+    only while the entity currently advertises `capabilities.cancel` in the
+    session's projection, and otherwise fail with an
+    `*acpv2.NotCancellableError` before writing. Neither method has an
+    initialize-time capability. The empty response only accepts the
+    cancellation; the tool call's final status or the terminal's
+    `exitStatus` confirms it.
+  - `UpdateProjection.CanCancelToolCall` and `.CanCancelTerminal` read the
+    stored `capabilities` with patch semantics (omitted keeps, `null` clears,
+    an object replaces).
+  - `UpdateProjection.Background` keeps the `background` list of the latest
+    `state_update` (running, requires_action, idle, or a custom state) as a
+    snapshot; omitted, `null`, or malformed means not reported, not empty.
+    `ToolCallInBackground` (listed, or referencing a listed terminal) and
+    `TerminalInBackground` read it.
+  - `ActiveWork.Background` and `WorkResult.Background`/`.BackgroundReported`
+    report the list the work observed; an idle with background work still
+    completes the foreground work.
+  - `v2/agent.ToolCallCanceller` and `TerminalCanceller` serve the methods,
+    and `ToolCallNotCancellableError` and `TerminalNotCancellableError` build
+    the `-32602` for an unknown, final, or non-cancellable entity.
+  - `v2/agent.ForegroundPermissions` sends an Agent's foreground permission
+    requests and, from its `CancelSession`, stops waiting for them: each is
+    cancelled with `$/cancel_request` and reported as the cancelled outcome,
+    which is not an approval. Background requests sent directly stay open;
+    on `session/close` the Agent must cancel every pending request itself,
+    including those.
 - `acp.Connection.InputClosed`, closed when the connection stops reading
   frames. On a clean EOF it closes before `Done`, which still waits for
   in-flight handlers, so long-running handlers can stop instead of waiting on
@@ -510,6 +540,25 @@ series, minor releases may contain breaking API changes.
   every notification to another connection should drop one, using
   `acp.IsCancelRequestNotification`, because its `requestId` is scoped to its
   own connection.
+- **Breaking (draft v2):** a `v2/agent` runtime whose Agent does not
+  implement `ToolCallCanceller` or `TerminalCanceller` answers
+  `tool_call/cancel` or `terminal/cancel` with `-32602` (`the tool call is
+  unknown or not cancellable`, or the terminal form) and data holding the
+  request's `toolCallId` or `terminalId` when it is a string, without
+  decoding the params, as the reference SDK's `Agent.v2()` does; it answered
+  `-32601` before (#70). Overrides for these methods still take precedence,
+  and they no longer reach `Runtime.Extensions`.
+- **Breaking (draft v2):** `SessionHandle.CancelActiveWork` (and
+  `CancelActiveWorkAndWait`) only sends `session/cancel`, like the reference
+  SDK's `cancel_active_work`; it no longer cancels pending permission
+  requests locally. Only the Agent knows which work a request belongs to:
+  it cancels the requests of the cancelled foreground work with
+  `$/cancel_request`, which `CancellablePermissions` resolves as the
+  cancelled outcome, and requests for background work stay open (ACP
+  background-work RFD revision of 2026-11-02). `SessionHandleOptions` loses
+  its `Permissions` field, which only served that local cancellation; call
+  `CancellablePermissions.CancelPermissionRequests` explicitly to cancel
+  every pending request of a session (#70).
 - **Breaking:** the v1 agent runtime's `Client.Notify` gates
   `session/update` params of every type, not only `acp.Update`: a typed
   `schema/unstable.SessionNotification`, raw JSON, or any value that encodes

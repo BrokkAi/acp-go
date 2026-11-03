@@ -293,7 +293,12 @@ empty. The v1 runner and agent runtime remain under the root package
 for stable applications. Draft v2 agents can use
 `github.com/BrokkAi/acp-go/v2/agent`; its `Agent` interface covers the baseline
 session methods, prompt acceptance, cancellation, and typed permission and
-elicitation callbacks.
+elicitation callbacks. Agents serve `tool_call/cancel` and `terminal/cancel`
+through the optional `ToolCallCanceller` and `TerminalCanceller`; without them
+the runtime answers `-32602`, as the reference SDK does. `ForegroundPermissions`
+lets an Agent stop waiting for its foreground permission requests on
+`session/cancel`, cancelling each with `$/cancel_request`, while requests for
+background work stay open.
 
 ```sh
 go run ./examples/minimal-agent-v2
@@ -431,8 +436,19 @@ replay. Connect with `acp.WithRequestObserver(tracker.TrackerRequests(nil))` so 
 permission requests' tool calls are applied in receive order with the updates
 around them. `SessionTracker.ResumeSessionFromStart` resets the session's
 projection first, so a full replay rebuilds it, and closing a session through
-its handle drops it. `acpv2.CancellablePermissions` resolves pending
-permission requests as cancelled when active work is cancelled.
+its handle drops it. `CancelActiveWork` only sends `session/cancel`, like the
+reference SDK: only the Agent knows which work a permission request belongs
+to, so it cancels the cancelled foreground work's requests with
+`$/cancel_request` and leaves those for background work open.
+`acpv2.CancellablePermissions` answers a cancelled request with the cancelled
+outcome, and its `CancelPermissionRequests` cancels a session's requests
+locally on explicit request. The projection keeps the latest `background` list
+(`Background`) and each tool call's and terminal's `capabilities`.
+`SessionHandle.CancelToolCall` and `CancelTerminal` send `tool_call/cancel` and
+`terminal/cancel` only while the entity advertises `capabilities.cancel`, and
+fail with `*acpv2.NotCancellableError` before writing otherwise. Their empty
+response only accepts the cancellation: the tool call's final status or the
+terminal's `exitStatus` confirms it.
 `ResumeSessionFromStart` requires handlers to be installed before the resume
 request and returns only after replay updates have been applied in wire order.
 

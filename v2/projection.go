@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"maps"
+	"slices"
 	"sync"
 
 	"github.com/BrokkAi/acp-go"
@@ -28,6 +29,14 @@ type WorkResult struct {
 	// StopReasonFields keeps the other fields of a custom or future stop
 	// reason, as received. It is nil for the known reasons.
 	StopReasonFields map[string]json.RawMessage
+	// Background is the background list the idle update reported: work that
+	// keeps running after the foreground work ended. BackgroundReported is
+	// false when the idle update omitted it, set it to null, or sent a
+	// malformed one, so background work is unknown; a reported empty list
+	// means none is running. Background work does not keep the foreground
+	// work from completing.
+	Background         []schema.BackgroundWork
+	BackgroundReported bool
 }
 
 // Err returns a *WorkError when the work ended with StopReasonError, so a
@@ -46,9 +55,10 @@ func (r WorkResult) Err() error {
 // (running, requires_action, or any state other than idle) and completes at
 // the next idle update, whatever its stop reason: an omitted, null,
 // malformed, custom, or unknown reason, an error, or a non-empty background
-// list all end the foreground work. The result is fixed at that idle update;
-// later updates, including a repeated idle snapshot, are not a new completion
-// and do not change it.
+// list all end the foreground work. Listed background work keeps running
+// independently and is reported in WorkResult.Background. The result is
+// fixed at that idle update; later updates, including a repeated idle
+// snapshot, are not a new completion and do not change it.
 //
 // Tracking assumes each prompt starts new foreground work. The v2 prompt
 // lifecycle lets a Client prompt in any state, and an Agent may instead insert
@@ -63,6 +73,9 @@ type ActiveWork struct {
 	projection     *UpdateProjection
 	result         WorkResult
 	done           chan struct{}
+	// background is the latest background list this work observed.
+	background         []schema.BackgroundWork
+	backgroundReported bool
 }
 
 func BeginActiveWork() *ActiveWork {
@@ -79,15 +92,21 @@ func (w *ActiveWork) Apply(update schema.SessionUpdate) {
 	if !w.observedActive {
 		if state != nil && state.Idle == nil {
 			w.observedActive = true
+			w.observeBackground(*state)
 		}
 		return
+	}
+	if state != nil {
+		w.observeBackground(*state)
 	}
 	if state != nil && state.Idle != nil {
 		idle := state.Idle
 		w.result = WorkResult{
-			Text:             w.projection.Text(),
-			StopReason:       clonePtr(idle.StopReason),
-			StopReasonFields: maps.Clone(idle.StopReasonFields),
+			Text:               w.projection.Text(),
+			StopReason:         clonePtr(idle.StopReason),
+			StopReasonFields:   maps.Clone(idle.StopReasonFields),
+			Background:         w.background,
+			BackgroundReported: w.backgroundReported,
 		}
 		if idle.StopReason != nil && *idle.StopReason == schema.StopReasonError {
 			w.result.Error = clonePtr(idle.Error)
@@ -97,6 +116,31 @@ func (w *ActiveWork) Apply(update schema.SessionUpdate) {
 		return
 	}
 	w.projection.Apply(update)
+}
+
+// observeBackground records a state update's background list, or that it
+// reported none.
+func (w *ActiveWork) observeBackground(state schema.StateUpdate) {
+	background := stateBackground(state)
+	w.backgroundReported = background.Set && !background.Null
+	w.background = nil
+	if w.backgroundReported {
+		w.background = slices.Clip(background.Value)
+		if w.background == nil {
+			w.background = []schema.BackgroundWork{}
+		}
+	}
+}
+
+// Background returns the background list of the latest state update this
+// work observed, from the state update that made it active to the idle update
+// that ended it. reported is false when that update did not report one
+// (omitted, null, or malformed), or before the work became active. The list
+// is a snapshot shared with the update it came from; do not modify it.
+func (w *ActiveWork) Background() (work []schema.BackgroundWork, reported bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.background, w.backgroundReported
 }
 
 func (w *ActiveWork) Done() <-chan struct{} { return w.done }
