@@ -268,42 +268,72 @@ func encode(b *bytes.Buffer, v *Value) {
 // or 0.00001, and in exponent form otherwise, such as 1e+300 or 1.5e-7. A
 // non-finite value, which serde_json writes as null, formats as "null".
 func FormatFloat(f float64) string {
+	var buf [32]byte
+	return string(AppendFloat(buf[:0], f))
+}
+
+// AppendFloat appends f as FormatFloat formats it, without allocating
+// beyond out.
+func AppendFloat(out []byte, f float64) []byte {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return "null"
+		return append(out, "null"...)
 	}
 	if f == 0 {
 		if math.Signbit(f) {
-			return "-0.0"
+			return append(out, "-0.0"...)
 		}
-		return "0.0"
+		return append(out, "0.0"...)
 	}
-	sign := ""
 	if f < 0 {
-		sign = "-"
+		out = append(out, '-')
 		f = -f
 	}
-	scientific := strconv.FormatFloat(f, 'e', -1, 64)
-	mantissa, exponentText, _ := strings.Cut(scientific, "e")
-	digits := strings.Replace(mantissa, ".", "", 1)
-	exponent, _ := strconv.Atoi(exponentText)
+	// The shortest digits that round-trip, as d.ddde±x.
+	var buf [32]byte
+	scientific := strconv.AppendFloat(buf[:0], f, 'e', -1, 64)
+	e := bytes.IndexByte(scientific, 'e')
+	var digitBuf [24]byte
+	digits := append(digitBuf[:0], scientific[0])
+	if e > 1 {
+		digits = append(digits, scientific[2:e]...)
+	}
+	exponent := 0
+	for _, c := range scientific[e+2:] {
+		exponent = exponent*10 + int(c-'0')
+	}
+	if scientific[e+1] == '-' {
+		exponent = -exponent
+	}
 	point := exponent + 1
 	switch {
 	case point > 0 && point <= 16:
 		if len(digits) <= point {
-			return sign + digits + strings.Repeat("0", point-len(digits)) + ".0"
+			out = append(out, digits...)
+			for i := len(digits); i < point; i++ {
+				out = append(out, '0')
+			}
+			return append(out, '.', '0')
 		}
-		return sign + digits[:point] + "." + digits[point:]
+		out = append(out, digits[:point]...)
+		out = append(out, '.')
+		return append(out, digits[point:]...)
 	case point > -5 && point <= 0:
-		return sign + "0." + strings.Repeat("0", -point) + digits
+		out = append(out, '0', '.')
+		for i := 0; i < -point; i++ {
+			out = append(out, '0')
+		}
+		return append(out, digits...)
 	}
-	result := sign + digits[:1]
+	out = append(out, digits[0])
 	if len(digits) > 1 {
-		result += "." + digits[1:]
+		out = append(out, '.')
+		out = append(out, digits[1:]...)
 	}
+	out = append(out, 'e')
 	if exponent >= 0 {
-		return result + "e+" + strconv.Itoa(exponent)
+		out = append(out, '+')
 	}
-	return result + "e" + strconv.Itoa(exponent)
+	return strconv.AppendInt(out, int64(exponent), 10)
 }
 
 // Unexpected describes v as serde's de::Unexpected does in an invalid-type

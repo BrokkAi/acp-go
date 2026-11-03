@@ -8,6 +8,7 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/jsonline"
+	"github.com/BrokkAi/acp-go/internal/serdewire"
 	schema1 "github.com/BrokkAi/acp-go/schema"
 )
 
@@ -266,10 +267,16 @@ func requestsV2(message message, method string, supported Supported) bool {
 	return err == nil && requested >= V2
 }
 
+// response is the error response line a router writes to the peer, written
+// as the reference SDK writes a frame.
 func response(id json.RawMessage, err *acp.RPCError) []byte {
-	return mustMarshal(struct {
+	encoded, encodeErr := serdewire.Marshal(struct {
 		Version string          `json:"jsonrpc"`
 		ID      json.RawMessage `json:"id"`
 		Error   *acp.RPCError   `json:"error"`
 	}{Version: "2.0", ID: id, Error: err})
+	if encodeErr != nil {
+		panic("negotiate: encode error response: " + encodeErr.Error())
+	}
+	return encoded
 }
