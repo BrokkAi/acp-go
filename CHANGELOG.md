@@ -399,6 +399,18 @@ series, minor releases may contain breaking API changes.
   message naming the session and when a `session/new` or `session/fork`
   result names a new one, and `Close` sends `DELETE`, as the Rust client does.
 
+- `acp.Connection.Shutdown(ctx)`, the reference SDK's orderly close of a
+  connection whose `connect_with` foreground returned `Ok` (#80). It stops
+  sending anything new (`Notify`, `Call`, and `CancelRequest` fail with
+  `io.ErrClosedPipe`, incoming requests' contexts are cancelled and responses
+  not yet queued are not sent, and incoming frames are read and discarded), writes
+  every frame already queued, then closes the output and input streams. `ctx`
+  bounds the drain: when it ends, `Shutdown` aborts like `Close` and returns
+  its error. A read or write failure during the drain is returned; a clean
+  peer EOF is not. `Close` still aborts at once, dropping queued frames, as
+  dropping the reference SDK's connection does. `v2.Connection` gains it
+  through its embedded `acp.Connection`.
+
 ### Changed
 
 - Every method the unstable `Handle` and `Install` routes serve (v1 and
@@ -1068,6 +1080,22 @@ series, minor releases may contain breaking API changes.
 
 ### Fixed
 
+- The v1 and draft-v2 runners closed the agent's stdin with `Close` at the
+  end of a successful run, dropping frames still queued for the agent, such
+  as a response to its last request. They now call `Shutdown`, bounded by the
+  run's context, before stdin closes, and a failed drain fails the run, as it
+  fails `connect_with` in the reference SDK (#80). A failed or cancelled run
+  still aborts with `Close`.
+- On a clean peer EOF with no handler running, `acp.Connection` stopped at
+  once and dropped frames still queued for the peer. As the reference SDK
+  keeps its output working after incoming EOF, the connection now writes
+  every frame queued by the time in-flight handlers return before it stops,
+  and `Done` waits for that. From then on nothing new is sent (`Notify`,
+  `Call`, and `CancelRequest` fail with `io.ErrClosedPipe`), and a
+  `Shutdown` called during the flush waits for it. As in the reference SDK
+  the flush has no time limit; `Shutdown`'s context or `Close` bounds it. A
+  write failure during the
+  flush becomes `Err` instead of `io.EOF` (#80).
 - Two concurrent `initialize` requests on the v1 agent runtime could leave
   the client capabilities of one and the agent capabilities of the other;
   both are now recorded together (#62).

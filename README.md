@@ -17,7 +17,14 @@ _, err := connection.InitializeWithInfo(ctx, acp.Capabilities{}, acp.ClientInfo{
 // Handle err, then create a session and send prompts.
 session, err := connection.NewSession(ctx, absoluteWorkingDirectory)
 reason, err := connection.Prompt(ctx, session, "Inspect the project")
+// After a successful run, write what is still queued before stdin closes.
+err = connection.Shutdown(ctx)
 ```
+
+`Close` aborts the connection, dropping frames not yet written. `Shutdown`
+is the reference SDK's orderly end of a successful run: it sends nothing new,
+writes every frame already queued, then closes the agent's stdin, and its
+context bounds the drain.
 
 The import path is `github.com/BrokkAi/acp-go`; its package name is `acp`.
 The runtime now uses the generated [`schema`](schema/) types directly: `Capabilities`,

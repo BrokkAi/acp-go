@@ -141,6 +141,18 @@ func (a Runner) Execute(ctx context.Context, prompt string) (result string, runE
 	started := time.Now()
 	defer func() {
 		crashed = release()
+		if runErr == nil && crashed == nil && !isClosed(connection.Done()) {
+			// As the reference SDK does on a successful run, write what is
+			// still queued for the agent before its stdin closes; a failed
+			// drain fails the run, as it fails connect_with there. A
+			// connection that already stopped is skipped: one the agent
+			// ended with a clean EOF wrote its queued frames before
+			// stopping, and one the supervisor closed after the agent
+			// exited has no reader left.
+			if err := connection.Shutdown(ctx); err != nil {
+				runErr = fmt.Errorf("shut down ACP connection: %w", err)
+			}
+		}
 		record := map[string]any{"event": "session_end", "phase": phase, "elapsed": time.Since(started).String()}
 		if runErr != nil {
 			record["error"] = runErr.Error()
@@ -273,4 +285,14 @@ var newHost = func(ctx context.Context, directory string, transcript io.Writer, 
 		Logger:     logger,
 		Transcript: transcript,
 	})
+}
+
+// isClosed reports whether done is closed.
+func isClosed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
 }

@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -79,6 +80,25 @@ type Connection struct {
 	once       sync.Once
 	loops      sync.WaitGroup
 	tasks      sync.WaitGroup
+	// serving is the parent of every incoming request's context. Shutdown
+	// cancels it before draining, as the reference SDK drops its handlers
+	// once the foreground succeeds.
+	serving     context.Context
+	stopServing context.CancelFunc
+	// shuttingDown is set when Shutdown begins. From then on no frame is
+	// queued, incoming frames are read and discarded, and the drain marker
+	// Shutdown queues closes drained once every frame queued before it is
+	// written.
+	shuttingDown atomic.Bool
+	// sealMu orders sealing against queueing: a sender checks shuttingDown
+	// and registers in enqueuing under it, and the drain marker is queued
+	// only after every registered sender has finished, so no frame accepted
+	// before the seal can land behind the marker.
+	sealMu      sync.Mutex
+	enqueuing   sync.WaitGroup
+	drained     chan struct{}
+	closeOut    sync.Once
+	closeOutErr error
 }
 
 // RequestObserver sees each incoming request in wire order, on the read loop,
@@ -141,10 +161,10 @@ func (p *HandlerPanic) Error() string {
 	return fmt.Sprintf("acp: %s handler panicked: %v", p.Method, p.Value)
 }
 
-// Connect owns both streams until Close. Frames are limited to 8 MiB. Each
-// incoming request runs in its own goroutine with no concurrency limit, as in
-// the reference SDK, so a peer that pipelines many requests is served rather
-// than disconnected. Unknown notifications can be ignored.
+// Connect owns both streams until Close or Shutdown. Frames are limited to 8
+// MiB. Each incoming request runs in its own goroutine with no concurrency
+// limit, as in the reference SDK, so a peer that pipelines many requests is
+// served rather than disconnected. Unknown notifications can be ignored.
 //
 // One bad message or one failing handler does not close the connection. A
 // valid JSON value that is not a JSON-RPC message is answered with -32600 and
@@ -154,7 +174,8 @@ func (p *HandlerPanic) Error() string {
 // transport failure closes the connection.
 func Connect(in io.ReadCloser, out io.WriteCloser, h Handler, n Notifications, options ...ConnectOption) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Connection{in: in, out: out, ctx: ctx, cancel: cancel, onRequest: h, onNotify: n, writes: make(chan outgoing, 32), sendLock: make(chan struct{}, 1), inputDone: make(chan struct{}), pending: make(map[string]pendingCall), inbound: make(map[string][]inboundCancellation)}
+	serving, stopServing := context.WithCancel(ctx)
+	c := &Connection{in: in, out: out, ctx: ctx, cancel: cancel, serving: serving, stopServing: stopServing, onRequest: h, onNotify: n, writes: make(chan outgoing, 32), sendLock: make(chan struct{}, 1), drained: make(chan struct{}), inputDone: make(chan struct{}), pending: make(map[string]pendingCall), inbound: make(map[string][]inboundCancellation)}
 	for _, option := range options {
 		option(c)
 	}
@@ -170,23 +191,162 @@ func (c *Connection) stop(err error) {
 		c.mu.Unlock()
 		c.cancel()
 		_ = c.in.Close()
-		_ = c.out.Close()
+		_ = c.closeOutput()
 	})
 }
+
+// closeOutput closes the output stream once and returns that close's error.
+func (c *Connection) closeOutput() error {
+	c.closeOut.Do(func() { c.closeOutErr = c.out.Close() })
+	return c.closeOutErr
+}
+
+// Close aborts the connection: it closes both streams at once, without
+// writing frames still queued for the peer, and waits for the connection's
+// goroutines and in-flight handlers to return. Calls waiting for a response
+// fail with io.ErrClosedPipe. Close is the reference SDK's dropped
+// connection; Shutdown is its orderly shutdown. Close always returns nil and
+// may be called after Shutdown, or concurrently with it to abort its drain.
 func (c *Connection) Close() error {
 	c.stop(io.ErrClosedPipe)
 	c.loops.Wait()
 	c.tasks.Wait()
 	return nil
 }
+
+// Shutdown closes the connection in order, as the reference SDK does when a
+// connect_with foreground returns Ok: it writes every frame already queued for
+// the peer, then closes the output stream, then the input stream, and waits
+// for the connection's goroutines and in-flight handlers to return, as Close
+// does.
+//
+// Once Shutdown begins, the connection sends nothing new: Notify, Call, and
+// CancelRequest fail with io.ErrClosedPipe without writing, the contexts of
+// incoming requests are cancelled and responses not yet queued are not sent,
+// and incoming frames are read and discarded, so responses arriving during
+// the drain complete no call. A call already waiting for its response stops
+// waiting, with io.ErrClosedPipe, when the connection closes. Cancelling a
+// call's context during the drain does not stop the connection; ctx bounds
+// the drain instead.
+//
+// Shutdown returns nil once the queued frames are written and the output
+// stream is closed, or the close's error. If ctx ends first, or ended before
+// Shutdown was called, Shutdown aborts like Close and returns ctx's error;
+// frames not yet written are dropped, as they are when the reference SDK's
+// connection future is dropped. ctx bounds only the drain: the wait for
+// in-flight handlers that follows is not bounded, as for Close, so handlers
+// must honor cancellation. If the connection had already stopped, or fails
+// during the drain, Shutdown returns Err. A connection that stopped on the
+// peer's clean EOF returns nil: it wrote every frame queued before it stopped.
+// Concurrent calls wait for the same drain; when the ctx of the call that
+// began it ends first, that call aborts the connection, and the others return
+// io.ErrClosedPipe.
+//
+// Calling Shutdown or Close from inside a handler, a Notifications function,
+// or a RequestObserver deadlocks: both wait for those to return.
+func (c *Connection) Shutdown(ctx context.Context) error {
+	err := c.drain(ctx)
+	c.stop(io.ErrClosedPipe)
+	c.loops.Wait()
+	c.tasks.Wait()
+	return err
+}
+
+// seal stops the queue accepting frames and reports whether this call sealed
+// it.
+func (c *Connection) seal() bool {
+	c.sealMu.Lock()
+	defer c.sealMu.Unlock()
+	return c.shuttingDown.CompareAndSwap(false, true)
+}
+
+// admitFrame registers a sender about to queue a frame, unless the queue is
+// sealed. An admitted sender calls c.enqueuing.Done once it has queued its
+// frame or given up.
+func (c *Connection) admitFrame() bool {
+	c.sealMu.Lock()
+	defer c.sealMu.Unlock()
+	if c.shuttingDown.Load() {
+		return false
+	}
+	c.enqueuing.Add(1)
+	return true
+}
+
+// queueDrainMarker queues the marker that closes drained once every frame
+// queued before it is written. It takes the send lock, so a frame a guard
+// admitted is queued before it. It gives up when ctx or the connection ends.
+func (c *Connection) queueDrainMarker(ctx context.Context) {
+	// Senders that passed the seal check finish queueing first.
+	settled := make(chan struct{})
+	go func() {
+		c.enqueuing.Wait()
+		close(settled)
+	}()
+	select {
+	case <-settled:
+	case <-ctx.Done():
+		return
+	case <-c.ctx.Done():
+		return
+	}
+	release, err := c.lockSend(ctx)
+	if err != nil {
+		return
+	}
+	defer release()
+	select {
+	case c.writes <- outgoing{}:
+	case <-ctx.Done():
+	case <-c.ctx.Done():
+	}
+}
+
+// drain begins the shutdown, waits until the frames queued before it are
+// written, and closes the output stream.
+func (c *Connection) drain(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.seal() {
+		c.stopServing()
+		c.queueDrainMarker(ctx)
+	}
+	select {
+	case <-c.drained:
+		return c.closeOutput()
+	case <-ctx.Done():
+	case <-c.ctx.Done():
+	}
+	// A completed drain wins over a connection stopped after it, and a
+	// stopped connection's reason over the deadline.
+	if closedChannel(c.drained) {
+		return c.closeOutput()
+	}
+	if !closedChannel(c.ctx.Done()) {
+		return ctx.Err()
+	}
+	if err := c.Err(); !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
+
 func (c *Connection) Done() <-chan struct{} { return c.ctx.Done() }
 
 // InputClosed is closed once the connection stops reading frames: the peer
 // closed its output (EOF), a frame was not valid UTF-8 or exceeded 8 MiB, or
 // the connection was closed.
-// On a clean EOF, Done stays open until in-flight handlers return so their
-// responses can still be written; long-running handlers that wait on the peer
-// can select on InputClosed to stop instead of waiting forever.
+// On a clean EOF, Done stays open until in-flight handlers return and every
+// frame queued by then, theirs included, is written, as the reference SDK
+// keeps its output working after incoming EOF. Once the handlers have
+// returned, nothing new is sent: Notify, Call, and CancelRequest fail with
+// io.ErrClosedPipe, as during Shutdown, and a Shutdown called then waits for
+// the same flush. Like the reference SDK's, the flush has no time limit: a
+// peer that stops reading keeps Done open, so bound it with Shutdown, whose
+// ctx aborts the flush when it ends, or with Close. Long-running handlers
+// that wait on the peer can select on InputClosed to stop instead of waiting
+// forever.
 func (c *Connection) InputClosed() <-chan struct{} { return c.inputDone }
 func (c *Connection) Err() error                   { c.mu.Lock(); defer c.mu.Unlock(); return c.failure }
 
@@ -219,11 +379,20 @@ func (c *Connection) lockSend(ctx context.Context) (func(), error) {
 // build runs, so nothing is begun. built reports whether build succeeded, so a
 // caller can settle what a guard began when queueing then fails.
 func (c *Connection) queue(ctx context.Context, build func() (any, error)) (w outgoing, built bool, err error) {
+	// A sealed queue refuses with io.ErrClosedPipe even after the connection
+	// stops, guarded or not.
+	if c.shuttingDown.Load() {
+		return outgoing{}, false, io.ErrClosedPipe
+	}
 	release, err := c.lockSend(ctx)
 	if err != nil {
 		return outgoing{}, false, err
 	}
 	defer release()
+	if !c.admitFrame() {
+		return outgoing{}, false, io.ErrClosedPipe
+	}
+	defer c.enqueuing.Done()
 	value, err := build()
 	if err != nil {
 		return outgoing{}, false, err
@@ -259,12 +428,27 @@ func (c *Connection) awaitWrite(ctx context.Context, w outgoing) error {
 		case err := <-w.sent:
 			return err
 		case <-timer.C:
-			c.stop(ctx.Err())
+			// Once the queue is sealed, by Shutdown or the EOF flush, the
+			// frame stays queued: the drain writes it or is aborted.
+			if !c.shuttingDown.Load() {
+				c.stop(ctx.Err())
+			}
 			return ctx.Err()
 		case <-c.ctx.Done():
-			return c.Err()
+			return c.sentOr(w)
 		}
 	case <-c.ctx.Done():
+		return c.sentOr(w)
+	}
+}
+
+// sentOr reports a stopped connection's error for w, unless w was written,
+// which wins when both are ready.
+func (c *Connection) sentOr(w outgoing) error {
+	select {
+	case err := <-w.sent:
+		return err
+	default:
 		return c.Err()
 	}
 }
@@ -310,6 +494,11 @@ func (c *Connection) writeLoop() {
 		case <-c.ctx.Done():
 			return
 		case w := <-c.writes:
+			if w.data == nil {
+				// Shutdown's marker: every frame queued before it is written.
+				close(c.drained)
+				return
+			}
 			_, err := io.Copy(c.out, bytes.NewReader(w.data))
 			w.sent <- err
 			if err != nil {
@@ -494,6 +683,11 @@ func (c *Connection) readLoop() {
 			c.stop(errors.New("invalid ACP JSON-RPC frame"))
 			return
 		}
+		if c.shuttingDown.Load() {
+			// As in the reference SDK, Shutdown stops delivery but keeps
+			// reading, so a peer still writing is not failed mid-drain.
+			continue
+		}
 		// A value the reference SDK cannot read as one JSON-RPC message gets
 		// its single id-null error, and the connection keeps reading.
 		switch jsonline.Classify(line) {
@@ -556,7 +750,27 @@ func (c *Connection) readLoop() {
 	err := s.Err()
 	inputDone()
 	if err == nil {
+		// A clean EOF during Shutdown leaves the drain to finish; a read
+		// failure still stops it, as in the reference SDK.
+		if c.shuttingDown.Load() {
+			return
+		}
 		c.tasks.Wait()
+		// As in the reference SDK, incoming EOF does not stop output:
+		// every frame already queued is written before the connection
+		// stops. The flush seals the queue first, as Shutdown does, so no
+		// frame is accepted behind its marker, and a Shutdown that starts
+		// during the flush waits for this one instead of queueing its own.
+		// A write failure during the flush stops the connection first and
+		// becomes its error. A Shutdown that began first owns the drain.
+		if !c.seal() {
+			return
+		}
+		c.queueDrainMarker(c.ctx)
+		select {
+		case <-c.drained:
+		case <-c.ctx.Done():
+		}
 		err = io.EOF
 	}
 	c.stop(err)
@@ -569,15 +783,24 @@ func (c *Connection) readLoop() {
 // queue is full, which is backpressure from a peer that is not reading. Only
 // waiting for the write runs as a task, which EOF still waits for.
 func (c *Connection) answerFrame(response []byte) {
+	if c.shuttingDown.Load() {
+		return
+	}
 	w := outgoing{data: append(response, '\n'), sent: make(chan error, 1)}
 	release, err := c.lockSend(c.ctx)
 	if err != nil {
 		return
 	}
+	if !c.admitFrame() {
+		release()
+		return
+	}
 	select {
 	case c.writes <- w:
+		c.enqueuing.Done()
 		release()
 	case <-c.ctx.Done():
+		c.enqueuing.Done()
 		release()
 		return
 	}
@@ -745,7 +968,7 @@ func (c *Connection) report(err error) {
 }
 
 func (c *Connection) startRequest(p packet) {
-	ctx, cancel := context.WithCancel(c.ctx)
+	ctx, cancel := context.WithCancel(c.serving)
 	generation := c.registerInbound(string(p.ID), cancel)
 	c.tasks.Add(1)
 	go func() {
