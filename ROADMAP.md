@@ -112,6 +112,18 @@ only remaining work.
   - handler panics are recovered and answered with `-32603`, notification
     handler errors are reported rather than fatal, and incoming requests are
     not limited.
+- Streamable HTTP server parity with Rust `agent-client-protocol-http` 5.0.0
+  (#65), apart from WebSocket (#64):
+  - a connection stream and per-session streams under the Rust session-naming
+    rules (rust-sdk #483), with the 16-stream cap on unnamed sessions, `409`
+    for a second subscriber, and stream removal on `session/close` and
+    `session/delete`,
+  - agent frames buffered per stream until the client opens it,
+  - `DELETE` returning `202`, `ServerOptions` (path, CORS disabled by default,
+    `/health`, 16 MiB body limit with `413`), and the Rust CORS header
+    allowlist without credentials,
+  - a client that opens session streams the way the Rust client does and
+    sends `DELETE` on close.
 - Rust-shaped v2 session command surface:
   - reusable session-update projection storing messages, thoughts, tool
     calls, terminals, compactions, session info, and usage with
