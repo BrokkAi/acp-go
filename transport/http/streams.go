@@ -75,8 +75,12 @@ type pendingRoute struct {
 
 // outbound routes agent frames to the connection stream and the session
 // streams of one HTTP connection, following the Rust crate's HttpOutbound.
+// A WebSocket connection has no session streams: like the Rust crate's
+// WebSocketOutbound, it queues every agent frame on the connection mailbox,
+// which the socket holds for its whole life.
 type outbound struct {
 	mu         sync.Mutex
+	websocket  bool
 	connection *mailbox
 	sessions   map[string]*sessionStream
 	pending    map[string][]pendingRoute
@@ -94,7 +98,7 @@ func newOutbound() *outbound {
 // Requests with a null id have no response to route.
 func (o *outbound) recordPending(id json.RawMessage, route pendingRoute) {
 	key, ok := idKey(id)
-	if !ok {
+	if !ok || o.websocket {
 		return
 	}
 	o.mu.Lock()
@@ -109,6 +113,7 @@ func (o *outbound) route(parsed frame, payload []byte) {
 	defer o.mu.Unlock()
 	target := o.connection
 	switch {
+	case o.websocket:
 	case parsed.hasMethod():
 		// The agent names the session, so it exists on this connection.
 		if sessionID, ok := parsed.sessionID(); ok {
@@ -234,13 +239,13 @@ func (o *outbound) leaseConnection() (*lease, error) {
 
 // leaseSession takes the stream of a session the connection knows, or of an
 // unknown session while fewer than maxUnconfirmedSessionStreams unconfirmed
-// streams exist.
+// streams exist. A WebSocket connection knows no sessions.
 func (o *outbound) leaseSession(sessionID string) (*lease, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	stream, ok := o.sessions[sessionID]
 	if !ok {
-		if o.unconfirmed() >= maxUnconfirmedSessionStreams {
+		if o.websocket || o.unconfirmed() >= maxUnconfirmedSessionStreams {
 			return nil, errUnknownSession
 		}
 		stream = &sessionStream{box: newMailbox()}

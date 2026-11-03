@@ -80,6 +80,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPost:
 			s.handlePost(w, r)
 		case http.MethodGet, http.MethodHead:
+			if isWebSocketUpgrade(w, r) {
+				s.handleWebSocket(w, r)
+				return
+			}
 			s.handleGet(w, r)
 		case http.MethodDelete:
 			s.handleDelete(w, r)
@@ -219,7 +223,7 @@ type initializeAnswer struct {
 // An error response rejects the connection: the client gets the error with no
 // connection id, and the agent is shut down.
 func (s *Server) serveInitialize(w http.ResponseWriter, r *http.Request, request frame) {
-	connection := s.newConnection(request.ID, request.encode())
+	connection := s.newConnection(newOutbound(), append([]byte(nil), request.ID...), request.encode())
 	var answer initializeAnswer
 	select {
 	case answer = <-connection.initialized:
@@ -378,10 +382,12 @@ func (s *Server) forget(connection *serverConn) {
 	s.mu.Unlock()
 }
 
-// newConnection registers a connection and starts its agent with the
-// initialize request already queued, so the agent reads it before it can have
-// returned, as a Rust agent is spawned with the request in its channel.
-func (s *Server) newConnection(initializeID, initialize []byte) *serverConn {
+// newConnection registers a connection and starts its agent. An HTTP
+// connection starts with the initialize request already queued, so the agent
+// reads it before it can have returned, as a Rust agent is spawned with the
+// request in its channel. A WebSocket connection starts with nothing queued
+// and a nil initializeID: every frame of its agent goes to the socket.
+func (s *Server) newConnection(out *outbound, initializeID, initialize []byte) *serverConn {
 	outReader, outWriter := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	connection := &serverConn{
@@ -390,11 +396,13 @@ func (s *Server) newConnection(initializeID, initialize []byte) *serverConn {
 		cancel:       cancel,
 		out:          outReader,
 		done:         make(chan struct{}),
-		outbound:     newOutbound(),
-		initializeID: append([]byte(nil), initializeID...),
+		outbound:     out,
+		initializeID: initializeID,
 		initialized:  make(chan initializeAnswer, 1),
 		inboxSignal:  make(chan struct{}, 1),
-		inbox:        [][]byte{append(append([]byte(nil), initialize...), '\n')},
+	}
+	if initialize != nil {
+		connection.inbox = [][]byte{append(append([]byte(nil), initialize...), '\n')}
 	}
 	s.mu.Lock()
 	if s.conns == nil {
@@ -440,7 +448,8 @@ type serverConn struct {
 	done chan struct{}
 
 	// initializeID is the id of the initialize request; the router hands the
-	// first valid response with that id to initialized.
+	// first valid response with that id to initialized. It is nil for a
+	// WebSocket connection, which answers nothing inline.
 	initializeID []byte
 	initialized  chan initializeAnswer
 
@@ -529,7 +538,7 @@ func (in *agentInput) Close() error {
 // goes to the connection stream verbatim.
 func (c *serverConn) route() {
 	reader := bufio.NewReader(c.out)
-	initializing := true
+	initializing := c.initializeID != nil
 	for {
 		line, err := lines.ReadLine(reader)
 		if err == nil {

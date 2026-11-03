@@ -133,7 +133,8 @@ The Rust workspace also contains crates that #17 did not ask about, listed here
 so the decision trail is complete:
 
 - `agent-client-protocol-http` — HTTP/WebSocket transport, implemented as the
-  opt-in draft package `transport/http` (HTTP + SSE; WebSocket deferred).
+  opt-in draft package `transport/http` (HTTP + SSE and WebSocket, with a
+  standard-library RFC 6455 codec).
 - `agent-client-protocol-derive` — a Rust `proc-macro` crate for trait derivation
   with no Go analogue.
 - `agent-client-protocol-polyfill` — backward-compatibility proxies (for example

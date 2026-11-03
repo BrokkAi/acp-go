@@ -13,6 +13,44 @@ series, minor releases may contain breaking API changes.
   `$/cancel_request`, plain or wrapped in any number of `proxy/successor`
   envelopes, so forwarding code can drop it instead of relaying a
   connection-scoped id (#69).
+- The draft HTTP transport (`transport/http`) speaks the WebSocket binding of
+  Rust `agent-client-protocol-http` 5.0.0 (#64), with RFC 6455 framing
+  implemented on the standard library, so the dependency policy is unchanged:
+  - `acphttp.Server` upgrades a `GET` of the endpoint that passes axum's
+    `WebSocketUpgrade` checks and serves any other `GET` as before. An upgrade
+    whose `Origin` the CORS policy does not allow gets
+    `403 WebSocket origin not allowed`; one without `Origin` passes. A
+    request body is read and discarded before the upgrade, as hyper does.
+    The `101`
+    carries the Rust server's headers, in its order, with the connection id
+    in `acp-connection-id`, and no subprotocol or extension. Each socket runs
+    one `Entry.Serve`, so any `agent.Runtime` or `v2/agent.Runtime` is served
+    unchanged.
+  - Each text frame is one JSON-RPC message, forwarded as a `POST` body is; a
+    JSON array frame gets one `-32600`/`id: null` frame and none of its
+    entries is forwarded. Binary frames and pongs are ignored and pings
+    answered. Frames may hold 16 MiB and messages 64 MiB; text must be UTF-8;
+    masking, reserved bits and opcodes, and fragmentation are checked as
+    tungstenite checks them.
+  - As in the Rust crate, neither side answers a close frame: a close frame
+    or protocol violation from the client ends the connection and stops the
+    agent, and an agent that finishes, `DELETE`, or `Server.Close` delivers
+    what was queued and closes the socket without a close frame. `POST`,
+    `GET` (`409`, or `404` with a session), and `DELETE` with the
+    connection id behave as in the Rust crate.
+  - `acphttp.Dial` accepts `ws://` and `wss://`: the handshake goes through a
+    copy of `Client.HTTP` with no redirects, HTTP/1.1 only, and reqwest's
+    request headers (`Accept: */*`, no `User-Agent`, no compression);
+    `Client.HTTP.Timeout` bounds the handshake only. It is checked
+    before any ACP data, failing with the Rust client's
+    `WebSocket connect failed: ...` texts. The connection writes one masked
+    text frame per message and fails with `WebSocket closed by peer: ...`,
+    `ws recv: ...`, or `ws send: ...` as the Rust client does; `Close` sends
+    a close frame without a payload. Other schemes are refused with
+    `unsupported URL scheme: <scheme>; expected http, https, ws, or wss`.
+  - Cancellation can be sent as soon as the socket is open, including while
+    `initialize` is in flight.
+
 - A standard-library MCP server framework in `mcp` and `v2/mcp`, mirroring
   Rust `agent-client-protocol` 5.0.0's `mcp_server` module and the tool-call
   rules of `agent-client-protocol-rmcp`'s `rmcp_3` builder (#63). The types are
