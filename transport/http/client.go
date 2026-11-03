@@ -20,8 +20,11 @@ import (
 	"github.com/BrokkAi/acp-go/internal/serdejson"
 )
 
-// Client connects one ACP connection to a draft Streamable HTTP endpoint. The
-// zero value targets Endpoint with http.DefaultClient.
+// Client connects one ACP connection to a draft Streamable HTTP endpoint, over
+// HTTP and SSE for an http:// or https:// endpoint and over one WebSocket for
+// a ws:// or wss:// one. The zero value targets Endpoint with
+// http.DefaultClient. A WebSocket handshake goes through a copy of HTTP that
+// follows no redirects and speaks only HTTP/1.1.
 type Client struct {
 	Endpoint string
 	HTTP     *http.Client
@@ -32,8 +35,11 @@ type Client struct {
 // usual Initialize, NewSession, and Prompt methods; the HTTP specifics stay
 // behind this package. A base URL targets the standard /acp endpoint: an empty
 // path becomes /acp, and other paths gain /acp unless they already end in it,
-// matching the Rust client. options configure the connection as in
-// acp.Connect, for example acp.WithErrorHandler or acp.WithProtocolVersion.
+// matching the Rust client. The scheme picks the binding: http and https use
+// POST and SSE, ws and wss one WebSocket, and any other scheme is refused;
+// the transport never falls back from one binding to another. options
+// configure the connection as in acp.Connect, for example
+// acp.WithErrorHandler or acp.WithProtocolVersion.
 func Dial(ctx context.Context, endpoint string, h acp.Handler, n acp.Notifications, options ...acp.ConnectOption) (*acp.Connection, error) {
 	return Client{Endpoint: endpoint}.Dial(ctx, h, n, options...)
 }
@@ -50,10 +56,26 @@ func (c Client) Dial(ctx context.Context, h acp.Handler, n acp.Notifications, op
 	if client == nil {
 		client = http.DefaultClient
 	}
+	switch scheme := endpointScheme(endpoint); scheme {
+	case "http", "https":
+	case "ws", "wss":
+		return dialWebSocket(ctx, endpoint, client, h, n, options...)
+	default:
+		return nil, fmt.Errorf("unsupported URL scheme: %s; expected http, https, ws, or wss", scheme)
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	reader, writer := io.Pipe()
 	transport := &httpTransport{endpoint: endpoint, http: client, ctx: ctx, cancel: cancel, feed: writer}
 	return acp.Connect(reader, transport, h, n, options...), nil
+}
+
+// endpointScheme is the scheme of a normalized endpoint, lower case.
+func endpointScheme(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return ""
+	}
+	return parsed.Scheme
 }
 
 func normalizeEndpoint(raw string) (string, error) {

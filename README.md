@@ -511,17 +511,21 @@ a transport: the SDK still speaks stdio by default.
 
 `github.com/BrokkAi/acp-go/transport/http` is an explicit, opt-in binding for the
 draft Streamable HTTP transport, matching the Rust `agent-client-protocol-http`
-5.0.0 server: `POST` with `application/json` for frames, `Acp-Connection-Id`
-and `Acp-Session-Id` headers, a connection-level and per-session
-`text/event-stream` `GET` that buffers frames until the client opens it, and
-`DELETE` to tear a connection down. `Dial` returns a normal `acp.Connection`, so
-callers drive it with the usual methods, and any `agent.Runtime` can be served
-with `acphttp.NewServer`, whose `ServerOptions` set the path, an opt-in CORS
-policy, the `/health` endpoint, and the 16 MiB body limit. Stdio stays the
-default and the transport never falls back between bindings; see
-[docs/http-transport.md](docs/http-transport.md) for the binding and its limits
-(no WebSocket yet). A JSON array `POST` body gets `400` with the JSON-RPC batch
-rejection.
+5.0.0 server and client: `POST` with `application/json` for frames,
+`Acp-Connection-Id` and `Acp-Session-Id` headers, a connection-level and
+per-session `text/event-stream` `GET` that buffers frames until the client opens
+it, `DELETE` to tear a connection down, and a WebSocket upgrade of the same
+`GET` that carries one JSON-RPC message per text frame over one socket, with
+the upgrade's `Origin` checked against the CORS policy. `Dial` returns a normal
+`acp.Connection` for an `http(s)://` or `ws(s)://` URL, so callers drive it with
+the usual methods, and any `agent.Runtime` can be served with
+`acphttp.NewServer`, whose `ServerOptions` set the path, an opt-in CORS policy,
+the `/health` endpoint, and the 16 MiB body limit. The WebSocket framing is
+implemented with the standard library. Stdio stays the default and the
+transport never falls back between bindings; see
+[docs/http-transport.md](docs/http-transport.md) for the binding and its limits.
+A JSON array `POST` body gets `400` with the JSON-RPC batch rejection, and a
+JSON array text frame gets the same error as one frame.
 
 ## Contributing
 

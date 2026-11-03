@@ -113,7 +113,7 @@ only remaining work.
     handler errors are reported rather than fatal, and incoming requests are
     not limited.
 - Streamable HTTP server parity with Rust `agent-client-protocol-http` 5.0.0
-  (#65), apart from WebSocket (#64):
+  (#65):
   - a connection stream and per-session streams under the Rust session-naming
     rules (rust-sdk #483), with the 16-stream cap on unnamed sessions, `409`
     for a second subscriber, and stream removal on `session/close` and
@@ -124,6 +124,20 @@ only remaining work.
     allowlist without credentials,
   - a client that opens session streams the way the Rust client does and
     sends `DELETE` on close.
+- WebSocket binding parity with Rust `agent-client-protocol-http` 5.0.0
+  (#64), with a standard-library RFC 6455 codec and no dependency-policy
+  change:
+  - the server upgrades `GET` under axum's extractor checks, falls back to
+    the event-stream `GET` otherwise, checks `Origin` against the CORS
+    policy (`403`), and answers `101` with the Rust headers and connection
+    id, serving any `agent.Runtime` or `v2/agent.Runtime`,
+  - one JSON-RPC message per text frame, a `-32600`/`id: null` frame for an
+    array, binary frames ignored, pings answered, tungstenite's frame and
+    message limits and protocol checks, and no close frame answered or sent,
+  - `Dial` on `ws://`/`wss://` with an HTTP/1.1, no-redirect handshake
+    validated before any ACP data and the Rust client's error texts,
+  - recorded raw exchanges with the Rust server and client replayed as
+    parity tests.
 - Rust-shaped v2 session command surface:
   - reusable session-update projection storing messages, thoughts, tool
     calls, terminals, compactions, session info, and usage with

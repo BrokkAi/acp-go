@@ -23,6 +23,11 @@ proposal in progress:
     `params.sessionId`, matching the set of methods that require it in the
     Rust crate.
   - `DELETE {endpoint}` with `Acp-Connection-Id` tears the connection down.
+  - A WebSocket upgrade of `GET {endpoint}` opens a connection that carries
+    every frame, one JSON-RPC message per text frame, both ways over one
+    socket. The 101 response returns the connection id in
+    `Acp-Connection-Id`. An upgrade with an `Origin` the CORS policy does not
+    allow gets 403. `Dial` opens this binding for a ws:// or wss:// URL.
 
 ServerOptions configures the path, a CORS policy (disabled by default), the
 `/health` endpoint (enabled by default), and the 16 MiB POST body limit. Its
@@ -42,8 +47,13 @@ a fixed order, other envelope members dropped, and values written as
 serde_json writes them. The server forwards an agent line that is not a
 message to the connection stream verbatim. See `docs/http-transport.md`.
 
-WebSocket upgrade is not implemented yet; see `docs/http-transport.md` for the
-remaining limits. This transport never falls back to stdio or between
-transports: a caller chooses one binding explicitly.
+The WebSocket framing is a standard-library implementation of RFC 6455 that
+takes and refuses the frames tungstenite does with its default configuration:
+no subprotocols or extensions, 16 MiB frames, 64 MiB messages, binary frames
+ignored, and pings answered. Neither side answers a close frame, and the
+server closes the socket without one, as the Rust crate does. See
+`docs/http-transport.md` for the binding and its limits. This transport never
+falls back to stdio or between transports: the URL scheme chooses one binding
+explicitly.
 */
 package acphttp

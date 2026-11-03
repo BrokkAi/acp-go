@@ -1,7 +1,8 @@
 # Draft Streamable HTTP transport
 
 `github.com/BrokkAi/acp-go/transport/http` (package `acphttp`) is an explicit,
-opt-in binding for the ACP *Streamable HTTP* transport. The ACP specification
+opt-in binding for the ACP *Streamable HTTP* transport, over HTTP + SSE and over
+WebSocket. The ACP specification
 still lists that transport as a draft proposal in progress, so this package is
 gated three ways:
 
@@ -17,6 +18,11 @@ The wire shape mirrors the reference Rust crate
 (`streamable-http-websocket-transport`); status codes, bodies, and headers
 follow the Rust server.
 
+The package uses the standard library only, as the rest of the SDK does: the
+WebSocket handshake goes through `net/http` (`Hijack` on the server, an
+`http.Client` upgrade on the client), and the RFC 6455 framing is implemented in
+the package. The dependency policy in `licenses/README.md` is unchanged.
+
 ## Binding
 
 | Element | Behavior |
@@ -26,6 +32,7 @@ follow the Rust server.
 | `POST` later frames | Also `application/json`, with `Acp-Connection-Id`; queued for the agent and answered `202 Accepted` with an empty body, and the response arrives on a stream. |
 | Session identity | A session is named by the `Acp-Session-Id` header or by `params.sessionId`. The header is written into `params.sessionId` before the frame reaches the agent; a conflicting or non-string `params.sessionId`, or non-object params, is a `400`. The session-scoped methods the Rust crate lists (`session/prompt`, `session/cancel`, `session/close`, `session/delete`, `session/fork`, `session/load`, `session/resume`, `session/set_config_option`, `session/set_mode`, `session/set_model`) need one or the other. `$/cancel_request` is connection-scoped and never takes the header. |
 | `GET` stream | `Accept: text/event-stream` with `Acp-Connection-Id` opens the connection stream; adding `Acp-Session-Id` opens that session's stream. Frames arrive as `data:` events, with an empty comment every 15 idle seconds. |
+| `GET` upgrade | A WebSocket upgrade opens a connection that carries every frame over one socket; see [WebSocket](#websocket). |
 | `DELETE` | With `Acp-Connection-Id`, stops the agent, ends the connection's streams after what is already queued, and answers `202`. |
 | Health | `GET /health` answers `ok` unless `ServerOptions.DisableHealth` is set. |
 
@@ -43,6 +50,7 @@ follow the Rust server.
 | `POST` body that is not valid UTF-8 | `400` `Invalid JSON-RPC: ` followed by the text of Rust's `Utf8Error`, such as `invalid utf-8 sequence of 1 bytes from index 0` |
 | `initialize` when the agent exits first | `500` `agent closed before initialize response` |
 | `GET` without the event-stream `Accept` | `406` `client must accept text/event-stream` |
+| WebSocket upgrade with an `Origin` the CORS policy does not allow | `403` `WebSocket origin not allowed` |
 | `GET` or `DELETE` without `Acp-Connection-Id` | `400` `Acp-Connection-Id header required` |
 | `GET` of a stream that already has a subscriber | `409` `outbound stream already has a subscriber` |
 | `GET` of an unknown session once 16 unconfirmed streams are open | `404` `unknown Acp-Session-Id` |
@@ -109,7 +117,9 @@ Rust crate's `ServerOptions::default()`:
 
 On the HTTP `POST` path, the body limit is the only frame-size limit, as in
 the Rust crate: the agent's frames, its event-stream events, and the
-`initialize` response the client reads may be of any size.
+`initialize` response the client reads may be of any size. The WebSocket
+binding instead has tungstenite's limits: 16 MiB per frame and 64 MiB per
+message.
 
 `acphttp.NewServer` validates the options; a `Server` built as a literal with
 invalid options answers every request with `500`.
@@ -130,9 +140,182 @@ the server behaves like the Rust crate's tower-http layer:
 CORS is not authentication. The built-in policy does not allow `Authorization`
 and never sends `Access-Control-Allow-Credentials`; hosts that need a
 credential policy keep CORS disabled here and wrap the server with their own.
-The same policy is the origin check for the WebSocket binding (#64): a request
-without `Origin` passes, a disabled policy rejects any `Origin`, and an
-allowlist must match it exactly.
+The same policy is the origin check for WebSocket upgrades, even when a host
+supplies its own HTTP CORS layer: a request without `Origin` passes, a
+disabled policy rejects any `Origin` with `403`, and an allowlist must match
+it exactly.
+
+## WebSocket
+
+A `GET` of the endpoint that asks for a WebSocket upgrade opens a connection
+that carries every frame both ways over one socket, as the Rust crate's
+`GET /acp` WebSocket upgrade does. Requests and responses carry no connection
+or session headers after the handshake.
+
+### Handshake
+
+The server takes the upgrade when the request passes the checks of axum's
+`WebSocketUpgrade` extractor, which the Rust crate tries first:
+
+- an HTTP/1.1 `GET` (`HEAD`, HTTP/1.0, and HTTP/2 requests are served as
+  ordinary `GET`s),
+- a first `Connection` header that contains `upgrade` in any case, as a
+  substring,
+- a first `Upgrade` header equal to `websocket` in any case,
+- a `Sec-WebSocket-Key` header of any value,
+- a first `Sec-WebSocket-Version` header equal to `13`,
+- a response writer that can be hijacked.
+
+A request that fails one of them is not an upgrade: it is served as the
+event-stream `GET`, so it gets `406`, `400`, or the event stream exactly as the
+Rust crate answers it. An upgrade then passes the origin check: a request with
+an `Origin` header that `ServerOptions.CORS` does not allow gets
+`403 WebSocket origin not allowed`. A request without `Origin` always passes,
+so the check is not authentication.
+
+The server answers `101 Switching Protocols` with the headers the Rust server
+writes, in its order and case: `connection: upgrade` (`upgrade, close` when
+the request's `Connection` lists `close`, as hyper writes it),
+`upgrade: websocket`, `sec-websocket-accept`, `acp-connection-id` with the new
+connection's id, the CORS headers when CORS is enabled, and `date`. It selects
+no subprotocol and no extension, whatever the request offers. A request body,
+which hyper reads before it hands the connection over, is read and discarded
+first, so it is never taken for frames; it is not buffered, and like the
+Rust crate the server does not bound its size. Each upgrade starts one
+`Entry.Serve`; the agent sees no initialize handling of its own, so it can
+send frames before the client's first message.
+
+`Dial` accepts `ws://` and `wss://` endpoints, with the same `/acp` path rule
+as HTTP. Like the Rust client, it sends the handshake before anything else
+and checks the answer before any ACP message goes out, failing with
+`WebSocket connect failed: ` and the reason:
+
+- the handshake is a `GET` of the `http://` or `https://` form of the
+  endpoint, with `Connection: Upgrade`, `Upgrade: websocket`,
+  `Sec-WebSocket-Version: 13`, a random 16-byte `Sec-WebSocket-Key`, and
+  reqwest's defaults: `Accept: */*`, no `User-Agent`, and no
+  `Accept-Encoding`;
+- it goes through a copy of `Client.HTTP` (or `http.DefaultClient`) that
+  follows no redirects and, for an `*http.Transport`, speaks only HTTP/1.1
+  and requests no compression. These are applied after the caller's
+  configuration, as the Rust client applies them after `configure_http`.
+  Proxies, TLS settings, and dialers of the caller's transport still apply;
+- `Client.HTTP.Timeout` bounds the handshake only, as reqwest's request
+  timeout covers the opening handshake but not the upgraded socket;
+- a response that is not HTTP/1.1 fails with
+  `expected HTTP/1.1, received HTTP/2.0; preconfigured TLS must use HTTP/1.1 ALPN`,
+  a status other than `101` with `unexpected status ` and the status, such as
+  `301 Moved Permanently`, then `invalid upgrade header` (not exactly one
+  `Upgrade: websocket`), `invalid connection header` (no `upgrade` token),
+  `invalid Sec-WebSocket-Accept` (not exactly one, matching value), and
+  `unsupported sec-websocket-protocol` or
+  `unsupported sec-websocket-extensions` for a response that has either
+  header;
+- a refused handshake closes its connection.
+
+`Dial`'s context bounds the handshake and the connection's whole life, as it
+bounds the HTTP binding's requests, so pass a context that lives as long as
+the connection and bound the handshake with `Client.HTTP.Timeout`:
+
+```go
+client := acphttp.Client{Endpoint: "wss://agent.example.com", HTTP: &http.Client{Timeout: 10 * time.Second}}
+connection, err := client.Dial(context.Background(), clientHandler, notifications)
+```
+
+Neither side sets a write deadline on the socket, as the Rust crate's sends
+wait without one: a peer that stops reading stalls the writer until the
+socket fails or is closed. Any scheme other than `http`, `https`, `ws`, and
+`wss` is refused with
+`unsupported URL scheme: <scheme>; expected http, https, ws, or wss`. The
+scheme picks the binding, and the transport never falls back from one to the
+other.
+
+### Frames
+
+The SDK implements RFC 6455 framing itself, as the Rust crate gets it from
+tungstenite with its default configuration, so both sides take and refuse the
+same frames:
+
+- Every message is one text frame holding one JSON-RPC message, sent
+  unfragmented with the shortest length form. A client masks each frame with
+  a fresh random key; the server does not mask.
+- Fragmented messages are reassembled, with control frames between
+  fragments. A frame may hold 16 MiB and a message 64 MiB: a longer frame
+  fails as soon as its header is read, and a longer message at the fragment
+  that crosses the limit.
+- A text message must be UTF-8; a fragmented one is checked fragment by
+  fragment.
+- Binary frames are ignored, and so are pongs. A ping is answered with a
+  pong carrying its payload.
+- A server frame must not be masked and a client frame must be. Reserved
+  bits, reserved opcodes, a continuation without a message, a new message
+  inside a fragmented one, and a fragmented or over-125-byte control frame
+  are protocol violations.
+
+On the server, a text frame goes to the agent as a `POST` body does: a
+JSON-RPC message re-serialized as the Rust crate serializes it, and anything
+else made one line, so the agent answers a frame that is not JSON with
+`-32700` and one that is not a message with `-32600`. A JSON array, including
+`[]`, is answered with one `-32600`/`id: null` text frame, and none of its
+entries is forwarded; the socket stays open. The `Acp-Session-Id` rules do not
+apply to frames, so a session method without a session is forwarded as is.
+Every agent line goes to the socket, a JSON-RPC message re-serialized and
+anything else verbatim, in the order the agent wrote it.
+
+On the client, every frame the connection writes is one text frame, a
+JSON-RPC message re-serialized and anything else verbatim, with no
+first-message rule. A text frame received is handed to the connection as an
+HTTP event is: a JSON-RPC message re-serialized, anything else made one line,
+and a frame of several lines that is not JSON answered with the parse error
+the connection would send. An array is malformed.
+
+### Closing
+
+Neither side answers a close frame, and the server never sends one, matching
+the Rust server and client, which drop the socket instead:
+
+- The server ends the connection at once, and stops the agent, when the
+  client sends a close frame, breaks the protocol, or the socket fails or
+  ends. As in the Rust crate, a message that arrived together with the close
+  frame or the violation, so that both were read at once, does not reach the
+  agent: messages are handed over only once no further frame is already
+  buffered.
+- When the agent finishes, or `DELETE` (with the connection id from the
+  `101`) or `Server.Close` ends the connection, the server writes what the
+  agent sent and closes the socket.
+- When the agent stops reading, the next text frame stops the server reading
+  the socket, which still delivers what the agent sends until it finishes.
+- The client's `Close` sends a close frame without a payload and closes the
+  socket without waiting.
+- A close frame from the server fails the client with
+  `WebSocket closed by peer: ` and the frame as Rust debug-prints it, such as
+  `None` or `Some(CloseFrame { code: Normal, reason: Utf8Bytes(b"bye") })`.
+  A code that may not be received (1005, 1006, 1015, reserved, and out of
+  range codes) reads as `Some(CloseFrame { code: Protocol, reason: Utf8Bytes(b"Protocol violation") })`.
+- Any other failure fails the client with `ws recv: ` or `ws send: ` and
+  tungstenite's text, such as
+  `ws recv: WebSocket protocol error: Connection reset without closing handshake`,
+  `ws recv: Space limit exceeded: Message too long: 16777217 > 16777216`, or
+  `ws recv: UTF-8 encoding error: invalid utf-8 sequence of 1 bytes from index 6`.
+  Later writes fail with the same error.
+
+### Connection id
+
+The WebSocket connection is registered under the id the `101` returns, as in
+the Rust crate, so HTTP requests can name it:
+
+- a `POST` with `Acp-Connection-Id` is forwarded to the agent with the HTTP
+  session header rules and answered `202`, and the agent's response arrives
+  on the socket;
+- an event-stream `GET` gets `409 outbound stream already has a subscriber`,
+  or `404 unknown Acp-Session-Id` with `Acp-Session-Id`;
+- `DELETE` ends the connection as above;
+- an `initialize` `POST` opens a new HTTP connection, as it always does.
+
+Cancellation can be sent at any point after the socket is open, including
+while `initialize` is in flight, since the socket carries frames in order
+from the start; with HTTP + SSE it needs the connection id that `initialize`
+returns.
 
 ## JSON-RPC batches
 
@@ -273,6 +456,15 @@ connection, err := acphttp.Dial(ctx, "https://agent.example.com", clientHandler,
 initialization, err := connection.InitializeWithInfo(ctx, capabilities, info)
 ```
 
+The same call with a `ws://` or `wss://` URL opens one WebSocket instead:
+
+```go
+connection, err := acphttp.Dial(ctx, "wss://agent.example.com", clientHandler, notifications)
+```
+
+The server needs nothing more: the `Server` that serves HTTP + SSE also takes
+WebSocket upgrades on the same endpoint.
+
 Both `github.com/BrokkAi/acp-go/agent.Runtime.Serve` and
 `.../v2/agent.Runtime.Serve` satisfy `acphttp.Entry`, so the same agent
 implementation can be served over stdio or HTTP without changes.
@@ -281,9 +473,11 @@ implementation can be served over stdio or HTTP without changes.
 
 These are out of scope for this package today:
 
-- **No WebSocket upgrade.** The Rust server can also upgrade `GET` to
-  WebSocket; that is #64, and it will reuse `ServerOptions.CORS` for its
-  `Origin` check.
+- **WebSocket over HTTP/1.1 only.** As in the Rust crate, there is no HTTP/2
+  (RFC 8441) or HTTP/3 WebSocket, and no subprotocol or extension, including
+  compression. A client handshake through a custom `http.RoundTripper` is sent
+  as that round tripper sends it, and fails unless the answer is an HTTP/1.1
+  `101` whose body can be written.
 - **Connections live until the agent exits.** There is no idle timeout, so a
   server must call `Server.Close`, or the client `DELETE`, to release them.
 
@@ -306,3 +500,25 @@ body limit, invalid UTF-8, and an agent that stops reading.
 cover the client's stream lifecycle and `DELETE`, the initialize outcomes, the
 `Accept` header, a large `initialize` body, and a failed `session/new`
 `POST`.
+
+The WebSocket binding is checked against the Rust crate itself.
+`testdata/websocket_rust_server.json` records 141 raw exchanges with the Rust
+`AcpHttpServer` serving a `Lines` agent: handshake variants (each extractor
+check, `HEAD`, HTTP/1.0, subprotocols and extensions offered, and the origin
+policy disabled, wildcard, allowed, denied, and absent), frames of every
+length form, fragmentation and interleaved control frames, invalid UTF-8,
+masking, reserved bits and opcodes, oversized frames and messages, binary
+frames, pings and pongs, close frames with every class of code, batches,
+malformed frames, and `POST`, `GET`, and `DELETE` with the connection id.
+`websocket_rust_parity_test.go` replays them against `acphttp.Server` and
+requires the same 101 response, frames, socket ending, HTTP answers, and agent
+input. `testdata/websocket_rust_client.json` records 81 scripted servers
+against the Rust `HttpClient` on a `ws://` URL (handshake answers, frames,
+close frames, and protocol violations), and `websocket_client_parity_test.go`
+requires the same handshake request headers, frames, delivered lines, and
+error text from the Go client. `websocket_test.go` and
+`websocket_internal_test.go` run real v1 and v2 agent runtimes over `ws://`
+and `wss://` (against a server that also offers HTTP/2), cancellation before
+the `initialize` response, `Server.Close`, refused schemes and handshakes, and
+the codec's masking, length forms, fragmentation, size limits, UTF-8 checks,
+and close frames.
