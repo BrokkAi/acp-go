@@ -5,11 +5,15 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/serdejson"
+	unstable "github.com/BrokkAi/acp-go/schema/unstable"
 )
 
-// successorMethod is the reference SDK 5.0.0's proxy successor method, which
-// its outgoing initialize check matches literally.
-const successorMethod = "proxy/successor"
+// The proxy-chains RFD's methods, as the pinned unstable schema names them.
+// The reference SDK 5.0.0's outgoing initialize check matches them literally.
+const (
+	successorMethod       = unstable.ProxySuccessorMethodName
+	proxyInitializeMethod = unstable.ProxyInitializeMethodName
+)
 
 // SuccessorEnclosesInitialize reports whether a request already wraps an
 // initialize in proxy/successor, as the reference SDK's
@@ -37,7 +41,7 @@ func SuccessorEnclosesInitialize(method string, params json.RawMessage) bool {
 			params = next
 		}
 	}
-	return wrapped && (method == "initialize" || method == "proxy/initialize")
+	return wrapped && (method == "initialize" || method == proxyInitializeMethod)
 }
 
 // InvalidPrewrappedInitialize refuses an outgoing initialize that is already
