@@ -147,11 +147,14 @@ func TestUpdateProjectionToolCalls(t *testing.T) {
 // session/update notifications, before the permission handler runs. The
 // handler blocks until the notification that follows the request on the wire
 // has been observed, so applying the subject on the handler path would apply
-// it after that notification.
+// it after that notification. The handler can answer before the read loop
+// reaches the final agent_message_chunk, so the test waits for that chunk to be
+// observed before checking the timeline.
 func TestTrackerRequestsApplyPermissionSubjectInReceiveOrder(t *testing.T) {
 	tracker := NewSessionTracker()
 	notified := make(chan struct{})
-	var once sync.Once
+	chunked := make(chan struct{})
+	var once, chunkOnce sync.Once
 	var atHandler schema.ToolCallUpdate
 	host := permissionFunc(func(ctx context.Context, request schema.RequestPermissionRequest) (schema.RequestPermissionResponse, error) {
 		select {
@@ -167,9 +170,12 @@ func TestTrackerRequestsApplyPermissionSubjectInReceiveOrder(t *testing.T) {
 	_ = local.SetDeadline(deadline)
 	_ = peer.SetDeadline(deadline)
 	client := Connect(local, local, HandlePermissions(nil, host),
-		tracker.TrackerNotifications(func(method string, _ json.RawMessage) error {
+		tracker.TrackerNotifications(func(method string, raw json.RawMessage) error {
 			if method == schema.SessionUpdateMethodName {
 				once.Do(func() { close(notified) })
+				if bytes.Contains(raw, []byte(`"agent_message_chunk"`)) {
+					chunkOnce.Do(func() { close(chunked) })
+				}
 			}
 			return nil
 		}),
@@ -193,6 +199,11 @@ func TestTrackerRequestsApplyPermissionSubjectInReceiveOrder(t *testing.T) {
 	assertWire(t, atHandler, want)
 	call, _ := tracker.Projection("s").ToolCall("call")
 	assertWire(t, call, want)
+	select {
+	case <-chunked:
+	case <-time.After(time.Until(deadline)):
+		t.Fatal("agent_message_chunk not observed")
+	}
 	if got := tracker.Projection("s").Timeline(); !reflect.DeepEqual(got, []EntityRef{{EntityToolCall, "call"}, {EntityAgentMessage, "m"}}) {
 		t.Fatalf("timeline = %v", got)
 	}
