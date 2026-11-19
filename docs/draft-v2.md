@@ -143,6 +143,22 @@ active-work state. Install it before session setup.
   coordination recipe does).
 - Closing a session through its handle drops it from the tracker.
 
+### Subagent sessions
+
+Subagent sessions are part of the stable `schema/v2` package since schema
+crate 1.18, and need no capability. On the client side, `acpv2.SubagentTree`
+folds `subagent_update` associations, `session_message` upserts, and
+`session_message_chunk` appends into a parent/child tree with per-child work
+state and per-session transcripts; compose `tree.Notifications()` with the
+connection's other handlers. `CheckClientMethod` and `Cancel` permit only the
+child mutations an association advertises, and `Restore` treats a replayed
+resume's snapshots as history. On the agent side, `v2/agent` sends them with
+`NotifySubagentUpdate`, `NotifySubagentState`, `NotifySessionMessage`, and
+`NotifySessionMessageChunk`, and builds snapshots and patch fields with
+`RunningState`, `IdleState`, `ErrorState`, `Value`, `Null`, and the rest.
+[unstable-facades.md](unstable-facades.md#subagent-sessions) describes the
+rules both versions share.
+
 ### Cancellation
 
 - `CancelActiveWork` only sends `session/cancel`, like the reference SDK. Only

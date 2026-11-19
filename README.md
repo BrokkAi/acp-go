@@ -166,8 +166,9 @@ all supported:
   response without inserting the message twice.
 - **`replay_complete`** (draft v2), which tells replayed history from live
   updates when a session resumes.
-- **Subagent sessions**, background work, and per-entity cancellation in
-  draft v2.
+- **Subagent sessions** in draft v2, stable since schema 1.18: a client-side
+  `SubagentTree` and agent-side senders, plus background work and per-entity
+  cancellation.
 - **Unstable features** behind explicit imports: `session/options`, session
   fork, archive, status, and titles, LLM providers, auth status, plan
   operations, session cursors, prompt suggestions, agent skills,
@@ -191,9 +192,9 @@ package is `github.com/BrokkAi/acp-go`; its package name is `acp`.
 | `schema` | Generated v1 wire types and method registry | [connection](docs/connection.md#generated-schema-types), [schema pins](docs/schema-pin-workflow.md) |
 | `jsonvalue` | Untyped JSON held as `serde_json` holds it (backs `_meta`) | [connection](docs/connection.md#_meta-and-untyped-json) |
 | `tracecontext` | W3C Trace Context in `_meta` | [connection](docs/connection.md#trace-context) |
-| `v2`, `v2/agent`, `v2/runner`, `schema/v2` | Draft ACP v2 client, agent runtime, one-shot runner, and wire types | [draft v2](docs/draft-v2.md) |
+| `v2`, `v2/agent`, `v2/runner`, `schema/v2` | Draft ACP v2 client, agent runtime, one-shot runner, subagent sessions, and wire types | [draft v2](docs/draft-v2.md) |
 | `agentrouter`, `clientrouter`, `proxyrouter` | Serve or reach v1 and v2 from one endpoint | [draft v2](docs/draft-v2.md#version-routers) |
-| `unstable`, `v2/unstable`, `schema/unstable`, `schema/v2/unstable` | Opt-in unstable features: providers, session fork/archive/status/title/options, auth status, subagents, plans, usage | [unstable facades](docs/unstable-facades.md) |
+| `unstable`, `v2/unstable`, `schema/unstable`, `schema/v2/unstable` | Opt-in unstable features: providers, session fork/archive/status/title/options, auth status, v1 subagents, plans, usage | [unstable facades](docs/unstable-facades.md) |
 | `mcp`, `v2/mcp` | Opt-in MCP-over-ACP and a standard-library MCP server framework | [unstable facades](docs/unstable-facades.md#mcp-server-framework) |
 | `transport/http` | Draft Streamable HTTP and WebSocket transport | [HTTP transport](docs/http-transport.md) |
 | `acptest` | In-memory transport, deterministic test agent, and framing helpers for tests | `go doc` |

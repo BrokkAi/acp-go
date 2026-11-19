@@ -306,15 +306,14 @@ method rename (#69).
 The 1.19.0 pin lands every generated type of schema crates 1.16 through 1.19.
 The SDK behavior Rust 5.1–5.4 adds is delivered: stable system prompts,
 `session/options`, prompt idempotency keys, `replay_complete`, and lossy UTF-8
-line reading. Rust's aggregate-dispatch refactor (#507) changes no behavior
+line reading. Surfaces the schema stabilized moved to the stable packages:
+the draft-v2 subagent helpers (`SubagentTree` to `v2`, the senders to
+`v2/agent`) and system prompts on the stable session lifecycle requests. Rust's aggregate-dispatch refactor (#507) changes no behavior
 and has no Go counterpart.
 
 Remaining, all optional typed helpers over types that already decode and
 encode exactly:
 
-- Subagents are part of the stable draft-v2 schema since 1.18. The Go
-  `SubagentTree` and update constructors still live in `v2/unstable`; moving
-  them to `v2` is an API decision for a later release.
 - Session cursors, prompt suggestions, and agent skills have generated types
   and pass through every runtime and projection, but no projection or
   capability helpers of their own.

@@ -1,18 +1,18 @@
-package unstable
+package agent
 
 import (
 	"context"
 	"errors"
 
 	"github.com/BrokkAi/acp-go/internal/acpvalidate"
-	schema "github.com/BrokkAi/acp-go/schema/v2/unstable"
-	"github.com/BrokkAi/acp-go/v2/agent"
+	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
-// Subagent sessions are part of the draft-v2 baseline session model: there
-// is no client capability, a client must understand subagent_update,
-// session_message, and session_message_chunk, and an agent may send them on
-// any connection.
+// Subagent sessions are part of the draft-v2 baseline session model, and of
+// the stable schema/v2 package since schema crate 1.18: there is no client
+// capability, a client must understand subagent_update, session_message, and
+// session_message_chunk, and an agent may send them on any connection. The
+// client side is github.com/BrokkAi/acp-go/v2.SubagentTree.
 
 // Value returns a patch field that sets value, for the nullable patch fields
 // of schema.SubagentUpdate and schema.SessionMessage.
@@ -94,7 +94,7 @@ func SessionMessageChunkNotification(transcript schema.SessionId, chunk schema.S
 //
 // It fails before writing for a blank parent or child ID and a cwd or
 // additional directory that is not absolute.
-func NotifySubagentUpdate(ctx context.Context, client agent.Client, parent schema.SessionId, update schema.SubagentUpdate) error {
+func NotifySubagentUpdate(ctx context.Context, client Client, parent schema.SessionId, update schema.SubagentUpdate) error {
 	if client == nil {
 		return errors.New("subagent_update requires a client")
 	}
@@ -108,7 +108,7 @@ func NotifySubagentUpdate(ctx context.Context, client agent.Client, parent schem
 // subagents RFD defines for v2: the child's own state_update first, then the
 // same snapshot mirrored on its parent's association. Both describe one
 // logical state, so a client applies the second idempotently.
-func NotifySubagentState(ctx context.Context, client agent.Client, parent, child schema.SessionId, state schema.StateUpdate) error {
+func NotifySubagentState(ctx context.Context, client Client, parent, child schema.SessionId, state schema.StateUpdate) error {
 	if client == nil {
 		return errors.New("state_update requires a client")
 	}
@@ -124,7 +124,7 @@ func NotifySubagentState(ctx context.Context, client agent.Client, parent, child
 // NotifySessionMessage upserts a session-directed message in the transcript
 // of the session named by transcript. It fails before writing for a blank
 // transcript or message ID.
-func NotifySessionMessage(ctx context.Context, client agent.Client, transcript schema.SessionId, message schema.SessionMessage) error {
+func NotifySessionMessage(ctx context.Context, client Client, transcript schema.SessionId, message schema.SessionMessage) error {
 	if client == nil {
 		return errors.New("session_message requires a client")
 	}
@@ -139,7 +139,7 @@ func NotifySessionMessage(ctx context.Context, client agent.Client, transcript s
 // carries no participants; send them with NotifySessionMessage before the
 // first chunk when they are known. It fails before writing for a blank
 // transcript or message ID.
-func NotifySessionMessageChunk(ctx context.Context, client agent.Client, transcript schema.SessionId, chunk schema.SessionMessageChunk) error {
+func NotifySessionMessageChunk(ctx context.Context, client Client, transcript schema.SessionId, chunk schema.SessionMessageChunk) error {
 	if client == nil {
 		return errors.New("session_message_chunk requires a client")
 	}

@@ -46,9 +46,9 @@ func (e *NotCancellableError) Error() string {
 // Agent answers -32602 when the tool call is unknown, already final, or not
 // cancellable, which a race with its final update can still produce.
 //
-// A subagent's child session permits neither method: with the unstable
-// subagent facade, check SubagentTree.CheckClientMethod first, which refuses
-// them on child sessions.
+// A subagent's child session permits neither method: with a SubagentTree,
+// check SubagentTree.CheckClientMethod first, which refuses them on child
+// sessions.
 func (t *SessionTracker) CancelToolCall(ctx context.Context, connection *Connection, sessionID SessionID, toolCallID schema.ToolCallId) error {
 	if t == nil {
 		return fmt.Errorf("session tracker is required")

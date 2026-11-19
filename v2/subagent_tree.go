@@ -1,4 +1,4 @@
-package unstable
+package v2
 
 import (
 	"context"
@@ -11,8 +11,7 @@ import (
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/acpvalidate"
 	"github.com/BrokkAi/acp-go/internal/rpcctl"
-	schema "github.com/BrokkAi/acp-go/schema/v2/unstable"
-	acpv2 "github.com/BrokkAi/acp-go/v2"
+	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
 // SubagentTree is the client side of subagent sessions: it folds the
@@ -254,7 +253,7 @@ func (t *SubagentTree) historical(sessionID schema.SessionId) bool {
 func (t *SubagentTree) applyState(sessionID schema.SessionId, state schema.StateUpdate) {
 	node, isChild := t.nodes[sessionID]
 	if isChild {
-		node.association.State = Value(state)
+		node.association.State = schema.Nullable[schema.StateUpdate]{Set: true, Value: state}
 	}
 	if t.historical(sessionID) {
 		return
@@ -529,10 +528,6 @@ func (t *SubagentTree) LinkedMessage(sessionID schema.SessionId, messageID schem
 	return other, true
 }
 
-func present[T any](field schema.Nullable[T]) bool {
-	return field.Set && !field.Null
-}
-
 // CheckClientMethod applies the restricted-session allowlist to a
 // client-initiated method addressed to sessionID. Ordinary sessions are not
 // restricted. On a child, session/cancel is permitted only while
@@ -554,7 +549,7 @@ func (t *SubagentTree) CheckClientMethod(method string, sessionID schema.Session
 			return fmt.Errorf("subagent session %q does not currently permit %s", sessionID, method)
 		}
 		return nil
-	case schema.SessionStatusMethodName:
+	case sessionStatusMethod:
 		return nil
 	}
 	return fmt.Errorf("%s is not permitted on subagent session %q", method, sessionID)
@@ -566,14 +561,14 @@ func (t *SubagentTree) CheckClientMethod(method string, sessionID schema.Session
 // an idle state whose stop reason is cancelled; Cancel itself changes no
 // state. Cancelling also cascades to descendant work the cancelled work waits
 // on; the client learns which descendants stopped from their state reports.
-func (t *SubagentTree) Cancel(ctx context.Context, connection *acpv2.Connection, sessionID schema.SessionId) error {
+func (t *SubagentTree) Cancel(ctx context.Context, connection *Connection, sessionID schema.SessionId) error {
 	if err := t.CheckClientMethod(schema.SessionCancelMethodName, sessionID); err != nil {
 		return err
 	}
 	if !t.IsSubagent(sessionID) {
 		return fmt.Errorf("session %q is not a known subagent session", sessionID)
 	}
-	return connection.CancelSession(ctx, acpv2.SessionID(sessionID))
+	return connection.CancelSession(ctx, SessionID(sessionID))
 }
 
 // Restore runs send, which resumes the ordinary session sessionID, as a
@@ -674,6 +669,11 @@ func (t *SubagentTree) Disconnected() {
 	clear(t.restores)
 	clear(t.states)
 }
+
+// sessionStatusMethod is the unstable session/status, a read-only query the
+// restricted-session allowlist leaves to its ordinary rules. It is not in the
+// stable registry, so the allowlist names it here.
+const sessionStatusMethod = "session/status"
 
 // restoreMethod reports whether a response to method can mark a restore's
 // boundary.

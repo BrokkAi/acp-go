@@ -461,9 +461,12 @@ client through `agent.ClientFromContext` (`v2/agent.ClientFromContext`), so
 
 ## Subagent sessions
 
-Subagent sessions follow the [RFD](https://agentclientprotocol.com/rfds/subagents)
-and the reference SDK's `unstable_subagents` feature, which only enables the
-schema types; the tree and the senders here are acp-go's. An agent exposes a
+Subagent sessions follow the [RFD](https://agentclientprotocol.com/rfds/subagents).
+In v1 they are unstable (the reference SDK's `unstable_subagents` feature) and
+live in `unstable`. Draft v2 includes them without a feature since schema
+crate 1.18, so their v2 helpers are stable: `SubagentTree` is in `v2` and the
+senders are in `v2/agent`. The schema crate only provides the types; the tree
+and the senders are acp-go's. This section describes both versions. An agent exposes a
 child it delegates work to as its own session: `subagent_update` on the parent
 announces and patches the association, the child's own updates use its session
 ID, and `session_message` upserts and `session_message_chunk` appends report
@@ -495,8 +498,8 @@ them on any connection.
 
 ### Client: the subagent tree
 
-`SubagentTree` (`unstable` and `v2/unstable`) folds the updates in receive
-order. `unstable.Projection` carries one (`Projection.Subagents`); in v2,
+`SubagentTree` (`unstable` for v1, `v2` for draft v2) folds the updates in
+receive order. `unstable.Projection` carries one (`Projection.Subagents`); in v2,
 compose `tree.Notifications()` with the connection's other handlers.
 
 - **Associations.** `subagent_update` is an upsert keyed by the child's session
@@ -589,9 +592,9 @@ connection: no child keeps a live state or control.
 ### Agent: senders
 
 `NotifySubagentUpdate`, `NotifySessionMessage`, and
-`NotifySessionMessageChunk` send the three updates through an `agent.Client`
-(`v2/agent.Client`), and the `*Notification` functions build them for replay
-or hand-wiring. `NotifySubagentState` reports a child's work state: in v1 on
+`NotifySessionMessageChunk` (`unstable` for v1, `v2/agent` for draft v2) send
+the three updates through an `agent.Client` (`v2/agent.Client`), and the
+`*Notification` functions build them for replay or hand-wiring. `NotifySubagentState` reports a child's work state: in v1 on
 its parent's association, the only v1 path; in v2 as the child's own
 `state_update` followed by the same snapshot mirrored on the association.
 `RunningState`, `RequiresActionState`, `UnknownState`, `IdleState`, and

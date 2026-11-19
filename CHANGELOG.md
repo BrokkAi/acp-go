@@ -70,6 +70,16 @@ outcomes pass in all four.
   content), with `-32602` and the reason as string data, before the Agent
   runs. Before, the stable dispatch dropped the prompt, so an agent created
   the session without applying it.
+- **Breaking (API):** the draft-v2 subagent helpers move out of
+  `v2/unstable` into the stable packages, because subagents are part of v2
+  without a feature since schema crate 1.18: `SubagentTree`, `Subagent`,
+  `MessageRef`, and `NewSubagentTree` to `v2`, and `NotifySubagentUpdate`,
+  `NotifySubagentState`, `NotifySessionMessage`, `NotifySessionMessageChunk`,
+  the `*Notification` builders, the state constructors (`RunningState`,
+  `RequiresActionState`, `UnknownState`, `IdleState`, `ErrorState`), and
+  `Value` and `Null` to `v2/agent`. They take the stable `schema/v2` types;
+  behavior is unchanged. The v1 helpers stay in `unstable`, as v1 subagents
+  are still unstable.
 - **Breaking (API):** the unstable `PlanFile`, `PlanUpdateContent.File`, and
   `PlanUpdateContentKindFile` are removed, as schema 1.18 replaces the `file`
   plan type with `path` on markdown plans. The draft-v2

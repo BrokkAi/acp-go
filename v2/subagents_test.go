@@ -1,4 +1,4 @@
-package unstable_test
+package v2_test
 
 import (
 	"context"
@@ -9,13 +9,12 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/acptest"
-	schema "github.com/BrokkAi/acp-go/schema/v2/unstable"
+	schema "github.com/BrokkAi/acp-go/schema/v2"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
-	"github.com/BrokkAi/acp-go/v2/agent"
-	acpunstable "github.com/BrokkAi/acp-go/v2/unstable"
+	agentv2 "github.com/BrokkAi/acp-go/v2/agent"
 )
 
-func observeWire(t *testing.T, tree *acpunstable.SubagentTree, notifications ...string) {
+func observeWire(t *testing.T, tree *acpv2.SubagentTree, notifications ...string) {
 	t.Helper()
 	handle := tree.Notifications()
 	for _, notification := range notifications {
@@ -52,7 +51,7 @@ func canonicalDoc(t *testing.T, document string) string {
 	return encoded(t, value)
 }
 
-func mustSubagent(t *testing.T, tree *acpunstable.SubagentTree, id schema.SessionId) acpunstable.Subagent {
+func mustSubagent(t *testing.T, tree *acpv2.SubagentTree, id schema.SessionId) acpv2.Subagent {
 	t.Helper()
 	subagent, ok := tree.Subagent(id)
 	if !ok {
@@ -64,7 +63,7 @@ func mustSubagent(t *testing.T, tree *acpunstable.SubagentTree, id schema.Sessio
 // v2 patches the association's _meta by top-level key and otherwise keeps
 // the v1 patch rules.
 func TestSubagentTreeAssociationPatchesV2(t *testing.T) {
-	tree := acpunstable.NewSubagentTree()
+	tree := acpv2.NewSubagentTree()
 	observeWire(t, tree,
 		`{"sessionId":"parent","update":{"sessionUpdate":"subagent_update","sessionId":"child","title":"Worker","capabilities":{"cancel":{}},"cwd":"/work","_meta":{"a":1,"b":2}}}`,
 		`{"sessionId":"parent","update":{"sessionUpdate":"subagent_update","sessionId":"child","title":null,"capabilities":{"cancel":null},"_meta":{"a":null,"c":3}}}`,
@@ -99,7 +98,7 @@ func TestSubagentTreeAssociationPatchesV2(t *testing.T) {
 // association; both are one logical state. The parent's background list
 // names its background children.
 func TestSubagentTreeMirrorsChildStateAndBackground(t *testing.T) {
-	tree := acpunstable.NewSubagentTree()
+	tree := acpv2.NewSubagentTree()
 	observeWire(t, tree,
 		`{"sessionId":"parent","update":{"sessionUpdate":"subagent_update","sessionId":"child"}}`,
 		`{"sessionId":"child","update":{"sessionUpdate":"state_update","state":"running"}}`,
@@ -138,7 +137,7 @@ func TestSubagentTreeMirrorsChildStateAndBackground(t *testing.T) {
 }
 
 func TestSubagentTreeMessagesV2(t *testing.T) {
-	tree := acpunstable.NewSubagentTree()
+	tree := acpv2.NewSubagentTree()
 	observeWire(t, tree,
 		`{"sessionId":"child","update":{"sessionUpdate":"session_message_chunk","messageId":"m","content":{"type":"text","text":"a"}}}`,
 		`{"sessionId":"child","update":{"sessionUpdate":"session_message","messageId":"m","senderSessionId":"parent","recipientSessionId":"child","senderMessageId":"out","_meta":{"k":1}}}`,
@@ -149,7 +148,7 @@ func TestSubagentTreeMessagesV2(t *testing.T) {
 	if got := encoded(t, message); !ok || got != canonicalDoc(t, `{"messageId":"m","senderSessionId":"parent","recipientSessionId":"child","senderMessageId":"out","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"_meta":{"k":1,"j":2}}`) {
 		t.Fatalf("message = %s", got)
 	}
-	if ref, ok := tree.LinkedMessage("child", "m"); !ok || ref != (acpunstable.MessageRef{SessionID: "parent", MessageID: "out"}) {
+	if ref, ok := tree.LinkedMessage("child", "m"); !ok || ref != (acpv2.MessageRef{SessionID: "parent", MessageID: "out"}) {
 		t.Fatalf("linked = %+v, %v", ref, ok)
 	}
 	observeWire(t, tree, `{"sessionId":"child","update":{"sessionUpdate":"session_message","messageId":"m","content":[]}}`)
@@ -159,18 +158,24 @@ func TestSubagentTreeMessagesV2(t *testing.T) {
 }
 
 func TestSubagentTreeRestrictsChildMethodsV2(t *testing.T) {
-	tree := acpunstable.NewSubagentTree()
+	tree := acpv2.NewSubagentTree()
 	observeWire(t, tree, `{"sessionId":"parent","update":{"sessionUpdate":"subagent_update","sessionId":"child","capabilities":{"cancel":{}}}}`)
 	for _, method := range []string{
 		schema.SessionPromptMethodName, schema.SessionResumeMethodName, schema.SessionCloseMethodName,
-		schema.SessionDeleteMethodName, schema.SessionForkMethodName, schema.SessionSetConfigOptionMethodName,
+		schema.SessionDeleteMethodName, schema.SessionSetConfigOptionMethodName,
 		schema.ToolCallCancelMethodName, schema.TerminalCancelMethodName,
+		// Unstable methods, and any a later revision adds, are refused too.
+		"session/fork", "session/archive", "session/set_title", "_vendor/mutate",
 	} {
 		if err := tree.CheckClientMethod(method, "child"); err == nil {
 			t.Errorf("%s was permitted on a child", method)
 		}
 	}
 	if err := tree.CheckClientMethod(schema.SessionCancelMethodName, "child"); err != nil {
+		t.Fatal(err)
+	}
+	// The unstable session/status is a read-only query with ordinary rules.
+	if err := tree.CheckClientMethod("session/status", "child"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -211,6 +216,13 @@ func v2Peer(t *testing.T, notifications acp.Notifications) (*acpv2.Connection, *
 	return connection, encoder, frames
 }
 
+func initialize(t *testing.T, connection *acpv2.Connection) {
+	t.Helper()
+	if _, err := connection.InitializeWithInfo(context.Background(), acpv2.Capabilities{}, acpv2.ClientInfo{Name: "client", Version: "1"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func nextFrame(t *testing.T, frames chan map[string]json.RawMessage) map[string]json.RawMessage {
 	t.Helper()
 	select {
@@ -232,7 +244,7 @@ func sessionUpdate(session, body string) json.RawMessage {
 // A session/resume with replay treats the child state_update and
 // association snapshots before its response as history.
 func TestSubagentTreeResumeWithReplay(t *testing.T) {
-	tree := acpunstable.NewSubagentTree()
+	tree := acpv2.NewSubagentTree()
 	connection, encoder, frames := v2Peer(t, tree.Notifications())
 	observeWire(t, tree, `{"sessionId":"root","update":{"sessionUpdate":"subagent_update","sessionId":"child","capabilities":{"cancel":{}},"state":{"state":"running"}}}`)
 
@@ -292,27 +304,27 @@ func TestSubagentTreeResumeWithReplay(t *testing.T) {
 // subagentExtension sends the v2 subagent surface from an Extensions
 // request, through the client the runtime puts on the request context.
 func subagentExtension(ctx context.Context, _ string, _ json.RawMessage) (any, error) {
-	client, _ := agent.ClientFromContext(ctx)
+	client, _ := agentv2.ClientFromContext(ctx)
 	steps := []func() error{
 		func() error {
-			return acpunstable.NotifySubagentUpdate(ctx, client, "parent", schema.SubagentUpdate{
+			return agentv2.NotifySubagentUpdate(ctx, client, "parent", schema.SubagentUpdate{
 				SessionID:    "child",
-				Capabilities: acpunstable.Value(schema.SubagentSessionCapabilities{Cancel: &schema.SessionCancelCapabilities{}}),
-				Cwd:          acpunstable.Value[schema.AbsolutePath]("/work"),
+				Capabilities: agentv2.Value(schema.SubagentSessionCapabilities{Cancel: &schema.SessionCancelCapabilities{}}),
+				Cwd:          agentv2.Value[schema.AbsolutePath]("/work"),
 			})
 		},
 		func() error {
-			return acpunstable.NotifySubagentState(ctx, client, "parent", "child", acpunstable.IdleState(schema.StopReasonEndTurn))
+			return agentv2.NotifySubagentState(ctx, client, "parent", "child", agentv2.IdleState(schema.StopReasonEndTurn))
 		},
 		func() error {
-			return acpunstable.NotifySessionMessage(ctx, client, "parent", schema.SessionMessage{
+			return agentv2.NotifySessionMessage(ctx, client, "parent", schema.SessionMessage{
 				MessageID:          "m",
-				SenderSessionID:    acpunstable.Value[schema.SessionId]("parent"),
-				RecipientSessionID: acpunstable.Value[schema.SessionId]("child"),
+				SenderSessionID:    agentv2.Value[schema.SessionId]("parent"),
+				RecipientSessionID: agentv2.Value[schema.SessionId]("child"),
 			})
 		},
 		func() error {
-			return acpunstable.NotifySessionMessageChunk(ctx, client, "parent", schema.SessionMessageChunk{MessageID: "m", Content: schema.ContentBlock{Text: &schema.TextContent{Text: "hi"}}})
+			return agentv2.NotifySessionMessageChunk(ctx, client, "parent", schema.SessionMessageChunk{MessageID: "m", Content: schema.ContentBlock{Text: &schema.TextContent{Text: "hi"}}})
 		},
 	}
 	for _, step := range steps {
@@ -326,7 +338,7 @@ func subagentExtension(ctx context.Context, _ string, _ json.RawMessage) (any, e
 // Subagent updates are baseline v2: the runtime sends them with no client
 // capability.
 func TestRuntimeSendsSubagentUpdatesWithoutACapability(t *testing.T) {
-	tree := acpunstable.NewSubagentTree()
+	tree := acpv2.NewSubagentTree()
 	var states []string
 	notifications := acpv2.CombineNotifications(tree.Notifications(), func(_ string, raw json.RawMessage) error {
 		var notification schema.UpdateSessionNotification
@@ -337,7 +349,7 @@ func TestRuntimeSendsSubagentUpdatesWithoutACapability(t *testing.T) {
 	})
 	pair := acptest.NewPairWithDeadline(time.Now().Add(5 * time.Second))
 	implementation := &acptest.V2Agent{}
-	runtime := agent.New(implementation)
+	runtime := agentv2.New(implementation)
 	runtime.Extensions = subagentExtension
 	done := make(chan error, 1)
 	go func() { done <- runtime.Serve(context.Background(), pair.B, pair.B) }()
