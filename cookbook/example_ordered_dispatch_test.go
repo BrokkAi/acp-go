@@ -108,12 +108,18 @@ func Example_orderedApplicationDispatch() {
 	}
 	// The projection is application state: only apply touches it.
 	projection := acpv2.NewUpdateProjection()
-	replayed := 0
+	replayed, replayDone := 0, false
 	err = observeSession(ctx, link.A, link.A, notes, directory, func(event applicationEvent) {
 		switch {
+		case event.Update != nil && event.Update.Update.ReplayComplete != nil:
+			// replay_complete ends the replayed history (schema crate
+			// 1.18); later updates are live.
+			replayDone = true
 		case event.Update != nil:
 			projection.Apply(event.Update.Update)
-			replayed++
+			if !replayDone {
+				replayed++
+			}
 		case event.Resumed != nil:
 			if event.Resumed.Err != nil {
 				fmt.Println("resume failed:", event.Resumed.Err)

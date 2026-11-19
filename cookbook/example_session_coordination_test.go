@@ -43,15 +43,41 @@ var errSessionsStopped = errors.New("session coordinator stopped")
 type sessionView struct {
 	Response schema.ResumeSessionResponse
 
-	mu           sync.Mutex
-	updates      []schema.SessionUpdate
+	mu      sync.Mutex
+	updates []schema.SessionUpdate
+	// historyLen is how many leading updates are replayed history. The rest
+	// are live: the replay_complete marker, current-state synchronization,
+	// and everything received after the resume response.
+	historyLen   int
 	disconnected bool
+}
+
+// newSessionView returns the view of a completed resume. replay_complete
+// ends the replayed history (schema crate 1.18); an agent that omits it
+// violates the protocol, but the successful response still certifies
+// everything before it as the history.
+func newSessionView(response schema.ResumeSessionResponse, updates []schema.SessionUpdate) *sessionView {
+	historyLen := len(updates)
+	for i, update := range updates {
+		if update.ReplayComplete != nil {
+			historyLen = i
+			break
+		}
+	}
+	return &sessionView{Response: response, updates: updates, historyLen: historyLen}
 }
 
 func (v *sessionView) Updates() []schema.SessionUpdate {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return append([]schema.SessionUpdate(nil), v.updates...)
+}
+
+// History returns the replayed history, without the live updates after it.
+func (v *sessionView) History() []schema.SessionUpdate {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]schema.SessionUpdate(nil), v.updates[:v.historyLen]...)
 }
 
 // Disconnected reports that the connection ended while the view was open.
@@ -322,7 +348,7 @@ func (s *sessions) receive(event wireEvent) {
 			s.close(event.sessionID)
 			return
 		}
-		view := &sessionView{Response: event.response, updates: current.replay}
+		view := newSessionView(event.response, current.replay)
 		current.phase, current.view, current.leases = ready, view, make(map[uint64]bool)
 		for ticket, reply := range current.waiters {
 			current.leases[ticket] = true
@@ -413,7 +439,7 @@ func Example_v2SessionCoordination() {
 		}
 		resumes, closes := fixture.counts(notes)
 		fmt.Printf("shared view: %t, replayed %d updates, resumes %d, closes %d\n",
-			first.View() == second.View(), len(first.View().Updates()), resumes, closes)
+			first.View() == second.View(), len(first.View().History()), resumes, closes)
 
 		// Releasing the last lease closes the session on the agent. An Open
 		// that arrives meanwhile waits for the close, then resumes afresh.
@@ -426,7 +452,7 @@ func Example_v2SessionCoordination() {
 		defer reopened.Release()
 		resumes, closes = fixture.counts(notes)
 		fmt.Printf("fresh view: %t, replayed %d updates, resumes %d, closes %d\n",
-			reopened.View() != first.View(), len(reopened.View().Updates()), resumes, closes)
+			reopened.View() != first.View(), len(reopened.View().History()), resumes, closes)
 		return nil
 	})
 	if err != nil {
