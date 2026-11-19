@@ -1,5 +1,5 @@
 // Package castparams decodes JSON-RPC params the way the reference Rust SDK
-// 5.0.0 hands them to a typed handler, and builds the data of the -32602 it
+// 5.4.0 hands them to a typed handler, and builds the data of the -32602 it
 // answers when they do not deserialize.
 //
 // The reference SDK's JSON-RPC layer reads absent params as null for every

@@ -108,6 +108,17 @@ func TestClientLifecycleMethodsHaveIndependentWireFixtures(t *testing.T) {
 		]`)
 	})
 
+	t.Run("new session with system prompt", func(t *testing.T) {
+		withPrompts := allCapabilities()
+		withPrompts.AgentCapabilities.SessionCapabilities.SystemPrompt = &schema.SessionSystemPromptCapabilities{}
+		c, requests := singleRequestFixture(t, `{"sessionId":"new-session"}`)
+		if _, err := c.NewSessionWithOptions(ctx, withPrompts, hostRoot+"/tmp", NewSessionOptions{SystemPrompt: NewTextSystemPrompt("Be brief.")}); err != nil {
+			t.Fatal(err)
+		}
+		request := receiveRequest(t, requests)
+		assertJSONEqual(t, request.Params, "systemPrompt", `{"mode":"append","content":[{"type":"text","text":"Be brief."}]}`)
+	})
+
 	t.Run("prompt", func(t *testing.T) {
 		c, requests := singleRequestFixture(t, `{"stopReason":"end_turn"}`)
 		reason, err := c.PromptContent(ctx, init, session, []Content{
@@ -247,6 +258,8 @@ func TestSessionValidationRejectsBeforeWire(t *testing.T) {
 	disabled := false
 	full := allCapabilities()
 	noCapabilities := Initialization{}
+	appendPrompts := allCapabilities()
+	appendPrompts.AgentCapabilities.SessionCapabilities.SystemPrompt = &schema.SessionSystemPromptCapabilities{}
 	falseLoad := Initialization{AgentCapabilities: &schema.AgentCapabilities{LoadSession: &disabled}}
 	falseMCP := Initialization{AgentCapabilities: &schema.AgentCapabilities{
 		MCPCapabilities: &schema.McpCapabilities{HTTP: &disabled, SSE: &disabled},
@@ -317,6 +330,24 @@ func TestSessionValidationRejectsBeforeWire(t *testing.T) {
 		}},
 		{"sse missing url", "SSE MCP server 0 requires a name and URL", func() error {
 			_, err := c.NewSessionWithOptions(ctx, full, hostRoot+"/tmp", NewSessionOptions{MCPServers: []schema.McpServer{NewSSEMCPServer("events", "")}})
+			return err
+		}},
+		{"system prompt unsupported", "agent did not advertise systemPrompt support", func() error {
+			_, err := c.NewSessionWithOptions(ctx, full, hostRoot+"/tmp", NewSessionOptions{SystemPrompt: NewTextSystemPrompt("Be brief.")})
+			return err
+		}},
+		{"system prompt override unsupported", "agent did not advertise systemPrompt override mode support", func() error {
+			prompt := NewTextSystemPrompt("Be brief.")
+			prompt.Mode = schema.SystemPromptModeOverride
+			_, err := c.NewSessionWithOptions(ctx, appendPrompts, hostRoot+"/tmp", NewSessionOptions{SystemPrompt: prompt})
+			return err
+		}},
+		{"load system prompt unsupported", "agent did not advertise systemPrompt support", func() error {
+			_, err := c.LoadSession(ctx, full, schema.LoadSessionRequest{SessionID: "old", Cwd: hostRoot + "/tmp", SystemPrompt: NewTextSystemPrompt("Be brief.")})
+			return err
+		}},
+		{"resume system prompt empty", "systemPrompt content must not be empty", func() error {
+			_, err := c.ResumeSession(ctx, appendPrompts, schema.ResumeSessionRequest{SessionID: "old", Cwd: hostRoot + "/tmp", SystemPrompt: &schema.SystemPrompt{Mode: schema.SystemPromptModeAppend}})
 			return err
 		}},
 		{"load unsupported", "agent did not advertise session/load support", func() error {

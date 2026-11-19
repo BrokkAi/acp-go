@@ -37,12 +37,10 @@ import (
 // that adds sessionCapabilities.list does not gain archive, and one that
 // removes archive leaves the session/list override installed, so the agent
 // still serves the archived filter it no longer announces. systemPrompt is
-// announced from that response too, but checked again after customize: a
-// customize function may add mode.override, while a systemPrompt capability
-// that some advertised lifecycle request would drop (a customize function
-// that adds it without a SystemPromptHandler, or adds loadSession without a
-// SystemPromptLoader, for example) fails the initialize request instead of
-// being sent.
+// announced from that response too, and a customize function may add
+// mode.override, or announce systemPrompt itself for an agent that applies
+// the prompt from the stable requests, which carry it since schema crate
+// 1.16.
 //
 // Install fails without changing runtime when runtime is nil, when
 // runtime.InitializeResult is already set (including by an earlier Install),

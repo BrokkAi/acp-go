@@ -2,7 +2,6 @@ package unstable
 
 import (
 	"context"
-	"errors"
 
 	"github.com/BrokkAi/acp-go/internal/systemprompt"
 	"github.com/BrokkAi/acp-go/internal/unstabledispatch"
@@ -40,8 +39,13 @@ func NewTextSystemPrompt(text string) SystemPrompt {
 	return NewSystemPrompt(schema.ContentBlock{Kind: schema.ContentBlockKindText, Text: &schema.TextContent{Text: text}})
 }
 
-// SystemPromptHandler serves session/new with the client-provided system
-// prompt, which the stable request the agent runtime decodes does not carry.
+// SystemPromptHandler serves session/new from the unstable request, which
+// carries the client-provided system prompt together with the other unstable
+// session setup fields, such as initial configOptions. System prompts are
+// stable since schema crate 1.16: the stable request carries the prompt too,
+// and the agent runtime checks it against the announced capability before the
+// Agent's NewSession runs, so an agent that needs only the prompt can announce
+// sessionCapabilities.systemPrompt in its own initialize response instead.
 // Install serves session/new from NewSessionWithSystemPrompt, in place of the
 // Agent's NewSession, through a runtime override, and announces
 // sessionCapabilities.systemPrompt ({}, append only) when every session
@@ -125,17 +129,6 @@ func advertiseSystemPrompt(handler any, response *schema.InitializeResponse) {
 	if response.AgentCapabilities.SessionCapabilities.SystemPrompt == nil {
 		response.AgentCapabilities.SessionCapabilities.SystemPrompt = &schema.SessionSystemPromptCapabilities{}
 	}
-}
-
-// checkSystemPromptServed refuses, after the customize functions ran, a
-// systemPrompt capability that some advertised lifecycle request would
-// silently drop.
-func checkSystemPromptServed(handler any, response schema.InitializeResponse) error {
-	session := sessionCapabilities(response)
-	if session == nil || session.SystemPrompt == nil || servesSystemPrompt(handler, response) {
-		return nil
-	}
-	return errors.New("unstable.Install: sessionCapabilities.systemPrompt is advertised, but the handler does not serve it on every advertised session lifecycle request (SystemPromptHandler, plus SystemPromptLoader for loadSession, SystemPromptResumer for resume, and ForkHandler for fork)")
 }
 
 // systemPromptRoute is the binding for a lifecycle method whose request

@@ -9,7 +9,7 @@ import (
 )
 
 // The proxy-chains RFD's methods, as the pinned unstable schema names them.
-// The reference SDK 5.0.0's outgoing initialize check matches them literally.
+// The reference SDK 5.4.0's outgoing initialize check matches them literally.
 const (
 	successorMethod       = unstable.ProxySuccessorMethodName
 	proxyInitializeMethod = unstable.ProxyInitializeMethodName

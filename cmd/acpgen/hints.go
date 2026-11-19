@@ -47,7 +47,7 @@ var rustOmittedDefaults = map[string]struct {
 func patchField(r *ir, def, key string) bool {
 	if r.PreserveNull {
 		p, ok := patchDefs[def]
-		return ok && (p.upsert || key != "_meta")
+		return ok && (p.upsert || key != "_meta") && !patchOptional(def, key)
 	}
 	for _, k := range v1PatchDefs[def] {
 		if k == key {
@@ -531,6 +531,13 @@ func fieldHintCases(r *ir, def, owner, base string, f field) ([]hintCase, error)
 			}
 		}
 	}
+	// Checked strings: each length bound, counted in characters, and a
+	// value of the wrong type.
+	if td := resolve(elemType); td != nil && td.Length != nil {
+		for _, c := range lengthCases(td.Length) {
+			cases = append(cases, variantCase{c.name, wrap(c.value)})
+		}
+	}
 	// Hinted fields: a valid value, and values the hint reads leniently.
 	if hinted {
 		malformed := "true"
@@ -560,6 +567,26 @@ func fieldHintCases(r *ir, def, owner, base string, f field) ([]hintCase, error)
 		out = append(out, hintCase{name: owner + "." + f.JSONName + "/" + c.name, def: def, input: doc})
 	}
 	return out, nil
+}
+
+// lengthCases are the values that probe a lengthCheckedStrings bound: the
+// shortest and longest valid values, one character past each bound, the
+// same at the upper bound in two-byte and four-byte characters (the bounds
+// count characters, not bytes), and an integer.
+func lengthCases(l *stringLength) []struct{ name, value string } {
+	str := func(s string, n int) string { return fmt.Sprintf("%q", strings.Repeat(s, n)) }
+	cases := []struct{ name, value string }{
+		{"min-length", str("k", l.Min)},
+		{"too-short", str("k", l.Min-1)},
+		{"max-length", str("k", l.Max)},
+		{"too-long", str("k", l.Max+1)},
+		{"max-length-2-byte", str("é", l.Max)},
+		{"too-long-2-byte", str("é", l.Max+1)},
+		{"max-length-4-byte", str("😀", l.Max)},
+		{"too-long-4-byte", str("😀", l.Max+1)},
+		{"integer", "1"},
+	}
+	return cases
 }
 
 // withMember returns doc with key set to the raw JSON value, or removed when

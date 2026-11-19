@@ -28,6 +28,9 @@ func ValidateNewSessionRequest(initialization schema.InitializeResponse, request
 	if err := validatePaths(capabilities, "session working directory", request.Cwd, "session additional directory", request.AdditionalDirectories); err != nil {
 		return err
 	}
+	if err := validateInitialConfigOptions(capabilities, request.ConfigOptions); err != nil {
+		return err
+	}
 	return ValidateSystemPrompt(initialization, request.SystemPrompt)
 }
 
@@ -44,7 +47,28 @@ func ValidateResumeSessionRequest(initialization schema.InitializeResponse, requ
 	if err := validatePaths(capabilities, "session working directory", request.Cwd, "session additional directory", request.AdditionalDirectories); err != nil {
 		return err
 	}
+	if err := validateInitialConfigOptions(capabilities, request.ConfigOptions); err != nil {
+		return err
+	}
 	return ValidateSystemPrompt(initialization, request.SystemPrompt)
+}
+
+// ValidateSessionOptionsRequest checks a session/options request before it
+// reaches the wire: the agent must advertise capabilities.session.options,
+// cwd must be absolute, additional directories need the additionalDirectories
+// capability and must each be absolute, and a session ID, when present, must
+// be non-blank.
+func ValidateSessionOptionsRequest(initialization schema.InitializeResponse, request schema.SessionOptionsRequest) error {
+	capabilities := sessionCapabilities(initialization)
+	if capabilities == nil || capabilities.Options == nil {
+		return fmt.Errorf("agent did not advertise session/options support")
+	}
+	if request.SessionID != nil {
+		if err := acpvalidate.Identifier("session ID", string(*request.SessionID)); err != nil {
+			return err
+		}
+	}
+	return validatePaths(capabilities, "session/options working directory", request.Cwd, "session/options additional directory", request.AdditionalDirectories)
 }
 
 // ValidateForkRequest checks a session/fork request against the agent's
@@ -64,7 +88,20 @@ func ValidateForkRequest(initialization schema.InitializeResponse, request schem
 	if err := validatePaths(capabilities, "fork working directory", request.Cwd, "fork additional directory", request.AdditionalDirectories); err != nil {
 		return err
 	}
+	if err := validateInitialConfigOptions(capabilities, request.ConfigOptions); err != nil {
+		return err
+	}
 	return ValidateSystemPrompt(initialization, request.SystemPrompt)
+}
+
+// validateInitialConfigOptions requires capabilities.session.options for the
+// initial configOptions of a session setup request, which that capability
+// covers.
+func validateInitialConfigOptions(capabilities *schema.SessionCapabilities, options []schema.InitialSessionConfigOption) error {
+	if len(options) > 0 && capabilities.Options == nil {
+		return fmt.Errorf("agent did not advertise session/options support for initial configOptions")
+	}
+	return nil
 }
 
 // ValidateSystemPrompt checks a client-provided system prompt: the agent must

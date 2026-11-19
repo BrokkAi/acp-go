@@ -107,7 +107,8 @@ func (a *historyAgent) ListSessions(context.Context, agentv2.Client, schema.List
 }
 
 // ResumeSession replays the retained history before it responds, so replay
-// precedes the resume response on the wire.
+// precedes the resume response on the wire, and ends a requested replay with
+// replay_complete, as agents must since schema crate 1.18.
 func (a *historyAgent) ResumeSession(ctx context.Context, client agentv2.Client, request schema.ResumeSessionRequest) (schema.ResumeSessionResponse, error) {
 	a.mu.Lock()
 	history, known := a.history[request.SessionID]
@@ -118,7 +119,8 @@ func (a *historyAgent) ResumeSession(ctx context.Context, client agentv2.Client,
 		return schema.ResumeSessionResponse{}, &acp.RPCError{Code: -32002, Message: "unknown session"}
 	}
 	if request.ReplayFrom != nil && request.ReplayFrom.Start != nil {
-		for _, update := range history {
+		replay := append(history, schema.SessionUpdate{ReplayComplete: &schema.ReplayComplete{}})
+		for _, update := range replay {
 			if err := client.Notify(ctx, schema.SessionUpdateMethodName, acpv2.Update{
 				SessionID: request.SessionID,
 				Update:    update,

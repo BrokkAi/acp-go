@@ -5,9 +5,10 @@ the reference Rust SDK workspace have no Go equivalent, which are worth porting,
 and which are not. This document records that evaluation.
 
 It was checked against Rust `agent-client-protocol` 2.2.0. The baseline in
-[ROADMAP.md](../ROADMAP.md) has since moved to `agent-client-protocol` 5.0.0
-and schema crate 1.15.1; the decisions below still hold, and the conductor
-section notes the one wire-shape change. For each crate we read the workspace
+[ROADMAP.md](../ROADMAP.md) has since moved to `agent-client-protocol` 5.4.0
+and schema crate 1.19.0. The workspace has the same crates at 5.4.0, the
+decisions below still hold, and the conductor section notes the one
+wire-shape change. For each crate we read the workspace
 `Cargo.toml` and its public documentation, then compared the surface with what
 `acp-go` already ships.
 
@@ -100,7 +101,7 @@ component that spawns and manages proxies and appears to the editor as an
 ordinary agent, and it names the Rust `agent-client-protocol-conductor` as the
 canonical implementation that editors use directly. A component SDK only has
 to speak the proxy side of the protocol, which `acp-go` does: `proxyrouter`
-negotiates `proxy/initialize` like Rust 5.0.0's proxy protocol router, and the
+negotiates `proxy/initialize` like Rust 5.4.0's proxy protocol router, and the
 cookbook proxy recipe shows a Go proxy built on the generated envelopes, so a
 Go proxy runs under the reference conductor (#69). A Go conductor's only
 consumer would be an editor pointed at a binary, and no Go proxy-chain user

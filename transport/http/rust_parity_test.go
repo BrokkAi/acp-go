@@ -353,11 +353,15 @@ func (a batchesAgent) Serve(ctx context.Context, in io.ReadCloser, out io.WriteC
 	}
 }
 
-func readStreamToEnd(t *testing.T, url, connectionID, sessionID string) chan string {
+// readStreamPrefix opens a stream and returns a channel that receives its
+// first n bytes, or what arrived before the stream failed or ten seconds
+// passed. The stream is subscribed when it returns.
+func readStreamPrefix(t *testing.T, url, connectionID, sessionID string, n int) chan string {
 	t.Helper()
-	streamed := make(chan string, 1)
-	request, err := http.NewRequest(http.MethodGet, url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
 	request.Header.Set("Accept", "text/event-stream")
@@ -367,28 +371,30 @@ func readStreamToEnd(t *testing.T, url, connectionID, sessionID string) chan str
 	}
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
+	streamed := make(chan string, 1)
 	go func() {
+		defer cancel()
 		defer response.Body.Close()
-		body, err := io.ReadAll(response.Body)
-		if err != nil {
-			streamed <- "error: " + err.Error()
-			return
-		}
-		streamed <- string(body)
+		got := make([]byte, n)
+		read, _ := io.ReadFull(response.Body, got)
+		streamed <- string(got[:read])
 	}()
 	return streamed
 }
 
-// An agent line that is not UTF-8 ends the agent's transport as the Rust line
-// reader's error does: the frames before it are delivered and the streams
-// end, the line and everything after it are dropped, and the connection is
-// gone, so later requests get 404.
-func TestServerEndsConnectionOnAgentLineNotUTF8(t *testing.T) {
+// An agent line that is not UTF-8 is read as the Rust line reader reads it
+// since 5.4: each invalid sequence becomes U+FFFD, so a line with one inside a
+// JSON string is a message carrying the replacement, routed as usual, and any
+// other is a malformed frame sent verbatim on the connection stream. The
+// agent's transport stays up: such a line before the initialize response
+// does not fail initialize, and later requests still reach the agent.
+func TestServerReplacesInvalidUTF8InAgentLines(t *testing.T) {
 	agent := batchesAgent{batches: [][]string{
-		{`{"jsonrpc":"2.0","method":"n/a"}`, `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}`},
-		{`{"jsonrpc":"2.0","method":"n/b","params":{"sessionId":"S"}}`, `{"jsonrpc":"2.0","method":"n/c"}`, "\xff", `{"jsonrpc":"2.0","method":"n/d"}`},
+		{`{"jsonrpc":"2.0","method":"n/a"}`, "\xff", `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}`},
+		{`{"jsonrpc":"2.0","method":"n/b","params":{"sessionId":"S","t":"a` + "\xff" + `b"}}`, "\xe2\x82{", `{"jsonrpc":"2.0","method":"n/c"}`},
 	}}
 	server := httptest.NewServer(&acphttp.Server{Entry: agent})
 	t.Cleanup(server.Close)
@@ -398,42 +404,20 @@ func TestServerEndsConnectionOnAgentLineNotUTF8(t *testing.T) {
 	if want := `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}`; response.StatusCode != http.StatusOK || connectionID == "" || answer != want {
 		t.Fatalf("initialize answered %d %q %q", response.StatusCode, connectionID, answer)
 	}
-	connection := readStreamToEnd(t, url, connectionID, "")
-	session := readStreamToEnd(t, url, connectionID, "S")
+	// The session stream is open before the agent writes to the session.
+	wantSession := "data: {\"jsonrpc\":\"2.0\",\"method\":\"n/b\",\"params\":{\"sessionId\":\"S\",\"t\":\"a\uFFFDb\"}}\n\n"
+	session := readStreamPrefix(t, url, connectionID, "S", len(wantSession))
 	if response, _ := rustProbePost(t, url, connectionID, "", []byte(`{"jsonrpc":"2.0","method":"x/trigger"}`)); response.StatusCode != http.StatusAccepted {
 		t.Fatalf("trigger answered %d", response.StatusCode)
 	}
-	if got, want := <-connection, "data: {\"jsonrpc\":\"2.0\",\"method\":\"n/a\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"n/c\"}\n\n"; got != want {
-		t.Errorf("connection stream = %q, want %q", got, want)
+	wantConnection := "data: {\"jsonrpc\":\"2.0\",\"method\":\"n/a\"}\n\ndata: \uFFFD\n\ndata: \uFFFD{\n\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"n/c\"}\n\n"
+	if got := readStreamBytes(t, url, connectionID, "", len(wantConnection)); got != wantConnection {
+		t.Errorf("connection stream = %q, want %q", got, wantConnection)
 	}
-	if got, want := <-session, "data: {\"jsonrpc\":\"2.0\",\"method\":\"n/b\",\"params\":{\"sessionId\":\"S\"}}\n\n"; got != want {
-		t.Errorf("session stream = %q, want %q", got, want)
+	if got := <-session; got != wantSession {
+		t.Errorf("session stream = %q, want %q", got, wantSession)
 	}
-	if response, answer := rustProbePost(t, url, connectionID, "", []byte(`{"jsonrpc":"2.0","method":"x/after"}`)); response.StatusCode != http.StatusNotFound || answer != "" {
-		t.Errorf("POST after the line answered %d %q, want an empty 404", response.StatusCode, answer)
-	}
-	request, _ := http.NewRequest(http.MethodDelete, url, nil)
-	request.Header.Set(acphttp.HeaderConnectionID, connectionID)
-	deleted, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = deleted.Body.Close()
-	if deleted.StatusCode != http.StatusNotFound {
-		t.Errorf("DELETE answered %d, want 404", deleted.StatusCode)
-	}
-}
-
-// Before the initialize response, such a line ends the agent the same way, so
-// the initialize POST gets the Rust crate's 500.
-func TestServerInitializeFailsOnAgentLineNotUTF8(t *testing.T) {
-	agent := batchesAgent{batches: [][]string{
-		{`{"jsonrpc":"2.0","method":"n/a"}`, "\xff", `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}`},
-	}}
-	server := httptest.NewServer(&acphttp.Server{Entry: agent})
-	t.Cleanup(server.Close)
-	response, answer := rustProbePost(t, server.URL+acphttp.DefaultPath, "", "", []byte(`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}`))
-	if response.StatusCode != http.StatusInternalServerError || response.Header.Get(acphttp.HeaderConnectionID) != "" || answer != "agent closed before initialize response" {
-		t.Fatalf("initialize answered %d %q %q", response.StatusCode, response.Header.Get(acphttp.HeaderConnectionID), answer)
+	if response, _ := rustProbePost(t, url, connectionID, "", []byte(`{"jsonrpc":"2.0","method":"x/after"}`)); response.StatusCode != http.StatusAccepted {
+		t.Errorf("POST after the lines answered %d, want 202", response.StatusCode)
 	}
 }

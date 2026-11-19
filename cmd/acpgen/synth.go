@@ -26,6 +26,9 @@ func synthWire(r *ir, name string, full bool, depth map[string]int) (string, err
 			if td.Kind == kindEnum && len(td.Variants) > 0 {
 				return fmt.Sprintf("%q", td.Variants[0].Const), nil
 			}
+			if td.Length != nil {
+				return fmt.Sprintf("%q", strings.Repeat("k", td.Length.Min)), nil
+			}
 			return `""`, nil
 		}
 		if td.Base == "float64" {

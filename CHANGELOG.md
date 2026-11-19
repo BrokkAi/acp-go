@@ -4,6 +4,96 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
+## 0.14.0 - 2026-11-19
+
+The behavioral reference moves to Rust `agent-client-protocol` **5.4.0**, which
+pins `agent-client-protocol-schema` `=1.19.0`: ACP v1 `schema-v1.33.0`, draft
+v2 `schema-v2.0.0-alpha.17`, and their unstable artifacts, byte for byte. Every
+generated package is regenerated, and the recaptured Rust decode and encode
+outcomes pass in all four.
+
+### Added
+
+- Client-provided system prompts on the stable surfaces, stable since schema
+  crate 1.16 (Rust 5.1):
+  - `schema` and `schema/v2` gain `SystemPrompt`, `SystemPromptMode`, the
+    `SessionSystemPromptCapabilities` types, and `systemPrompt` on
+    `NewSessionRequest`, `ResumeSessionRequest`, and v1 `LoadSessionRequest`.
+  - `acp.NewSessionOptions.SystemPrompt` and `acpv2.NewSessionOptions.SystemPrompt`,
+    and `acp.NewTextSystemPrompt` and `acpv2.NewTextSystemPrompt`. The v1
+    `NewSessionWithOptions`, `LoadSession`, and `ResumeSession` and the v2
+    `NewSessionWithOptions` and `ResumeSession` check a prompt against the
+    advertised capability before writing: the capability, `append` or
+    `override` with `mode.override`, and non-empty text content.
+- Draft-v2 prompt idempotency keys (schema 1.19, Rust 5.4): `acpv2.IdempotencyKey`,
+  `acpv2.NewIdempotencyKey` (a random UUIDv4 in its hyphenated lowercase
+  form, like Rust's `IdempotencyKey::generate`), and
+  `Connection.PromptContentWithKey` and `SessionHandle.PromptContentWithKey`,
+  like Rust's `send_prompt_blocks_with_key`. The generated
+  `schema/v2.IdempotencyKey` has a `Validate` method, and its decoder rejects
+  an empty key or one over 255 characters with the Rust error text.
+- `replay_complete` (schema 1.18) in the stable draft-v2 schema, with
+  subagent sessions (`subagent_update`, `session_message`,
+  `session_message_chunk`, `BackgroundSubagent`, the `unknown` state, and
+  `session` tool call content), which are part of v2 without a feature since
+  1.18.
+- `session/options` (schema 1.17, Rust 5.2) in the unstable facades:
+  `unstable.SessionOptions` and `v2/unstable.SessionOptions`, gated on the
+  options capability, and an `OptionsHandler` that `Handle` and `Install`
+  route. Initial `configOptions` on the unstable session setup requests need
+  the same capability.
+- The other unstable schema additions of 1.16–1.19, as generated types:
+  session cursors (`cursor_update`, `cursorId` on `session/fork`), prompt
+  suggestions, agent skills (draft-v2 `skill` commands and content blocks),
+  the `speed` config option category, `description` on `AuthAccount`, and
+  `configOptions` on `session/fork`.
+- `cmd/acpgen` models string newtypes whose Rust `Deserialize` checks their
+  length (`lengthCheckedStrings`), `patchDefs` fields Rust keeps as a plain
+  `Option`, and the new `InitialSessionConfigOption` flattening; a bounded
+  string def it does not know fails generation.
+
+### Changed
+
+- **Breaking (wire):** a line that is not valid UTF-8 no longer closes
+  `acp.Connection`, as Rust 5.4 (#504) no longer does. Bytes that are not
+  valid UTF-8 are replaced with U+FFFD as `String::from_utf8_lossy` replaces
+  them, each maximal invalid sequence with one character: a line with one
+  inside a JSON string is delivered with the replacement, and any other is
+  answered with `-32700` quoting the replaced line. The agent, proxy, and
+  client protocol routers and the HTTP server's agent line reader read lines
+  the same way; the HTTP server keeps the connection and sends such a line on
+  the connection stream as a malformed frame.
+- **Breaking (wire):** the v1 and draft-v2 agent runtimes answer a
+  `systemPrompt` on `session/new`, `session/load` (v1), and `session/resume`
+  that their initialize response did not announce, or that it does not cover
+  (an unknown mode, `override` without `mode.override`, empty or non-text
+  content), with `-32602` and the reason as string data, before the Agent
+  runs. Before, the stable dispatch dropped the prompt, so an agent created
+  the session without applying it.
+- **Breaking (API):** the draft-v2 subagent helpers move out of
+  `v2/unstable` into the stable packages, because subagents are part of v2
+  without a feature since schema crate 1.18: `SubagentTree`, `Subagent`,
+  `MessageRef`, and `NewSubagentTree` to `v2`, and `NotifySubagentUpdate`,
+  `NotifySubagentState`, `NotifySessionMessage`, `NotifySessionMessageChunk`,
+  the `*Notification` builders, the state constructors (`RunningState`,
+  `RequiresActionState`, `UnknownState`, `IdleState`, `ErrorState`), and
+  `Value` and `Null` to `v2/agent`. They take the stable `schema/v2` types;
+  behavior is unchanged. The v1 helpers stay in `unstable`, as v1 subagents
+  are still unstable.
+- **Breaking (API):** the unstable `PlanFile`, `PlanUpdateContent.File`, and
+  `PlanUpdateContentKindFile` are removed, as schema 1.18 replaces the `file`
+  plan type with `path` on markdown plans. The draft-v2
+  `StringPropertySchema.Pattern` is removed, as schema 1.19 removes `pattern`
+  from v2 elicitation string properties; v1 keeps it.
+- `unstable.Install` and `v2/unstable.Install` no longer fail `initialize`
+  when a customize function announces `systemPrompt` without a
+  `SystemPromptHandler`: since the stable lifecycle requests carry the
+  prompt, no lifecycle request drops it.
+- The draft-v2 example agent honors idempotency keys and ends a requested
+  replay with `replay_complete`, and the cookbook's session coordination and
+  ordered dispatch recipes tell replayed history from live updates with it,
+  like Rust's examples.
+
 ## 0.13.0 - 2026-11-03
 
 ### Added

@@ -8,7 +8,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-agent-client-protocol-schema = { version = "=1.15.1", default-features = false }
+agent-client-protocol-schema = { version = "=1.19.0", default-features = false }
 serde = "=1.0.229"
 serde_json = { version = "=1.0.154", features = ["preserve_order", "raw_value"] }
 

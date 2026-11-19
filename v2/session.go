@@ -66,6 +66,25 @@ func (s *SessionHandle) PromptContent(ctx context.Context, prompt []Content) (Me
 	)
 }
 
+// PromptContentWithKey is PromptContent with an idempotency key, like Rust's
+// ActiveSession::send_prompt_blocks_with_key; see
+// Connection.PromptContentWithKey. A retry the agent recognizes answers with
+// the original messageId and starts no new work, so with a SessionTracker,
+// bound WaitForIdle with ctx after a retry, as after any prompt.
+func (s *SessionHandle) PromptContentWithKey(ctx context.Context, prompt []Content, key IdempotencyKey) (MessageID, error) {
+	if err := key.Validate(); err != nil {
+		return "", err
+	}
+	s.beginWork()
+	return s.connection.PromptContentWithKey(
+		ctx,
+		s.initialization,
+		Session{SessionID: s.sessionID},
+		prompt,
+		key,
+	)
+}
+
 func (s *SessionHandle) beginWork() *ActiveWork {
 	if s.tracker == nil {
 		return nil

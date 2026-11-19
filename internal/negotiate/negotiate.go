@@ -1,5 +1,5 @@
 // Package negotiate implements ACP protocol-version negotiation the way the
-// reference Rust SDK 5.0.0 does: the v1 and draft-v2 agent runtimes negotiate
+// reference Rust SDK 5.4.0 does: the v1 and draft-v2 agent runtimes negotiate
 // each initialize request they receive, and the agent and proxy protocol
 // routers select one configured implementation from the first initialize
 // request on a connection.

@@ -8,6 +8,7 @@ import (
 
 	"github.com/BrokkAi/acp-go/internal/acpvalidate"
 	"github.com/BrokkAi/acp-go/internal/castparams"
+	"github.com/BrokkAi/acp-go/internal/promptrule"
 	"github.com/BrokkAi/acp-go/schema"
 )
 
@@ -15,6 +16,24 @@ import (
 type NewSessionOptions struct {
 	AdditionalDirectories []string
 	MCPServers            []schema.McpServer
+	// SystemPrompt is the client-provided system prompt, sent only when the
+	// agent advertises sessionCapabilities.systemPrompt (stable since
+	// schema crate 1.16). It must use append mode, or override when the
+	// agent advertises mode.override, with only text content; anything else
+	// fails before the request is sent. See NewTextSystemPrompt.
+	SystemPrompt *schema.SystemPrompt
+}
+
+// NewTextSystemPrompt returns an append-mode system prompt with one text block,
+// the mode and content type every agent advertising
+// sessionCapabilities.systemPrompt accepts. Set Mode to
+// schema.SystemPromptModeOverride to replace the agent's default instructions
+// instead, which needs sessionCapabilities.systemPrompt.mode.override.
+func NewTextSystemPrompt(text string) *schema.SystemPrompt {
+	return &schema.SystemPrompt{
+		Mode:    schema.SystemPromptModeAppend,
+		Content: []schema.ContentBlock{NewTextContent(text)},
+	}
 }
 
 func requireAbsolutePath(path string) error {
@@ -89,6 +108,9 @@ func (c *Connection) NewSessionWithOptions(ctx context.Context, init Initializat
 	if err := validateMCPServers(init, options.MCPServers); err != nil {
 		return session, err
 	}
+	if err := promptrule.V1Client(init, options.SystemPrompt); err != nil {
+		return session, err
+	}
 	if options.MCPServers == nil {
 		options.MCPServers = make([]schema.McpServer, 0)
 	}
@@ -96,6 +118,7 @@ func (c *Connection) NewSessionWithOptions(ctx context.Context, init Initializat
 		Cwd:                   directory,
 		MCPServers:            options.MCPServers,
 		AdditionalDirectories: options.AdditionalDirectories,
+		SystemPrompt:          options.SystemPrompt,
 	}
 	if err := c.Call(ctx, schema.SessionNewMethodName, request, &session); err != nil {
 		return session, err
@@ -127,6 +150,9 @@ func (c *Connection) LoadSession(ctx context.Context, init Initialization, reque
 	if err := validateMCPServers(init, request.MCPServers); err != nil {
 		return result, err
 	}
+	if err := promptrule.V1Client(init, request.SystemPrompt); err != nil {
+		return result, err
+	}
 	if request.MCPServers == nil {
 		request.MCPServers = make([]schema.McpServer, 0)
 	}
@@ -152,6 +178,9 @@ func (c *Connection) ResumeSession(ctx context.Context, init Initialization, req
 		return result, err
 	}
 	if err := validateMCPServers(init, request.MCPServers); err != nil {
+		return result, err
+	}
+	if err := promptrule.V1Client(init, request.SystemPrompt); err != nil {
 		return result, err
 	}
 	return result, c.Call(ctx, schema.SessionResumeMethodName, request, &result)

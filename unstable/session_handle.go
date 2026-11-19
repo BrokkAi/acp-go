@@ -41,6 +41,25 @@ type StatusHandler interface {
 	SessionStatus(context.Context, schema.SessionStatusRequest) (schema.SessionStatusResponse, error)
 }
 
+// OptionsHandler serves the agent side of session/options, which returns the
+// config options a session would start with without creating or resuming
+// one. SessionOptions must not create, load, or resume a session, send
+// session/update, add a session/list entry, or change an existing session,
+// and should not connect to MCP servers. Without a session ID it answers for
+// a new session; with one, what session/load or session/resume with the same cwd and
+// additional directories would return, and -32002 for a session the agent
+// does not know (return acp.SessionNotFoundError).
+//
+// Advertise does not announce sessionCapabilities.options for it, because the
+// capability also promises that the agent applies the initial configOptions
+// a client sends on session setup requests, which the stable requests the
+// runtime dispatches do not carry. The unstable lifecycle requests Install
+// serves (see SystemPromptHandler) carry them; an agent that applies them
+// announces the capability with a customize function.
+type OptionsHandler interface {
+	SessionOptions(context.Context, schema.SessionOptionsRequest) (schema.SessionOptionsResponse, error)
+}
+
 // TitleHandler serves the agent side of session/set_title. Advertise
 // announces sessionCapabilities.title for it. The session need not be active.
 // SetSessionTitle may normalize the title, answers -32602 for a title it

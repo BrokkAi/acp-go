@@ -29,6 +29,8 @@ type rawSchema struct {
 	Not          *rawSchema            `json:"not"`
 	Default      json.RawMessage       `json:"default"`
 	Minimum      *float64              `json:"minimum"`
+	MinLength    *int                  `json:"minLength"`
+	MaxLength    *int                  `json:"maxLength"`
 	// The x-deserialize-* hints record the serde_with adapters the Rust
 	// schema crate decodes a field with.
 	//

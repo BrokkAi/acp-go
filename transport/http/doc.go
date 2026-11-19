@@ -4,7 +4,7 @@ binding of ACP. It is not part of the stable surface and is not a default: the
 SDK stays stdio-first, and a caller must import this package to use it.
 
 The binding is the one the reference Rust SDK's `agent-client-protocol-http`
-5.0.0 crate speaks, which the ACP specification still lists as a draft
+5.4.0 crate speaks (unchanged since 5.0.0), which the ACP specification still lists as a draft
 proposal in progress:
 
   - `POST {endpoint}` with `Content-Type: application/json` and an `initialize`

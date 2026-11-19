@@ -9,8 +9,8 @@ generator commands; this page is the review checklist that runs around them.
 The reference Rust SDK releases `agent-client-protocol` with a different
 `agent-client-protocol-schema = "=X.Y.Z"` pin, or that schema crate publishes a
 new version. [ROADMAP.md](../ROADMAP.md) records the current baseline: Rust
-`agent-client-protocol` 5.0.0 pins schema crate `=1.15.1` → ACP v1
-`schema-v1.29.1`, draft v2 `schema-v2.0.0-alpha.13`, and their `-unstable`
+`agent-client-protocol` 5.4.0 pins schema crate `=1.19.0` → ACP v1
+`schema-v1.33.0`, draft v2 `schema-v2.0.0-alpha.17`, and their `-unstable`
 artifacts.
 
 The release assets the downloader fetches are the same files the schema crate
@@ -61,13 +61,14 @@ schema crate or when the Rust SDK moves its exact pin.
      `patchDefs` (`cmd/acpgen/ir.go`) keep `null` distinct from omission, and
      their upserts get a generated `ApplyUpdate` that patches the top-level
      `_meta` with `ApplyMetaUpdate`. Add a new upsert to `patchDefs` (a field
-     it cannot patch fails generation), and check that the Metadata Patches
-     rule still lists the same updates. v1 otherwise treats `null` like
+     it cannot patch fails generation, unless `optional` lists it as a plain
+     Rust `Option`, like `CursorUpdate`'s `anchor`), and check that the
+     Metadata Patches rule still lists the same updates. v1 otherwise treats `null` like
      omission; a v1 field that Rust models with `MaybeUndefined` (today
      `CompactionUpdate`'s `summary`, `error`, and `_meta`, and
      `SessionInfoUpdate`'s `title` and `updatedAt`, and in the unstable pin
-     `SessionMessage`'s and `SubagentUpdate`'s optional fields) is listed by
-     def and field
+     `SessionMessage`'s and `SubagentUpdate`'s optional fields and
+     `CursorUpdate`'s `capabilities` and `_meta`) is listed by def and field
      in `v1PatchDefs`, which keeps `null` distinct as `Nullable` without the
      v2 metadata patch helpers. A listed field that is missing, required, or
      not nullable fails generation;
@@ -205,8 +206,16 @@ checked at generation:
 - `mapOnlyStructs`: plain structs with a `#[serde(flatten)]` field in Rust,
   per protocol version; an entry that is not a plain struct fails generation.
 - `stringTagUnions`: unions whose hand-written Rust `Deserialize` requires a
-  string tag (v2 `SetSessionConfigOptionRequest`), with the errors it words
-  itself.
+  string tag (v2 `SetSessionConfigOptionRequest` and the unstable
+  `InitialSessionConfigOption`, which flatten `SessionConfigOptionValue`),
+  with the errors it words itself.
+- `lengthCheckedStrings`: string newtypes whose hand-written Rust
+  `Deserialize` checks the length in characters (v2 `IdempotencyKey`, 1 to
+  255), with the errors it words itself. The generated type gets a
+  `Validate` method its decoder calls. The schema states `minLength` and
+  `maxLength` on strings Rust never checks too (a notice's `title`), so a
+  string def with a bound fails generation until it is listed here, and its
+  hint cases probe each bound in one-, two-, and four-byte characters.
 - `defaultOnNullPayloads`: the `default_on_null!` inventory.
 - `pathFields`: v1 string fields Rust decodes as a `PathBuf`, whose errors
   expect a "path string". v2 names the type `AbsolutePath`, so it needs no
@@ -360,7 +369,7 @@ draft-v2 agent runtimes, `agent.HandleClientHost` and its parts, the v2
 `HandleClientHost`, `acp.HandleElicitation`, `clienthost.Host`, the
 unstable `Handle` routes, and the `mcp` and `v2/mcp` routers for
 `mcp/message` envelopes and session setup params) decodes params as the
-reference SDK 5.0.0 does:
+reference SDK 5.4.0 does:
 
 - Absent params read as `null` for every message, as Rust's
   `params_from_transport` hands them over, so a message without params

@@ -1,6 +1,6 @@
 // Package rpcparams is the request dispatch every acp-go dispatch layer that
 // imports the root acp package shares: the agent runtimes, the client hosts,
-// and the unstable dispatch. It reads params as the reference Rust SDK 5.0.0
+// and the unstable dispatch. It reads params as the reference Rust SDK 5.4.0
 // does, answers a failure with the reference SDK's json_cast_params -32602,
 // built by internal/castparams, and answers a request no handler serves with
 // the reference SDK's -32601.

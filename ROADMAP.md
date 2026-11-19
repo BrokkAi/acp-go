@@ -6,12 +6,12 @@ Protocol, with v1 and draft-v2 behavior aligned to the
 
 ## Reference baseline
 
-The behavioral reference is Rust `agent-client-protocol` **5.0.0**, which pins
-`agent-client-protocol-schema` **`=1.15.1`**. That schema crate publishes ACP
-v1 **`schema-v1.29.1`** and draft ACP v2 **`schema-v2.0.0-alpha.13`**, and our
+The behavioral reference is Rust `agent-client-protocol` **5.4.0**, which pins
+`agent-client-protocol-schema` **`=1.19.0`**. That schema crate publishes ACP
+v1 **`schema-v1.33.0`** and draft ACP v2 **`schema-v2.0.0-alpha.17`**, and our
 pinned stable and unstable artifacts are byte-for-byte identical to it. The
-generated types cover the whole 1.15.1 surface; the 5.0.0 behavior built on
-the newer types is tracked under "Schema crate 1.15.1 follow-ups" below.
+generated types cover the whole 1.19.0 surface; the 5.1–5.4 behavior built on
+the newer types is tracked under "Schema crate 1.16–1.19 follow-ups" below.
 
 ## Status
 
@@ -180,15 +180,34 @@ only remaining work.
   the pre-RFD underscore-prefixed names; a `$/cancel_request` wrapped in
   `proxy/successor` cancels like a plain one; the cookbook proxy uses the
   generated envelopes.
-- Unstable schema surfaces from the exact Rust schema crate 1.15.1 unstable
+- Client-provided system prompts, stable since schema crate 1.16 (Rust 5.1):
+  the stable v1 and draft-v2 session lifecycle requests carry `systemPrompt`,
+  the clients check it against the advertised capability before writing, and
+  the agent runtimes refuse a prompt the connection did not announce with
+  `-32602` before the Agent runs. The unstable facades keep their handlers
+  for `session/fork` and the other unstable setup fields.
+- Draft-v2 prompt idempotency keys (schema 1.19, Rust 5.4):
+  `NewIdempotencyKey` and `PromptContentWithKey`, decoders that reject a
+  malformed key with the Rust error, and an example agent that answers a
+  retry with the original `messageId`.
+- `replay_complete` (schema 1.18, Rust 5.3) ending a requested replay, used by
+  the cookbook recipes to tell replayed history from live updates.
+- Lossy UTF-8 line reading (Rust 5.4, #504): invalid bytes become U+FFFD as
+  `String::from_utf8_lossy` replaces them, instead of closing the connection.
+- Unstable schema surfaces from the exact Rust schema crate 1.19.0 unstable
   artifacts:
   - v1 and v2 generated bindings in explicit import-only packages,
   - LLM providers,
-  - plan operations,
-  - session fork,
+  - plan operations (markdown plans with `path`; the `file` plan type is gone),
+  - session fork, with initial `configOptions` and `cursorId`,
   - session archive/unarchive (with the `session/list` archived filter),
     status, and title,
-  - client-provided system prompts on the session lifecycle requests, with
+  - `session/options` with initial `configOptions` on session setup
+    requests: capability-gated client facades and an `OptionsHandler` route
+    on v1 and draft v2 (schema 1.17, Rust 5.2),
+  - session cursors, prompt suggestions, agent skills (draft v2), and the
+    `speed` config option category, as generated types (schema 1.18–1.19),
+  - client-provided system prompts on `session/fork`, with
     capability-gated client facades and agent-side handlers that `Install`
     serves through runtime overrides (#58),
   - auth status (`auth/status` and the `auth/status_update` notification),
@@ -281,6 +300,26 @@ them is tracked separately and is now delivered: v2 background work with
 (#71), client-provided system prompts (#58), `-32022` version negotiation
 (#62), unstable auth status (#72), subagent sessions (#60), and the proxy-chain
 method rename (#69).
+
+### 4. Schema crate 1.16–1.19 follow-ups
+
+The 1.19.0 pin lands every generated type of schema crates 1.16 through 1.19.
+The SDK behavior Rust 5.1–5.4 adds is delivered: stable system prompts,
+`session/options`, prompt idempotency keys, `replay_complete`, and lossy UTF-8
+line reading. Surfaces the schema stabilized moved to the stable packages:
+the draft-v2 subagent helpers (`SubagentTree` to `v2`, the senders to
+`v2/agent`) and system prompts on the stable session lifecycle requests. Rust's aggregate-dispatch refactor (#507) changes no behavior
+and has no Go counterpart.
+
+Remaining, all optional typed helpers over types that already decode and
+encode exactly:
+
+- Session cursors, prompt suggestions, and agent skills have generated types
+  and pass through every runtime and projection, but no projection or
+  capability helpers of their own.
+- Initial `configOptions` reach an agent through the unstable lifecycle
+  requests `Install` serves; the stable dispatch does not carry them, so
+  `Advertise` never announces `options` on an agent's behalf.
 
 ## Guardrails
 

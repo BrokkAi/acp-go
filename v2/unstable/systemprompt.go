@@ -2,7 +2,6 @@ package unstable
 
 import (
 	"context"
-	"errors"
 
 	"github.com/BrokkAi/acp-go/internal/systemprompt"
 	"github.com/BrokkAi/acp-go/internal/unstabledispatch"
@@ -52,9 +51,14 @@ func ValidateSessionSystemPrompt(initialization schema.InitializeResponse, promp
 	return v2session.ValidateSystemPrompt(initialization, prompt)
 }
 
-// SystemPromptHandler serves session/new and session/resume with the
-// client-provided system prompt, which the stable draft-v2 requests the
-// v2/agent runtime decodes do not carry. Install serves both from these
+// SystemPromptHandler serves session/new and session/resume from the
+// unstable requests, which carry the client-provided system prompt together
+// with the other unstable session setup fields, such as initial
+// configOptions. System prompts are stable since schema crate 1.16: the
+// stable requests carry the prompt too, and the v2/agent runtime checks it
+// against the announced capability before the Agent runs, so an agent that
+// needs only the prompt can announce capabilities.session.systemPrompt in its
+// own initialize response instead. Install serves both from these
 // methods, in place of the Agent's NewSession and ResumeSession, through
 // runtime overrides, and announces capabilities.session.systemPrompt ({},
 // append only) when session/fork, if advertised, also receives the prompt
@@ -104,17 +108,6 @@ func advertiseSystemPrompt(handler any, response *schema.InitializeResponse) {
 		return
 	}
 	session.SystemPrompt = &schema.SessionSystemPromptCapabilities{}
-}
-
-// checkSystemPromptServed refuses, after the customize functions ran, a
-// systemPrompt capability that some advertised lifecycle request would
-// silently drop.
-func checkSystemPromptServed(handler any, response schema.InitializeResponse) error {
-	session := sessionCapabilities(response)
-	if session == nil || session.SystemPrompt == nil || servesSystemPrompt(handler, response) {
-		return nil
-	}
-	return errors.New("unstable.Install: capabilities.session.systemPrompt is advertised, but the handler does not serve it on every advertised session lifecycle request (SystemPromptHandler, plus ForkHandler for fork)")
 }
 
 // systemPromptRoute is the binding for a lifecycle method whose request
