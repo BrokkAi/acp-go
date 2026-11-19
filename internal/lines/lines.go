@@ -1,11 +1,12 @@
 // Package lines reads newline-delimited frames as the reference Rust SDK
-// 5.0.0 does with futures' AsyncBufReadExt::lines: a line ends at "\n", the
-// "\n" and then one "\r" before it are removed, a last line without "\n" is
-// returned as is, and there is no size limit. A line of any length is read;
-// its buffer grows only as far as the line needs.
+// does with its lossy_lines reader: a line ends at "\n", the "\n" and then
+// one "\r" before it are removed, a last line without "\n" is returned as is,
+// and there is no size limit. A line of any length is read; its buffer grows
+// only as far as the line needs.
 //
-// Unlike Rust's lines, the readers here do not check UTF-8; callers do, so
-// each can report the failure its own way.
+// The readers here return the bytes as read. The reference SDK replaces
+// bytes that are not valid UTF-8 with U+FFFD; callers do that with
+// rustutf8.Lossy.
 package lines
 
 import (

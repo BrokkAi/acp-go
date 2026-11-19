@@ -14,11 +14,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/BrokkAi/acp-go/internal/jsonline"
 	"github.com/BrokkAi/acp-go/internal/lines"
 	"github.com/BrokkAi/acp-go/internal/rpcctl"
+	"github.com/BrokkAi/acp-go/internal/rustutf8"
 	"github.com/BrokkAi/acp-go/internal/serdejson"
 	"github.com/BrokkAi/acp-go/internal/serdewire"
 	"github.com/BrokkAi/acp-go/schema"
@@ -192,17 +192,19 @@ func (p *HandlerPanic) Error() string {
 	return fmt.Sprintf("acp: %s handler panicked: %v", p.Method, p.Value)
 }
 
-// Connect owns both streams until Close or Shutdown. Frames are limited to 8
-// MiB. Each incoming request runs in its own goroutine with no concurrency
+// Connect owns both streams until Close or Shutdown. Frames have no size
+// limit, as in the reference SDK. Each incoming request runs in its own goroutine with no concurrency
 // limit, as in the reference SDK, so a peer that pipelines many requests is
 // served rather than disconnected. Unknown notifications can be ignored.
 //
 // One bad message or one failing handler does not close the connection. A
 // valid JSON value that is not a JSON-RPC message is answered with -32600 and
 // id null, or ignored when it is shaped like a response, as the reference SDK
-// does. A notification handler's error is reported, and a handler panic is
-// recovered and answered. Only invalid UTF-8, an oversized frame, or a
-// transport failure closes the connection.
+// does. A line that is not valid UTF-8 has each invalid sequence replaced
+// with U+FFFD, as the reference SDK's line reader does, and is then handled
+// like any other line. A notification handler's error is reported, and a
+// handler panic is recovered and answered. Only a transport failure closes
+// the connection.
 func Connect(in io.ReadCloser, out io.WriteCloser, h Handler, n Notifications, options ...ConnectOption) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 	serving, stopServing := context.WithCancel(ctx)
@@ -366,8 +368,7 @@ func (c *Connection) drain(ctx context.Context) error {
 func (c *Connection) Done() <-chan struct{} { return c.ctx.Done() }
 
 // InputClosed is closed once the connection stops reading frames: the peer
-// closed its output (EOF), reading failed, a frame was not valid UTF-8, or the
-// connection was closed. Frames have no size limit, as in the reference SDK.
+// closed its output (EOF), reading failed, or the connection was closed. Frames have no size limit, as in the reference SDK.
 // On a clean EOF, Done stays open until in-flight handlers return and every
 // frame queued by then, theirs included, is written, as the reference SDK
 // keeps its output working after incoming EOF. Once the handlers have
@@ -785,12 +786,11 @@ func (c *Connection) readLoop() {
 		if line, err = frames.Next(); err != nil {
 			break
 		}
-		if !utf8.Valid(line) {
-			// The reference SDK reads lines as UTF-8 text, so this is a
-			// transport failure there, not a malformed message.
-			c.stop(errors.New("invalid ACP JSON-RPC frame"))
-			return
-		}
+		// As in the reference SDK, bytes that are not valid UTF-8 are
+		// replaced with U+FFFD rather than failing the read, so such a line
+		// is one message to parse: inside a JSON string it is delivered with
+		// the replacement, and anywhere else the line is a parse error.
+		line = rustutf8.Lossy(line)
 		if c.shuttingDown.Load() {
 			// As in the reference SDK, Shutdown stops delivery but keeps
 			// reading, so a peer still writing is not failed mid-drain.

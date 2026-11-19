@@ -349,6 +349,10 @@ var unreadableFirstFrames = []struct{ wire, answer string }{
 	{"[1,\r\n", parseErrorLine(`"[1,"`)},
 	{"\n", parseErrorLine(`""`)},
 	{"not-json\n", parseErrorLine(`"not-json"`)},
+	// As in the reference SDK, bytes that are not valid UTF-8 become U+FFFD,
+	// so the line is a parse error rather than a read failure.
+	{"\xff\n", parseErrorLine(`"` + "\uFFFD" + `"`)},
+	{"{\"jsonrpc\":\"2.0\",\"id\":1,\xe2\x82\n", parseErrorLine(`"{\"jsonrpc\":\"2.0\",\"id\":1,` + "\uFFFD" + `"`)},
 	{`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}` + "\n", parseErrorLine(`"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}"`)},
 	// serde_json, unlike encoding/json, rejects a float64 overflow, so this
 	// is a parse error rather than a batch.

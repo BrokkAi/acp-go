@@ -631,15 +631,46 @@ func TestInvalidJSONGetsOneParseErrorAndConnectionContinues(t *testing.T) {
 	}
 }
 
-func TestInvalidUTF8StillClosesConnection(t *testing.T) {
-	// The reference SDK reads lines as UTF-8 text, so invalid UTF-8 is a
-	// transport failure there, not a parse error.
-	c, peer := pipeClient(t, nil, nil)
-	_, _ = io.WriteString(peer, "\xff\n")
+// TestInvalidUTF8IsReplacedAndConnectionStaysAlive mirrors the reference
+// SDK's test_invalid_utf8_is_replaced_and_connection_stays_alive: bytes that
+// are not valid UTF-8 become U+FFFD, so a line with one outside a JSON string
+// is a parse error that quotes the replaced line, a line with one inside a
+// string is delivered with the replacement, and the connection stays open.
+func TestInvalidUTF8IsReplacedAndConnectionStaysAlive(t *testing.T) {
+	c, peer := pipeClient(t, func(_ context.Context, method string, params json.RawMessage) (any, error) {
+		var request struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(params, &request); err != nil {
+			return nil, err
+		}
+		return map[string]string{"result": "echo: " + request.Message}, nil
+	}, nil)
+	reader := bufio.NewReader(peer)
+	read := func() string {
+		t.Helper()
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read: %v (connection error %v)", err, c.Err())
+		}
+		return strings.TrimSuffix(line, "\n")
+	}
+
+	// Outside a string, the line is not JSON after the replacement either.
+	_, _ = io.WriteString(peer, "\xff{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"simple_method\"}\n")
+	if got, want := read(), parseErrorLine(`"`+"\uFFFD"+`{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"simple_method\"}"`); got != want {
+		t.Fatalf("answer = %s, want %s", got, want)
+	}
+
+	// Inside a string, the message is delivered with the replacement.
+	_, _ = io.WriteString(peer, "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"simple_method\",\"params\":{\"message\":\"a\xffb\"}}\n")
+	if got, want := read(), "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"result\":\"echo: a\uFFFDb\"}}"; got != want {
+		t.Fatalf("answer = %s, want %s", got, want)
+	}
 	select {
 	case <-c.Done():
-	case <-time.After(time.Second):
-		t.Fatal("invalid UTF-8 was accepted")
+		t.Fatalf("connection closed: %v", c.Err())
+	default:
 	}
 }
 

@@ -11,10 +11,10 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/BrokkAi/acp-go/internal/jsonline"
 	"github.com/BrokkAi/acp-go/internal/lines"
+	"github.com/BrokkAi/acp-go/internal/rustutf8"
 )
 
 // keepAliveInterval is how long an idle event stream waits before it sends an
@@ -542,16 +542,9 @@ func (c *serverConn) route() {
 	for {
 		line, err := lines.ReadLine(reader)
 		if err == nil {
-			if !utf8.Valid(line) {
-				// The Rust line reader fails on a line that is not UTF-8,
-				// which ends the agent's transport as if it had returned:
-				// what it sent before is delivered, the streams end, the
-				// connection is gone, and nothing more is read from the agent.
-				c.server.forget(c)
-				c.finish()
-				_ = c.out.CloseWithError(io.ErrClosedPipe)
-				return
-			}
+			// The Rust line reader replaces bytes that are not valid UTF-8
+			// with U+FFFD, so such a line is handled like any other.
+			line = rustutf8.Lossy(line)
 			parsed, isMessage := parseMessage(line)
 			switch {
 			case initializing && isMessage && c.isInitializeResponse(parsed):

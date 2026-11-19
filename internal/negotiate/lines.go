@@ -2,11 +2,10 @@ package negotiate
 
 import (
 	"bufio"
-	"errors"
 	"io"
-	"unicode/utf8"
 
 	"github.com/BrokkAi/acp-go/internal/lines"
+	"github.com/BrokkAi/acp-go/internal/rustutf8"
 )
 
 // ReadLine reads one frame for a protocol router as the reference SDK's line
@@ -14,17 +13,15 @@ import (
 // is stripped, so a parse error reports the same line. It returns io.EOF when
 // the input ends before another frame. The line may be followed by more input
 // already buffered in reader; hand both to the selected implementation with
-// NewPrefixedReader. A frame that is not valid UTF-8, which the reference SDK
-// cannot read as a line, is an error.
+// NewPrefixedReader. As in the reference SDK, bytes that are not valid UTF-8
+// are replaced with U+FFFD, so such a frame is handled like any other line
+// rather than failing the read.
 func ReadLine(reader *bufio.Reader) ([]byte, error) {
 	line, err := lines.ReadLine(reader)
 	if err != nil {
 		return nil, err
 	}
-	if !utf8.Valid(line) {
-		return nil, errors.New("ACP frame is not valid UTF-8")
-	}
-	return line, nil
+	return rustutf8.Lossy(line), nil
 }
 
 // PrefixedReader replays the frame a router selected on before the rest of
