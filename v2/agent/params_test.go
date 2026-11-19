@@ -161,6 +161,10 @@ func TestRuntimeAnswersMalformedParamsAsTheReferenceSDK(t *testing.T) {
 		{schema.SessionPromptMethodName, "", "invalid type: null, expected struct PromptRequest", `null`},
 		{schema.SessionPromptMethodName, `null`, "invalid type: null, expected struct PromptRequest", `null`},
 		{schema.SessionPromptMethodName, `{"sessionId":"s","prompt":5}`, "invalid type: integer `5`, expected a sequence", `{"sessionId":"s","prompt":5}`},
+		// A malformed idempotency key fails the request rather than reading
+		// as omitted, with the reference SDK's IdempotencyKey error.
+		{schema.SessionPromptMethodName, `{"sessionId":"s","prompt":[{"type":"text","text":"hi"}],"idempotencyKey":""}`, "idempotency key must not be empty", `{"sessionId":"s","prompt":[{"type":"text","text":"hi"}],"idempotencyKey":""}`},
+		{schema.SessionPromptMethodName, `{"sessionId":"s","prompt":[{"type":"text","text":"hi"}],"idempotencyKey":7}`, "invalid type: integer `7`, expected a string", `{"sessionId":"s","prompt":[{"type":"text","text":"hi"}],"idempotencyKey":7}`},
 	} {
 		requireAnswer(t, exchange(t, w, r, i+1, tc.method, tc.params), i+1, tc)
 	}

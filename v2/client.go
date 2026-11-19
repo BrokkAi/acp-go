@@ -12,6 +12,7 @@ import (
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/acpvalidate"
 	"github.com/BrokkAi/acp-go/internal/negotiate"
+	"github.com/BrokkAi/acp-go/internal/promptrulev2"
 	"github.com/BrokkAi/acp-go/internal/rpcctl"
 	schemav1 "github.com/BrokkAi/acp-go/schema"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
@@ -26,6 +27,7 @@ type (
 	Session        = schema.NewSessionResponse
 	SessionID      = schema.SessionId
 	MessageID      = schema.MessageId
+	IdempotencyKey = schema.IdempotencyKey
 	Content        = schema.ContentBlock
 	Update         = schema.UpdateSessionNotification
 	ClientInfo     = schema.Implementation
@@ -369,6 +371,24 @@ func findAgentAuthMethod(initialization Initialization, method string) (schema.A
 // NewSessionOptions carries optional fields for session/new.
 type NewSessionOptions struct {
 	AdditionalDirectories []string
+	// SystemPrompt is the client-provided system prompt, sent only when the
+	// agent advertises capabilities.session.systemPrompt (stable since
+	// schema crate 1.16). It must use append mode, or override when the
+	// agent advertises mode.override, with only text content; anything else
+	// fails before the request is sent. See NewTextSystemPrompt.
+	SystemPrompt *schema.SystemPrompt
+}
+
+// NewTextSystemPrompt returns an append-mode system prompt with one text block,
+// the mode and content type every agent advertising
+// capabilities.session.systemPrompt accepts. Set Mode to
+// schema.SystemPromptModeOverride to replace the agent's default instructions
+// instead, which needs capabilities.session.systemPrompt.mode.override.
+func NewTextSystemPrompt(text string) *schema.SystemPrompt {
+	return &schema.SystemPrompt{
+		Mode:    schema.SystemPromptModeAppend,
+		Content: []schema.ContentBlock{NewTextContent(text)},
+	}
 }
 
 // NewSession starts a session using the initialization response from the most
@@ -401,9 +421,13 @@ func (c *Connection) NewSessionWithOptions(ctx context.Context, initialization I
 	if err := validateAdditionalDirectories(initialization, options.AdditionalDirectories); err != nil {
 		return session, err
 	}
+	if err := promptrulev2.Client(initialization, options.SystemPrompt); err != nil {
+		return session, err
+	}
 	request := schema.NewSessionRequest{
 		Cwd:                   schema.AbsolutePath(directory),
 		AdditionalDirectories: absolutePaths(options.AdditionalDirectories),
+		SystemPrompt:          options.SystemPrompt,
 	}
 	if err := c.Call(ctx, schema.SessionNewMethodName, request, &session); err != nil {
 		return session, err
@@ -431,6 +455,9 @@ func (c *Connection) ResumeSession(ctx context.Context, initialization Initializ
 	if err := validateAdditionalDirectories(initialization, absoluteStrings(request.AdditionalDirectories)); err != nil {
 		return result, err
 	}
+	if err := promptrulev2.Client(initialization, request.SystemPrompt); err != nil {
+		return result, err
+	}
 	return result, c.Call(ctx, schema.SessionResumeMethodName, request, &result)
 }
 
@@ -443,7 +470,36 @@ func (c *Connection) Prompt(ctx context.Context, initialization Initialization, 
 // matching user_message session update carries the same ID and may arrive
 // before or after this call returns. In ACP v2, foreground completion is
 // reported later through idle state updates.
+//
+// The prompt carries no idempotency key, so sending it again after a lost
+// response can insert a second user message. Use PromptContentWithKey for a
+// prompt that may need to be retried.
 func (c *Connection) PromptContent(ctx context.Context, initialization Initialization, session Session, prompt []Content) (MessageID, error) {
+	return c.promptContent(ctx, initialization, session, prompt, nil)
+}
+
+// PromptContentWithKey is PromptContent with an idempotency key, like Rust's
+// send_prompt_blocks_with_key. The key identifies one submission: the agent
+// inserts at most one user message for a key in a session and answers a
+// retry with the messageId of the message it already inserted, without
+// starting the work again. To retry after a lost response, for example on a
+// new connection after session/resume, call it again with the same key and
+// the same prompt.
+//
+// Create the key with NewIdempotencyKey when the user submits the input and
+// store it with the pending input. Use a new key for a new submission, even
+// one with the same text; do not derive it from the content or reuse it with
+// a different prompt. An error response means the message was not inserted
+// and leaves the key unused. A key that is empty or longer than 255
+// characters fails before the request is sent.
+func (c *Connection) PromptContentWithKey(ctx context.Context, initialization Initialization, session Session, prompt []Content, key IdempotencyKey) (MessageID, error) {
+	if err := key.Validate(); err != nil {
+		return "", err
+	}
+	return c.promptContent(ctx, initialization, session, prompt, &key)
+}
+
+func (c *Connection) promptContent(ctx context.Context, initialization Initialization, session Session, prompt []Content, key *IdempotencyKey) (MessageID, error) {
 	if err := requireSessionCapabilities(initialization); err != nil {
 		return "", err
 	}
@@ -455,8 +511,9 @@ func (c *Connection) PromptContent(ctx context.Context, initialization Initializ
 	}
 	var result schema.PromptResponse
 	if err := c.Call(ctx, schema.SessionPromptMethodName, schema.PromptRequest{
-		SessionID: session.SessionID,
-		Prompt:    prompt,
+		SessionID:      session.SessionID,
+		Prompt:         prompt,
+		IdempotencyKey: key,
 	}, &result); err != nil {
 		return "", err
 	}

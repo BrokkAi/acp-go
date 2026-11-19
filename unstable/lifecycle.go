@@ -23,6 +23,9 @@ func NewSession(ctx context.Context, connection *acp.Connection, initialization 
 	if err := validateSessionSetup(initialization, request.Cwd, request.AdditionalDirectories, request.MCPServers, request.SystemPrompt); err != nil {
 		return result, err
 	}
+	if err := validateInitialConfigOptions(initialization, request.ConfigOptions); err != nil {
+		return result, err
+	}
 	// mcpServers is required in v1, so send an empty array, not null.
 	request.MCPServers = []schema.McpServer{}
 	if err := connection.Call(ctx, schema.SessionNewMethodName, request, &result); err != nil {
@@ -48,6 +51,9 @@ func LoadSession(ctx context.Context, connection *acp.Connection, initialization
 	if err := validateSessionSetup(initialization, request.Cwd, request.AdditionalDirectories, request.MCPServers, request.SystemPrompt); err != nil {
 		return result, err
 	}
+	if err := validateInitialConfigOptions(initialization, request.ConfigOptions); err != nil {
+		return result, err
+	}
 	request.MCPServers = []schema.McpServer{}
 	return result, connection.Call(ctx, schema.SessionLoadMethodName, request, &result)
 }
@@ -66,7 +72,40 @@ func ResumeSession(ctx context.Context, connection *acp.Connection, initializati
 	if err := validateSessionSetup(initialization, request.Cwd, request.AdditionalDirectories, request.MCPServers, request.SystemPrompt); err != nil {
 		return result, err
 	}
+	if err := validateInitialConfigOptions(initialization, request.ConfigOptions); err != nil {
+		return result, err
+	}
 	return result, connection.Call(ctx, schema.SessionResumeMethodName, request, &result)
+}
+
+// SessionOptions sends session/options, gated on sessionCapabilities.options:
+// the config options and modes a session would start with, without creating,
+// loading, or resuming one. cwd must be absolute; additional directories need
+// sessionCapabilities.additionalDirectories and must each be absolute; a
+// session ID, when present, must be non-blank, needs session/load or
+// session/resume support, and asks for what those would return, and an
+// unknown one answers -32002 (acp.IsResourceNotFound). The result is a
+// snapshot: the options a session starts with are the ones in its setup
+// response.
+func SessionOptions(ctx context.Context, connection *acp.Connection, initialization schema.InitializeResponse, request schema.SessionOptionsRequest) (schema.SessionOptionsResponse, error) {
+	var result schema.SessionOptionsResponse
+	capabilities := sessionCapabilities(initialization)
+	if capabilities == nil || capabilities.Options == nil {
+		return result, fmt.Errorf("agent did not advertise session/options support")
+	}
+	if request.SessionID != nil {
+		if err := acpvalidate.Identifier("session ID", string(*request.SessionID)); err != nil {
+			return result, err
+		}
+		load := initialization.AgentCapabilities.LoadSession != nil && *initialization.AgentCapabilities.LoadSession
+		if !load && capabilities.Resume == nil {
+			return result, fmt.Errorf("agent did not advertise session/load or session/resume support for a session/options session ID")
+		}
+	}
+	if err := validateSessionSetup(initialization, request.Cwd, request.AdditionalDirectories, nil, nil); err != nil {
+		return result, err
+	}
+	return result, connection.Call(ctx, schema.SessionOptionsMethodName, request, &result)
 }
 
 // ValidateSessionSystemPrompt is the client-side check NewSession,

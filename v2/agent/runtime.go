@@ -14,6 +14,7 @@ import (
 	"github.com/BrokkAi/acp-go/internal/negotiate"
 	"github.com/BrokkAi/acp-go/internal/rpcctl"
 	"github.com/BrokkAi/acp-go/internal/rpcparams"
+	"github.com/BrokkAi/acp-go/internal/systemprompt"
 	schema "github.com/BrokkAi/acp-go/schema/v2"
 )
 
@@ -172,10 +173,16 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		if err != nil {
 			return nil, err
 		}
+		if err := systemprompt.AgentStableV2(ctx, request.SystemPrompt); err != nil {
+			return nil, err
+		}
 		return s.agent.NewSession(ctx, s.client, request)
 	case schema.SessionResumeMethodName:
 		request, err := rpcparams.Decode[schema.ResumeSessionRequest](raw)
 		if err != nil {
+			return nil, err
+		}
+		if err := systemprompt.AgentStableV2(ctx, request.SystemPrompt); err != nil {
 			return nil, err
 		}
 		return s.agent.ResumeSession(ctx, s.client, request)

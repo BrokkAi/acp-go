@@ -392,15 +392,16 @@ func TestInstallAnnouncesSystemPromptOnlyWhenEveryLifecycleRequestIsServed(t *te
 	if !strings.Contains(string(encoded), `"systemPrompt":{}`) {
 		t.Fatalf("agentCapabilities = %s, want systemPrompt {}", encoded)
 	}
-	// A customize function that announces the capability anyway fails
-	// initialize instead of sending it.
+	// A customize function may announce the capability itself: since schema
+	// crate 1.16 the stable session/load and session/resume carry the prompt
+	// to the Agent, so no lifecycle request drops it.
 	connection = serveAgent(t, lifecycle, newOnly{}, func(response *schema.InitializeResponse) error {
 		response.AgentCapabilities.SessionCapabilities.SystemPrompt = &schema.SessionSystemPromptCapabilities{}
 		return nil
 	})
 	var response schema.InitializeResponse
-	if err := connection.Call(context.Background(), schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: schema.ProtocolVersion(acp.Version)}, &response); err == nil {
-		t.Fatalf("initialize with an unserved systemPrompt succeeded: %+v", response)
+	if err := connection.Call(context.Background(), schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: schema.ProtocolVersion(acp.Version)}, &response); err != nil || response.AgentCapabilities.SessionCapabilities.SystemPrompt == nil {
+		t.Fatalf("initialize with a self-announced systemPrompt = %+v, %v", response, err)
 	}
 }
 

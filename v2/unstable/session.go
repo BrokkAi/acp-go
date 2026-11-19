@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/BrokkAi/acp-go/internal/acpvalidate"
+	"github.com/BrokkAi/acp-go/internal/v2session"
 	schema "github.com/BrokkAi/acp-go/schema/v2/unstable"
 	acpv2 "github.com/BrokkAi/acp-go/v2"
 )
@@ -100,6 +101,21 @@ func SessionStatus(ctx context.Context, connection *acpv2.Connection, initializa
 		return result, err
 	}
 	return result, callRequiring(ctx, connection, schema.SessionStatusMethodName, request, "status", &result)
+}
+
+// SessionOptions sends session/options, gated on capabilities.session.options:
+// the config options and commands a session would start with, without
+// creating or resuming one. cwd must be absolute; additional directories need
+// capabilities.session.additionalDirectories and must each be absolute; a
+// session ID, when present, must be non-blank and asks for what session/resume
+// would return, and an unknown one answers -32002. The result is a snapshot:
+// the options a session starts with are the ones in its setup response.
+func SessionOptions(ctx context.Context, connection *acpv2.Connection, initialization schema.InitializeResponse, request schema.SessionOptionsRequest) (schema.SessionOptionsResponse, error) {
+	var result schema.SessionOptionsResponse
+	if err := v2session.ValidateSessionOptionsRequest(initialization, request); err != nil {
+		return result, err
+	}
+	return result, connection.Call(ctx, schema.SessionOptionsMethodName, request, &result)
 }
 
 // SetSessionTitle sends session/set_title, gated on

@@ -113,6 +113,9 @@ func ForkSession(ctx context.Context, connection *acp.Connection, initialization
 	if len(request.MCPServers) > 0 {
 		return result, fmt.Errorf("MCP servers require the explicit github.com/BrokkAi/acp-go/mcp package")
 	}
+	if err := validateInitialConfigOptions(initialization, request.ConfigOptions); err != nil {
+		return result, err
+	}
 	if err := ValidateSessionSystemPrompt(initialization, request.SystemPrompt); err != nil {
 		return result, err
 	}
@@ -132,6 +135,16 @@ func requireFork(initialization schema.InitializeResponse) error {
 	}
 	if capabilities == nil || capabilities.Fork == nil {
 		return fmt.Errorf("agent did not advertise session/fork support")
+	}
+	return nil
+}
+
+// validateInitialConfigOptions requires sessionCapabilities.options for the
+// initial configOptions of a session setup request, which that capability
+// covers.
+func validateInitialConfigOptions(initialization schema.InitializeResponse, options []schema.InitialSessionConfigOption) error {
+	if capabilities := sessionCapabilities(initialization); len(options) > 0 && (capabilities == nil || capabilities.Options == nil) {
+		return fmt.Errorf("agent did not advertise session/options support for initial configOptions")
 	}
 	return nil
 }

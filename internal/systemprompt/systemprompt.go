@@ -1,7 +1,9 @@
 // Package systemprompt holds the client-provided system prompt rules shared by
-// the v1 github.com/BrokkAi/acp-go/unstable and github.com/BrokkAi/acp-go/mcp
-// facades and their draft-v2 counterparts, so every lifecycle request that can
-// carry a systemPrompt is checked the same way on both sides of the wire.
+// the stable v1 and draft-v2 clients and agent runtimes (system prompts are
+// stable since schema crate 1.16), the v1 github.com/BrokkAi/acp-go/unstable
+// and github.com/BrokkAi/acp-go/mcp facades, and their draft-v2 counterparts,
+// so every lifecycle request that can carry a systemPrompt is checked the
+// same way on both sides of the wire.
 //
 // The rules follow the client-provided system prompt RFD: the agent must
 // advertise the systemPrompt session capability; append is the baseline mode
@@ -20,43 +22,13 @@ import (
 
 	"github.com/BrokkAi/acp-go"
 	"github.com/BrokkAi/acp-go/internal/initresult"
+	"github.com/BrokkAi/acp-go/internal/promptrule"
+	"github.com/BrokkAi/acp-go/internal/promptrulev2"
+	s1 "github.com/BrokkAi/acp-go/schema"
 	v1 "github.com/BrokkAi/acp-go/schema/unstable"
+	s2 "github.com/BrokkAi/acp-go/schema/v2"
 	v2 "github.com/BrokkAi/acp-go/schema/v2/unstable"
 )
-
-// capability is the advertised systemPrompt capability of either version.
-type capability struct {
-	advertised bool
-	override   bool
-}
-
-// check applies the rules to a prompt reduced to its mode and the content
-// type of each block ("text" for a text block).
-func check(capability capability, mode string, content []string) error {
-	if !capability.advertised {
-		return fmt.Errorf("agent did not advertise systemPrompt support")
-	}
-	switch mode {
-	case "":
-		return fmt.Errorf("systemPrompt mode is required")
-	case string(v1.SystemPromptModeAppend):
-	case string(v1.SystemPromptModeOverride):
-		if !capability.override {
-			return fmt.Errorf("agent did not advertise systemPrompt override mode support")
-		}
-	default:
-		return fmt.Errorf("unsupported systemPrompt mode %q", mode)
-	}
-	if len(content) == 0 {
-		return fmt.Errorf("systemPrompt content must not be empty")
-	}
-	for i, kind := range content {
-		if kind != "text" {
-			return fmt.Errorf("systemPrompt content block %d is not text (%s); only text content is supported", i, kind)
-		}
-	}
-	return nil
-}
 
 // V1 checks a v1 prompt against the capability an agent advertised at
 // agentCapabilities.sessionCapabilities.systemPrompt. A nil prompt is valid.
@@ -64,15 +36,15 @@ func V1(advertised *v1.SessionSystemPromptCapabilities, prompt *v1.SystemPrompt)
 	if prompt == nil {
 		return nil
 	}
-	capability := capability{advertised: advertised != nil}
+	capability := promptrule.Capability{Advertised: advertised != nil}
 	if advertised != nil && advertised.Mode != nil {
-		capability.override = advertised.Mode.Override != nil
+		capability.Override = advertised.Mode.Override != nil
 	}
 	content := make([]string, len(prompt.Content))
 	for i, block := range prompt.Content {
 		content[i] = v1Kind(block)
 	}
-	return check(capability, string(prompt.Mode), content)
+	return promptrule.Check(capability, string(prompt.Mode), content)
 }
 
 // V1Client is V1 against the capability in the agent's initialize response.
@@ -84,21 +56,31 @@ func V1Client(initialization v1.InitializeResponse, prompt *v1.SystemPrompt) err
 	return V1(advertised, prompt)
 }
 
+// StableV1 is V1 for the stable v1 schema types (promptrule.V1).
+func StableV1(advertised *s1.SessionSystemPromptCapabilities, prompt *s1.SystemPrompt) error {
+	return promptrule.V1(advertised, prompt)
+}
+
+// StableV2 is V2 for the stable draft-v2 schema types (promptrulev2.Check).
+func StableV2(advertised *s2.SessionSystemPromptCapabilities, prompt *s2.SystemPrompt) error {
+	return promptrulev2.Check(advertised, prompt)
+}
+
 // V2 checks a draft-v2 prompt against the capability an agent advertised at
 // capabilities.session.systemPrompt. A nil prompt is valid.
 func V2(advertised *v2.SessionSystemPromptCapabilities, prompt *v2.SystemPrompt) error {
 	if prompt == nil {
 		return nil
 	}
-	capability := capability{advertised: advertised != nil}
+	capability := promptrule.Capability{Advertised: advertised != nil}
 	if advertised != nil && advertised.Mode != nil {
-		capability.override = advertised.Mode.Override != nil
+		capability.Override = advertised.Mode.Override != nil
 	}
 	content := make([]string, len(prompt.Content))
 	for i, block := range prompt.Content {
 		content[i] = v2Kind(block)
 	}
-	return check(capability, string(prompt.Mode), content)
+	return promptrule.Check(capability, string(prompt.Mode), content)
 }
 
 // V2Client is V2 against the capability in the agent's initialize response.
@@ -108,19 +90,6 @@ func V2Client(initialization v2.InitializeResponse, prompt *v2.SystemPrompt) err
 		advertised = agent.Session.SystemPrompt
 	}
 	return V2(advertised, prompt)
-}
-
-// variant names a content block by the variants set on it: its type tag when
-// exactly one is set.
-func variant(tags []string) string {
-	switch len(tags) {
-	case 0:
-		return "no content type"
-	case 1:
-		return tags[0]
-	default:
-		return "several content types"
-	}
 }
 
 func v1Kind(block v1.ContentBlock) string {
@@ -139,7 +108,7 @@ func v1Kind(block v1.ContentBlock) string {
 			tags = append(tags, set.tag)
 		}
 	}
-	return variant(tags)
+	return promptrule.Variant(tags)
 }
 
 func v2Kind(block v2.ContentBlock) string {
@@ -153,13 +122,14 @@ func v2Kind(block v2.ContentBlock) string {
 		{block.Audio != nil, "audio"},
 		{block.ResourceLink != nil, "resource_link"},
 		{block.Resource != nil, "resource"},
+		{block.Skill != nil, "skill"},
 		{block.Other != nil, fmt.Sprintf("unknown type %q", string(block.Kind))},
 	} {
 		if set.ok {
 			tags = append(tags, set.tag)
 		}
 	}
-	return variant(tags)
+	return promptrule.Variant(tags)
 }
 
 // Rejection is the reference SDK's -32602 for a system prompt an agent cannot
@@ -178,39 +148,61 @@ func Rejection(err error) error {
 // as Rejection. Without a recorded initialize response no capability was
 // announced, so any prompt is refused.
 func AgentV1(ctx context.Context, prompt *v1.SystemPrompt) error {
-	var sent struct {
-		AgentCapabilities *struct {
-			SessionCapabilities *struct {
-				SystemPrompt *v1.SessionSystemPromptCapabilities `json:"systemPrompt"`
-			} `json:"sessionCapabilities"`
-		} `json:"agentCapabilities"`
-	}
-	var advertised *v1.SessionSystemPromptCapabilities
-	if raw := initresult.From(ctx); raw != nil && json.Unmarshal(raw, &sent) == nil {
-		if agent := sent.AgentCapabilities; agent != nil && agent.SessionCapabilities != nil {
-			advertised = agent.SessionCapabilities.SystemPrompt
-		}
-	}
-	return Rejection(V1(advertised, prompt))
+	return Rejection(V1(announcedV1[v1.SessionSystemPromptCapabilities](ctx), prompt))
+}
+
+// AgentStableV1 is AgentV1 for the stable v1 schema types, which the v1
+// agent runtime applies to session/new, session/load, and session/resume.
+func AgentStableV1(ctx context.Context, prompt *s1.SystemPrompt) error {
+	return Rejection(StableV1(announcedV1[s1.SessionSystemPromptCapabilities](ctx), prompt))
 }
 
 // AgentV2 is AgentV1 for a draft-v2 prompt and
 // capabilities.session.systemPrompt.
 func AgentV2(ctx context.Context, prompt *v2.SystemPrompt) error {
+	return Rejection(V2(announcedV2[v2.SessionSystemPromptCapabilities](ctx), prompt))
+}
+
+// AgentStableV2 is AgentV2 for the stable draft-v2 schema types, which the
+// draft-v2 agent runtime applies to session/new and session/resume.
+func AgentStableV2(ctx context.Context, prompt *s2.SystemPrompt) error {
+	return Rejection(StableV2(announcedV2[s2.SessionSystemPromptCapabilities](ctx), prompt))
+}
+
+// announcedV1 reads agentCapabilities.sessionCapabilities.systemPrompt from
+// the initialize response the runtime sent on the request's connection, or
+// nil when there is none.
+func announcedV1[C any](ctx context.Context) *C {
+	var sent struct {
+		AgentCapabilities *struct {
+			SessionCapabilities *struct {
+				SystemPrompt *C `json:"systemPrompt"`
+			} `json:"sessionCapabilities"`
+		} `json:"agentCapabilities"`
+	}
+	if raw := initresult.From(ctx); raw != nil && json.Unmarshal(raw, &sent) == nil {
+		if agent := sent.AgentCapabilities; agent != nil && agent.SessionCapabilities != nil {
+			return agent.SessionCapabilities.SystemPrompt
+		}
+	}
+	return nil
+}
+
+// announcedV2 is announcedV1 for capabilities.session.systemPrompt.
+func announcedV2[C any](ctx context.Context) *C {
 	var sent struct {
 		Capabilities *struct {
 			Session *struct {
-				SystemPrompt *v2.SessionSystemPromptCapabilities `json:"systemPrompt"`
+				SystemPrompt *C `json:"systemPrompt"`
 			} `json:"session"`
 		} `json:"capabilities"`
 	}
-	var advertised *v2.SessionSystemPromptCapabilities
 	if raw := initresult.From(ctx); raw != nil && json.Unmarshal(raw, &sent) == nil {
 		if agent := sent.Capabilities; agent != nil && agent.Session != nil {
-			advertised = agent.Session.SystemPrompt
+			return agent.Session.SystemPrompt
 		}
 	}
-	return Rejection(V2(advertised, prompt))
+	return nil
 }
 
 // StrictV1 reports the reference SDK's deserialization error, with its text,

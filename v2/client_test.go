@@ -323,6 +323,28 @@ func TestV2CapabilityGates(t *testing.T) {
 				return client.DeleteSession(context.Background(), sessionInitialization(), "s")
 			},
 		},
+		{
+			name: "system prompt",
+			run: func(client *Connection) error {
+				_, err := client.NewSessionWithOptions(context.Background(), sessionInitialization(), hostRoot+"/repo", NewSessionOptions{
+					SystemPrompt: NewTextSystemPrompt("Be brief."),
+				})
+				return err
+			},
+		},
+		{
+			name: "system prompt override on resume",
+			run: func(client *Connection) error {
+				initialization := sessionInitialization()
+				initialization.Capabilities.Session.SystemPrompt = &schema.SessionSystemPromptCapabilities{}
+				prompt := NewTextSystemPrompt("Be brief.")
+				prompt.Mode = schema.SystemPromptModeOverride
+				_, err := client.ResumeSession(context.Background(), initialization, schema.ResumeSessionRequest{
+					SessionID: "s", Cwd: schema.AbsolutePath(hostRoot + "/repo"), SystemPrompt: prompt,
+				})
+				return err
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -636,6 +658,33 @@ func TestV2NewSessionUsesStoredInitialization(t *testing.T) {
 	}
 	if session.SessionID != "v2-session" {
 		t.Fatalf("session ID = %q", session.SessionID)
+	}
+}
+
+// TestV2NewSessionSendsAdvertisedSystemPrompt checks that a system prompt
+// the agent advertised support for goes out on session/new.
+func TestV2NewSessionSendsAdvertisedSystemPrompt(t *testing.T) {
+	received := make(chan *schema.SystemPrompt, 1)
+	initialization := sessionInitialization()
+	initialization.Capabilities.Session.SystemPrompt = &schema.SessionSystemPromptCapabilities{}
+	client, _ := pipeClient(t, func(_ context.Context, method string, raw json.RawMessage) (any, error) {
+		if method == schema.InitializeMethodName {
+			return initialization, nil
+		}
+		received <- decode[schema.NewSessionRequest](t, raw).SystemPrompt
+		return schema.NewSessionResponse{SessionID: "v2-session"}, nil
+	}, nil)
+	if _, err := client.InitializeWithInfo(context.Background(), Capabilities{}, ClientInfo{Name: "fixture-client", Version: "2.0"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.NewSessionWithOptions(context.Background(), initialization, hostRoot+"/repo", NewSessionOptions{
+		SystemPrompt: NewTextSystemPrompt("Be brief."),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := <-received
+	if prompt == nil || prompt.Mode != schema.SystemPromptModeAppend || len(prompt.Content) != 1 || prompt.Content[0].Text == nil || prompt.Content[0].Text.Text != "Be brief." {
+		t.Fatalf("system prompt = %+v", prompt)
 	}
 }
 

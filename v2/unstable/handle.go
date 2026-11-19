@@ -65,6 +65,7 @@ var routes = map[string]unstabledispatch.Binding{
 	schema.SessionArchiveMethodName:   unstabledispatch.Route(ArchiveHandler.ArchiveSession, nil),
 	schema.SessionUnarchiveMethodName: unstabledispatch.Route(ArchiveHandler.UnarchiveSession, nil),
 	schema.SessionStatusMethodName:    unstabledispatch.Route(StatusHandler.SessionStatus, nil),
+	schema.SessionOptionsMethodName:   unstabledispatch.Route(OptionsHandler.SessionOptions, nil),
 	schema.SessionSetTitleMethodName:  unstabledispatch.Route(TitleHandler.SetSessionTitle, nil),
 	schema.AuthStatusMethodName:       unstabledispatch.Route(AuthStatusHandler.AuthStatus, nil),
 }
@@ -89,9 +90,11 @@ func checkForkResponse(response schema.ForkSessionResponse) error {
 // Advertise never announces capabilities.session.archive: an agent that does
 // must also serve the archived session/list filter, which only Install wires
 // up. Install announces it for an ArchiveHandler. Advertise never announces
-// capabilities.session.systemPrompt either, because the stable session/new
-// and session/resume the runtime dispatches drop the prompt; Install
-// announces it for a SystemPromptHandler.
+// capabilities.session.systemPrompt on the agent's behalf either: the stable
+// session/new and session/resume carry the prompt since schema crate 1.16,
+// so an agent that applies it from them announces it in its own initialize
+// response, which Advertise keeps; Install announces it for a
+// SystemPromptHandler.
 //
 // The session entries are added only when the agent advertised the baseline
 // session capabilities, which the runtime requires anyway; Advertise never
@@ -102,8 +105,7 @@ func Advertise(handler any, customize ...func(*schema.InitializeResponse) error)
 
 // advertise is Advertise; install also announces the archive and systemPrompt
 // capabilities, which only Install, which serves the archived filter and the
-// system prompt through runtime overrides, may do, and then refuses a
-// systemPrompt capability the handler does not serve.
+// system prompt through runtime overrides, may do.
 func advertise(handler any, install bool, customize []func(*schema.InitializeResponse) error) func(stable.InitializeResponse) (any, error) {
 	return func(response stable.InitializeResponse) (any, error) {
 		encoded, err := json.Marshal(response)
@@ -134,11 +136,6 @@ func advertise(handler any, install bool, customize []func(*schema.InitializeRes
 		}
 		for _, apply := range customize {
 			if err := apply(&extended); err != nil {
-				return nil, err
-			}
-		}
-		if install {
-			if err := checkSystemPromptServed(handler, extended); err != nil {
 				return nil, err
 			}
 		}

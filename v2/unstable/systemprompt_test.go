@@ -355,22 +355,20 @@ func TestInstallAnnouncesSystemPromptOnlyWhenEveryLifecycleRequestIsServed(t *te
 	if !strings.Contains(string(raw), `"systemPrompt":{}`) {
 		t.Fatalf("initialize = %s, want systemPrompt {}", raw)
 	}
-	// Advertising session/fork without a ForkHandler would drop the prompt
-	// on fork, so initialize fails instead of announcing it.
-	connection = installed(t, promptOnly{}, func(response *schema.InitializeResponse) error {
-		response.Capabilities.Session.Fork = &schema.SessionForkCapabilities{}
-		return nil
-	})
-	if err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: 2}, &raw); err == nil {
-		t.Fatalf("initialize with an unserved systemPrompt on fork = %s", raw)
+	// Without a SystemPromptHandler, Install announces nothing, but an agent
+	// may announce the capability itself: since schema crate 1.16 the stable
+	// session/new and session/resume carry the prompt to the Agent, so no
+	// lifecycle request drops it.
+	connection = installed(t, struct{}{})
+	if err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: 2}, &raw); err != nil || strings.Contains(string(raw), "systemPrompt") {
+		t.Fatalf("initialize without a handler = %s, %v", raw, err)
 	}
-	// Without a SystemPromptHandler, a customize function cannot announce it.
 	connection = installed(t, struct{}{}, func(response *schema.InitializeResponse) error {
 		response.Capabilities.Session.SystemPrompt = &schema.SessionSystemPromptCapabilities{}
 		return nil
 	})
-	if err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: 2}, &raw); err == nil {
-		t.Fatalf("initialize with an unserved systemPrompt = %s", raw)
+	if err := connection.Call(ctx, schema.InitializeMethodName, schema.InitializeRequest{ProtocolVersion: 2}, &raw); err != nil || !strings.Contains(string(raw), `"systemPrompt":{}`) {
+		t.Fatalf("initialize with a self-announced systemPrompt = %s, %v", raw, err)
 	}
 }
 
