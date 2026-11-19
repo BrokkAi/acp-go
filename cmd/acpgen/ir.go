@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -108,6 +109,9 @@ type typeDef struct {
 	Flatten *flattenInfo
 	// Upsert structs get an ApplyUpdate method (see patchDefs).
 	Upsert bool
+	// Length is set on a string newtype whose Rust Deserialize checks its
+	// length (see lengthCheckedStrings).
+	Length *stringLength
 	// AnySynth is the parity fixture value of a kindAny def: a value of its
 	// first arm, so the fixture also decodes in the Rust schema crate.
 	AnySynth string
@@ -156,11 +160,18 @@ type anyArm struct {
 // distinct as Nullable. Upserts also get an ApplyUpdate method that applies a
 // later update to stored entity state, patching the top-level _meta by key
 // (see the v2 Metadata Patches rule). UsageUpdate is not an entity upsert: its
-// _meta describes the notification and is not a patch.
-var patchDefs = map[string]struct{ upsert bool }{
+// _meta describes the notification and is not a patch. A field in optional is
+// a plain Rust Option even so: null reads as omission, and ApplyUpdate keeps
+// the stored value for both (CursorUpdate's anchor, fixed after the first
+// update).
+var patchDefs = map[string]struct {
+	upsert   bool
+	optional []string
+}{
 	"AgentMessage":      {upsert: true},
 	"AgentThought":      {upsert: true},
 	"CompactionUpdate":  {upsert: true},
+	"CursorUpdate":      {upsert: true, optional: []string{"anchor"}},
 	"SessionInfoUpdate": {upsert: true},
 	"SessionMessage":    {upsert: true},
 	"SubagentUpdate":    {upsert: true},
@@ -168,6 +179,12 @@ var patchDefs = map[string]struct{ upsert bool }{
 	"ToolCallUpdate":    {upsert: true},
 	"UsageUpdate":       {},
 	"UserMessage":       {upsert: true},
+}
+
+// patchOptional reports whether a field of a patchDefs def is a plain
+// Option in Rust (see patchDefs).
+func patchOptional(def, key string) bool {
+	return slices.Contains(patchDefs[def].optional, key)
 }
 
 // v1PatchDefs lists, per v1 def, the optional fields that are patches. v1
@@ -182,7 +199,8 @@ var patchDefs = map[string]struct{ upsert bool }{
 var v1PatchDefs = map[string][]string{
 	"CompactionUpdate":  {"summary", "error", "_meta"},
 	"SessionInfoUpdate": {"title", "updatedAt"},
-	// Unstable subagent updates (present only in the unstable v1 pin).
+	// Unstable updates (present only in the unstable v1 pin).
+	"CursorUpdate":   {"capabilities", "_meta"},
 	"SessionMessage": {"senderSessionId", "recipientSessionId", "senderMessageId", "recipientMessageId", "content", "_meta"},
 	"SubagentUpdate": {"title", "description", "capabilities", "state", "cwd", "additionalDirectories", "_meta"},
 }
@@ -252,13 +270,13 @@ var defaultOnNullPayloads = map[int]struct{ stable, unstable []string }{
 			"ListSessionsRequest", "LoadSessionResponse", "LogoutRequest", "LogoutResponse", "ReleaseTerminalResponse",
 			"ResumeSessionResponse", "SetSessionModeResponse", "WaitForTerminalExitResponse", "WriteTextFileResponse"},
 		unstable: []string{"ArchiveSessionResponse", "AuthStatusRequest", "DisableProviderResponse", "ListProvidersRequest",
-			"SetProviderResponse", "UnarchiveSessionResponse"},
+			"SessionOptionsResponse", "SetProviderResponse", "UnarchiveSessionResponse"},
 	},
 	2: {
 		stable: []string{"CancelTerminalResponse", "CancelToolCallResponse", "CloseSessionResponse", "DeleteSessionResponse",
 			"ListSessionsRequest", "LoginAuthResponse", "LogoutAuthRequest", "LogoutAuthResponse", "ResumeSessionResponse"},
 		unstable: []string{"ArchiveSessionResponse", "AuthStatusRequest", "DisableProviderResponse", "ListProvidersRequest",
-			"SetProviderResponse", "UnarchiveSessionResponse"},
+			"SessionOptionsResponse", "SetProviderResponse", "UnarchiveSessionResponse"},
 	},
 }
 
@@ -314,13 +332,19 @@ func (r *ir) checkDefaultOnNull(protocol int) error {
 // a string tag ("`type` must be a string"), and prefixes the error of a
 // known tag's payload with that tag's Payload text.
 var stringTagUnions = map[string]stringTagRule{
-	"SetSessionConfigOptionRequest": {
-		Since:    2,
-		Required: []string{"value", "type"},
-		Payload: map[string]string{
-			"id":      "`value` must be a string for `type: id`",
-			"boolean": "`value` must be a boolean for `type: boolean`",
-		},
+	"SetSessionConfigOptionRequest": sessionConfigOptionValueRule,
+	// The unstable session/options initial values flatten the same value.
+	"InitialSessionConfigOption": sessionConfigOptionValueRule,
+}
+
+// sessionConfigOptionValueRule is the hand-written Deserialize of v2
+// SessionConfigOptionValue.
+var sessionConfigOptionValueRule = stringTagRule{
+	Since:    2,
+	Required: []string{"value", "type"},
+	Payload: map[string]string{
+		"id":      "`value` must be a string for `type: id`",
+		"boolean": "`value` must be a boolean for `type: boolean`",
 	},
 }
 
@@ -337,25 +361,28 @@ type stringTagRule struct {
 // AbsolutePath, so its path fields need no table. A listed field present in
 // the pin that is not a string or a list of strings fails generation.
 var pathFields = map[string]bool{
-	"CreateTerminalRequest.cwd": true,
-	"Diff.path":                 true,
-	"ForkSessionRequest.additionalDirectories":   true,
-	"ForkSessionRequest.cwd":                     true,
-	"ListSessionsRequest.cwd":                    true,
-	"LoadSessionRequest.additionalDirectories":   true,
-	"LoadSessionRequest.cwd":                     true,
-	"McpServerStdio.command":                     true,
-	"NewSessionRequest.additionalDirectories":    true,
-	"NewSessionRequest.cwd":                      true,
-	"ReadTextFileRequest.path":                   true,
-	"ResumeSessionRequest.additionalDirectories": true,
-	"ResumeSessionRequest.cwd":                   true,
-	"SessionInfo.additionalDirectories":          true,
-	"SessionInfo.cwd":                            true,
-	"SubagentUpdate.additionalDirectories":       true,
-	"SubagentUpdate.cwd":                         true,
-	"ToolCallLocation.path":                      true,
-	"WriteTextFileRequest.path":                  true,
+	"CreateTerminalRequest.cwd":                   true,
+	"Diff.path":                                   true,
+	"ForkSessionRequest.additionalDirectories":    true,
+	"ForkSessionRequest.cwd":                      true,
+	"ListSessionsRequest.cwd":                     true,
+	"LoadSessionRequest.additionalDirectories":    true,
+	"LoadSessionRequest.cwd":                      true,
+	"McpServerStdio.command":                      true,
+	"NewSessionRequest.additionalDirectories":     true,
+	"NewSessionRequest.cwd":                       true,
+	"ReadTextFileRequest.path":                    true,
+	"ResumeSessionRequest.additionalDirectories":  true,
+	"ResumeSessionRequest.cwd":                    true,
+	"SessionOptionsRequest.additionalDirectories": true,
+	"SessionOptionsRequest.cwd":                   true,
+	"PlanMarkdown.path":                           true,
+	"SessionInfo.additionalDirectories":           true,
+	"SessionInfo.cwd":                             true,
+	"SubagentUpdate.additionalDirectories":        true,
+	"SubagentUpdate.cwd":                          true,
+	"ToolCallLocation.path":                       true,
+	"WriteTextFileRequest.path":                   true,
 }
 
 // flattenedEnums names the Rust enum of each union with shared fields that
@@ -369,6 +396,54 @@ var flattenedEnums = map[string]string{
 	"DiffChange":                    "DiffChangeOperation",
 	"SessionConfigOption":           "SessionConfigKind",
 	"SetSessionConfigOptionRequest": "SessionConfigOptionValue",
+	"InitialSessionConfigOption":    "SessionConfigOptionValue",
+}
+
+// lengthCheckedStrings are string newtypes whose hand-written Rust
+// Deserialize checks the value's length, keyed by def: the bounds count
+// characters (Unicode scalar values), as JSON Schema's minLength and
+// maxLength do, and each failure has the error text the Rust type words
+// itself. The schema states the bounds but not that Rust enforces them (it
+// also bounds strings Rust does not check, such as a notice's title), so a
+// string def with a bound fails generation unless it is listed here with the
+// same bounds.
+var lengthCheckedStrings = map[string]stringLength{
+	// v2 IdempotencyKey::new: InvalidIdempotencyKey's Display.
+	"IdempotencyKey": {
+		Min:      1,
+		Max:      255,
+		TooShort: "idempotency key must not be empty",
+		TooLong:  "idempotency key must be at most 255 characters",
+	},
+}
+
+// stringLength describes a lengthCheckedStrings entry.
+type stringLength struct {
+	Min, Max          int
+	TooShort, TooLong string
+}
+
+// stringLengthOf returns the length check of a string def, failing when the
+// schema bounds a def lengthCheckedStrings does not list, or lists with
+// other bounds.
+func stringLengthOf(name string, def *rawSchema) (*stringLength, error) {
+	rule, listed := lengthCheckedStrings[name]
+	if def.MinLength == nil && def.MaxLength == nil {
+		if listed {
+			return nil, fmt.Errorf("%s: lengthCheckedStrings lists it, but its schema has no length bounds", name)
+		}
+		return nil, nil
+	}
+	if !listed {
+		return nil, fmt.Errorf("%s: a string def with length bounds; add the Rust check to lengthCheckedStrings", name)
+	}
+	if def.MinLength == nil || def.MaxLength == nil || *def.MinLength != rule.Min || *def.MaxLength != rule.Max {
+		return nil, fmt.Errorf("%s: schema length bounds differ from lengthCheckedStrings", name)
+	}
+	if rule.Min < 1 || rule.Max < rule.Min {
+		return nil, fmt.Errorf("%s: lengthCheckedStrings bounds are not a range of at least one character", name)
+	}
+	return &rule, nil
 }
 
 // applyPathFields marks the def's path fields: the v1 pathFields, and in v2
@@ -651,6 +726,7 @@ func checkUpsert(td *typeDef) error {
 			}
 			meta = true
 		case f.Required, f.Nullable, f.GoType == "json.RawMessage":
+		case patchOptional(td.Name, f.JSONName) && f.pointer():
 		default:
 			return fmt.Errorf("%s.%s: upsert patch field %s cannot represent null", td.Name, f.JSONName, f.declType())
 		}
@@ -711,7 +787,7 @@ func classify(name string, def *rawSchema, root *rootSchema, preserveNull bool) 
 				return nil, fmt.Errorf("%s.%s: %w", name, p.key, err)
 			}
 			f.Required = required[p.key]
-			if _, patch := patchDefs[name]; patch && preserveNull && !f.Required {
+			if _, patch := patchDefs[name]; patch && preserveNull && !f.Required && !patchOptional(name, p.key) {
 				if _, ok := nullableRef(p.value.unwrap()); ok {
 					f.Nullable = true
 				}
@@ -722,6 +798,11 @@ func classify(name string, def *rawSchema, root *rootSchema, preserveNull bool) 
 
 	case def.soleType() == "string":
 		td.Kind, td.Base = kindNewtype, "string"
+		length, err := stringLengthOf(name, def)
+		if err != nil {
+			return nil, err
+		}
+		td.Length = length
 		return td, nil
 
 	case def.soleType() == "integer":
@@ -898,6 +979,7 @@ var flattenAfter = map[string]string{
 	"IdleStateUpdate":               "",
 	"SessionConfigOption":           "category",
 	"SetSessionConfigOptionRequest": "configId",
+	"InitialSessionConfigOption":    "configId",
 	"DiffChange":                    "mimeType",
 }
 

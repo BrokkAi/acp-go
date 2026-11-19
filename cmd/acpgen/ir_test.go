@@ -162,3 +162,37 @@ func TestUnionRejectsUnmodeledSharedProperties(t *testing.T) {
 		t.Fatalf("classify error = %v, want unmodeled property error", err)
 	}
 }
+
+// TestStringLengthBoundsNeedTheRustCheck covers lengthCheckedStrings: a
+// listed def gets its Rust length check, and a string def whose schema bounds
+// its length fails generation unless it is listed with the same bounds, since
+// the schema also bounds strings Rust never checks.
+func TestStringLengthBoundsNeedTheRustCheck(t *testing.T) {
+	str := json.RawMessage(`"string"`)
+	bound := func(n int) *int { return &n }
+
+	td, err := classify("IdempotencyKey", &rawSchema{Type: str, MinLength: bound(1), MaxLength: bound(255)}, &rootSchema{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if td.Kind != kindNewtype || td.Length == nil || td.Length.Min != 1 || td.Length.Max != 255 {
+		t.Fatalf("IdempotencyKey = %+v, want a newtype with its length check", td)
+	}
+	if td, err := classify("SessionId", &rawSchema{Type: str}, &rootSchema{}, true); err != nil || td.Length != nil {
+		t.Fatalf("SessionId = %+v, %v; want a plain newtype", td, err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		def  *rawSchema
+		want string
+	}{
+		{"Unlisted", &rawSchema{Type: str, MinLength: bound(1)}, "add the Rust check to lengthCheckedStrings"},
+		{"IdempotencyKey", &rawSchema{Type: str, MinLength: bound(1), MaxLength: bound(64)}, "differ from lengthCheckedStrings"},
+		{"IdempotencyKey", &rawSchema{Type: str}, "has no length bounds"},
+	} {
+		if _, err := classify(tc.name, tc.def, &rootSchema{}, true); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("classify(%s) error = %v, want %q", tc.name, err, tc.want)
+		}
+	}
+}

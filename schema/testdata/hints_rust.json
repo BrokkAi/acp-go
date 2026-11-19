@@ -61,12 +61,12 @@
    "input": "{}"
   },
   "AgentCapabilities._meta/encode-empty": {
-   "encoded": "{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
-   "input": "{\"_meta\": {}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"loadSession\": true, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
+   "encoded": "{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
+   "input": "{\"_meta\": {}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"loadSession\": true, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
   },
   "AgentCapabilities._meta/encode-meta": {
-   "encoded": "{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
-   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"loadSession\": true, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
+   "encoded": "{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
+   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"loadSession\": true, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
   },
   "AgentCapabilities._meta/malformed": {
    "encoded": "{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false},\"sessionCapabilities\":{},\"auth\":{}}",
@@ -177,8 +177,8 @@
    "input": "{\"sessionCapabilities\": null}"
   },
   "AgentCapabilities.sessionCapabilities/valid": {
-   "encoded": "{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{}}",
-   "input": "{\"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
+   "encoded": "{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{}}",
+   "input": "{\"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
   },
   "AgentCapabilities/array": {
    "encoded": "{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false},\"sessionCapabilities\":{},\"auth\":{}}",
@@ -189,8 +189,8 @@
    "input": "[null, null, null, null, null, null, null]"
   },
   "AgentCapabilities/encode-full": {
-   "encoded": "{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
+   "encoded": "{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
   },
   "AgentCapabilities/encode-minimal": {
    "encoded": "{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false},\"sessionCapabilities\":{},\"auth\":{}}",
@@ -4269,12 +4269,12 @@
    "input": "{\"protocolVersion\": 0}"
   },
   "InitializeResponse._meta/encode-empty": {
-   "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"authMethods\":[{\"type\":\"terminal\",\"id\":\"\",\"name\":\"\",\"description\":\"\",\"args\":[\"\"],\"env\":{\"k\":\"\"},\"_meta\":{\"k\":\"v\"}}],\"agentInfo\":{\"name\":\"\",\"title\":\"\",\"version\":\"\",\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
-   "input": "{\"_meta\": {}, \"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"agentInfo\": {\"name\": \"\", \"title\": \"\", \"version\": \"\", \"_meta\": {\"k\": \"v\"}}, \"authMethods\": [{\"type\": \"terminal\", \"id\": \"\", \"name\": \"\", \"description\": \"\", \"args\": [\"\"], \"env\": {\"k\": \"\"}, \"_meta\": {\"k\": \"v\"}}], \"protocolVersion\": 0}"
+   "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"authMethods\":[{\"type\":\"terminal\",\"id\":\"\",\"name\":\"\",\"description\":\"\",\"args\":[\"\"],\"env\":{\"k\":\"\"},\"_meta\":{\"k\":\"v\"}}],\"agentInfo\":{\"name\":\"\",\"title\":\"\",\"version\":\"\",\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
+   "input": "{\"_meta\": {}, \"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"agentInfo\": {\"name\": \"\", \"title\": \"\", \"version\": \"\", \"_meta\": {\"k\": \"v\"}}, \"authMethods\": [{\"type\": \"terminal\", \"id\": \"\", \"name\": \"\", \"description\": \"\", \"args\": [\"\"], \"env\": {\"k\": \"\"}, \"_meta\": {\"k\": \"v\"}}], \"protocolVersion\": 0}"
   },
   "InitializeResponse._meta/encode-meta": {
-   "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"authMethods\":[{\"type\":\"terminal\",\"id\":\"\",\"name\":\"\",\"description\":\"\",\"args\":[\"\"],\"env\":{\"k\":\"\"},\"_meta\":{\"k\":\"v\"}}],\"agentInfo\":{\"name\":\"\",\"title\":\"\",\"version\":\"\",\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
-   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"agentInfo\": {\"name\": \"\", \"title\": \"\", \"version\": \"\", \"_meta\": {\"k\": \"v\"}}, \"authMethods\": [{\"type\": \"terminal\", \"id\": \"\", \"name\": \"\", \"description\": \"\", \"args\": [\"\"], \"env\": {\"k\": \"\"}, \"_meta\": {\"k\": \"v\"}}], \"protocolVersion\": 0}"
+   "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"authMethods\":[{\"type\":\"terminal\",\"id\":\"\",\"name\":\"\",\"description\":\"\",\"args\":[\"\"],\"env\":{\"k\":\"\"},\"_meta\":{\"k\":\"v\"}}],\"agentInfo\":{\"name\":\"\",\"title\":\"\",\"version\":\"\",\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
+   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"agentInfo\": {\"name\": \"\", \"title\": \"\", \"version\": \"\", \"_meta\": {\"k\": \"v\"}}, \"authMethods\": [{\"type\": \"terminal\", \"id\": \"\", \"name\": \"\", \"description\": \"\", \"args\": [\"\"], \"env\": {\"k\": \"\"}, \"_meta\": {\"k\": \"v\"}}], \"protocolVersion\": 0}"
   },
   "InitializeResponse._meta/malformed": {
    "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false},\"sessionCapabilities\":{},\"auth\":{}},\"authMethods\":[]}",
@@ -4309,8 +4309,8 @@
    "input": "{\"agentCapabilities\": null, \"protocolVersion\": 0}"
   },
   "InitializeResponse.agentCapabilities/valid": {
-   "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"authMethods\":[]}",
-   "input": "{\"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"protocolVersion\": 0}"
+   "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"authMethods\":[]}",
+   "input": "{\"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"protocolVersion\": 0}"
   },
   "InitializeResponse.agentInfo/empty-object": {
    "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false},\"sessionCapabilities\":{},\"auth\":{}},\"authMethods\":[]}",
@@ -4337,8 +4337,8 @@
    "input": "{\"authMethods\": [{}, {\"type\": \"terminal\", \"id\": \"\", \"name\": \"\", \"description\": \"\", \"args\": [\"\"], \"env\": {\"k\": \"\"}, \"_meta\": {\"k\": \"v\"}}], \"protocolVersion\": 0}"
   },
   "InitializeResponse.authMethods/encode-empty": {
-   "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"authMethods\":[],\"agentInfo\":{\"name\":\"\",\"title\":\"\",\"version\":\"\",\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"_meta\": {\"k\": \"v\"}, \"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"agentInfo\": {\"name\": \"\", \"title\": \"\", \"version\": \"\", \"_meta\": {\"k\": \"v\"}}, \"authMethods\": [], \"protocolVersion\": 0}"
+   "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"authMethods\":[],\"agentInfo\":{\"name\":\"\",\"title\":\"\",\"version\":\"\",\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"_meta\": {\"k\": \"v\"}, \"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"agentInfo\": {\"name\": \"\", \"title\": \"\", \"version\": \"\", \"_meta\": {\"k\": \"v\"}}, \"authMethods\": [], \"protocolVersion\": 0}"
   },
   "InitializeResponse.authMethods/index-tag": {
    "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false},\"sessionCapabilities\":{},\"auth\":{}},\"authMethods\":[{\"type\":\"terminal\",\"id\":\"\",\"name\":\"\",\"description\":\"\",\"args\":[\"\"],\"env\":{\"k\":\"\"},\"_meta\":{\"k\":\"v\"}}]}",
@@ -4374,7 +4374,7 @@
   },
   "InitializeResponse.protocolVersion/negative-zero": {
    "error": "invalid type: floating point `-0.0`, expected u16",
-   "input": "{\"_meta\": {\"k\": \"v\"}, \"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"agentInfo\": {\"name\": \"\", \"title\": \"\", \"version\": \"\", \"_meta\": {\"k\": \"v\"}}, \"authMethods\": [{\"type\": \"terminal\", \"id\": \"\", \"name\": \"\", \"description\": \"\", \"args\": [\"\"], \"env\": {\"k\": \"\"}, \"_meta\": {\"k\": \"v\"}}], \"protocolVersion\": -0}"
+   "input": "{\"_meta\": {\"k\": \"v\"}, \"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"agentInfo\": {\"name\": \"\", \"title\": \"\", \"version\": \"\", \"_meta\": {\"k\": \"v\"}}, \"authMethods\": [{\"type\": \"terminal\", \"id\": \"\", \"name\": \"\", \"description\": \"\", \"args\": [\"\"], \"env\": {\"k\": \"\"}, \"_meta\": {\"k\": \"v\"}}], \"protocolVersion\": -0}"
   },
   "InitializeResponse.protocolVersion/null": {
    "error": "invalid type: null, expected u16",
@@ -4393,8 +4393,8 @@
    "input": "[0, null, null, null, null, null]"
   },
   "InitializeResponse/encode-full": {
-   "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"authMethods\":[{\"type\":\"terminal\",\"id\":\"\",\"name\":\"\",\"description\":\"\",\"args\":[\"\"],\"env\":{\"k\":\"\"},\"_meta\":{\"k\":\"v\"}}],\"agentInfo\":{\"name\":\"\",\"title\":\"\",\"version\":\"\",\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"protocolVersion\": 0, \"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"authMethods\": [{\"type\": \"terminal\", \"id\": \"\", \"name\": \"\", \"description\": \"\", \"args\": [\"\"], \"env\": {\"k\": \"\"}, \"_meta\": {\"k\": \"v\"}}], \"agentInfo\": {\"name\": \"\", \"title\": \"\", \"version\": \"\", \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
+   "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,\"audio\":true,\"embeddedContext\":true,\"_meta\":{\"k\":\"v\"}},\"mcpCapabilities\":{\"http\":true,\"sse\":true,\"_meta\":{\"k\":\"v\"}},\"sessionCapabilities\":{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"auth\":{\"logout\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"authMethods\":[{\"type\":\"terminal\",\"id\":\"\",\"name\":\"\",\"description\":\"\",\"args\":[\"\"],\"env\":{\"k\":\"\"},\"_meta\":{\"k\":\"v\"}}],\"agentInfo\":{\"name\":\"\",\"title\":\"\",\"version\":\"\",\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"protocolVersion\": 0, \"agentCapabilities\": {\"loadSession\": true, \"promptCapabilities\": {\"image\": true, \"audio\": true, \"embeddedContext\": true, \"_meta\": {\"k\": \"v\"}}, \"mcpCapabilities\": {\"http\": true, \"sse\": true, \"_meta\": {\"k\": \"v\"}}, \"sessionCapabilities\": {\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"auth\": {\"logout\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"authMethods\": [{\"type\": \"terminal\", \"id\": \"\", \"name\": \"\", \"description\": \"\", \"args\": [\"\"], \"env\": {\"k\": \"\"}, \"_meta\": {\"k\": \"v\"}}], \"agentInfo\": {\"name\": \"\", \"title\": \"\", \"version\": \"\", \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
   },
   "InitializeResponse/encode-minimal": {
    "encoded": "{\"protocolVersion\":0,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false},\"sessionCapabilities\":{},\"auth\":{}},\"authMethods\":[]}",
@@ -4745,12 +4745,12 @@
    "input": "{\"sessions\": [{\"sessionId\": \"\", \"cwd\": \"\", \"additionalDirectories\": [\"\"], \"title\": \"\", \"updatedAt\": \"\", \"_meta\": {\"k\": \"v\"}}]}"
   },
   "LoadSessionRequest._meta/encode-empty": {
-   "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"sessionId\":\"\",\"_meta\":{}}",
-   "input": "{\"_meta\": {}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\"}"
+   "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"sessionId\":\"\",\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
+   "input": "{\"_meta\": {}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\", \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}}"
   },
   "LoadSessionRequest._meta/encode-meta": {
-   "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"sessionId\":\"\",\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
-   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\"}"
+   "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"sessionId\":\"\",\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
+   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\", \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}}"
   },
   "LoadSessionRequest._meta/malformed": {
    "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"sessionId\":\"\"}",
@@ -4769,8 +4769,8 @@
    "input": "{\"_meta\": {\"k\": \"v\"}, \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\"}"
   },
   "LoadSessionRequest.additionalDirectories/encode-empty": {
-   "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"sessionId\":\"\",\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"_meta\": {\"k\": \"v\"}, \"additionalDirectories\": [], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\"}"
+   "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"sessionId\":\"\",\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"_meta\": {\"k\": \"v\"}, \"additionalDirectories\": [], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\", \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}}"
   },
   "LoadSessionRequest.additionalDirectories/invalid-item": {
    "error": "invalid type: boolean `true`, expected path string",
@@ -4844,21 +4844,25 @@
    "error": "invalid type: null, expected a string",
    "input": "{\"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": null}"
   },
+  "LoadSessionRequest.systemPrompt/null": {
+   "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"sessionId\":\"\"}",
+   "input": "{\"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\", \"systemPrompt\": null}"
+  },
   "LoadSessionRequest/array": {
    "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"sessionId\":\"\"}",
    "input": "[[{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"\", null, \"\"]"
   },
   "LoadSessionRequest/array-empty": {
-   "error": "invalid length 0, expected struct LoadSessionRequest with 5 elements",
+   "error": "invalid length 0, expected struct LoadSessionRequest with 6 elements",
    "input": "[]"
   },
   "LoadSessionRequest/array-long": {
-   "error": "invalid length 6, expected fewer elements in array",
-   "input": "[[{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"\", null, \"\", null, null]"
+   "error": "invalid length 7, expected fewer elements in array",
+   "input": "[[{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"\", null, \"\", null, null, null]"
   },
   "LoadSessionRequest/encode-full": {
-   "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"sessionId\":\"\",\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"cwd\": \"\", \"additionalDirectories\": [\"\"], \"sessionId\": \"\", \"_meta\": {\"k\": \"v\"}}"
+   "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"sessionId\":\"\",\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"cwd\": \"\", \"additionalDirectories\": [\"\"], \"sessionId\": \"\", \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
   },
   "LoadSessionRequest/encode-minimal": {
    "encoded": "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"cwd\":\"\",\"sessionId\":\"\"}",
@@ -5753,12 +5757,12 @@
    "input": "{\"items\": {\"type\": \"string\", \"enum\": [\"\"]}}"
   },
   "NewSessionRequest._meta/encode-empty": {
-   "encoded": "{\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"_meta\":{}}",
-   "input": "{\"_meta\": {}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}]}"
+   "encoded": "{\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
+   "input": "{\"_meta\": {}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}}"
   },
   "NewSessionRequest._meta/encode-meta": {
-   "encoded": "{\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
-   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}]}"
+   "encoded": "{\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
+   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}}"
   },
   "NewSessionRequest._meta/malformed": {
    "encoded": "{\"cwd\":\"\",\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}]}",
@@ -5777,8 +5781,8 @@
    "input": "{\"_meta\": {\"k\": \"v\"}, \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}]}"
   },
   "NewSessionRequest.additionalDirectories/encode-empty": {
-   "encoded": "{\"cwd\":\"\",\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"_meta\": {\"k\": \"v\"}, \"additionalDirectories\": [], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}]}"
+   "encoded": "{\"cwd\":\"\",\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"_meta\": {\"k\": \"v\"}, \"additionalDirectories\": [], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}}"
   },
   "NewSessionRequest.additionalDirectories/invalid-item": {
    "error": "invalid type: boolean `true`, expected path string",
@@ -5844,21 +5848,25 @@
    "encoded": "{\"cwd\":\"\",\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}]}",
    "input": "{\"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}]}"
   },
+  "NewSessionRequest.systemPrompt/null": {
+   "encoded": "{\"cwd\":\"\",\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}]}",
+   "input": "{\"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"systemPrompt\": null}"
+  },
   "NewSessionRequest/array": {
    "encoded": "{\"cwd\":\"\",\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}]}",
    "input": "[\"\", null, [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}]]"
   },
   "NewSessionRequest/array-empty": {
-   "error": "invalid length 0, expected struct NewSessionRequest with 4 elements",
+   "error": "invalid length 0, expected struct NewSessionRequest with 5 elements",
    "input": "[]"
   },
   "NewSessionRequest/array-long": {
-   "error": "invalid length 5, expected fewer elements in array",
-   "input": "[\"\", null, [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], null, null]"
+   "error": "invalid length 6, expected fewer elements in array",
+   "input": "[\"\", null, [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], null, null, null]"
   },
   "NewSessionRequest/encode-full": {
-   "encoded": "{\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"cwd\": \"\", \"additionalDirectories\": [\"\"], \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}"
+   "encoded": "{\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"cwd\": \"\", \"additionalDirectories\": [\"\"], \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
   },
   "NewSessionRequest/encode-minimal": {
    "encoded": "{\"cwd\":\"\",\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}]}",
@@ -7397,12 +7405,12 @@
    "input": "{\"name\": \"\", \"uri\": \"\"}"
   },
   "ResumeSessionRequest._meta/encode-empty": {
-   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"_meta\":{}}",
-   "input": "{\"_meta\": {}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\"}"
+   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
+   "input": "{\"_meta\": {}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\", \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}}"
   },
   "ResumeSessionRequest._meta/encode-meta": {
-   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
-   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\"}"
+   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
+   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\", \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}}"
   },
   "ResumeSessionRequest._meta/malformed": {
    "encoded": "{\"sessionId\":\"\",\"cwd\":\"\"}",
@@ -7421,8 +7429,8 @@
    "input": "{\"_meta\": {\"k\": \"v\"}, \"cwd\": \"\", \"sessionId\": \"\"}"
   },
   "ResumeSessionRequest.additionalDirectories/encode-empty": {
-   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"_meta\": {\"k\": \"v\"}, \"additionalDirectories\": [], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\"}"
+   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"_meta\": {\"k\": \"v\"}, \"additionalDirectories\": [], \"cwd\": \"\", \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\", \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}}"
   },
   "ResumeSessionRequest.additionalDirectories/invalid-item": {
    "error": "invalid type: boolean `true`, expected path string",
@@ -7461,8 +7469,8 @@
    "input": "{\"cwd\": \"\", \"mcpServers\": [{}, {\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"sessionId\": \"\"}"
   },
   "ResumeSessionRequest.mcpServers/encode-empty": {
-   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"_meta\": {\"k\": \"v\"}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [], \"sessionId\": \"\"}"
+   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"_meta\": {\"k\": \"v\"}, \"additionalDirectories\": [\"\"], \"cwd\": \"\", \"mcpServers\": [], \"sessionId\": \"\", \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}}"
   },
   "ResumeSessionRequest.mcpServers/index-tag": {
    "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}]}",
@@ -7500,21 +7508,25 @@
    "error": "invalid type: null, expected a string",
    "input": "{\"cwd\": \"\", \"sessionId\": null}"
   },
+  "ResumeSessionRequest.systemPrompt/null": {
+   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\"}",
+   "input": "{\"cwd\": \"\", \"sessionId\": \"\", \"systemPrompt\": null}"
+  },
   "ResumeSessionRequest/array": {
    "encoded": "{\"sessionId\":\"\",\"cwd\":\"\"}",
    "input": "[\"\", \"\"]"
   },
   "ResumeSessionRequest/array-empty": {
-   "error": "invalid length 0, expected struct ResumeSessionRequest with 5 elements",
+   "error": "invalid length 0, expected struct ResumeSessionRequest with 6 elements",
    "input": "[]"
   },
   "ResumeSessionRequest/array-long": {
-   "error": "invalid length 6, expected fewer elements in array",
-   "input": "[\"\", \"\", null, null, null, null]"
+   "error": "invalid length 7, expected fewer elements in array",
+   "input": "[\"\", \"\", null, null, null, null, null]"
   },
   "ResumeSessionRequest/encode-full": {
-   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"sessionId\": \"\", \"cwd\": \"\", \"additionalDirectories\": [\"\"], \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}"
+   "encoded": "{\"sessionId\":\"\",\"cwd\":\"\",\"additionalDirectories\":[\"\"],\"mcpServers\":[{\"type\":\"http\",\"name\":\"\",\"url\":\"\",\"headers\":[{\"name\":\"\",\"value\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}],\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"sessionId\": \"\", \"cwd\": \"\", \"additionalDirectories\": [\"\"], \"mcpServers\": [{\"type\": \"http\", \"name\": \"\", \"url\": \"\", \"headers\": [{\"name\": \"\", \"value\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}], \"systemPrompt\": {\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
   },
   "ResumeSessionRequest/encode-minimal": {
    "encoded": "{\"sessionId\":\"\",\"cwd\":\"\"}",
@@ -7717,12 +7729,12 @@
    "input": "{}"
   },
   "SessionCapabilities._meta/encode-empty": {
-   "encoded": "{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
-   "input": "{\"_meta\": {}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"list\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}}"
+   "encoded": "{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
+   "input": "{\"_meta\": {}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"list\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
   },
   "SessionCapabilities._meta/encode-meta": {
-   "encoded": "{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
-   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"list\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}}"
+   "encoded": "{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
+   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"list\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
   },
   "SessionCapabilities._meta/malformed": {
    "encoded": "{}",
@@ -7840,17 +7852,37 @@
    "encoded": "{\"resume\":{\"_meta\":{\"k\":\"v\"}}}",
    "input": "{\"resume\": {\"_meta\": {\"k\": \"v\"}}}"
   },
+  "SessionCapabilities.systemPrompt/empty-object": {
+   "encoded": "{\"systemPrompt\":{}}",
+   "input": "{\"systemPrompt\": {}}"
+  },
+  "SessionCapabilities.systemPrompt/malformed": {
+   "encoded": "{}",
+   "input": "{\"systemPrompt\": true}"
+  },
+  "SessionCapabilities.systemPrompt/missing": {
+   "encoded": "{}",
+   "input": "{}"
+  },
+  "SessionCapabilities.systemPrompt/null": {
+   "encoded": "{}",
+   "input": "{\"systemPrompt\": null}"
+  },
+  "SessionCapabilities.systemPrompt/valid": {
+   "encoded": "{\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}}",
+   "input": "{\"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
+  },
   "SessionCapabilities/array": {
    "encoded": "{}",
    "input": "[]"
   },
   "SessionCapabilities/array-long": {
-   "error": "invalid length 7, expected fewer elements in array",
-   "input": "[null, null, null, null, null, null, null]"
+   "error": "invalid length 8, expected fewer elements in array",
+   "input": "[null, null, null, null, null, null, null, null]"
   },
   "SessionCapabilities/encode-full": {
-   "encoded": "{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
-   "input": "{\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
+   "encoded": "{\"list\":{\"_meta\":{\"k\":\"v\"}},\"delete\":{\"_meta\":{\"k\":\"v\"}},\"additionalDirectories\":{\"_meta\":{\"k\":\"v\"}},\"systemPrompt\":{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"resume\":{\"_meta\":{\"k\":\"v\"}},\"close\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"list\": {\"_meta\": {\"k\": \"v\"}}, \"delete\": {\"_meta\": {\"k\": \"v\"}}, \"additionalDirectories\": {\"_meta\": {\"k\": \"v\"}}, \"systemPrompt\": {\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"resume\": {\"_meta\": {\"k\": \"v\"}}, \"close\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
   },
   "SessionCapabilities/encode-minimal": {
    "encoded": "{}",
@@ -8932,6 +8964,166 @@
    "encoded": "{}",
    "input": "{}"
   },
+  "SessionSystemPromptCapabilities._meta/encode-empty": {
+   "encoded": "{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
+   "input": "{\"_meta\": {}, \"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
+  },
+  "SessionSystemPromptCapabilities._meta/encode-meta": {
+   "encoded": "{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
+   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
+  },
+  "SessionSystemPromptCapabilities._meta/malformed": {
+   "encoded": "{}",
+   "input": "{\"_meta\": true}"
+  },
+  "SessionSystemPromptCapabilities._meta/missing": {
+   "encoded": "{}",
+   "input": "{}"
+  },
+  "SessionSystemPromptCapabilities._meta/null": {
+   "encoded": "{}",
+   "input": "{\"_meta\": null}"
+  },
+  "SessionSystemPromptCapabilities._meta/valid": {
+   "encoded": "{\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"_meta\": {\"k\": \"v\"}}"
+  },
+  "SessionSystemPromptCapabilities.mode/empty-object": {
+   "encoded": "{\"mode\":{}}",
+   "input": "{\"mode\": {}}"
+  },
+  "SessionSystemPromptCapabilities.mode/malformed": {
+   "encoded": "{}",
+   "input": "{\"mode\": true}"
+  },
+  "SessionSystemPromptCapabilities.mode/missing": {
+   "encoded": "{}",
+   "input": "{}"
+  },
+  "SessionSystemPromptCapabilities.mode/null": {
+   "encoded": "{}",
+   "input": "{\"mode\": null}"
+  },
+  "SessionSystemPromptCapabilities.mode/valid": {
+   "encoded": "{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}}",
+   "input": "{\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}}"
+  },
+  "SessionSystemPromptCapabilities/array": {
+   "encoded": "{}",
+   "input": "[]"
+  },
+  "SessionSystemPromptCapabilities/array-long": {
+   "error": "invalid length 3, expected fewer elements in array",
+   "input": "[null, null, null]"
+  },
+  "SessionSystemPromptCapabilities/encode-full": {
+   "encoded": "{\"mode\":{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"mode\": {\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
+  },
+  "SessionSystemPromptCapabilities/encode-minimal": {
+   "encoded": "{}",
+   "input": "{}"
+  },
+  "SessionSystemPromptModeCapabilities._meta/encode-empty": {
+   "encoded": "{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{}}",
+   "input": "{\"_meta\": {}, \"override\": {\"_meta\": {\"k\": \"v\"}}}"
+  },
+  "SessionSystemPromptModeCapabilities._meta/encode-meta": {
+   "encoded": "{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
+   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"override\": {\"_meta\": {\"k\": \"v\"}}}"
+  },
+  "SessionSystemPromptModeCapabilities._meta/malformed": {
+   "encoded": "{}",
+   "input": "{\"_meta\": true}"
+  },
+  "SessionSystemPromptModeCapabilities._meta/missing": {
+   "encoded": "{}",
+   "input": "{}"
+  },
+  "SessionSystemPromptModeCapabilities._meta/null": {
+   "encoded": "{}",
+   "input": "{\"_meta\": null}"
+  },
+  "SessionSystemPromptModeCapabilities._meta/valid": {
+   "encoded": "{\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"_meta\": {\"k\": \"v\"}}"
+  },
+  "SessionSystemPromptModeCapabilities.override/empty-object": {
+   "encoded": "{\"override\":{}}",
+   "input": "{\"override\": {}}"
+  },
+  "SessionSystemPromptModeCapabilities.override/malformed": {
+   "encoded": "{}",
+   "input": "{\"override\": true}"
+  },
+  "SessionSystemPromptModeCapabilities.override/missing": {
+   "encoded": "{}",
+   "input": "{}"
+  },
+  "SessionSystemPromptModeCapabilities.override/null": {
+   "encoded": "{}",
+   "input": "{\"override\": null}"
+  },
+  "SessionSystemPromptModeCapabilities.override/valid": {
+   "encoded": "{\"override\":{\"_meta\":{\"k\":\"v\"}}}",
+   "input": "{\"override\": {\"_meta\": {\"k\": \"v\"}}}"
+  },
+  "SessionSystemPromptModeCapabilities/array": {
+   "encoded": "{}",
+   "input": "[]"
+  },
+  "SessionSystemPromptModeCapabilities/array-long": {
+   "error": "invalid length 3, expected fewer elements in array",
+   "input": "[null, null, null]"
+  },
+  "SessionSystemPromptModeCapabilities/encode-full": {
+   "encoded": "{\"override\":{\"_meta\":{\"k\":\"v\"}},\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"override\": {\"_meta\": {\"k\": \"v\"}}, \"_meta\": {\"k\": \"v\"}}"
+  },
+  "SessionSystemPromptModeCapabilities/encode-minimal": {
+   "encoded": "{}",
+   "input": "{}"
+  },
+  "SessionSystemPromptOverrideCapabilities._meta/encode-empty": {
+   "encoded": "{\"_meta\":{}}",
+   "input": "{\"_meta\": {}}"
+  },
+  "SessionSystemPromptOverrideCapabilities._meta/encode-meta": {
+   "encoded": "{\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
+   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}}"
+  },
+  "SessionSystemPromptOverrideCapabilities._meta/malformed": {
+   "encoded": "{}",
+   "input": "{\"_meta\": true}"
+  },
+  "SessionSystemPromptOverrideCapabilities._meta/missing": {
+   "encoded": "{}",
+   "input": "{}"
+  },
+  "SessionSystemPromptOverrideCapabilities._meta/null": {
+   "encoded": "{}",
+   "input": "{\"_meta\": null}"
+  },
+  "SessionSystemPromptOverrideCapabilities._meta/valid": {
+   "encoded": "{\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"_meta\": {\"k\": \"v\"}}"
+  },
+  "SessionSystemPromptOverrideCapabilities/array": {
+   "encoded": "{}",
+   "input": "[]"
+  },
+  "SessionSystemPromptOverrideCapabilities/array-long": {
+   "error": "invalid length 2, expected fewer elements in array",
+   "input": "[null, null]"
+  },
+  "SessionSystemPromptOverrideCapabilities/encode-full": {
+   "encoded": "{\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"_meta\": {\"k\": \"v\"}}"
+  },
+  "SessionSystemPromptOverrideCapabilities/encode-minimal": {
+   "encoded": "{}",
+   "input": "{}"
+  },
   "SessionUpdate.sessionUpdate/bare-agent_message_chunk": {
    "error": "missing field `content`",
    "input": "{\"sessionUpdate\": \"agent_message_chunk\"}"
@@ -9587,6 +9779,98 @@
   "StringPropertySchema/encode-minimal": {
    "encoded": "{}",
    "input": "{}"
+  },
+  "SystemPrompt._meta/encode-empty": {
+   "encoded": "{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{}}",
+   "input": "{\"_meta\": {}, \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": \"append\"}"
+  },
+  "SystemPrompt._meta/encode-meta": {
+   "encoded": "{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"z\":9007199254740993,\"a\":{\"y\":[1.0,-0.0,100.0,0.1,7.199999999999999e-300,0.9405161066866752],\"x\":null},\"u\":18446744073709551615,\"i\":-9223372036854775808,\"h\":12345678901234567890,\"o\":1.8446744073709552e+19,\"A/\":\"😀 \\\"\\\\\\u0001<&>\"}}",
+   "input": "{\"_meta\": {\"z\": 1, \"a\": {\"y\": [1.0, -0.0, 1e2, 0.10, 7.2e-300, 0.9405161066866751], \"x\": null}, \"z\": 9007199254740993, \"u\": 18446744073709551615, \"i\": -9223372036854775808, \"h\": 12345678901234567890, \"o\": 18446744073709551616, \"\\u0041\\/\": \"\\ud83d\\ude00\\u2028\\\"\\\\\\u0001<&>\"}, \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": \"append\"}"
+  },
+  "SystemPrompt._meta/malformed": {
+   "encoded": "{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}]}",
+   "input": "{\"_meta\": true, \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": \"append\"}"
+  },
+  "SystemPrompt._meta/missing": {
+   "encoded": "{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}]}",
+   "input": "{\"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": \"append\"}"
+  },
+  "SystemPrompt._meta/null": {
+   "encoded": "{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}]}",
+   "input": "{\"_meta\": null, \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": \"append\"}"
+  },
+  "SystemPrompt._meta/valid": {
+   "encoded": "{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"_meta\": {\"k\": \"v\"}, \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": \"append\"}"
+  },
+  "SystemPrompt.content/index-tag": {
+   "error": "invalid type: integer `0`, expected variant identifier",
+   "input": "{\"content\": [{\"_meta\": {\"k\": \"v\"}, \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"type\": 0}], \"mode\": \"append\"}"
+  },
+  "SystemPrompt.content/missing": {
+   "error": "missing field `content`",
+   "input": "{\"mode\": \"append\"}"
+  },
+  "SystemPrompt.content/null": {
+   "error": "invalid type: null, expected a sequence",
+   "input": "{\"content\": null, \"mode\": \"append\"}"
+  },
+  "SystemPrompt.content/null-item": {
+   "error": "invalid type: null, expected internally tagged enum ContentBlock",
+   "input": "{\"content\": [null, {\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": \"append\"}"
+  },
+  "SystemPrompt.mode/map-form": {
+   "encoded": "{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}]}",
+   "input": "{\"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": {\"append\": null}}"
+  },
+  "SystemPrompt.mode/map-form-unknown": {
+   "error": "data did not match any variant of untagged enum SystemPromptMode",
+   "input": "{\"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": {\"_unknown\": null}}"
+  },
+  "SystemPrompt.mode/map-form-value": {
+   "error": "data did not match any variant of untagged enum SystemPromptMode",
+   "input": "{\"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": {\"append\": 1}}"
+  },
+  "SystemPrompt.mode/missing": {
+   "error": "missing field `mode`",
+   "input": "{\"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}]}"
+  },
+  "SystemPrompt.mode/null": {
+   "error": "data did not match any variant of untagged enum SystemPromptMode",
+   "input": "{\"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": null}"
+  },
+  "SystemPrompt.mode/unknown": {
+   "encoded": "{\"mode\":\"_unknown\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}]}",
+   "input": "{\"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"mode\": \"_unknown\"}"
+  },
+  "SystemPrompt/array": {
+   "encoded": "{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}]}",
+   "input": "[\"append\", [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}]]"
+  },
+  "SystemPrompt/array-empty": {
+   "error": "invalid length 0, expected struct SystemPrompt with 3 elements",
+   "input": "[]"
+  },
+  "SystemPrompt/array-long": {
+   "error": "invalid length 4, expected fewer elements in array",
+   "input": "[\"append\", [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], null, null]"
+  },
+  "SystemPrompt/encode-full": {
+   "encoded": "{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}],\"_meta\":{\"k\":\"v\"}}",
+   "input": "{\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}], \"_meta\": {\"k\": \"v\"}}"
+  },
+  "SystemPrompt/encode-minimal": {
+   "encoded": "{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"],\"lastModified\":\"\",\"priority\":0.5,\"_meta\":{\"k\":\"v\"}},\"text\":\"\",\"_meta\":{\"k\":\"v\"}}]}",
+   "input": "{\"mode\": \"append\", \"content\": [{\"type\": \"text\", \"annotations\": {\"audience\": [\"assistant\"], \"lastModified\": \"\", \"priority\": 0.5, \"_meta\": {\"k\": \"v\"}}, \"text\": \"\", \"_meta\": {\"k\": \"v\"}}]}"
+  },
+  "SystemPromptMode/encode-full": {
+   "encoded": "\"append\"",
+   "input": "\"append\""
+  },
+  "SystemPromptMode/encode-minimal": {
+   "encoded": "\"append\"",
+   "input": "\"append\""
   },
   "Terminal._meta/encode-empty": {
    "encoded": "{\"terminalId\":\"\",\"_meta\":{}}",
@@ -11121,7 +11405,7 @@
    "input": "{}"
   }
  },
- "crate": "agent-client-protocol-schema 1.15.1",
- "pin": "schema-v1.29.1",
+ "crate": "agent-client-protocol-schema 1.19.0",
+ "pin": "schema-v1.33.0",
  "protocol": "v1"
 }

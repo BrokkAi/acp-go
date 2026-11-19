@@ -637,6 +637,22 @@
               "$ref": "#/$defs/Terminal"
             }
           ]
+        },
+        {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nA display-only reference to another session, such as a subagent.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "session"
+            }
+          },
+          "required": ["type"],
+          "allOf": [
+            {
+              "$ref": "#/$defs/SessionReference"
+            }
+          ]
         }
       ],
       "discriminator": {
@@ -1111,6 +1127,27 @@
         }
       },
       "required": ["terminalId"]
+    },
+    "SessionReference": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nA display-only reference to another session that this tool call operates on,\nsuch as a subagent it created, delegated to, or is waiting on.\n\nThe referenced session must already be known to the Client through ordinary\nsession setup or a `subagent_update` announcement. The reference does not\nestablish ownership, grant any Client-initiated controls, or report that the\nreferenced session received or finished any work.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "description": "The referenced session.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            }
+          ]
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      },
+      "required": ["sessionId"]
     },
     "ToolCallLocation": {
       "description": "A file location being accessed or modified by a tool.\n\nEnables clients to implement \"follow-along\" features that track\nwhich files the agent is working with in real-time.\n\nSee protocol docs: [Following the Agent](https://agentclientprotocol.com/protocol/v1/draft/tool-calls#following-the-agent)",
@@ -2413,6 +2450,15 @@
                   ]
                 },
                 {
+                  "title": "SessionOptionsResponse",
+                  "description": "Successful result returned for a `session/options` request.",
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/SessionOptionsResponse"
+                    }
+                  ]
+                },
+                {
                   "title": "SetSessionTitleResponse",
                   "description": "Successful result returned for a `session/set_title` request.",
                   "allOf": [
@@ -2762,7 +2808,7 @@
           "x-deserialize-default-on-error": true
         },
         "systemPrompt": {
-          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nWhether the agent supports `systemPrompt` on session lifecycle requests.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports `systemPrompt` in `append` mode.",
+          "description": "Whether the agent supports `systemPrompt` on session lifecycle requests.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports `systemPrompt` in `append` mode.",
           "anyOf": [
             {
               "$ref": "#/$defs/SessionSystemPromptCapabilities"
@@ -2802,6 +2848,18 @@
           "anyOf": [
             {
               "$ref": "#/$defs/SessionStatusCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-deserialize-default-on-error": true
+        },
+        "options": {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nWhether the agent supports `session/options`.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports `session/options` and accepts initial\nconfig option values on session setup requests.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionOptionsCapabilities"
             },
             {
               "type": "null"
@@ -2890,7 +2948,7 @@
       }
     },
     "SessionSystemPromptCapabilities": {
-      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nCapabilities for client-provided system prompts.\n\nSupplying `{}` means the agent supports `systemPrompt` on session lifecycle\nrequests in `append` mode.",
+      "description": "Capabilities for client-provided system prompts.\n\nSupplying `{}` means the agent supports `systemPrompt` on session lifecycle\nrequests in `append` mode.",
       "type": "object",
       "properties": {
         "mode": {
@@ -2914,7 +2972,7 @@
       }
     },
     "SessionSystemPromptModeCapabilities": {
-      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nSystem prompt delivery modes the agent supports in addition to `append`.\n\n`append` has no entry because every agent advertising\n`sessionCapabilities.systemPrompt` supports it.",
+      "description": "System prompt delivery modes the agent supports in addition to `append`.\n\n`append` has no entry because every agent advertising\n`sessionCapabilities.systemPrompt` supports it.",
       "type": "object",
       "properties": {
         "override": {
@@ -2938,7 +2996,7 @@
       }
     },
     "SessionSystemPromptOverrideCapabilities": {
-      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nCapabilities for the `override` system prompt mode.\n\nSupplying `{}` means the agent supports replacing its built-in default\ninstructions with the client-provided system prompt.",
+      "description": "Capabilities for the `override` system prompt mode.\n\nSupplying `{}` means the agent supports replacing its built-in default\ninstructions with the client-provided system prompt.",
       "type": "object",
       "properties": {
         "_meta": {
@@ -2975,6 +3033,18 @@
     },
     "SessionStatusCapabilities": {
       "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nCapabilities for the `session/status` method.\n\nSupplying `{}` means the agent supports checking session status.",
+      "type": "object",
+      "properties": {
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      }
+    },
+    "SessionOptionsCapabilities": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nCapabilities for the `session/options` method.\n\nSupplying `{}` means the agent supports `session/options` and accepts initial config\noption values on session setup requests.",
       "type": "object",
       "properties": {
         "_meta": {
@@ -3421,7 +3491,7 @@
       "type": "object",
       "properties": {
         "state": {
-          "description": "Whether the agent can start sessions without the user signing in first.\n\nThis is the only field clients should act on. Clients MUST treat values they\ndo not recognize as `unknown`.",
+          "description": "Whether the agent can start sessions without the user signing in first.\n\nClients use this field to decide whether sign-in is needed. Clients MUST treat\nvalues they do not recognize as `unknown`.",
           "allOf": [
             {
               "$ref": "#/$defs/AuthState"
@@ -3485,6 +3555,11 @@
         "label": {
           "description": "Human-readable name for the account, suitable for display on its own,\nfor example `Claude Max`, `OpenAI API key`, or `Vertex AI`.",
           "type": "string"
+        },
+        "description": {
+          "description": "Short text shown with the label, such as the credential source, for example\n`API key helper`. MUST NOT contain credentials.\n\nOptional. Omitted and `null` are equivalent and mean no description is reported.",
+          "type": ["string", "null"],
+          "x-deserialize-default-on-error": true
         },
         "active": {
           "description": "Whether the agent currently uses this account by default.\n\nSeveral accounts MAY be active, for example one per provider.\n\nOptional. Omitted and `null` are equivalent and mean the agent does not indicate whether this account is in effect.",
@@ -3723,6 +3798,11 @@
           "description": "Model-related configuration parameter.",
           "type": "string",
           "const": "model_config"
+        },
+        {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nResponse speed selector, such as a fast mode toggle.",
+          "type": "string",
+          "const": "speed"
         },
         {
           "description": "Thought/reasoning level selector.",
@@ -4104,6 +4184,41 @@
           "type": "string"
         }
       ]
+    },
+    "SessionOptionsResponse": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nResponse from `session/options`.\n\nThe result is a snapshot. The options a session actually starts with are the ones in\nthe session setup response.\n\nAgents only return `type: \"boolean\"` options when the Client advertises\n`sessionCapabilities.configOptions.boolean`.",
+      "type": "object",
+      "properties": {
+        "modes": {
+          "description": "The mode state the session would start with, if the Agent supports modes.\n\nSee protocol docs: [Session Modes](https://agentclientprotocol.com/protocol/v1/draft/session-modes)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionModeState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-deserialize-default-on-error": true
+        },
+        "configOptions": {
+          "description": "The config options the session would start with, with the same rules as on\n`NewSessionResponse`.\n\nOptional. Omitted, `null`, or empty means no config options are advertised.",
+          "type": ["array", "null"],
+          "items": {
+            "$ref": "#/$defs/SessionConfigOption"
+          },
+          "x-deserialize-default-on-error": true,
+          "x-deserialize-skip-invalid-items": true
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      },
+      "x-side": "agent",
+      "x-method": "session/options"
     },
     "SetSessionTitleResponse": {
       "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nResponse from setting the title of a session.",
@@ -4773,6 +4888,38 @@
           ]
         },
         {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nReplaces the session's current list of prompt suggestions.\n\nAgents MUST only send this update when the Client advertised\nthe `session.promptSuggestions` Client capability.",
+          "type": "object",
+          "properties": {
+            "sessionUpdate": {
+              "type": "string",
+              "const": "prompt_suggestions_update"
+            }
+          },
+          "required": ["sessionUpdate"],
+          "allOf": [
+            {
+              "$ref": "#/$defs/PromptSuggestionsUpdate"
+            }
+          ]
+        },
+        {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nA session cursor has been announced or its capabilities have changed.\n\nAgents MUST only send this update when the Client advertised\nthe `session.cursors` Client capability.",
+          "type": "object",
+          "properties": {
+            "sessionUpdate": {
+              "type": "string",
+              "const": "cursor_update"
+            }
+          },
+          "required": ["sessionUpdate"],
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorUpdate"
+            }
+          ]
+        },
+        {
           "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nAnnounces a child session created and owned by this session, or updates\nthat ownership association's metadata.",
           "type": "object",
           "properties": {
@@ -5051,22 +5198,6 @@
           ]
         },
         {
-          "description": "A URI pointing to a file containing the plan.",
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "file"
-            }
-          },
-          "required": ["type"],
-          "allOf": [
-            {
-              "$ref": "#/$defs/PlanFile"
-            }
-          ]
-        },
-        {
           "description": "Raw markdown content for the plan.",
           "type": "object",
           "properties": {
@@ -5121,31 +5252,6 @@
       },
       "required": ["planId", "entries"]
     },
-    "PlanFile": {
-      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nA plan represented by a file URI.",
-      "type": "object",
-      "properties": {
-        "planId": {
-          "description": "The plan ID to update.",
-          "allOf": [
-            {
-              "$ref": "#/$defs/PlanId"
-            }
-          ]
-        },
-        "uri": {
-          "description": "The URI of the file containing the plan.",
-          "type": "string"
-        },
-        "_meta": {
-          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
-          "type": ["object", "null"],
-          "x-deserialize-default-on-error": true,
-          "additionalProperties": true
-        }
-      },
-      "required": ["planId", "uri"]
-    },
     "PlanMarkdown": {
       "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nA plan represented as raw markdown content.",
       "type": "object",
@@ -5161,6 +5267,11 @@
         "content": {
           "description": "Markdown content for the plan.",
           "type": "string"
+        },
+        "path": {
+          "description": "The absolute path of the file that holds this plan.\n\nThis field is optional. Omitting it or sending `null` both mean that the plan\nhas no file. `content` is the plan to display whether or not `path` is set.\nClients can use `path` to open the file.",
+          "type": ["string", "null"],
+          "x-deserialize-default-on-error": true
         },
         "_meta": {
           "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
@@ -5585,6 +5696,417 @@
       },
       "required": ["compactionId", "content"]
     },
+    "PromptSuggestion": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nA prompt the Agent predicts the user will send next.",
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "description": "The content of the suggested prompt.\n\nRequired and non-null. Must contain at least one content block. This is\nthe same type as the `prompt` field of `session/prompt`, and the Client\ncan send it in that field unchanged.\n\nAgents MUST only use `text` and `resource_link` content blocks, and\nother content block types that both the Agent's prompt capabilities\nand the Client's `session.promptSuggestions` capability advertise.\nAgents MUST NOT send a prompt whose only content is empty or\nwhitespace-only text.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "minItems": 1
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      },
+      "required": ["prompt"]
+    },
+    "PromptSuggestionsUpdate": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nReplaces the session's current list of prompt suggestions.\n\nA prompt suggestion is a prompt the Agent predicts the user will send next.\nThe Client offers suggestions where the user writes the next prompt. The\nlist in the most recent update is the current list until the Agent sends\nanother update. A session starts with an empty list.\n\nSuggestions are not part of session history. Agents SHOULD NOT include\nthis update when they replay a session.\n\nAgents MUST only send this update when the Client advertised\nthe `session.promptSuggestions` Client capability.",
+      "type": "object",
+      "properties": {
+        "suggestions": {
+          "description": "The suggestions the Client can offer, ordered most likely first.\n\nRequired and non-null. An empty list withdraws the suggestions the\nClient is offering. A Client skips an entry it cannot parse and keeps\nthe rest.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PromptSuggestion"
+          },
+          "x-deserialize-skip-invalid-items": true
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      },
+      "required": ["suggestions"]
+    },
+    "CursorId": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nUnique identifier for a session cursor within a session.\n\nThe Agent generates it, and it is never reused for another position in the\nsession. Clients MUST NOT parse, change, or construct it.\n\nSee the [Session Cursors RFD](https://agentclientprotocol.com/rfds/session-cursors).",
+      "type": "string"
+    },
+    "CursorCapabilities": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nThe methods that currently accept a session cursor.\n\nA malformed value falls back to no capabilities, so the Client never passes a\ncursor to a method the Agent did not advertise.\n\nSee the [Session Cursors RFD](https://agentclientprotocol.com/rfds/session-cursors).",
+      "type": "object",
+      "properties": {
+        "fork": {
+          "description": "Permits the Client to fork the session at this cursor with `session/fork`.\n\nOmitted and `null` are equivalent and mean unsupported. An object (including `{}`)\nmeans supported.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CursorForkCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-deserialize-default-on-error": true
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Omitted and `null` are equivalent and mean no metadata.\nImplementations MUST NOT assign meaning to keys they do not recognize.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      }
+    },
+    "CursorForkCapabilities": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nCapability to fork the session at a cursor with `session/fork`.\n\nSupplying `{}` advertises support. An omitted or `null` `fork` does not.",
+      "type": "object",
+      "properties": {
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Omitted and `null` are equivalent and mean no metadata.\nImplementations MUST NOT assign meaning to keys they do not recognize.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      }
+    },
+    "CursorAnchor": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nWhere a session cursor is, relative to an entity the Client holds.\n\nThe anchor names the entity by its type and ID, and `position` says on which\nside of that entity the cursor is. A known `type` with a malformed payload is\nan error. It does not fall back to the unknown-type variant.\n\nSee the [Session Cursors RFD](https://agentclientprotocol.com/rfds/session-cursors).",
+      "anyOf": [
+        {
+          "description": "The cursor is next to a user message.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "user_message"
+            }
+          },
+          "required": ["type"],
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorMessageAnchor"
+            }
+          ]
+        },
+        {
+          "description": "The cursor is next to an agent message.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "agent_message"
+            }
+          },
+          "required": ["type"],
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorMessageAnchor"
+            }
+          ]
+        },
+        {
+          "description": "The cursor is next to an agent thought.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "agent_thought"
+            }
+          },
+          "required": ["type"],
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorMessageAnchor"
+            }
+          ]
+        },
+        {
+          "description": "The cursor is next to a session-directed message.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "session_message"
+            }
+          },
+          "required": ["type"],
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorMessageAnchor"
+            }
+          ]
+        },
+        {
+          "description": "The cursor is next to a tool call.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "tool_call"
+            }
+          },
+          "required": ["type"],
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorToolCallAnchor"
+            }
+          ]
+        },
+        {
+          "description": "The cursor is next to a compaction.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "compaction"
+            }
+          },
+          "required": ["type"],
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorCompactionAnchor"
+            }
+          ]
+        },
+        {
+          "title": "other",
+          "description": "Custom or future anchor type.\n\nValues beginning with `_` are reserved for implementation-specific\nextensions. Unknown values that do not begin with `_` are reserved for\nfuture ACP variants.\n\nA Client that does not recognize the type cannot place the cursor and\nMUST NOT guess a place for it.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "description": "Custom or future anchor type.\n\nValues beginning with `_` are reserved for implementation-specific\nextensions. Unknown values that do not begin with `_` are reserved for\nfuture ACP variants.",
+              "type": "string"
+            }
+          },
+          "required": ["type"],
+          "not": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "user_message"
+                  }
+                },
+                "required": ["type"]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "agent_message"
+                  }
+                },
+                "required": ["type"]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "agent_thought"
+                  }
+                },
+                "required": ["type"]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "session_message"
+                  }
+                },
+                "required": ["type"]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "tool_call"
+                  }
+                },
+                "required": ["type"]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "compaction"
+                  }
+                },
+                "required": ["type"]
+              }
+            ]
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "CursorAnchorPosition": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nOn which side of the anchored entity a session cursor is.",
+      "anyOf": [
+        {
+          "description": "The cursor is immediately before the entity. The history before the\ncursor does not include the entity.",
+          "type": "string",
+          "const": "before"
+        },
+        {
+          "description": "The cursor is immediately after the entity. The history before the\ncursor includes the entity and nothing that follows it in the timeline.",
+          "type": "string",
+          "const": "after"
+        },
+        {
+          "title": "other",
+          "description": "Custom or future position.\n\nValues beginning with `_` are reserved for implementation-specific\nextensions. Other unknown values are reserved for future ACP positions.\nA Client that does not recognize the value cannot place the cursor.",
+          "type": "string"
+        }
+      ]
+    },
+    "CursorMessageAnchor": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nA session cursor anchor to a message. The anchor's `type` names the kind of message.",
+      "type": "object",
+      "properties": {
+        "messageId": {
+          "description": "The ID of the anchored message.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            }
+          ]
+        },
+        "position": {
+          "description": "On which side of the message the cursor is.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorAnchorPosition"
+            }
+          ]
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Omitted and `null` are equivalent and mean no metadata.\nImplementations MUST NOT assign meaning to keys they do not recognize.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      },
+      "required": ["messageId", "position"]
+    },
+    "CursorToolCallAnchor": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nA session cursor anchor to a tool call.",
+      "type": "object",
+      "properties": {
+        "toolCallId": {
+          "description": "The ID of the anchored tool call.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/ToolCallId"
+            }
+          ]
+        },
+        "position": {
+          "description": "On which side of the tool call the cursor is.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorAnchorPosition"
+            }
+          ]
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Omitted and `null` are equivalent and mean no metadata.\nImplementations MUST NOT assign meaning to keys they do not recognize.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      },
+      "required": ["toolCallId", "position"]
+    },
+    "CursorCompactionAnchor": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nA session cursor anchor to a compaction.",
+      "type": "object",
+      "properties": {
+        "compactionId": {
+          "description": "The ID of the anchored compaction.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/CompactionId"
+            }
+          ]
+        },
+        "position": {
+          "description": "On which side of the compaction the cursor is.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorAnchorPosition"
+            }
+          ]
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Omitted and `null` are equivalent and mean no metadata.\nImplementations MUST NOT assign meaning to keys they do not recognize.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      },
+      "required": ["compactionId", "position"]
+    },
+    "CursorUpdate": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nA session cursor upsert. A cursor names one position in the session's timeline.\n\nThe first update for a `cursorId` MUST include `anchor`. The anchor is fixed\nafter that, and later updates change only `capabilities`.\n\nAgents MUST only send this update when the Client advertised\nthe `session.cursors` Client capability.\n\n`capabilities` and `_meta` have patch semantics: omission leaves the stored\nvalue unchanged, `null` clears it, and a concrete value replaces it.\n\nSee the [Session Cursors RFD](https://agentclientprotocol.com/rfds/session-cursors).",
+      "type": "object",
+      "properties": {
+        "cursorId": {
+          "description": "The Agent-owned ID of this cursor, unique within the session.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/CursorId"
+            }
+          ]
+        },
+        "capabilities": {
+          "description": "The methods that currently accept this cursor.\n\nOmission leaves the capabilities unchanged, `null` clears them, and an object replaces\nthe whole previous value. A new cursor starts with none.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CursorCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-deserialize-default-on-error": true
+        },
+        "anchor": {
+          "description": "Where the cursor is, relative to an entity the Client holds.\n\nRequired on the first update for a cursor. The Agent MUST NOT change it afterwards.\nA later update can omit it or repeat the same anchor. Omitted and `null` are\nequivalent and leave the stored anchor unchanged.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CursorAnchor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "_meta": {
+          "description": "Extensible metadata patch for this cursor.",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      },
+      "required": ["cursorId"]
+    },
     "SubagentSessionCapabilities": {
       "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nClient-initiated session mutations permitted for a specific subagent session.\n\nA mutation requires an explicit per-child capability. Support for the method\non ordinary sessions does not grant support on a child.",
       "type": "object",
@@ -5800,7 +6322,7 @@
           "additionalProperties": true
         },
         "stopReason": {
-          "description": "Why foreground work stopped. The value selects one of this type's variants, which may add fields of their own.\n\nOptional. Omitted or `null` both mean the agent is not reporting a stop reason; a malformed value is treated the same way.\n\nSee protocol docs: [Current work state](https://agentclientprotocol.com/rfds/subagents#current-work-state)",
+          "description": "Why foreground work stopped. The value selects one of this type's variants, which may add fields of their own.\n\nOptional. Omitted or `null` both mean the agent is not reporting a stop reason; a malformed value is treated the same way.\n\nSee protocol docs: [Work state](https://agentclientprotocol.com/protocol/v1/draft/subagents#work-state)",
           "type": ["string", "null"],
           "x-deserialize-default-on-error": true
         }
@@ -5979,7 +6501,7 @@
       }
     },
     "UnknownStateUpdate": {
-      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nThe Agent cannot currently determine foreground activity.\n\nReport this when activity becomes unobservable, not merely because the child\nhas been quiet. The Client MUST stop presenting the previous state as confirmed\ncurrent activity, but may retain it as last known. A later state replaces this\nsnapshot normally.\n\nThis is not a task outcome or session closure. It does not cancel work, resolve\npending requests, or revoke capabilities. Capabilities are updated separately.",
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nThe Agent cannot currently determine foreground activity.\n\nReport this when activity becomes unobservable, not merely because the child\nhas been quiet. The Client MUST stop presenting the previous state as confirmed\ncurrent activity, but may retain it as last known. A later state replaces this\nsnapshot normally.\n\nThis is not a task outcome or session closure. It does not cancel work, resolve\npending requests, or revoke capabilities. If a control is no longer available,\nthe Agent updates the capabilities explicitly. Unfinished tool calls and\nterminals stay as last reported. The Agent does not invent a final status\nfor them, and Clients do not present them as confirmed live activity.",
       "type": "object",
       "properties": {
         "_meta": {
@@ -6191,7 +6713,7 @@
       "type": "object",
       "properties": {
         "state": {
-          "description": "Whether the agent can start sessions without the user signing in first.\n\nThis is the only field clients should act on. Clients MUST treat values they\ndo not recognize as `unknown`.",
+          "description": "Whether the agent can start sessions without the user signing in first.\n\nClients use this field to decide whether sign-in is needed. Clients MUST treat\nvalues they do not recognize as `unknown`.",
           "allOf": [
             {
               "$ref": "#/$defs/AuthState"
@@ -6375,6 +6897,15 @@
                   "allOf": [
                     {
                       "$ref": "#/$defs/SessionStatusRequest"
+                    }
+                  ]
+                },
+                {
+                  "title": "SessionOptionsRequest",
+                  "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nReturns the config options a session would start with, without creating or resuming a session.\n\nThis method is only available if the agent advertises the `sessionCapabilities.options` capability.",
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/SessionOptionsRequest"
                     }
                   ]
                 },
@@ -6661,6 +7192,30 @@
           ],
           "x-deserialize-default-on-error": true
         },
+        "promptSuggestions": {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nSupport for `prompt_suggestions_update` session updates.\n\nOptional. Omitted or `null` both mean the client does not advertise support.\nSupplying `{}` means the client can offer prompt suggestions made of\n`text` and `resource_link` content blocks.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PromptSuggestionsCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-deserialize-default-on-error": true
+        },
+        "cursors": {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nSupport for `cursor_update` session updates.\n\nOptional. Omitted or `null` both mean the client does not advertise support.\nSupplying `{}` means the client handles `cursor_update`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionCursorsCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-deserialize-default-on-error": true
+        },
         "_meta": {
           "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
           "type": ["object", "null"],
@@ -6711,6 +7266,94 @@
     },
     "NoticeCapabilities": {
       "description": "Client support for presenting live notices to the user.",
+      "type": "object"
+    },
+    "PromptSuggestionsCapabilities": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nClient support for `prompt_suggestions_update` session updates.\n\nSupplying `{}` means the client can offer prompt suggestions made of `text`\nand `resource_link` content blocks. The client opts in to other content\nblock types with the fields below. They have the same names as the agent's\nprompt capabilities.",
+      "type": "object",
+      "properties": {
+        "image": {
+          "description": "Whether prompt suggestions may include `image` content blocks.\n\nOptional. Omitted or `null` both mean the client does not advertise support.\nSupplying `{}` means the client can offer suggestions that include images.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PromptSuggestionsImageCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-deserialize-default-on-error": true
+        },
+        "audio": {
+          "description": "Whether prompt suggestions may include `audio` content blocks.\n\nOptional. Omitted or `null` both mean the client does not advertise support.\nSupplying `{}` means the client can offer suggestions that include audio.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PromptSuggestionsAudioCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-deserialize-default-on-error": true
+        },
+        "embeddedContext": {
+          "description": "Whether prompt suggestions may include `resource` content blocks.\n\nOptional. Omitted or `null` both mean the client does not advertise support.\nSupplying `{}` means the client can offer suggestions that include\nembedded resources.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PromptSuggestionsEmbeddedContextCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-deserialize-default-on-error": true
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      }
+    },
+    "PromptSuggestionsImageCapabilities": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nCapabilities for image content in prompt suggestions.\n\nSupplying `{}` means the client can offer suggestions that include images.",
+      "type": "object",
+      "properties": {
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      }
+    },
+    "PromptSuggestionsAudioCapabilities": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nCapabilities for audio content in prompt suggestions.\n\nSupplying `{}` means the client can offer suggestions that include audio.",
+      "type": "object",
+      "properties": {
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      }
+    },
+    "PromptSuggestionsEmbeddedContextCapabilities": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nCapabilities for embedded resources in prompt suggestions.\n\nSupplying `{}` means the client can offer suggestions that include\n`resource` content blocks.",
+      "type": "object",
+      "properties": {
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      }
+    },
+    "SessionCursorsCapabilities": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nClient support for `cursor_update` session updates.\n\nSee the [Session Cursors RFD](https://agentclientprotocol.com/rfds/session-cursors).",
       "type": "object"
     },
     "SubagentCapabilities": {
@@ -6970,7 +7613,7 @@
           "x-deserialize-default-on-null": true
         },
         "systemPrompt": {
-          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nSystem-level instructions for the new session.\n\nOptional. Omitted and `null` are equivalent and mean the Agent uses its\nown default instructions. Clients MUST only send this when the Agent\nadvertises `sessionCapabilities.systemPrompt`.",
+          "description": "System-level instructions for the new session.\n\nOptional. Omitted and `null` are equivalent and mean the Agent uses its\nown default instructions. Clients MUST only send this when the Agent\nadvertises `sessionCapabilities.systemPrompt`.",
           "anyOf": [
             {
               "$ref": "#/$defs/SystemPrompt"
@@ -6979,6 +7622,14 @@
               "type": "null"
             }
           ]
+        },
+        "configOptions": {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nInitial values for the session's config options.\n\nOptional. Omitted and `null` are equivalent to an empty list. Clients MUST only send\nthis when the Agent advertises `sessionCapabilities.options`.\n\nThe Agent applies the entries in list order, as if the Client had called\n`session/set_config_option` for each entry after the session was set up. Malformed\nentries and duplicate `configId` values fail the request with `-32602`. The Agent MUST\nignore an entry whose `configId` is unknown, whose `type` does not match the option,\nor whose value is not allowed when it is applied. The `configOptions` in the response contain the values the session actually\nhas. The Agent SHOULD NOT send `config_option_update` notifications for these entries,\nand SHOULD NOT send other `session/update` notifications caused by applying them\nbefore it responds.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InitialSessionConfigOption"
+          },
+          "x-deserialize-default-on-null": true
         },
         "_meta": {
           "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
@@ -7195,7 +7846,7 @@
       "required": ["name", "command", "args", "env"]
     },
     "SystemPrompt": {
-      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nClient-provided system-level instructions for a session.\n\nClients MUST only send this when the Agent advertises\n`sessionCapabilities.systemPrompt`. Agents that cannot apply it, for example\nbecause of an unadvertised mode or an unsupported content block type, MUST\nreturn an error instead of creating, loading, resuming, or forking the\nsession.",
+      "description": "Client-provided system-level instructions for a session.\n\nClients MUST only send this when the Agent advertises\n`sessionCapabilities.systemPrompt`. Agents that cannot apply it, for example\nbecause of an unadvertised mode or an unsupported content block type, MUST\nreturn an error instead of creating, loading, or resuming the session.",
       "type": "object",
       "properties": {
         "mode": {
@@ -7207,7 +7858,7 @@
           ]
         },
         "content": {
-          "description": "The system prompt content.\n\nAgents advertising the capability MUST accept `text` content blocks.\nClients MUST NOT send other content block types until a future\ncapability allows them, and Agents MUST return an error for content\nblocks they do not support.\n\nClients MUST NOT send an empty array. Agents MAY reject one with\n`-32602` without creating, loading, resuming, or forking the session.",
+          "description": "The system prompt content.\n\nAgents advertising the capability MUST accept `text` content blocks.\nClients MUST NOT send other content block types until a future\ncapability allows them, and Agents MUST return an error for content\nblocks they do not support.\n\nClients MUST NOT send an empty array. Agents MAY reject one with\n`-32602` without creating, loading, or resuming the session.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/ContentBlock"
@@ -7223,7 +7874,7 @@
       "required": ["mode", "content"]
     },
     "SystemPromptMode": {
-      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nHow the Agent combines a client-provided system prompt with its own instructions.\n\nUnknown modes are preserved so they can be stored,\nproxied, or forwarded. An Agent MUST return an error for a mode it does not\nsupport rather than treating it as `append` or `override`.",
+      "description": "How the Agent combines a client-provided system prompt with its own instructions.\n\nUnknown modes are preserved so they can be stored,\nproxied, or forwarded. An Agent MUST return an error for a mode it does not\nsupport rather than treating it as `append` or `override`.",
       "anyOf": [
         {
           "description": "Add the content to the Agent's own instructions rather than replacing them.\n\nEvery Agent that advertises `sessionCapabilities.systemPrompt` supports this mode.\nAgents SHOULD give the content system-level precedence, for example in the\nmodel's system prompt or developer instructions rather than in user-turn\ncontent. Where it is placed and how it is formatted is implementation-defined.",
@@ -7239,6 +7890,60 @@
           "title": "other",
           "description": "Custom or future system prompt mode.\n\nValues beginning with `_` are reserved for implementation-specific\nextensions. Unknown values that do not begin with `_` are reserved for\nfuture ACP variants.",
           "type": "string"
+        }
+      ]
+    },
+    "InitialSessionConfigOption": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nAn initial value for a config option, sent on session setup requests.\n\nSame shape as `session/set_config_option` without `sessionId`. Unlike\n`session/set_config_option`, an unknown `configId`, a `type` that does not match the\noption, or a value that is not allowed is ignored instead of rejected.\n\nClients only send `type: \"boolean\"` entries when they advertise\n`sessionCapabilities.configOptions.boolean`.",
+      "type": "object",
+      "properties": {
+        "configId": {
+          "description": "The ID of the configuration option to set.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/SessionConfigId"
+            }
+          ]
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      },
+      "required": ["configId"],
+      "anyOf": [
+        {
+          "description": "A boolean value (`type: \"boolean\"`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "boolean"
+            },
+            "value": {
+              "description": "The boolean value.",
+              "type": "boolean"
+            }
+          },
+          "required": ["type", "value"]
+        },
+        {
+          "title": "value_id",
+          "description": "A `SessionConfigValueId` string value.\n\nThis is the default when `type` is absent on the wire. Unknown `type`\nvalues with string payloads also gracefully deserialize into this\nvariant.",
+          "type": "object",
+          "properties": {
+            "value": {
+              "description": "The value ID.",
+              "allOf": [
+                {
+                  "$ref": "#/$defs/SessionConfigValueId"
+                }
+              ]
+            }
+          },
+          "required": ["value"]
         }
       ]
     },
@@ -7275,7 +7980,7 @@
           ]
         },
         "systemPrompt": {
-          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nSystem-level instructions for the loaded session.\n\nOptional. Omitted and `null` are equivalent. The Agent may then keep a\nsystem prompt it stored with the session or use its default instructions.\nClients MUST only send this when the Agent advertises\n`sessionCapabilities.systemPrompt`, and SHOULD send the same value they used\nwhen the session was created.",
+          "description": "System-level instructions for the loaded session.\n\nOptional. Omitted and `null` are equivalent. The Agent may then keep a\nsystem prompt it stored with the session or use its default instructions.\nClients MUST only send this when the Agent advertises\n`sessionCapabilities.systemPrompt`, and SHOULD send the same value they used\nwhen the session was created.",
           "anyOf": [
             {
               "$ref": "#/$defs/SystemPrompt"
@@ -7284,6 +7989,14 @@
               "type": "null"
             }
           ]
+        },
+        "configOptions": {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nInitial values for the session's config options.\n\nOptional. Omitted and `null` are equivalent to an empty list. Clients MUST only send\nthis when the Agent advertises `sessionCapabilities.options`.\n\nThe Agent applies the entries in list order, as if the Client had called\n`session/set_config_option` for each entry after the session was set up. Malformed\nentries and duplicate `configId` values fail the request with `-32602`. The Agent MUST\nignore an entry whose `configId` is unknown, whose `type` does not match the option,\nor whose value is not allowed when it is applied. The `configOptions` in the response contain the values the session actually\nhas. The Agent SHOULD NOT send `config_option_update` notifications for these entries.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InitialSessionConfigOption"
+          },
+          "x-deserialize-default-on-null": true
         },
         "_meta": {
           "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
@@ -7389,6 +8102,17 @@
             }
           ]
         },
+        "cursorId": {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nThe session cursor to fork at. The new session's history is the source\nsession's history before the cursor.\n\nOptional. Omitted and `null` are equivalent and fork the whole session.\nClients MUST only send the ID of a cursor that the Agent announced on the\nsource session and that currently advertises `capabilities.fork`. The Agent\nrejects any other ID with `-32602`. It does not fall back to forking the\nwhole session.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CursorId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cwd": {
           "description": "The working directory for this session. Must be an absolute path.",
           "type": "string"
@@ -7410,7 +8134,7 @@
           "x-deserialize-default-on-null": true
         },
         "systemPrompt": {
-          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nSystem-level instructions for the forked session.\n\nOptional. Omitted and `null` are equivalent. The Agent may then keep a\nsystem prompt it stored with the source session or use its default\ninstructions. Clients MUST only send this when the Agent advertises\n`sessionCapabilities.systemPrompt`, and SHOULD send the same value they used\nfor the source session.",
+          "description": "System-level instructions for the forked session.\n\nOptional. Omitted and `null` are equivalent. The Agent may then keep a\nsystem prompt it stored with the source session or use its default\ninstructions. Clients MUST only send this when the Agent advertises\n`sessionCapabilities.systemPrompt`, and SHOULD send the same value they used\nfor the source session.",
           "anyOf": [
             {
               "$ref": "#/$defs/SystemPrompt"
@@ -7419,6 +8143,14 @@
               "type": "null"
             }
           ]
+        },
+        "configOptions": {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nInitial values for the forked session's config options.\n\nOptional. Omitted and `null` are equivalent to an empty list. Clients MUST only send\nthis when the Agent advertises `sessionCapabilities.options`.\n\nThe Agent applies the entries in list order on top of the configuration the fork\nstarts with, as if the Client had called `session/set_config_option` for each entry\nafter the session was set up. Malformed entries and duplicate `configId` values fail\nthe request with `-32602`. The Agent MUST ignore an entry whose `configId` is unknown,\nwhose `type` does not match the option, or whose value is not allowed when it is\napplied. The `configOptions` in the response contain the values the session actually\nhas. The Agent SHOULD NOT send `config_option_update` notifications for these entries,\nand SHOULD NOT send other `session/update` notifications caused by applying them\nbefore it responds.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InitialSessionConfigOption"
+          },
+          "x-deserialize-default-on-null": true
         },
         "_meta": {
           "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
@@ -7500,6 +8232,44 @@
       "x-side": "agent",
       "x-method": "session/status"
     },
+    "SessionOptionsRequest": {
+      "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nRequest parameters for `session/options`, which returns the config options a session\nwould start with, without creating or resuming a session.\n\nOnly available if the Agent supports the `sessionCapabilities.options` capability.\n\n`session/options` MUST NOT create or resume a session, send `session/update`\nnotifications, add an entry to `session/list`, or change an existing session. Agents\nSHOULD NOT connect to MCP servers to answer it. Agents MAY start their runtime to resolve\nthe options. The rules above still hold for it.",
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "description": "The working directory to resolve options for. Must be an absolute path.",
+          "type": "string"
+        },
+        "additionalDirectories": {
+          "description": "Additional workspace roots to resolve options for. Each path must be absolute.\n\nOptional. Omitted and `null` are equivalent to an empty list.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "x-deserialize-default-on-null": true
+        },
+        "sessionId": {
+          "description": "The session to resolve options for.\n\nOptional. Omitted and `null` are equivalent and mean a new session. When present,\nthe Agent returns what `session/load` or `session/resume` with the same `cwd` and\n`additionalDirectories` would return, with the same `cwd` rules. A session the\nAgent does not know gets `-32002`.\nClients MUST only send this when the Agent supports `session/load` (`loadSession`)\nor `session/resume` (`sessionCapabilities.resume`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "_meta": {
+          "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",
+          "type": ["object", "null"],
+          "x-deserialize-default-on-error": true,
+          "additionalProperties": true
+        }
+      },
+      "required": ["cwd"],
+      "x-side": "agent",
+      "x-method": "session/options"
+    },
     "SetSessionTitleRequest": {
       "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nRequest parameters for setting the title of a session.\n\nOnly available if the Agent supports the `sessionCapabilities.title` capability.\n\nThe session does not need to be active on the connection. Any session the Agent would\nreturn from `session/list` can be retitled. A session that does not exist gets `-32002`.\n\nThe Agent responds only after it has stored the title. After a successful response, the\nAgent SHOULD NOT replace the title with one it generates automatically.",
       "type": "object",
@@ -7560,7 +8330,7 @@
           "x-deserialize-default-on-null": true
         },
         "systemPrompt": {
-          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nSystem-level instructions for the resumed session.\n\nOptional. Omitted and `null` are equivalent. The Agent may then keep a\nsystem prompt it stored with the session or use its default instructions.\nClients MUST only send this when the Agent advertises\n`sessionCapabilities.systemPrompt`, and SHOULD send the same value they used\nwhen the session was created.",
+          "description": "System-level instructions for the resumed session.\n\nOptional. Omitted and `null` are equivalent. The Agent may then keep a\nsystem prompt it stored with the session or use its default instructions.\nClients MUST only send this when the Agent advertises\n`sessionCapabilities.systemPrompt`, and SHOULD send the same value they used\nwhen the session was created.",
           "anyOf": [
             {
               "$ref": "#/$defs/SystemPrompt"
@@ -7569,6 +8339,14 @@
               "type": "null"
             }
           ]
+        },
+        "configOptions": {
+          "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nInitial values for the session's config options.\n\nOptional. Omitted and `null` are equivalent to an empty list. Clients MUST only send\nthis when the Agent advertises `sessionCapabilities.options`.\n\nThe Agent applies the entries in list order, as if the Client had called\n`session/set_config_option` for each entry after the session was set up. Malformed\nentries and duplicate `configId` values fail the request with `-32602`. The Agent MUST\nignore an entry whose `configId` is unknown, whose `type` does not match the option,\nor whose value is not allowed when it is applied. The `configOptions` in the response contain the values the session actually\nhas. The Agent SHOULD NOT send `config_option_update` notifications for these entries.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InitialSessionConfigOption"
+          },
+          "x-deserialize-default-on-null": true
         },
         "_meta": {
           "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)",

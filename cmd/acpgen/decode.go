@@ -52,6 +52,7 @@ const (
 	declNone   declKind = iota // encoding/json decodes it
 	declFields                 // struct or tagged union: decodeJSON, decodeFields, maybe decodeSeq
 	declJSON                   // untagged union: decodeJSON only
+	declValue                  // checked string newtype: decodeJSON and nullError
 )
 
 // curIR is the IR being emitted, for type lookups while rendering decoders.
@@ -79,6 +80,8 @@ func declOf(name string) declKind {
 		return declFields
 	case td.Kind == kindUntaggedUnion:
 		return declJSON
+	case td.Kind == kindNewtype && td.Length != nil:
+		return declValue
 	}
 	return declNone
 }
@@ -771,6 +774,42 @@ func emitEnumDecode(b *strings.Builder, td *typeDef) {
 	}
 	b.WriteString("\treturn nil\n}\n\n")
 	fmt.Fprintf(b, "func (v *%s) decodeJSON(data []byte, _ bool) error { return v.UnmarshalJSON(data) }\n\n", td.Name)
+}
+
+// emitLengthCheck writes the decoder of a string newtype Rust checks the
+// length of (see lengthCheckedStrings), and the Validate method it uses.
+func emitLengthCheck(b *strings.Builder, td *typeDef) {
+	l := td.Length
+	fmt.Fprintf(b, `// Validate reports whether v is a valid %[1]s, as the Rust type checks
+// one: from %[2]d to %[3]d characters (Unicode code points). Decoding rejects
+// any other value with the same error.
+func (v %[1]s) Validate() error {
+	switch n := utf8.RuneCountInString(string(v)); {
+	case n < %[2]d:
+		return errors.New(%[4]q)
+	case n > %[3]d:
+		return errors.New(%[5]q)
+	}
+	return nil
+}
+
+func (v *%[1]s) UnmarshalJSON(data []byte) error { return v.decodeJSON(data, false) }
+
+func (v *%[1]s) decodeJSON(data []byte, _ bool) error {
+	var s string
+	if err := decodeValue(data, &s, false, false); err != nil {
+		return err
+	}
+	if err := %[1]s(s).Validate(); err != nil {
+		return err
+	}
+	*v = %[1]s(s)
+	return nil
+}
+
+func (*%[1]s) nullError() error { return errors.New("invalid type: null, expected a string") }
+
+`, td.Name, l.Min, l.Max, l.TooShort, l.TooLong)
 }
 
 // emitAnyDecoder writes the decoder of a union of primitives: a value

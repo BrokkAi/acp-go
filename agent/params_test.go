@@ -167,7 +167,7 @@ func TestRuntimeAnswersMalformedParamsAsTheReferenceSDK(t *testing.T) {
 		{schema.SessionNewMethodName, `null`, "invalid type: null, expected struct NewSessionRequest", `null`},
 		{schema.SessionNewMethodName, `{"cwd":5}`, "invalid type: integer `5`, expected path string", `{"cwd":5}`},
 		{schema.SessionNewMethodName, `{"cwd":"/w","mcpServers":5}`, "invalid type: integer `5`, expected a sequence", `{"cwd":"/w","mcpServers":5}`},
-		{schema.SessionNewMethodName, `["s"]`, "invalid length 2, expected struct NewSessionRequest with 4 elements", `["s"]`},
+		{schema.SessionNewMethodName, `["s"]`, "invalid length 2, expected struct NewSessionRequest with 5 elements", `["s"]`},
 		{schema.SessionLoadMethodName, "", "invalid type: null, expected struct LoadSessionRequest", `null`},
 		{schema.SessionLoadMethodName, `null`, "invalid type: null, expected struct LoadSessionRequest", `null`},
 		{schema.SessionLoadMethodName, `{"sessionId":5}`, "invalid type: integer `5`, expected a string", `{"sessionId":5}`},

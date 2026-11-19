@@ -167,6 +167,9 @@ func emitTypes(r *ir, pin, packageName string) []byte {
 		switch td.Kind {
 		case kindNewtype:
 			fmt.Fprintf(&b, "type %s %s\n\n", td.Name, td.Base)
+			if td.Length != nil {
+				emitLengthCheck(&b, td)
+			}
 
 		case kindEnum:
 			fmt.Fprintf(&b, "type %s %s\n\n", td.Name, td.Base)

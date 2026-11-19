@@ -24,7 +24,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 PROBE = ROOT / "scripts" / "hintprobe"
-CRATE = "agent-client-protocol-schema 1.15.1"
+CRATE = "agent-client-protocol-schema 1.19.0"
 
 # Schema package directory -> probe build. The stable pins are decoded with
 # the stable Rust types; the unstable pins with every unstable feature on, as
