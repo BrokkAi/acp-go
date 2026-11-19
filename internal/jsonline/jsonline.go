@@ -1,5 +1,5 @@
 // Package jsonline classifies one JSON-RPC wire value the way the reference
-// Rust SDK 5.0.0 does before dispatch, and builds the single error that answers
+// Rust SDK 5.4.0 does before dispatch, and builds the single error that answers
 // a value that is not a JSON-RPC message.
 //
 // A line that is not valid JSON is a parse error: it gets one -32700 error with

@@ -19,12 +19,33 @@ disabled. If you would rather not manage the process yourself, use
   and reasoning effort
 - Prompt content blocks
 - MCP servers and additional workspace directories
+- Client-provided system prompts (stable since schema crate 1.16)
 - Typed error classification
 
 Optional methods and prompt content are checked against the agent's advertised
 capabilities before a request is sent. `NewSessionWithOptions`, `LoadSession`,
-and `ResumeSession` validate MCP transports and additional workspace roots
-against initialization capabilities. [validation-boundaries.md](validation-boundaries.md)
+and `ResumeSession` validate MCP transports, additional workspace roots, and a
+system prompt against initialization capabilities.
+
+### System prompts
+
+An agent that advertises `sessionCapabilities.systemPrompt` accepts
+system-level instructions on `session/new`, `session/load`, and
+`session/resume`:
+
+```go
+session, err := connection.NewSessionWithOptions(ctx, initialization, directory, acp.NewSessionOptions{
+	SystemPrompt: acp.NewTextSystemPrompt("Answer in one sentence."),
+})
+```
+
+`NewTextSystemPrompt` builds an `append` prompt, which every agent with the
+capability supports. Set `Mode` to `schema.SystemPromptModeOverride` to
+replace the agent's default instructions; that needs
+`sessionCapabilities.systemPrompt.mode.override`. Content must be a non-empty
+list of text blocks. Anything else fails before the request is written.
+Re-send the prompt the session was created with on `session/load` and
+`session/resume`. [validation-boundaries.md](validation-boundaries.md)
 lists where validation happens.
 
 ### Selections

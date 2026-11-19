@@ -2,13 +2,16 @@
 
 `github.com/BrokkAi/acp-go/v2` (imported as `acpv2` in the examples below) is a
 separate draft client for ACP v2, pinned to the official
-`schema-v2.0.0-alpha.13` artifacts in [`schema/v2`](../schema/v2). Those
-artifacts match Rust schema crate 1.15.1 byte for byte.
+`schema-v2.0.0-alpha.17` artifacts in [`schema/v2`](../schema/v2). Those
+artifacts match Rust schema crate 1.19.0 byte for byte.
 
 It supports initialization and version selection, `auth/login` and
 `auth/logout`, session creation, resume, list, delete, and close, prompt
-acceptance, cancellation, additional-directory capability checks, and typed
-`session/update` dispatch.
+acceptance with optional idempotency keys, client-provided system prompts,
+cancellation, additional-directory capability checks, and typed
+`session/update` dispatch. Since schema crate 1.18 the stable `schema/v2`
+package also models subagent sessions (`subagent_update`,
+`session_message`, `session_message_chunk`) and `replay_complete`.
 
 There is intentionally no v1/v2 conversion layer. The v1 client, runner, and
 agent runtime stay in the root packages for stable applications.
@@ -32,6 +35,43 @@ an idle `state_update`.
 - The matching `user_message` update may arrive before or after the response.
 - The agent runtime refuses to answer `session/prompt` when an implementation
   leaves `messageId` empty.
+
+### Retrying a prompt
+
+A prompt may carry an `idempotencyKey` (schema crate 1.19, Rust 5.4) so the
+client can send it again after a lost response without inserting a second
+user message. The agent inserts at most one user message for a key in a
+session and answers a retry with the original `messageId`, without starting
+the work again. Agents that advertise `capabilities.session` must support the
+key.
+
+```go
+key := acpv2.NewIdempotencyKey() // a random UUIDv4, like Rust's IdempotencyKey::generate
+messageID, err := session.PromptContentWithKey(ctx, prompt, key)
+// After a lost response, for example on a new connection after
+// session/resume, retry with the same key and the same prompt.
+messageID, err = session.PromptContentWithKey(ctx, prompt, key)
+```
+
+Create the key when the user submits the input and store it with the pending
+input; use a new key for every new submission. A key is 1 to 255 characters
+(counted as characters, not bytes): `PromptContentWithKey` fails before
+writing on any other key, and the generated decoder answers one with the
+reference SDK's `-32602` (`idempotency key must not be empty`, for example),
+never treating it as omitted. `PromptContent` sends no key, so retrying it
+can insert a second message.
+
+### System prompts
+
+Client-provided system prompts are stable since schema crate 1.16 (Rust 5.1).
+`NewSessionOptions.SystemPrompt` and `ResumeSessionRequest.SystemPrompt` carry
+one when the agent advertises `capabilities.session.systemPrompt`; the client
+checks the mode (`append`, or `override` with `mode.override`) and that the
+content is non-empty text before writing. `acpv2.NewTextSystemPrompt` builds
+an append-mode prompt. On the agent side, the runtime answers a prompt its
+initialize response did not cover with `-32602` before `NewSession` or
+`ResumeSession` runs, so an agent that does not advertise the capability never
+sees one.
 
 ## Generated types and patches
 
@@ -97,7 +137,10 @@ active-work state. Install it before session setup.
 - `ResumeSessionFromStart` resets the session's projection first, so a full
   replay rebuilds it. It requires handlers to be installed before the resume
   request, and returns only after replay updates have been applied in wire
-  order.
+  order. Since schema crate 1.18 the agent ends a requested replay with a
+  `replay_complete` update, also for an empty history, so an update handler
+  can tell replayed history from live updates (the cookbook's session
+  coordination recipe does).
 - Closing a session through its handle drops it from the tracker.
 
 ### Cancellation
@@ -264,7 +307,7 @@ and any other is normalized, and `-32022` is returned when no configured
 version fits.
 
 It uses the proxy-chains RFD's method names, as Rust `agent-client-protocol`
-5.0.0 does: a conductor sends `proxy/initialize` and wraps successor traffic in
+5.4.0 does: a conductor sends `proxy/initialize` and wraps successor traffic in
 `proxy/successor`. The pre-RFD underscore-prefixed names are not accepted.
 
 ## MCP over ACP

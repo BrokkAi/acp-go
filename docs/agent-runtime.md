@@ -43,9 +43,23 @@ unstable `plan` capability, and the subagent updates without the unstable
 A refusal is an `*acp.RPCError` with code `-32601`, like an unadvertised host
 method. `acp.RequireSessionUpdateCapability` exposes the check.
 
+## System prompts
+
+Since schema crate 1.16 the stable `session/new`, `session/load`, and
+`session/resume` requests carry the client-provided `systemPrompt`. Before
+the agent's `NewSession`, `LoadSession`, or `ResumeSession` runs, the runtime
+checks it against the `sessionCapabilities.systemPrompt` its initialize
+response announced and answers `-32602`, with the reason as string data,
+for a prompt that capability does not cover: any prompt when the capability
+is not announced, `override` without `mode.override`, an unknown mode, empty
+content, or non-text content. An agent that announces the capability applies
+`request.SystemPrompt` (nil when the client sent none) and returns an error
+rather than creating, loading, or resuming the session when it cannot. The
+draft-v2 runtime does the same for `session/new` and `session/resume`.
+
 ## Version negotiation and initialization
 
-Version negotiation follows the reference Rust SDK 5.0.0:
+Version negotiation follows the reference Rust SDK 5.4.0:
 
 - The v1 runtime keeps v1's fallback-to-latest rule: any valid
   `protocolVersion` selects v1, and a request for a newer version reaches the

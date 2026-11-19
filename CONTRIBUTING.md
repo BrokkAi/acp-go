@@ -71,11 +71,11 @@ sync with it. To track a new schema release:
 checklist around these commands, including the generated API diff review.
 
 ```sh
-go run ./cmd/acpgen -update <version>   # e.g. 1.29.1; downloads and pins
+go run ./cmd/acpgen -update <version>   # e.g. 1.33.0; downloads and pins
 go run ./cmd/acpgen                     # regenerates schema/*_gen*.go
 go run ./cmd/acpgen -update <version> \
   -schema schema/v2/schema.json -meta schema/v2/meta.json \
-  -out schema/v2 -package v2           # e.g. 2.0.0-alpha.13
+  -out schema/v2 -package v2           # e.g. 2.0.0-alpha.17
 go run ./cmd/acpgen -schema schema/v2/schema.json \
   -meta schema/v2/meta.json -out schema/v2 -package v2
 go run ./cmd/acpgen -update <version> -unstable \
@@ -98,8 +98,8 @@ output after regenerating both pins proves the checked-in files match them.
 The generator fails loudly on schema constructs it cannot model rather than
 guessing.
 
-The behavioral reference is Rust `agent-client-protocol` 5.0.0, which pins
-`agent-client-protocol-schema` `=1.15.1`; the generated packages use exactly
+The behavioral reference is Rust `agent-client-protocol` 5.4.0, which pins
+`agent-client-protocol-schema` `=1.19.0`; the generated packages use exactly
 that crate's artifacts. The pin workflow also triggers on a schema-crate
 release. When the SDK changes its own pin, reconcile behavior and record
 generated API differences in [CHANGELOG.md](CHANGELOG.md). Do not track
@@ -118,7 +118,7 @@ reviewed policy and notices together, and commit `go.mod` and `go.sum` when
 dependencies change. Do not add local replacement directives to a release.
 
 The `schema/unstable` and `schema/v2/unstable` packages are generated from the
-same Rust schema crate 1.15.1 release's `.unstable.json` artifacts. They
+same Rust schema crate 1.19.0 release's `.unstable.json` artifacts. They
 intentionally expose the combined optional Rust feature surface as an explicit
 import boundary.
 

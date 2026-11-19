@@ -14,7 +14,7 @@ gated three ways:
    are unchanged.
 
 The wire shape mirrors the reference Rust crate
-`agent-client-protocol-http` 5.0.0 and the transport RFD
+`agent-client-protocol-http` 5.4.0 (unchanged since 5.0.0) and the transport RFD
 (`streamable-http-websocket-transport`); status codes, bodies, and headers
 follow the Rust server.
 
@@ -396,9 +396,11 @@ crate's:
   skipped, `data` fields are joined with `\n`, and an event with empty data
   is skipped. Bytes that are not UTF-8 stall the stream, and when it ends it
   fails with the UTF-8 error.
-- An agent line that is not UTF-8 ends the connection as the Rust line
-  reader's error does: what the agent sent before it is delivered, the
-  streams end, the agent's input closes, and later requests get `404`.
+- An agent line that is not UTF-8 is read as the Rust line reader reads it
+  since 5.4: each invalid sequence becomes U+FFFD, so a line with one inside
+  a JSON string is a message carrying the replacement, routed as usual, and
+  any other is a malformed frame sent verbatim on the connection stream. The
+  connection stays up.
 
 ## Client errors
 

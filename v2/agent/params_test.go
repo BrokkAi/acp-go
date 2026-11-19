@@ -19,7 +19,8 @@ import (
 // with and echo the params as its data's json member holds them; an empty
 // err means the request succeeds. Empty params are absent from the frame. The
 // wants are captured from agent-client-protocol 5.0.0 with
-// agent-client-protocol-schema 1.15.1, which reads absent params as null.
+// agent-client-protocol-schema 1.15.1, which reads absent params as null; the
+// idempotencyKey cases are captured from schema crate 1.19.0.
 type paramsCase struct {
 	method string
 	params string

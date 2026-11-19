@@ -2,8 +2,8 @@
 
 ACP's optional features live in the generated `schema/unstable` and
 `schema/v2/unstable` packages, which already expose every request, response,
-and notification type from Rust schema crate 1.15.1's unstable artifacts (the
-crate the reference Rust SDK `agent-client-protocol` 5.0.0 pins).
+and notification type from Rust schema crate 1.19.0's unstable artifacts (the
+crate the reference Rust SDK `agent-client-protocol` 5.4.0 pins).
 `github.com/BrokkAi/acp-go/unstable` (v1) and
 `github.com/BrokkAi/acp-go/v2/unstable` (draft v2) add narrow typed facades on
 top where a capability check or a composite invariant earns its keep, and never
@@ -13,11 +13,23 @@ Next Edit Suggestions (`nes/*`, `document/did*`, and their capabilities) were
 removed from the upstream unstable schema in crate 1.15, so acp-go no longer
 generates or wraps them.
 
-One unstable surface in the 1.15.1 pin is generated but has no facade yet:
-proxy chains (`proxy/initialize`, `proxy/successor`, registered with
-`SideProxy`). `proxyrouter` routes `proxy/initialize` by its generated name,
-and the cookbook proxy recipe reads and writes the generated `proxy/successor`
-envelopes (#69).
+Client-provided system prompts are stable since schema crate 1.16 (Rust 5.1):
+the stable `session/new`, `session/load` (v1), and `session/resume` carry
+`systemPrompt`, the stable clients send it through `NewSessionOptions` and the
+lifecycle requests, and the agent runtimes check it against the announced
+capability. The facades below keep serving it on `session/fork`, which stays
+unstable, and on the unstable lifecycle requests, which also carry initial
+`configOptions`.
+
+Some unstable surfaces in the 1.19.0 pin are generated but have no facade
+yet: proxy chains (`proxy/initialize`, `proxy/successor`, registered with
+`SideProxy`), session cursors (`cursor_update` and `cursorId` on
+`session/fork`), prompt suggestions (`prompt_suggestions_update`), agent
+skills (draft-v2 `skill` command entries and content blocks), and the `speed`
+config option category. They decode, encode, and pass through every runtime
+and projection exactly as Rust does. `proxyrouter` routes `proxy/initialize`
+by its generated name, and the cookbook proxy recipe reads and writes the
+generated `proxy/successor` envelopes (#69).
 
 ## Why a separate import
 
@@ -64,6 +76,7 @@ initialization refuse to run.
 | `Server`, `Service`, `ToolRegistry`, `NewToolServer`, `NewTool` | — | Standard-library MCP server framework and typed tool registry, shared by `mcp` and `v2/mcp` (see below). |
 | `MessageRouter.Attach`, `NewAttachedSession`, `ResumeAttachedSession`, `ForkAttachedSession` (+ v1 `LoadAttachedSession`) | `mcpCapabilities.acp` (v1), `session.mcp.acp` (v2) | Generates a unique `serverId`, registers before writing, appends the `acp` declaration, and releases the registration when validation or the request fails. v2 rejects a name the request already declares with `-32602` before writing. |
 | `Attachment.HandleSessionSetup`, `Attachment.AppendDeclarations` | — | Connection-scoped (global) attachment for proxies: appends the declaration to the raw params of every session setup request, so unknown fields keep their values (the encoding is semantically equal; members may be re-ordered). v2 rejects name collisions with `-32602` and does not forward the request. |
+| `SessionOptions`, `OptionsHandler` | `sessionCapabilities.options` (v1), `capabilities.session.options` (v2) | `session/options` (schema crate 1.17, Rust 5.2): the config options a session would start with, without creating, loading, or resuming one. Requires an absolute `cwd`; additional directories need the additionalDirectories capability; a session ID must be non-blank and, in v1, needs `loadSession` or `sessionCapabilities.resume`. Initial `configOptions` on the unstable `NewSession`, `LoadSession`, `ResumeSession`, and `ForkSession` need the same capability. `Handle` routes the method to an `OptionsHandler`; `Advertise` does not announce the capability, which also promises applying initial `configOptions` the stable dispatch does not carry. |
 | `ArchiveSession`, `UnarchiveSession` | `sessionCapabilities.archive` | Require a non-blank session ID. An unknown session answers `-32002` (`acp.IsResourceNotFound`). |
 | `ListSessions` | `sessionCapabilities.list`; the `archived` filter also needs `sessionCapabilities.archive` | The unstable `session/list` request, whose `archived` filter (`exclude`, `include`, `only`, or any other value, sent unchanged) the stable `ListSessions` cannot carry. `cwd` must be absolute. `SessionInfo.Archived` reports the archive state. |
 | `SessionStatus` | `sessionCapabilities.status` | Requires a non-blank session ID. Unknown status values are preserved; treat anything other than `open` as `saved`. A response without `status` (omitted or `null`) is an error. An unknown session answers `-32002` with the session ID as data. |
@@ -158,16 +171,18 @@ if err := unstable.Install(runtime, implementation); err != nil { // or v2/unsta
 - `systemPrompt` is announced (as `{}`, append only) only for a
   `SystemPromptHandler` that receives the prompt on every lifecycle request
   the agent advertises. It is decided from the `Agent`'s own response, like
-  `archive`, but checked again after the customize functions: a customize
-  function may add `mode.override`, while a `systemPrompt` some advertised
-  lifecycle request would drop fails `initialize` instead of being sent.
+  `archive`. A customize function may add `mode.override`, or announce
+  `systemPrompt` itself for an agent that applies the prompt from the stable
+  requests, which carry it since schema crate 1.16.
 
 `Install` fails, changing nothing, for a nil runtime, a runtime whose
 `InitializeResult` is already set (including by an earlier `Install`), or one
 whose `Overrides` already serves a method it would override. `Handle` and
 `Advertise` remain for wiring by hand, but `Advertise` never announces
-`archive` or `systemPrompt`: an agent that does must also serve the
-`archived` filter or the prompt, which only `Install` wires up. The draft-v2
+`archive`, `systemPrompt`, or `options` on the agent's behalf: an agent that
+does must also serve the `archived` filter, apply the prompt, or apply initial
+`configOptions`. `Install` wires up the first two; `Advertise` keeps a
+capability the agent's own initialize response announces. The draft-v2
 runtime does not import the unstable schema; the v1 runtime reads only the
 initialize request with it, for the subagents capability (see
 [Subagent sessions](#subagent-sessions)).
@@ -217,6 +232,38 @@ interfaces, as auth status does (see [Auth status](#auth-status)).
 `auth/status` is not a method the runtime owns, so it needs no override; the
 `auth/status_update` notification it pairs with goes from agent to client and
 never reaches an override or `Handle`, which only see requests.
+
+## Session options
+
+`session/options` (schema crate 1.17, the reference SDK's
+`unstable_session_options` feature) returns the `configOptions` (and, in v1,
+the `modes`; in draft v2, the `availableCommands`) a session would start with,
+without creating, loading, or resuming one, so a client can show its pickers
+before the first session exists. The same capability lets a client send
+initial values as `configOptions` on `session/new`, `session/load` (v1),
+`session/resume`, and `session/fork`. An unknown `configId`, a mismatched
+`type`, or a value that is not allowed is ignored rather than rejected, and
+in draft v2 a `type` that is not a string fails as the reference SDK's
+hand-written decoder does.
+
+```go
+options, err := unstable.SessionOptions(ctx, connection, initialization, schema.SessionOptionsRequest{
+	Cwd: "/workspace",
+})
+// Start the session with the user's choices.
+session, err := unstable.NewSession(ctx, connection, initialization, schema.NewSessionRequest{
+	Cwd: "/workspace",
+	ConfigOptions: []schema.InitialSessionConfigOption{
+		{ConfigID: "model", ValueID: &schema.InitialSessionConfigOptionValueID{Value: "fast"}},
+	},
+})
+```
+
+On the agent side, an `OptionsHandler` serves the method through `Handle` or
+`Install`. Because the capability also covers initial `configOptions`, which
+reach an agent only through the unstable lifecycle requests (for example a
+`SystemPromptHandler` that `Install` serves), `Advertise` leaves announcing
+it to the agent's customize function.
 
 ## Auth status
 
@@ -380,7 +427,9 @@ func (a *myAgent) NewSessionWithSystemPrompt(ctx context.Context, request unstab
 ```
 
 The customize function adds `mode.override` only when `Install` announced the
-capability; setting `systemPrompt` where `Install` did not fails `initialize`.
+capability. Setting `systemPrompt` where `Install` did not is allowed since
+schema crate 1.16, because the stable requests then carry the prompt to the
+`Agent`, and the runtime checks it against the announced capability.
 
 The handlers do not check the prompt themselves. Before one runs, its route
 answers `-32602` without reaching it in two cases:
@@ -584,7 +633,7 @@ accept the unstable server transports, including the native `acp` variant.
 ## MCP-over-ACP methods: a request-scoped message mover
 
 The native MCP-over-ACP *methods* are still open from #10. The pinned schemas
-(`schema-v1.29.1` and `schema-v2.0.0-alpha.13`) model the request-scoped
+(`schema-v1.33.0` and `schema-v2.0.0-alpha.17`) model the request-scoped
 binding that upstream shipped in
 [agentclientprotocol/agent-client-protocol#2223](https://github.com/agentclientprotocol/agent-client-protocol/pull/2223):
 `mcp/connect` and `mcp/disconnect` are gone, and each `mcp/message` request
@@ -617,7 +666,7 @@ cancellation.
 ## MCP server framework
 
 `mcp` and `v2/mcp` also carry a standard-library MCP server framework that
-mirrors Rust `agent-client-protocol` 5.0.0's `mcp_server` module and the tool
+mirrors Rust `agent-client-protocol` 5.4.0's `mcp_server` module (unchanged since 5.0.0) and the tool
 semantics of `agent-client-protocol-rmcp`'s `rmcp_3` builder (rmcp 3.4.0),
 without an MCP SDK. The framework types are aliases of one internal
 implementation, so `mcp.Server` and the v2 `mcp.Server` are the same type:

@@ -32,6 +32,14 @@ never uses reflection over struct fields.
 | Media types on image, audio, and embedded content | v1 and draft-v2 prompt facades |
 | Absolute URIs on resource links and embedded resources | v1 and draft-v2 prompt facades |
 | Capability gates before writing | v1 and draft-v2 facades |
+| Client-provided system prompts (capability, `append` or advertised `override`, non-empty text content) | v1 `session.go` and draft-v2 client before writing (`internal/promptrule`); both agent runtimes before the Agent runs |
+| Prompt idempotency keys (1 to 255 characters) | draft-v2 `PromptContentWithKey` before writing; the generated `IdempotencyKey` decoder |
+
+One generated type validates on decode: `schema/v2.IdempotencyKey`, because the
+Rust type's hand-written `Deserialize` rejects a malformed key and the protocol
+says an agent must answer it with `-32602` rather than treat it as omitted.
+The generator lists such types in `lengthCheckedStrings`, so this stays a
+decode-parity rule, not a facade decision.
 
 `acpvalidate.AbsolutePath` accepts a path that is absolute on either platform -
 POSIX (`/dir`), Windows drive-absolute (`C:\dir` or `C:/dir`), or a Windows UNC
