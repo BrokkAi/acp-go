@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. Release
 entries use [Semantic Versioning](https://semver.org/); during the `0.x`
 series, minor releases may contain breaking API changes.
 
-## Unreleased
+## 0.14.0 - 2026-11-19
 
 The behavioral reference moves to Rust `agent-client-protocol` **5.4.0**, which
 pins `agent-client-protocol-schema` `=1.19.0`: ACP v1 `schema-v1.33.0`, draft
